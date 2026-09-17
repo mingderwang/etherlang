@@ -1,0 +1,7 @@
+_build
+data
+.git
+.gitignore
+*.dets
+erl_crash.dump
+logs

@@ -1,0 +1,64 @@
+services:
+  etherlang:
+    build: .
+    image: etherlang:latest
+    container_name: etherlang
+    ports:
+      - "8545:8545"
+    environment:
+      # An Ethereum JSON-RPC endpoint used as the sync source / proxy fallback.
+      # Defaults to the free public Sepolia endpoint.
+      UPSTREAM_RPC_URL: ${UPSTREAM_RPC_URL:-https://ethereum-sepolia-rpc.publicnode.com}
+      RPC_LISTEN_PORT: "8545"
+      DATA_DIR: /data
+      # "latest" = start from the current head (fast); a number = full history
+      # back to that block; 0 = everything from genesis.
+      ETH_START_BLOCK: ${ETH_START_BLOCK:-latest}
+      SYNC_CONCURRENCY: ${SYNC_CONCURRENCY:-8}
+      BODY_WINDOW: ${BODY_WINDOW:-100000}
+      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-5000}
+      MAX_REORG_DEPTH: ${MAX_REORG_DEPTH:-256}
+    volumes:
+      - etherlang-data:/data
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Optional local EthStats stack: `docker compose --profile ethstats up`.
+  #   - dashboard (browser UI) on http://localhost:3000
+  #   - agent that reads standard JSON-RPC from `etherlang` and feeds the graph
+  # ---------------------------------------------------------------------------
+  ethstats-dashboard:
+    image: ethereumex/eth-netstats
+    profiles: ["ethstats"]
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["npm start"]
+    environment:
+      WS_SECRET: ${ETHSTATS_SECRET:-etherlang-local}
+      ADMIN_PASSWORD: ${ETHSTATS_ADMIN:-admin}
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+  ethstats-agent:
+    image: nuagic/eth-net-intelligence-api
+    profiles: ["ethstats"]
+    environment:
+      RPC_HOST: etherlang
+      RPC_PORT: "8545"
+      LISTENING_PORT: "30303"
+      INSTANCE_NAME: ${INSTANCE_NAME:-etherlang-local}
+      CONTACT_DETAILS: ""
+      WS_SERVER: ws://ethstats-dashboard:3000
+      WS_SECRET: ${ETHSTATS_SECRET:-etherlang-local}
+      VERBOSITY: "3"
+    depends_on:
+      - etherlang
+      - ethstats-dashboard
+    restart: unless-stopped
+
+volumes:
+  etherlang-data:
+
+networks:
+  default:
+    name: etherlang_default

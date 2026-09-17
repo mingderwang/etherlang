@@ -1,0 +1,8 @@
+_build/
+data/
+erl_crash.dump
+*.beam
+.rebar3/
+doc/
+logs/
+.DS_Store

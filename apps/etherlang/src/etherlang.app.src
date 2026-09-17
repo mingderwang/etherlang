@@ -1,0 +1,11 @@
+{application, etherlang, [
+    {description, "Ethereum-compatible JSON-RPC node in Erlang: gap-sync + follow from an upstream node, no EVM."},
+    {vsn, "0.1.0"},
+    {registered, [etherlang_sup, eth_chain, eth_sync, eth_rpc_server]},
+    {mod, {etherlang_app, []}},
+    {applications, [kernel, stdlib, crypto, inets, ssl, ranch, cowboy, thoas]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, []}
+]}.

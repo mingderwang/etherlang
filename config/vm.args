@@ -1,0 +1,8 @@
+# Node name required by the relx start script.
+-sname etherlang
+
+# Kernel polling is useful with many concurrent sockets.
++K true
+
+# Async thread pool for inets/httpc, DETS, etc.
++A 32
