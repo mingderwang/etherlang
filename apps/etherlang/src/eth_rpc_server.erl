@@ -30,7 +30,7 @@ handle_cast(_Msg, S) -> {noreply, S}.
 handle_info(_Info, S) -> {noreply, S}.
 
 terminate(_Reason, #st{listener = L}) ->
-    catch cowboy:stop_listener(L),
+    _ = try cowboy:stop_listener(L) catch _:_ -> ok end,
     ok.
 
 code_change(_OldVsn, S, _Extra) -> {ok, S}.

@@ -1,7 +1,7 @@
 -module(eth_test_util).
 
 -export([start_apps/0, free_port/0, tmp_dir/1, tmp_dir/0, bin_to_hex/1,
-         wait_until/3, block/3, make_blocks/4]).
+         wait_until/3, block/3, header/3, header_hash/3, make_blocks/4]).
 
 start_apps() ->
     {ok, _} = application:ensure_all_started(crypto),
@@ -35,7 +35,7 @@ wait_until(Fun, SleepMs, TimeoutMs) ->
     wait_until_n(Fun, SleepMs, Deadline).
 
 wait_until_n(Fun, SleepMs, Deadline) ->
-    case catch Fun() of
+    case try Fun() catch _:_ -> false end of
         true ->
             ok;
         _ ->
@@ -48,34 +48,47 @@ wait_until_n(Fun, SleepMs, Deadline) ->
     end.
 
 %% ---------------------------------------------------------------------------
-%% Deterministic synthetic blocks (used by the mock node and chain tests)
+%% Deterministic synthetic blocks (used by the mock node and chain tests).
+%% Blocks carry *real* RLP+keccak header hashes so the chain store's
+%% verification path is exercised.
 %% ---------------------------------------------------------------------------
 
-block_hash(Num, Parent, Salt) ->
-    Hash = crypto:hash(sha256, term_to_binary({Num, Parent, Salt})),
-    <<"0x", (bin_to_hex(Hash))/binary>>.
+-define(ZERO32, <<"0x0000000000000000000000000000000000000000000000000000000000000000">>).
+-define(EMPTY_UNCLE_HASH, <<"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347">>).
 
 tx_hash(Num, Idx) ->
     Hash = crypto:hash(sha256, term_to_binary({tx, Num, Idx})),
     <<"0x", (bin_to_hex(Hash))/binary>>.
 
-block(Num, Parent, Salt) ->
-    H = block_hash(Num, Parent, Salt),
-    #{<<"number">> => eth_hex:encode_int(Num),
-      <<"hash">> => H,
-      <<"parentHash">> => Parent,
-      <<"timestamp">> => eth_hex:encode_int(1000 + Num),
+%% Header-only map for block Num chained to Parent. `Salt' goes into extraData
+%% so that competing forks from the same parent hash differently.
+header(Num, Parent, Salt) ->
+    #{<<"parentHash">> => Parent,
+      <<"sha3Uncles">> => ?EMPTY_UNCLE_HASH,
+      <<"miner">> => <<"0x0000000000000000000000000000000000000000">>,
+      <<"stateRoot">> => ?ZERO32,
+      <<"transactionsRoot">> => ?ZERO32,
+      <<"receiptsRoot">> => ?ZERO32,
+      <<"logsBloom">> => <<"0x">>,
+      <<"difficulty">> => eth_hex:encode_int(0),
+      <<"number">> => eth_hex:encode_int(Num),
       <<"gasLimit">> => eth_hex:encode_int(30000000),
       <<"gasUsed">> => eth_hex:encode_int(0),
-      <<"difficulty">> => eth_hex:encode_int(0),
+      <<"timestamp">> => eth_hex:encode_int(1000 + Num),
+      <<"extraData">> => eth_hex:encode_int(Salt),
+      <<"mixHash">> => ?ZERO32,
+      <<"nonce">> => <<"0x0000000000000000">>}.
+
+header_hash(Num, Parent, Salt) ->
+    {ok, H} = eth_header:hash(header(Num, Parent, Salt)),
+    <<"0x", (bin_to_hex(H))/binary>>.
+
+block(Num, Parent, Salt) ->
+    H = header_hash(Num, Parent, Salt),
+    (header(Num, Parent, Salt))#{
+      <<"hash">> => H,
       <<"totalDifficulty">> => eth_hex:encode_int(0),
-      <<"miner">> => <<"0x0000000000000000000000000000000000000000">>,
-      <<"nonce">> => <<"0x0000000000000000">>,
       <<"size">> => eth_hex:encode_int(600),
-      <<"extraData">> => <<"0x">>,
-      <<"stateRoot">> => <<"0x0000000000000000000000000000000000000000000000000000000000000000">>,
-      <<"receiptsRoot">> => <<"0x0000000000000000000000000000000000000000000000000000000000000000">>,
-      <<"logsBloom">> => <<"0x">>,
       <<"transactions">> =>
           [#{<<"hash">> => tx_hash(Num, 0),
              <<"blockHash">> => H,

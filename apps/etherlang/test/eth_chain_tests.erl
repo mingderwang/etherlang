@@ -108,3 +108,74 @@ dets_stats_check(Name) ->
         4 -> [];
         N -> ["unexpected size " ++ integer_to_list(N)]
     end.
+
+rejects_bad_hash_test() ->
+    Name = 'chain_g',
+    Dir = eth_test_util:tmp_dir(),
+    with_chain(Name, Dir, fun() ->
+        {_H, Blocks} = eth_test_util:make_blocks(0, 3, z0(), 0),
+        [B0, B1, B2] = Blocks,
+        Bad = B2#{<<"gasUsed">> => <<"0xffff">>},
+        ?assertMatch({error, {bad_block, 2, {bad_block_hash, _, _}}},
+                     eth_chain:append(Name, [{0, B0, true}, {1, B1, true}, {2, Bad, true}])),
+        %% nothing was accepted
+        ?assertEqual(undefined, eth_chain:head(Name))
+    end).
+
+finality_floor_test() ->
+    Name = 'chain_h',
+    Dir = eth_test_util:tmp_dir(),
+    with_chain(Name, Dir, fun() ->
+        {_H, Blocks} = eth_test_util:make_blocks(0, 6, z0(), 0),
+        ok = eth_chain:append(Name, pair(Blocks, true)),
+
+        ?assertEqual(undefined, eth_chain:finalized(Name)),
+        ok = eth_chain:set_finalized(Name, 3),
+        ?assertEqual(3, eth_chain:finalized(Name)),
+
+        %% rewind at or above the checkpoint is fine
+        ?assertEqual(ok, eth_chain:rewind(Name, 5)),
+        ?assertEqual(ok, eth_chain:rewind(Name, 3)),
+        ?assertEqual({3, hash_of(lists:nth(4, Blocks))}, eth_chain:head(Name)),
+
+        %% below the checkpoint is refused
+        ?assertEqual({error, {below_finality, 3}}, eth_chain:rewind(Name, 2)),
+        ?assertEqual({3, hash_of(lists:nth(4, Blocks))}, eth_chain:head(Name)),
+
+        %% checkpoint never moves backwards
+        ok = eth_chain:set_finalized(Name, 1),
+        ?assertEqual(3, eth_chain:finalized(Name))
+    end).
+
+finality_blocks_reorg_test() ->
+    Name = 'chain_i',
+    Dir = eth_test_util:tmp_dir(),
+    with_chain(Name, Dir, fun() ->
+        {_H, Blocks} = eth_test_util:make_blocks(0, 6, z0(), 0),
+        ok = eth_chain:append(Name, pair(Blocks, true)),
+        ok = eth_chain:set_finalized(Name, 4),
+
+        %% a fork replacing block 3 (i.e. below finality) must be rejected
+        {_, Fork} = eth_test_util:make_blocks(3, 3, hash_of(lists:nth(3, Blocks)), 7),
+        ?assertMatch({error, {below_finality, 4}},
+                     eth_chain:append(Name, pair(Fork, true))),
+        ?assertEqual(5, eth_chain:highest(Name))
+    end).
+
+finality_persistence_test() ->
+    NameA = 'chain_j',
+    NameB = 'chain_k',
+    Dir = eth_test_util:tmp_dir(),
+    {ok, _} = eth_chain:start_link(NameA, Dir),
+    {_H, Blocks} = eth_test_util:make_blocks(0, 4, z0(), 0),
+    ok = eth_chain:append(NameA, pair(Blocks, true)),
+    ok = eth_chain:set_finalized(NameA, 2),
+    gen_server:stop(NameA),
+
+    {ok, _} = eth_chain:start_link(NameB, Dir),
+    try
+        ?assertEqual(2, eth_chain:finalized(NameB)),
+        ?assertEqual({error, {below_finality, 2}}, eth_chain:rewind(NameB, 1))
+    after
+        gen_server:stop(NameB)
+    end.

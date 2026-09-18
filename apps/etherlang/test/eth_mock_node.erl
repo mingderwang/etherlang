@@ -6,10 +6,11 @@
 %% deterministically.
 
 -export([start_link/1, url/1, port/1,
-         set_chain/2, extend/3, fork_at/4, chain/1, handle_rpc/3]).
+         set_chain/2, extend/3, fork_at/4, chain/1,
+         set_finalized/2, finalized/1, handle_rpc/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
--record(st, {name, port, chain = []}).
+-record(st, {name, port, chain = [], finalized = undefined}).
 
 start_link(Name) when is_atom(Name) ->
     gen_server:start_link({local, Name}, ?MODULE, Name, []).
@@ -29,6 +30,11 @@ fork_at(Name, At, Count, Salt) when At >= 0 ->
 
 chain(Name) -> gen_server:call(Name, chain).
 
+%% Advertise a finalized checkpoint (used by finality tests).
+set_finalized(Name, Num) -> gen_server:cast(Name, {set_finalized, Num}).
+
+finalized(Name) -> gen_server:call(Name, finalized).
+
 %% Handled from the cowboy handler (eth_mock_http).
 handle_rpc(Name, Method, Params) ->
     gen_server:call(Name, {rpc, Method, Params}).
@@ -45,12 +51,16 @@ handle_call(port, _From, S) -> {reply, S#st.port, S};
 
 handle_call(chain, _From, S) -> {reply, S#st.chain, S};
 
+handle_call(finalized, _From, S) -> {reply, S#st.finalized, S};
+
 handle_call({rpc, Method, Params}, _From, S) ->
     {reply, do_rpc(S, Method, Params), S};
 
 handle_call(_Req, _From, S) -> {reply, {error, unknown_call}, S}.
 
 handle_cast({set_chain, Blocks}, S) -> {noreply, S#st{chain = Blocks}};
+
+handle_cast({set_finalized, Num}, S) -> {noreply, S#st{finalized = Num}};
 
 handle_cast({extend, Count, Salt}, S) ->
     {Parent, Blocks} = eth_test_util:make_blocks(length(S#st.chain), Count,
@@ -72,14 +82,14 @@ handle_cast(_Msg, S) -> {noreply, S}.
 handle_info(_Info, S) -> {noreply, S}.
 
 terminate(_Reason, #st{name = Name}) ->
-    catch cowboy:stop_listener(Name),
+    _ = try cowboy:stop_listener(Name) catch _:_ -> ok end,
     ok.
 
 code_change(_OldVsn, S, _Extra) -> {ok, S}.
 
 %% ---------------------------------------------------------------------------
 
-last_hash([]) -> eth_test_util:block_hash(-1, <<>>, -1);
+last_hash([]) -> <<"0x0000000000000000000000000000000000000000000000000000000000000000">>;
 last_hash(Chain) -> maps:get(<<"hash">>, lists:last(Chain)).
 
 do_rpc(S, <<"eth_blockNumber">>, _Params) ->
@@ -87,12 +97,15 @@ do_rpc(S, <<"eth_blockNumber">>, _Params) ->
         [] -> {ok, <<"0x0">>};
         C -> {ok, eth_hex:encode_int(length(C) - 1)}
     end;
-do_rpc(S, <<"eth_getBlockByNumber">>, [NumHex, Full]) ->
-    Num = eth_hex:decode(NumHex),
-    case lists:keyfind(Num, 1, indexed(S#st.chain)) of
-        false -> {ok, null};
-        {_, Block} -> {ok, render(Block, Full)}
+do_rpc(S, <<"eth_getBlockByNumber">>, [Tag, Full])
+  when Tag =:= <<"latest">>; Tag =:= <<"pending">>; Tag =:= <<"earliest">>;
+       Tag =:= <<"finalized">>; Tag =:= <<"safe">> ->
+    case tag_number(S, Tag) of
+        undefined -> {ok, null};
+        Num -> block_at(S, Num, Full)
     end;
+do_rpc(S, <<"eth_getBlockByNumber">>, [NumHex, Full]) when is_binary(NumHex) ->
+    block_at(S, eth_hex:decode(NumHex), Full);
 do_rpc(S, <<"eth_getBlockByHash">>, [HashHex, Full]) ->
     case lists:keyfind(HashHex, 1, [{maps:get(<<"hash">>, B), B} || B <- S#st.chain]) of
         false -> {ok, null};
@@ -110,6 +123,19 @@ do_rpc(_S, Method, _Params) ->
 
 indexed(Chain) ->
     [{Num, B} || {Num, B} <- lists:zip(lists:seq(0, length(Chain) - 1), Chain)].
+
+tag_number(#st{chain = []}, _Tag) -> undefined;
+tag_number(S, Tag) when Tag =:= <<"latest">>; Tag =:= <<"pending">> ->
+    length(S#st.chain) - 1;
+tag_number(_S, <<"earliest">>) -> 0;
+tag_number(S, Tag) when Tag =:= <<"finalized">>; Tag =:= <<"safe">> ->
+    S#st.finalized.
+
+block_at(S, Num, Full) ->
+    case lists:keyfind(Num, 1, indexed(S#st.chain)) of
+        false -> {ok, null};
+        {_, Block} -> {ok, render(Block, Full)}
+    end.
 
 render(Block, true) ->
     Block;

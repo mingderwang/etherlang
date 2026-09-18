@@ -113,6 +113,7 @@ run_once(S) ->
     case upstream_block_number() of
         {ok, HeadU} ->
             S0 = (S#st{mode = sync, budget = S#st.budget_max})#st{target = HeadU},
+            track_finalized(S0#st.chain),
             case local_head(S0#st.chain) of
                 undefined ->
                     From = anchor(S0, HeadU),
@@ -125,6 +126,19 @@ run_once(S) ->
         {error, Reason} ->
             logger:warning("etherlang: upstream unreachable (~p); will retry", [Reason]),
             S#st{mode = upstream_down, failed = S#st.failed + 1}
+    end.
+
+%% Pull the upstream finalized checkpoint and record it (never moves back).
+track_finalized(Chain) ->
+    case try eth_rpc_client:call(<<"eth_getBlockByNumber">>, [<<"finalized">>, false])
+         catch _:_ -> error end of
+        {ok, Block} when is_map(Block) ->
+            case eth_header:number(Block) of
+                undefined -> ok;
+                N -> eth_chain:set_finalized(Chain, N)
+            end;
+        _ ->
+            ok
     end.
 
 %% Where to start when the local store is empty.
@@ -142,13 +156,17 @@ rewind_to_upstream(S, HeadU) ->
             Hash = maps:get(<<"hash">>, Block),
             case eth_chain:canonical_hash(S#st.chain, HeadU) of
                 Hash ->
-                    ok = eth_chain:rewind(S#st.chain, HeadU),
-                    S#st{mode = follow};
+                    case eth_chain:rewind(S#st.chain, HeadU) of
+                        ok -> S#st{mode = follow};
+                        {error, Reason} -> rewind_refused(S, Reason)
+                    end;
                 _Other ->
                     case ancestor_walk(S, Hash) of
                         {ok, CA} ->
-                            ok = eth_chain:rewind(S#st.chain, CA),
-                            S#st{mode = follow, reorgs = S#st.reorgs + 1};
+                            case eth_chain:rewind(S#st.chain, CA) of
+                                ok -> S#st{mode = follow, reorgs = S#st.reorgs + 1};
+                                {error, Reason} -> rewind_refused(S, Reason)
+                            end;
                         error ->
                             S
                     end
@@ -156,6 +174,13 @@ rewind_to_upstream(S, HeadU) ->
         {error, _} ->
             S
     end.
+
+rewind_refused(S, {below_finality, F}) ->
+    logger:error("etherlang: upstream reorg below finalized ~p; refusing", [F]),
+    S#st{failed = S#st.failed + 1};
+rewind_refused(S, Reason) ->
+    logger:error("etherlang: rewind refused (~p)", [Reason]),
+    S#st{failed = S#st.failed + 1}.
 
 sync_range(S, _From, _To) when _From > _To ->
     S#st{mode = follow, synced = true};
@@ -178,12 +203,25 @@ sync_range(S, From, To) ->
                 {missing_parent, Parent} ->
                     case ancestor_walk(S, Parent) of
                         {ok, CA} ->
-                            ok = eth_chain:rewind(S#st.chain, CA),
-                            logger:notice("etherlang: deep reorg, rewound to ~p", [CA]),
-                            sync_range(S#st{reorgs = S#st.reorgs + 1}, CA + 1, To);
+                            case eth_chain:rewind(S#st.chain, CA) of
+                                ok ->
+                                    logger:notice("etherlang: deep reorg, rewound to ~p", [CA]),
+                                    sync_range(S#st{reorgs = S#st.reorgs + 1}, CA + 1, To);
+                                {error, Reason} ->
+                                    rewind_refused(S, Reason)
+                            end;
                         error ->
                             S#st{failed = S#st.failed + 1}
-                    end
+                    end;
+                {error, {bad_block, N, Reason}} ->
+                    logger:error("etherlang: rejecting block ~p: ~p", [N, Reason]),
+                    S#st{failed = S#st.failed + 1};
+                {error, {below_finality, F}} ->
+                    logger:error("etherlang: refusing rewind below finalized ~p", [F]),
+                    S#st{failed = S#st.failed + 1};
+                {error, Reason} ->
+                    logger:error("etherlang: append failed (~p)", [Reason]),
+                    S#st{failed = S#st.failed + 1}
             end;
         {error, Reason} ->
             logger:warning("etherlang: window fetch failed (~p); will retry", [Reason]),
@@ -263,14 +301,26 @@ do_walk(S, H, Depth) ->
         {ok, Block} when is_map(Block) ->
             BHash = maps:get(<<"hash">>, Block),
             Num = eth_hex:decode(maps:get(<<"number">>, Block)),
-            case eth_chain:canonical_hash(S#st.chain, Num) of
-                BHash -> {ok, Num};
-                _ -> do_walk(S, maps:get(<<"parentHash">>, Block), Depth + 1)
+            case below_finality(S#st.chain, Num) of
+                true ->
+                    logger:error("etherlang: reorg reaches below finalized checkpoint", []),
+                    error;
+                false ->
+                    case eth_chain:canonical_hash(S#st.chain, Num) of
+                        BHash -> {ok, Num};
+                        _ -> do_walk(S, maps:get(<<"parentHash">>, Block), Depth + 1)
+                    end
             end;
         {ok, _} ->
             {error, not_a_block};
         {error, _} = E ->
             E
+    end.
+
+below_finality(Chain, Num) ->
+    case try eth_chain:finalized(Chain) catch _:_ -> error end of
+        F when is_integer(F) -> Num < F;
+        _ -> false
     end.
 
 %% ---------------------------------------------------------------------------

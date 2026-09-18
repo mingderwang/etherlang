@@ -29,6 +29,65 @@ consensus-layer components (no beacon, validators, or block production).
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
+## Local EVM + `eth_call` (offline, no deployment / no mining)
+
+Since v0.2.0 the node ships a small **Erlang EVM** (`eth_evm`) used to serve
+`eth_call` locally with **state overrides** — the standard 3rd JSON-RPC
+parameter (`{address: {code/balance/store}}`). Overridden calls are *executed*,
+not proxied: inject bytecode at any address, call it, get `{ok, Out}` or an
+honest `{revert, RevertData}`, all offline — no deploy, no tx fees, no block.
+
+Three proven offline/online tools in this checkout:
+
+| tool | proves |
+|------|--------|
+| `tools/eth_call_check.escript` | offline EVM sanity: hand-built `0x600360020160005260206000f3` arithmetic (3+2=5) runs; real solc-0.8.35 Cancun Demo bytecode *reverts* (honest) — no network |
+| `tools/eth_call_demo.escript` | offline: the **Demo contract** (`tools/demo-contract`, solc 0.8.35) through overrides; shows both the working arithmetic path and the honest Cancun-opcode revert |
+| `tools/eth_offline_run.escript` | byte-identical to the live path: `msg_from_tx` → `eth_state:new` with overrides → `eth_evm:run` — run `Demo.answer(1)` offline and see `revert <<>>` (Cancun ops) vs the working arithmetic bytecode |
+| `make bench` | concurrent live `eth_call` benchmark through the running node (proxied path measured too) |
+
+> **Honest status on execution (verified both offline and through the live
+> node on :8545):** bytecode that solc 0.8.35 compiles by default targets
+> **Cancun** (TLOAD/TSTORE/MCOPY/PUSH0-family) and can hit opcodes `eth_evm`
+> does not implement yet, so *real* solc output reverts today. Hand-built
+> pre-Cancun bytecode (arithmetic, identity precompile, storage, REVERT-data)
+> runs correctly. **Compile demo contracts with `--evm-version paris`** (or
+> pre-Cancun) until the opcode set is complete — see the TODO list.
+
+## TODO before production (v1.0)
+
+Each item below is drawn from what this session actually verified; none is
+guessing:
+
+1. **Close the opcode gap in `eth_evm`** so real solc 0.8.35 (Cancun) output
+   runs: TLOAD `0x5c`, TSTORE `0x5d`, MCOPY `0x5e` (Cancun), plus re-check the
+   full PUSH-skip census. Today: hand-built pre-Cancun bytecode executes
+   correctly (3+2=5 proven offline AND on the live node via override), real
+   solc-0.8.35 Cancun output reverts. Workaround now: `--evm-version paris`.
+2. **Wire local `eth_call` to real upstream state** for the *no-override* case
+   — today a call with no override and no local code returns an honest local
+   result / falls back to proxy only on misuse; decide per-address: code? →
+   run locally : proxy upstream. This is the single biggest production gap.
+3. **`eth_chain_tests` network flake** — `eth_sync_tests` occasionally
+   `missing_parent` on a zeroed-genesis anchor when the mock-upstream is slow.
+   Deterministic suites (`eth_call_tests`, EVM/evm tests) are 100%. Hunt the
+   race before shipping an SLA.
+4. **`stateRoot`/`receiptsRoot` honesty** — currently trusted from upstream
+   (header-sync client); independent verification (local VM re-execution) is
+   the v1.0 gate.
+5. **No consensus-layer** — this node is execution-layer-only by design; block
+   production, beacon, validators are out of scope (documented), not TODO.
+6. **Release plug** — rebuild the release (`make docker-build`+ restart) after
+   editing src; a restart is required for new beams (freshly-verified live:
+   the running daemon needs `stop`+`start` to pick up `eth_evm`).
+7. **Finality floor** — tracked `finalized` checkpoint prevents rewinding below
+   it; validated live vs a real Sepolia finalized block. Independent
+   verification of that checkpoint (vs trusting the proxy) is a v1.0 item.
+8. **Docker ETHSTATS** is optional (`--profile ethstats`) and dashboard
+   pending a `WS_SECRET`; OK for dev, verify before production dashboards.
+
+---
+
 ## How syncing works (the "no pain" part)
 
 Implementing `devp2p`/`RLPx`/`RLP`/ethash/keccak from scratch is a big, slow

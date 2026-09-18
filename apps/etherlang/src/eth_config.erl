@@ -14,10 +14,12 @@
 %%   MAX_REORG_DEPTH    - ancestor walk limit when handling a reorg
 %%   HTTP_TIMEOUT_MS    - per-request upstream timeout
 %%   SYNC_BUDGET        - max blocks fetched per sync tick (progress granularity)
+%%   VERIFY_HEADERS     - recompute RLP+keccak header hashes on append (default true)
+%%   EVM_ETH_CALL       - serve eth_call locally via the built-in EVM (default true)
 
 -export([upstream_url/0, listen_port/0, data_dir/0, start_block/0, concurrency/0,
          body_window/0, poll_interval_ms/0, sync_retry_ms/0, max_reorg_depth/0,
-         http_timeout_ms/0, sync_budget/0]).
+         http_timeout_ms/0, sync_budget/0, verify_headers/0, evm_enabled/0]).
 
 -define(DEF_URL, "https://ethereum-sepolia-rpc.publicnode.com").
 -define(DEF_PORT, 8545).
@@ -60,6 +62,22 @@ max_reorg_depth() -> int_env("MAX_REORG_DEPTH", max_reorg_depth, ?DEF_MAX_REORG)
 http_timeout_ms() -> int_env("HTTP_TIMEOUT_MS", http_timeout_ms, ?DEF_HTTP_TIMEOUT).
 
 sync_budget() -> int_env("SYNC_BUDGET", sync_budget, ?DEF_BUDGET).
+
+verify_headers() ->
+    case string:lowercase(str_env("VERIFY_HEADERS", verify_headers, "true")) of
+        "false" -> false;
+        "0" -> false;
+        "no" -> false;
+        _ -> true
+    end.
+
+evm_enabled() ->
+    case string:lowercase(str_env("EVM_ETH_CALL", evm_enabled, "true")) of
+        "false" -> false;
+        "0" -> false;
+        "no" -> false;
+        _ -> true
+    end.
 
 str_env(Env, _Key, Default) ->
     case os:getenv(Env) of

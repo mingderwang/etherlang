@@ -105,9 +105,9 @@ rpc_server_case() ->
             httpc:request(get, {"http://127.0.0.1:" ++ integer_to_list(Port), []},
                           [{timeout, 10000}], [])
     after
-        catch gen_server:stop(Server),
-        catch gen_server:stop(Chain),
-        catch gen_server:stop(Mock)
+        _ = try gen_server:stop(Server) catch _:_ -> ok end,
+        _ = try gen_server:stop(Chain) catch _:_ -> ok end,
+        _ = try gen_server:stop(Mock) catch _:_ -> ok end
     end.
 
 rpc(Port, Payload) when is_binary(Payload) ->

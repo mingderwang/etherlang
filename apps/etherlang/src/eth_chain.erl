@@ -9,10 +9,17 @@
 %% (i.e. we fetched header-only). Only canonical blocks are kept; reorgs are
 %% detected through parent-hash linkage and handled by rewinding the head.
 %%
+%% Integrity: unless `VERIFY_HEADERS=false', every appended block's header is
+%% re-hashed (RLP + keccak-256) and must match its claimed `hash'; the stored
+%% canonical hash is the recomputed one, so parent linkage is cryptographic.
+%% A `finalized' checkpoint (fetched from upstream) is persisted and forms a
+%% hard floor: the chain is never rewound below it.
+%%
 %% Storage layout (DETS "set" tables):
 %%   num_tab   : {{Num}}        -> {Hash, Block, Full}
 %%   hash_tab  : {{Hash}}       -> Num
 %%   meta_tab  : head           -> {Num, Hash}
+%%               finalized      -> Num
 
 -export([start_link/1, start_link/2,
          head/0, head/1,
@@ -21,11 +28,14 @@
          get_by_number/1, get_by_number/2,
          get_by_hash/1, get_by_hash/2,
          canonical_hash/1, canonical_hash/2,
-         highest/1, has_block/1, has_block/2, size/1]).
+         highest/1, has_block/1, has_block/2, size/1,
+         finalized/0, finalized/1, set_finalized/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
--record(st, {dir, head :: undefined | {integer(), binary()}}).
+-record(st, {dir, head :: undefined | {integer(), binary()},
+             finalized :: undefined | integer(),
+             verify = true :: boolean()}).
 
 start_link(Dir) -> start_link(eth_chain, Dir).
 start_link(Name, Dir) when is_atom(Name) ->
@@ -40,11 +50,13 @@ head(Name) -> gen_server:call(Name, head).
 
 %% Append canonical blocks, ascending by number. Each entry is {Num, Block, Full}.
 %% Returns: ok | {reorg, CommonAncestorNum} | {missing_parent, ParentHash}
+%%        | {error, {bad_block, Num, Reason}} | {error, {below_finality, Num}}.
 append(Blocks) when is_list(Blocks) -> append(eth_chain, Blocks).
 append(Name, Blocks) when is_list(Blocks) ->
     gen_server:call(Name, {append, Blocks}).
 
-%% Rewind the canonical head to Num, discarding everything above it.
+%% Rewind the canonical head to Num, discarding everything above it. Refuses to
+%% go below the finalized checkpoint.
 rewind(N) -> rewind(eth_chain, N).
 rewind(Name, N) -> gen_server:call(Name, {rewind, N}).
 
@@ -61,12 +73,19 @@ highest(Name) -> gen_server:call(Name, highest).
 
 has_block(N) -> has_block(eth_chain, N).
 has_block(Name, N) ->
-    case (catch gen_server:call(Name, {get_by_number, N})) of
+    case try gen_server:call(Name, {get_by_number, N}) catch _:_ -> error end of
         {ok, _, _} -> true;
         _ -> false
     end.
 
 size(Name) -> gen_server:call(Name, size).
+
+finalized() -> finalized(eth_chain).
+finalized(Name) -> gen_server:call(Name, finalized).
+
+%% Advance the finalized checkpoint (monotonic; never goes backwards).
+set_finalized(Name, Num) when is_integer(Num), Num >= 0 ->
+    gen_server:call(Name, {set_finalized, Num}).
 
 %% ---------------------------------------------------------------------------
 %% gen_server callbacks
@@ -84,8 +103,13 @@ init({Name, Dir}) ->
                [{head, {N, H}}] -> {N, H};
                _ -> undefined
            end,
+    Fin = case dets:lookup(meta_tab, finalized) of
+              [{finalized, F}] when is_integer(F) -> F;
+              _ -> undefined
+          end,
     _ = Name,
-    {ok, #st{dir = Dir, head = Head}}.
+    {ok, #st{dir = Dir, head = Head, finalized = Fin,
+             verify = eth_config:verify_headers()}}.
 
 handle_call(head, _From, S) ->
     {reply, S#st.head, S};
@@ -119,12 +143,30 @@ handle_call({get_by_hash, H}, _From, S) ->
     end;
 
 handle_call({append, Blocks}, _From, S) ->
-    {Res, S1} = do_append(Blocks, S),
-    {reply, Res, S1};
+    case verify_blocks(Blocks, S#st.verify) of
+        {ok, Blocks1} ->
+            {Res, S1} = do_append(Blocks1, S),
+            {reply, Res, S1};
+        {error, Reason} ->
+            {reply, {error, Reason}, S}
+    end;
 
 handle_call({rewind, N}, _From, S) ->
-    S1 = rewind_to(S, N),
-    {reply, ok, S1};
+    case below_finality(S, N) of
+        true ->
+            {reply, {error, {below_finality, S#st.finalized}}, S};
+        false ->
+            {reply, ok, rewind_to(S, N)}
+    end;
+
+handle_call(finalized, _From, S) ->
+    {reply, S#st.finalized, S};
+
+handle_call({set_finalized, N}, _From, #st{finalized = F} = S) when F =/= undefined, N =< F ->
+    {reply, ok, S};
+handle_call({set_finalized, N}, _From, S) ->
+    ok = dets:insert(meta_tab, {finalized, N}),
+    {reply, ok, S#st{finalized = N}};
 
 handle_call(_Req, _From, S) ->
     {reply, {error, unknown_call}, S}.
@@ -134,7 +176,9 @@ handle_cast(_Msg, S) -> {noreply, S}.
 handle_info(_Info, S) -> {noreply, S}.
 
 terminate(_Reason, _S) ->
-    lists:foreach(fun(T) -> catch dets:close(T) end, [num_tab, hash_tab, meta_tab]),
+    lists:foreach(fun(T) ->
+                          _ = try dets:close(T) catch _:_ -> ok end
+                  end, [num_tab, hash_tab, meta_tab]),
     ok.
 
 code_change(_OldVsn, S, _Extra) -> {ok, S}.
@@ -157,12 +201,14 @@ do_append([{Num, Block, _Full} | _] = Blocks, #st{head = {HN, HS}} = S) ->
         false ->
             case dets:lookup(hash_tab, {Parent}) of
                 [{{Parent}, CA}] when is_integer(CA), CA < HN ->
-                    S1 = rewind_to(S, CA),
-                    case Num =:= CA + 1 of
-                        true ->
-                            do_append_cont(Blocks, S1);
-                        false ->
-                            {{reorg, CA}, S1}
+                    case reorg_rewind(S, CA) of
+                        {ok, S1} ->
+                            case Num =:= CA + 1 of
+                                true -> do_append_cont(Blocks, S1);
+                                false -> {{reorg, CA}, S1}
+                            end;
+                        {error, R} ->
+                            {{error, R}, S}
                     end;
                 _ ->
                     {{missing_parent, Parent}, S}
@@ -184,14 +230,43 @@ do_append_cont([{Num, Block, Full} | Rest], #st{head = {HN, HS}} = S) ->
         false ->
             case dets:lookup(hash_tab, {Parent}) of
                 [{{Parent}, CA}] when is_integer(CA), CA < HN ->
-                    S1 = rewind_to(S, CA),
-                    case Num =:= CA + 1 of
-                        true -> do_append_cont(Rest, insert(S1, Num, Hash, Block, Full));
-                        false -> {{reorg, CA}, S1}
+                    case reorg_rewind(S, CA) of
+                        {ok, S1} ->
+                            case Num =:= CA + 1 of
+                                true -> do_append_cont(Rest, insert(S1, Num, Hash, Block, Full));
+                                false -> {{reorg, CA}, S1}
+                            end;
+                        {error, R} ->
+                            {{error, R}, S}
                     end;
                 _ ->
                     {{missing_parent, Parent}, S}
             end
+    end.
+
+%% Recompute and verify each block's header hash before storing it. The
+%% normalised block carries the recomputed hash, so the hash index (and thus
+%% parent linkage) is grounded in verified content, not the upstream's claim.
+verify_blocks(Blocks, false) -> {ok, Blocks};
+verify_blocks([], _Verify) -> {ok, []};
+verify_blocks([{Num, Block, Full} | Rest], true) ->
+    case eth_header:verify(Block) of
+        {ok, H} ->
+            case verify_blocks(Rest, true) of
+                {ok, RestV} -> {ok, [{Num, Block#{<<"hash">> => H}, Full} | RestV]};
+                {error, _} = E -> E
+            end;
+        {error, Reason} ->
+            {error, {bad_block, Num, Reason}}
+    end.
+
+below_finality(#st{finalized = undefined}, _N) -> false;
+below_finality(#st{finalized = F}, N) -> N < F.
+
+reorg_rewind(S, CA) ->
+    case below_finality(S, CA) of
+        true -> {error, {below_finality, S#st.finalized}};
+        false -> {ok, rewind_to(S, CA)}
     end.
 
 insert(S, Num, Hash, Block, Full) ->

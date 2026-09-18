@@ -79,7 +79,7 @@ dispatch(<<"eth_blockNumber">>, _Params, State) ->
 
 dispatch(<<"eth_syncing">>, _Params, State) ->
     Sync = maps:get(sync, State, eth_sync),
-    case (catch eth_sync:status(Sync)) of
+    case try eth_sync:status(Sync) catch _:_ -> error end of
         false -> {ok, false};
         Map when is_map(Map) -> {ok, Map};
         _ -> {ok, false}
@@ -158,6 +158,23 @@ dispatch(<<"eth_getTransactionByBlockNumberAndIndex">>, [NumHex, IndexHex], Stat
                   [num_or_tag(NumHex, Num), IndexHex])
     end;
 
+dispatch(<<"eth_call">>, Params, _State) ->
+    case eth_config:evm_enabled() of
+        false ->
+            proxy(<<"eth_call">>, Params);
+        true ->
+            case eth_call:call(Params) of
+                {ok, Result} ->
+                    {ok, Result};
+                {error, {rpc_error, ErrMap}} when is_map(ErrMap) ->
+                    {error, {rpc_error, ErrMap}};
+                {error, {bad_params, Why}} ->
+                    {error, {bad_params, Why}};
+                _ ->
+                    proxy(<<"eth_call">>, Params)
+            end
+    end;
+
 dispatch(_Method, Params, _State) ->
     proxy(_Method, Params).
 
@@ -173,12 +190,21 @@ proxy(Method, Params) ->
             {error, Reason}
     end.
 
-%% Resolve a block-number reference ("latest"/"earliest"/"pending" or a
-%% 0x-hex number) to an actual block number for the local store.
+%% Resolve a block-number reference ("latest"/"earliest"/"pending"/
+%% "finalized"/"safe" or a 0x-hex number) to an actual block number for the
+%% local store. `safe' is approximated by the finalized checkpoint we track.
 resolve_num(Chain, <<"latest">>) -> max(local_head_num(Chain), 0);
 resolve_num(Chain, <<"pending">>) -> max(local_head_num(Chain), 0);
+resolve_num(Chain, <<"finalized">>) -> finality_num(Chain);
+resolve_num(Chain, <<"safe">>) -> finality_num(Chain);
 resolve_num(_Chain, <<"earliest">>) -> 0;
 resolve_num(_Chain, Hex) -> eth_hex:decode(Hex).
+
+finality_num(Chain) ->
+    case try eth_chain:finalized(Chain) catch _:_ -> error end of
+        F when is_integer(F) -> F;
+        _ -> max(local_head_num(Chain), 0)
+    end.
 
 %% Pass tags through to upstream verbatim, otherwise use the raw hex number.
 num_or_tag(Hex, _Num) -> Hex.

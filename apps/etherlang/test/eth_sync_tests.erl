@@ -34,7 +34,7 @@ sync_full() ->
                                           start_block => 0}),
 
     ok = wait_head(Mock, Chain, 24, 30000),
-    ?assertEqual(false, (catch eth_sync:status(Sync))),
+    ?assertEqual(false, (try eth_sync:status(Sync) catch _:_ -> error end)),
 
     {ok, B17, Full} = eth_chain:get_by_number(Chain, 17),
     ?assertEqual(<<"0x11">>, maps:get(<<"number">>, B17)),
@@ -45,6 +45,11 @@ sync_full() ->
     %% --- phase 2: live follow (upstream extends) --------------------------
     eth_mock_node:extend(Mock, 5, 0),
     ok = wait_head(Mock, Chain, 29, 30000),
+
+    %% --- phase 2b: finalized checkpoint is fetched and recorded ------------
+    eth_mock_node:set_finalized(Mock, 20),
+    ok = eth_test_util:wait_until(fun() -> eth_chain:finalized(Chain) =:= 20 end,
+                                  50, 30000),
 
     %% --- phase 3: upstream reorg ------------------------------------------
     %% Upstream replaces blocks 23..30 (still linked to our block 22) with a
@@ -64,9 +69,9 @@ sync_full() ->
     ?assertEqual(maps:get(<<"hash">>, lists:last(MockChain)),
                  maps:get(<<"hash">>, element(2, eth_chain:get_by_number(Chain, 30)))),
 
-    catch gen_server:stop(Sync),
-    catch gen_server:stop(Chain),
-    catch gen_server:stop(Mock).
+    _ = try gen_server:stop(Sync) catch _:_ -> ok end,
+    _ = try gen_server:stop(Chain) catch _:_ -> ok end,
+    _ = try gen_server:stop(Mock) catch _:_ -> ok end.
 
 wait_head(Mock, Chain, Num, Timeout) ->
     ok = eth_test_util:wait_until(
