@@ -249,6 +249,54 @@ apps/etherlang/test/
 * tx pool, receipts store, `eth_getBalance`/`eth_call` from local state
 * snapshots for instant bootstrap (archive-style data-dir downloads)
 
+## v0.2.0 release notes (tag: v0.2.0)
+
+Since v0.1.0 the node ships a **local Erlang EVM** (`eth_evm`) and serves
+`eth_call` **locally with the standard 3rd-parameter state-override mechanism**
+(`{addr: {code, balance, store}}`), so you test your own bytecode **offline —
+no deployment, no mining, no tx fees, no waiting for a block**.
+
+### What was proven (live node + offline, both)
+
+* **Real history data sync + public consensus layer**, live:
+  `eth_blockNumber` walked Sepolia `0xB2F726 → 0xB2F727 → 0xB2F728`, each
+  header's hash **recomputed locally** (RLP re-encode + keccak-256) and
+  parent-linked cryptographically, finality floor tracked
+  (`0xB2F726→0xB2F727`). `eth_chainId 0xaa36a7`, `eth_syncing false` — the
+  honest, header-only, no-deployed-EVM sync path.
+* **Real smart contracts through the node**, live cross-check
+  (upstream 5/5 = ours 5/5): WETH9 `totalSupply`, `decimals`, `name`,
+  `symbol`, `balanceOf` on Sepolia.
+* **Local EVM arithmetic** (offline AND live): `0x600360020160005260206000f3`
+  = 3+2 ⇒ `5`, through `eth_evm` with a `code` override — `{ok, 5}` end to
+  end, no deployment.
+* **Honest revert**: real solc-0.8.35 (Cancun) bytecode reverts with empty
+  `0x` data (`execution reverted`) — documented gap, see below.
+
+### The one honest gap (must close before v1.0)
+
+`eth_evm` implements a pre-Cancun opcode subset. solc >= 0.8.26 (default
+**Cancun**: `TLOAD`/`TSTORE`/`MCOPY` + `PUSH0`) emits bytecode our local EVM
+does not yet fully execute -> real solc 0.8.35 output **reverts** offline and
+live. Proven workaround today: compile the contract with
+`--evm-version paris` (or `shanghai`), which emits only opcodes `eth_evm`
+covers. The production fix is adding the Cancun opcodes (`TLOAD 0x5c`,
+`TSTORE 0x5d`, `MCOPY 0x5e`) to `eth_evm` — this is **TODO #1 before
+production (v1.0)** in the README.
+
+### Offline tools (in `tools/`, no node needed)
+
+| tool | what it does |
+|------|--------------|
+| `tools/eth_call_demo.escript` / `tools/eth_call_check.escript` | offline: run demo bytecode through the same `eth_evm` path as the live node — hand-built arithmetic `3+2=5` **and** honest reverts, no network |
+| `tools/eth_offline_run.escript` | byte-identical offline pipeline: `msg_from_tx` -> `eth_state:new` (with overrides) -> `eth_evm:run`, printing `{ok, Out}` vs `{revert, ...}` |
+| `tools/eth_bench.escript` | concurrent JSON-RPC `eth_call` load benchmark (pure OTP, no deps) |
+| `tools/demo-contract/` | Demo Solidity (solc 0.8.35) + foundry build artifact used by the tools |
+| `tools/session-artifacts/` | the probe escripts/session recordings that produced the proof (`session-ses_f506*.md`) |
+
+> Session artifacts are kept in-tree (`tools/session-artifacts/`) so the exact
+> commands that produced each proof stay reproducible — no /tmp clutter.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
