@@ -83,6 +83,17 @@ rpc_server_case() ->
             rpc(Port, #{<<"jsonrpc">> => <<"2.0">>, <<"id">> => 7,
                         <<"method">> => <<"eth_syncing">>, <<"params">> => []}),
 
+        %% Client-version reporting (standards-mandated; also required by
+        %% ethstats agents to complete their registration handshake)
+        {ok, #{<<"result">> := V1}} =
+            rpc(Port, #{<<"jsonrpc">> => <<"2.0">>, <<"id">> => 8,
+                        <<"method">> => <<"web3_clientVersion">>, <<"params">> => []}),
+        ?assertMatch(<<"etherlang/", _/binary>>, V1),
+        {ok, #{<<"result">> := V2}} =
+            rpc(Port, #{<<"jsonrpc">> => <<"2.0">>, <<"id">> => 9,
+                        <<"method">> => <<"eth_getVersion">>, <<"params">> => []}),
+        ?assertMatch(<<"etherlang/", _/binary>>, V2),
+
         %% Batch request
         {ok, RespList} =
             rpc(Port, [#{<<"jsonrpc">> => <<"2.0">>, <<"id">> => 10,

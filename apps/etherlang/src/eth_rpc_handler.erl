@@ -86,7 +86,10 @@ dispatch(<<"eth_syncing">>, _Params, State) ->
     end;
 
 dispatch(<<"web3_clientVersion">>, _Params, _State) ->
-    {ok, <<"etherlang/0.1.0 (erlang)">>};
+    {ok, <<"etherlang/0.2.0 (erlang)">>};
+
+dispatch(<<"eth_getVersion">>, _Params, _State) ->
+    {ok, <<"etherlang/0.2.0 (erlang)">>};
 
 dispatch(<<"eth_coinbase">>, _Params, _State) ->
     %% No miner/signer configured in v1; report the zero address.

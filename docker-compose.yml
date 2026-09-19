@@ -36,14 +36,19 @@ services:
       WS_SECRET: ${ETHSTATS_SECRET:-etherlang-local}
       ADMIN_PASSWORD: ${ETHSTATS_ADMIN:-admin}
     ports:
-      - "3000:3000"
+      # host 3000 is commonly occupied by unrelated local dev servers; map to
+      # 3001 unless ETHSTATS_UI_PORT is set (internal dashboard port stays 3000).
+      - "${ETHSTATS_UI_PORT:-3001}:3000"
     restart: unless-stopped
 
   ethstats-agent:
     image: nuagic/eth-net-intelligence-api
     profiles: ["ethstats"]
+    # The node is the host-side dev release (fresh beams are faster than the
+    # qemu-emulated container, and the container's DETS store has been flaky);
+    # reach it via the Docker host gateway.
     environment:
-      RPC_HOST: etherlang
+      RPC_HOST: host.docker.internal
       RPC_PORT: "8545"
       LISTENING_PORT: "30303"
       INSTANCE_NAME: ${INSTANCE_NAME:-etherlang-local}
