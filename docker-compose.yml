@@ -61,6 +61,24 @@ services:
       - ethstats-dashboard
     restart: unless-stopped
 
+  # Second node (host-dev release on :8546, OTP name etherlang2) registered on
+  # the same dashboard as a separate row.
+  ethstats-agent-node2:
+    image: nuagic/eth-net-intelligence-api
+    profiles: ["ethstats"]
+    environment:
+      RPC_HOST: host.docker.internal
+      RPC_PORT: "8546"
+      LISTENING_PORT: "30303"
+      INSTANCE_NAME: etherlang2-local
+      CONTACT_DETAILS: ""
+      WS_SERVER: ws://ethstats-dashboard:3000
+      WS_SECRET: ${ETHSTATS_SECRET:-etherlang-local}
+      VERBOSITY: "3"
+    depends_on:
+      - ethstats-dashboard
+    restart: unless-stopped
+
 volumes:
   etherlang-data:
 
