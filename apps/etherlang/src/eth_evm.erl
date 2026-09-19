@@ -246,9 +246,9 @@ do_op(16#18, E, Ctx) -> bin_op(fun eth_word:xorb/2, E, Ctx);
 do_op(16#19, E, Ctx) ->
     {A, E1} = pop(E), next(push(E1, eth_word:notb(A)), Ctx);
 do_op(16#1A, E, Ctx) -> bin_op(fun eth_word:byte/2, E, Ctx);
-do_op(16#1B, E, Ctx) -> bin_op(fun eth_word:shl/2, E, Ctx);
-do_op(16#1C, E, Ctx) -> bin_op(fun eth_word:shr/2, E, Ctx);
-do_op(16#1D, E, Ctx) -> bin_op(fun eth_word:sar/2, E, Ctx);
+do_op(16#1B, E, Ctx) -> shift_op(fun eth_word:shl/2, E, Ctx);
+do_op(16#1C, E, Ctx) -> shift_op(fun eth_word:shr/2, E, Ctx);
+do_op(16#1D, E, Ctx) -> shift_op(fun eth_word:sar/2, E, Ctx);
 
 %% keccak256
 do_op(16#20, E, Ctx) ->
@@ -496,6 +496,14 @@ bin_op(Fun, E, Ctx) ->
     {A, E1} = pop(E),
     {B, E2} = pop(E1),
     next(push(E2, Fun(A, B)), Ctx).
+
+%% EIP-145 SHL/SHR/SAR: the stack-top is the shift amount and the word BELOW
+%% it is the value shifted, so the operand order is the reverse of a regular
+%% binop (EIP-145: R = value <<|>> amount).
+shift_op(Fun, E, Ctx) ->
+    {Amount, E1} = pop(E),
+    {Value, E2} = pop(E1),
+    next(push(E2, Fun(Value, Amount)), Ctx).
 
 tri_op(Fun, E, Ctx) ->
     {A, E1} = pop(E),

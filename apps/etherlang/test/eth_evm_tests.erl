@@ -76,3 +76,59 @@ jumpdest_test() ->
     Code = <<16#60,2, 16#5B, 16#60,2, 16#56>>,
     ?assertMatch({error, out_of_gas, _, _},
                  eth_evm:run(Code, ?MSG0, ?STATE, ?ENV, 30)).
+
+%% EIP-145 SHL/SHR/SAR: stack-top is the shift AMOUNT, word below is the
+%% VALUE being shifted (Fun(Value, Amount), not Fun(Amount, Value)).  These
+%% three are the regression for the foundry/solidity selector-dispatch bug
+%% (SHR 0xe0 on a CALLDATALOAD'd selector compared to PUSH4).
+shr_operand_order_test() ->
+    %% PUSH2 0x0100, PUSH1 4, SHR, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
+    %% value=0x100 >> amount=4 -> 0x10 (16).  Buggy order (4>>0x100) -> 0.
+    Code = <<16#61,16#01,16#00, 16#60,4, 16#1C, 16#60,0, 16#52, 16#60,32, 16#60,0, 16#F3>>,
+    {ok, Out, _Gas, _St, []} = eth_evm:run(Code, ?MSG0, ?STATE, ?ENV, ?GAS),
+    ?assertEqual(16, binary:decode_unsigned(Out)).
+
+shl_operand_order_test() ->
+    %% PUSH1 1, PUSH1 4, SHL -> 1 << 4 = 16.  Buggy order (4<<1) -> 8.
+    Code = <<16#60,1, 16#60,4, 16#1B, 16#60,0, 16#52, 16#60,32, 16#60,0, 16#F3>>,
+    {ok, Out, _Gas, _St, []} = eth_evm:run(Code, ?MSG0, ?STATE, ?ENV, ?GAS),
+    ?assertEqual(16, binary:decode_unsigned(Out)).
+
+sar_operand_order_test() ->
+    %% PUSH2 0x0100, PUSH1 4, SAR -> 0x100 >> 4 = 16 (arithmetic, positive).
+    Code = <<16#61,16#01,16#00, 16#60,4, 16#1D, 16#60,0, 16#52, 16#60,32, 16#60,0, 16#F3>>,
+    {ok, Out, _Gas, _St, []} = eth_evm:run(Code, ?MSG0, ?STATE, ?ENV, ?GAS),
+    ?assertEqual(16, binary:decode_unsigned(Out)).
+
+%% The full solidity-style selector dispatcher: load calldata[0:32], SHR by
+%% 0xe0, compare to PUSH4 0x85bb7d69, JUMPI to the "answer" body or fall to
+%% the empty REVERT.  This is the exact pattern forge/foundry bytecode uses
+%% and was 100%-reverting before the shift fix.
+selector_dispatch_returns_42_test() ->
+    Code = <<16#60,16#00, 16#35,                       %% PUSH1 0, CALLDATALOAD
+             16#60,16#E0, 16#1C,                       %% PUSH1 0xe0, SHR
+             16#80, 16#63,16#85,16#bb,16#7d,16#69, 16#14,  %% DUP1 PUSH4 sel EQ
+             16#61,16#00,16#15, 16#57,                 %% PUSH2 0x15 JUMPI
+             16#60,16#00, 16#80, 16#FD,                %% fallback: REVERT(0,0)
+             16#5B,                                    %% JUMPDEST
+             16#60,16#2A, 16#60,0, 16#52,              %% answer: PUSH1 42, MSTORE
+             16#60,32, 16#60,0, 16#F3>>,               %% RETURN 32 bytes
+    Msg0 = ?MSG0,
+    Msg = Msg0#{data => <<16#85bb7d69:32>>},
+    {ok, Out, _Gas, _St, []} = eth_evm:run(Code, Msg, ?STATE, ?ENV, ?GAS),
+    ?assertEqual(32, byte_size(Out)),
+    ?assertEqual(42, binary:decode_unsigned(Out)).
+
+selector_dispatch_wrong_selector_reverts_test() ->
+    Code = <<16#60,16#00, 16#35,
+             16#60,16#E0, 16#1C,
+             16#80, 16#63,16#85,16#bb,16#7d,16#69, 16#14,
+             16#61,16#00,16#15, 16#57,
+             16#60,16#00, 16#80, 16#FD,
+             16#5B,
+             16#60,16#2A, 16#60,0, 16#52,
+             16#60,32, 16#60,0, 16#F3>>,
+    Msg0 = ?MSG0,
+    Msg = Msg0#{data => <<16#12345678:32>>},
+    ?assertMatch({revert, <<>>, _, _, _},
+                 eth_evm:run(Code, Msg, ?STATE, ?ENV, ?GAS)).
