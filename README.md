@@ -29,9 +29,9 @@ beacon, validators, or block production).
   accepts checkpoints ahead of the local head or off the canonical chain.
 * **Local EVM** — pure-Erlang interpreter covering the full defined opcode set
   including Cancun (`PUSH0`/`TLOAD`/`TSTORE`/`MCOPY`) plus precompiles
-  `0x02`–`0x05`; serves `eth_call` locally with standard state overrides,
-  proxying upstream on unsupported paths. Known fidelity simplifications are
-  listed under TODO.
+  `0x01`–`0x09` (`0x0A` KZG still proxies); serves `eth_call` locally with
+  standard state overrides, proxying upstream on unsupported paths. Known
+  fidelity simplifications are listed under TODO.
 * **JSON-RPC server** — cowboy listener on `:8545` that answers chain/block/tx
   queries and `eth_call` from local storage + local execution, transparently
   proxying everything else (`eth_getBalance`, `net_*`, …) to upstream.
@@ -42,8 +42,8 @@ beacon, validators, or block production).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**57 tests, green**).
-* **Status** — v0.2.6; eunit green and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**103 tests, green**).
+* **Status** — v0.3.0; eunit green (103 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -105,9 +105,12 @@ code; none is guessing. Items marked DONE were closed with live verification.
    `CALL` without cold/warm/stipend subtleties, pre-EIP-6780 `SELFDESTRUCT`,
    `MODEXP` gas undercharge (ignores exponent bit-length), dropped child-frame
    logs. Each is a wrong-data-vs-upstream divergence, not a crash.
-5. **Precompile gaps**: `0x01 ECRECOVER` recognized but unimplemented;
-   `0x06`–`0x0A` (ECADD/ECMUL/ECPAIRING/BLAKE2/KZG) absent. All currently fall
-   back to the upstream proxy (safe), but dense crypto contracts always proxy.
+5. **Precompile gaps narrowed**: `0x01` ECRECOVER, `0x06` ECADD, `0x07` ECMUL,
+   `0x08` ECPAIRING (Tate, pure Erlang), `0x09` BLAKE2b-F now execute locally,
+   each verified against live upstream (76-vector ecrecover parity, 39-vector
+   bn128/pairing parity, EIP-152 vectors byte-exact). Remaining: `0x0A` KZG —
+   deliberately deferred (needs a BLS12-381 backend, and blob data is unserved
+   anyway, so it could never trigger locally); stays on proxy fallback.
 
 ### Sync / chain store
 
@@ -297,7 +300,7 @@ they cover gap sync, live follow, reorg handling + rewind, finalized-floor
 guards (never ahead of head / off-chain), persistence across restart, the
 JSON-RPC client, the JSON-RPC server (local + proxy + batch + `totalDifficulty`
 compat), shift/dispatch EVM regressions, and the local `eth_call` override
-path — **57 tests, all green**.
+path — **103 tests, all green**.
 
 ```bash
 make docker-test        # builds a test image and runs `rebar3 eunit`
@@ -350,7 +353,8 @@ apps/etherlang/src/
   eth_chain.erl           canonical chain store (DETS) + reorg/rewind
   eth_state.erl           call-state overlay (overrides) + upstream cache
   eth_evm.erl             local EVM interpreter (full defined opcode set)
-  eth_evm_precompiles.erl precompiles 0x02-0x05 (0x01 recognized, 0x06+ proxied)
+  eth_evm_precompiles.erl precompiles 0x01-0x09 (0x0A KZG proxies) + bn128 EC ops
+  eth_pairing_bn128.erl Tate pairing check (EIP-197), pure Erlang
   eth_call.erl            eth_call execution incl. contract creation
   eth_rpc_client.erl      JSON-RPC client over HTTP(S) (httpc)
   eth_sync.erl            gap + follow sync engine + finality tracking
@@ -435,7 +439,7 @@ production (v1.0)** in the README.
 > The session transcript (`session-ses_f506.md`, repo root) keeps the exact
 > commands behind each proof reproducible.
 
-## Release notes v0.2.1 → v0.2.6 (all verified live on Sepolia)
+## Release notes v0.2.1 → v0.3.0 (all verified live on Sepolia)
 
 * **v0.2.1** — `eth_getVersion` shim (EthStats registration compat);
   `web3_clientVersion` → `etherlang/0.2.0`; dashboard remapped to `:3001`;
@@ -454,6 +458,22 @@ production (v1.0)** in the README.
 * **v0.2.6** — Sepolia TTD served as `totalDifficulty` on post-merge blocks
   missing it (merge gate verified at block 1450409); dashboard height tracks
   the tip again. Test tmp dirs pid-scoped (full suite 57/57).
+* **v0.2.7** — docs: full README overhaul (EVM documented as implemented,
+  corrected methods/config/layout, refreshed TODO with done-list) + support
+  section/sponsors wiring + live smoke-test script committed.
+* **v0.2.8** — P0 value semantics (revert rolls back transfers, balance
+  checks, precompile value moves, `create_address` split fix) + tx-global
+  transient storage + `BLOBHASH` fallback + child-log propagation
+  (suite 64/64; both nodes live-verified).
+* **v0.2.9** — execution fidelity round 2: EIP-198 `MODEXP` gas, EIP-6780
+  selfdestruct, EIP-2929 warm/cold (`SLOAD`/`BALANCE`/ext-code/`CALL`),
+  `create_address` fix (CREATE always crashed); suite 76/76.
+* **v0.3.0** — precompiles `0x01` ECRECOVER (secp256k1 recovery, 76-vector
+  upstream parity), `0x06`/`0x07` ECADD/ECMUL (alt_bn128, live vectors),
+  `0x08` ECPAIRING (Tate, 39-vector parity incl. engineered true cases),
+  `0x09` BLAKE2b-F (EIP-152 vectors byte-exact); suite 103/103. Only `0x0A`
+  KZG remains on proxy fallback (deliberate: needs BLS12-381 + unserved
+  blobs).
 
 ## License
 
