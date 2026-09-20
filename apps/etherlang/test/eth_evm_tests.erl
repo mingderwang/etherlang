@@ -234,3 +234,94 @@ child_logs_propagate_test() ->
     {ok, _, _, _, Logs} = eth_evm:run(Parent, ?MSG0, call_state(0, Child),
                                       ?ENV, ?GAS),
     ?assertEqual(1, length(Logs)).
+
+%% ---------------------------------------------------------------------------
+%% EIP-2929 warm/cold access costs (gas-observable via GasLeft)
+%% ---------------------------------------------------------------------------
+
+sload_cold_then_warm_test() ->
+    %% First SLOAD: 100 base + 2000 cold; second: 100 warm.
+    %% PUSH1x2 (6) + 2100 + POP (2) + 100 + POP (2) + STOP (0) = 2210.
+    State = eth_state:new(0, #{{store, ?CALLER, 5} => 77}),
+    Code = <<16#60,5, 16#54, 16#50, 16#60,5, 16#54, 16#50, 16#00>>,
+    {ok, _, GasLeft, _, _} = eth_evm:run(Code, ?MSG0, State, ?ENV, ?GAS),
+    ?assertEqual(?GAS - 2210, GasLeft).
+
+balance_cold_then_warm_test() ->
+    %% First BALANCE: 100 base + 2500 cold; second: 100 warm.
+    %% PUSH1x2 (6) + 2600 + POP (2) + 100 + POP (2) + STOP (0) = 2710.
+    Tgt = <<0:152, 16#0E:8>>,
+    State = eth_state:new(0, #{{balance, Tgt} => 123,
+                                {nonce, Tgt} => 0,
+                                {code, Tgt} => <<>>}),
+    Code = <<16#60,16#0E, 16#31, 16#50, 16#60,16#0E, 16#31, 16#50, 16#00>>,
+    {ok, _, GasLeft, _, _} = eth_evm:run(Code, ?MSG0, State, ?ENV, ?GAS),
+    ?assertEqual(?GAS - 2710, GasLeft).
+
+%% ---------------------------------------------------------------------------
+%% EIP-6780 SELFDESTRUCT (P0 regression set)
+%% ---------------------------------------------------------------------------
+
+%% SELFDESTRUCT stack: beneficiary only.
+selfdestruct_seq(BenByte) ->
+    <<16#60,BenByte, 16#FF>>.
+
+selfdestruct_other_tx_keeps_code_test() ->
+    %% Victim NOT created in this tx: balance moves, code and storage stay
+    %% (EIP-6780). Old code happened to match on code (it never deleted),
+    %% so this locks the specified behavior.
+    VictimCode = <<16#60,1, 16#60,0, 16#52, 16#60,32, 16#60,0, 16#F3>>,
+    Ben = <<0:152, 16#0E:8>>,
+    State0 = eth_state:new(0, #{{balance, ?CALLEE} => 70,
+                                {nonce, ?CALLEE} => 0,
+                                {code, ?CALLEE} => VictimCode,
+                                {store, ?CALLEE, 3} => 9,
+                                {balance, Ben} => 0,
+                                {balance, ?CALLER} => 0,
+                                {nonce, ?CALLER} => 0}),
+    Msg0 = ?MSG0,
+    Msg = Msg0#{address => ?CALLEE},
+    {ok, _, _, St, _} = eth_evm:run(selfdestruct_seq(16#0E), Msg, State0,
+                                    ?ENV, ?GAS),
+    ?assertEqual(0, eth_state:balance(St, ?CALLEE)),
+    ?assertEqual(70, eth_state:balance(St, Ben)),
+    ?assertEqual(VictimCode, eth_state:code(St, ?CALLEE)),
+    ?assertEqual(9, eth_state:storage(St, ?CALLEE, 3)).
+
+selfdestruct_same_tx_destroys_test() ->
+    %% Victim created, then CALLED in the same run: its runtime
+    %% self-destructs -> full deletion (code gone, storage shadowed).
+    %% Init stores 8 at slot 1 and RETURNS the self-destructing runtime
+    %% (3 bytes at init offset 17); it must not execute it inline.
+    Runtime = selfdestruct_seq(16#0E),
+    Init = <<16#60,8, 16#60,1, 16#55,
+             16#60,3, 16#60,17, 16#60,0, 16#39,
+             16#60,3, 16#60,0, 16#F3,
+             Runtime/binary>>,
+    InitLen = byte_size(Init),
+    <<_:12/binary, NewAddr:20/binary>> =
+        eth_keccak:hash(eth_rlp:encode([?CALLER, 0])),
+    Ben = <<0:152, 16#0E:8>>,
+    State0 = eth_state:new(0, #{{balance, ?CALLER} => 100,
+                                {nonce, ?CALLER} => 0,
+                                {balance, NewAddr} => 0,
+                                {nonce, NewAddr} => 0,
+                                {code, NewAddr} => <<>>,
+                                %% SSTORE gas tiering reads current value:
+                                %% seed so the test never fetches upstream.
+                                {store, NewAddr, 1} => 0,
+                                {balance, Ben} => 0}),
+    %% CODECOPY init from pc 50, CREATE(value 0), then CALL the deployment.
+    Parent = <<16#60,InitLen:8, 16#60,50, 16#60,0, 16#39,
+               16#60,InitLen:8, 16#60,0, 16#60,0, 16#F0,
+               16#60,0, 16#60,0, 16#60,0, 16#60,0, 16#60,0,
+               16#73, NewAddr:20/binary, 16#61,16#FF,16#FF, 16#F1,
+               16#00,
+               Init/binary>>,
+    {ok, _, _, St, _} = eth_evm:run(Parent, ?MSG0, State0, ?ENV, ?GAS),
+    ?assertEqual(1, eth_state:nonce(St, ?CALLER)),
+    ?assertEqual(100, eth_state:balance(St, ?CALLER)),
+    ?assertEqual(0, eth_state:balance(St, Ben)),
+    ?assertEqual(<<>>, eth_state:code(St, NewAddr)),
+    ?assertEqual(0, eth_state:storage(St, NewAddr, 1)),
+    ?assertEqual(false, eth_state:exists(St, NewAddr)).

@@ -74,5 +74,19 @@ mult_complexity(X) when X =< 64 -> X * X;
 mult_complexity(X) when X =< 1024 -> X * X div 4 + 96 * X - 3072;
 mult_complexity(X) -> X * X div 16 + 480 * X - 199680.
 
-adjusted_exp_len(LenE, _E) when LenE =< 32 -> 0;
-adjusted_exp_len(LenE, _E) -> 8 * (LenE - 32).
+adjusted_exp_len(LenE, E) when LenE =< 32 ->
+    %% EIP-198: index of the highest bit (1->0, 2->1, 255->7, 256->8),
+    %% defined as 0 when the exponent is all zeros.
+    case E of
+        0 -> 0;
+        _ -> bit_length(E) - 1
+    end;
+adjusted_exp_len(LenE, E) ->
+    %% EIP-198: 8*(LenE-32) plus the bit index within the leading 32 bytes.
+    Head = E bsr (8 * (LenE - 32)),
+    8 * (LenE - 32) + max(bit_length(Head) - 1, 0).
+
+bit_length(0) -> 0;
+bit_length(N) when N > 0 -> bit_length(N, 0).
+bit_length(0, Acc) -> Acc;
+bit_length(N, Acc) -> bit_length(N bsr 1, Acc + 1).

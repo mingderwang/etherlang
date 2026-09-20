@@ -164,7 +164,7 @@ base_cost(16#0A) -> 10;
 base_cost(16#0B) -> 5;
 base_cost(Op) when Op >= 16#01, Op =< 16#1D -> 3;
 base_cost(16#20) -> 30;
-base_cost(16#31) -> 2600;
+base_cost(16#31) -> 100;
 base_cost(16#32) -> 2;
 base_cost(16#33) -> 2;
 base_cost(16#34) -> 2;
@@ -174,11 +174,11 @@ base_cost(16#37) -> 3;
 base_cost(16#38) -> 2;
 base_cost(16#39) -> 3;
 base_cost(16#3A) -> 2;
-base_cost(16#3B) -> 2600;
-base_cost(16#3C) -> 2600;
+base_cost(16#3B) -> 100;
+base_cost(16#3C) -> 100;
 base_cost(16#3D) -> 2;
 base_cost(16#3E) -> 3;
-base_cost(16#3F) -> 2600;
+base_cost(16#3F) -> 100;
 base_cost(16#40) -> 20;
 base_cost(Op) when Op >= 16#41, Op =< 16#46 -> 2;
 base_cost(16#47) -> 5;
@@ -189,7 +189,7 @@ base_cost(16#50) -> 2;
 base_cost(16#51) -> 3;
 base_cost(16#52) -> 3;
 base_cost(16#53) -> 3;
-base_cost(16#54) -> 2100;
+base_cost(16#54) -> 100;
 base_cost(16#55) -> 0;
 base_cost(16#56) -> 8;
 base_cost(16#57) -> 10;
@@ -277,7 +277,11 @@ do_op(16#30, E, Ctx) -> next(push(E, eth_word:from_bytes(s_msg(address, Ctx, <<0
 do_op(16#31, E, Ctx) ->
     {A, E1} = pop(E),
     Addr = eth_state:address(eth_word:to_bytes(A, 20)),
-    next(push(E1, eth_state:balance(Ctx#ctx.state, Addr)), Ctx);
+    {Extra, Ctx1} = cold_account_extra(Ctx, Addr),
+    case charge(E1, Extra) of
+        oog -> oog(E1, Ctx1);
+        {ok, E2} -> next(push(E2, eth_state:balance(Ctx1#ctx.state, Addr)), Ctx1)
+    end;
 do_op(16#32, E, Ctx) -> next(push(E, eth_word:from_bytes(s_msg(origin, Ctx, <<0:160>>))), Ctx);
 do_op(16#33, E, Ctx) -> next(push(E, eth_word:from_bytes(s_msg(caller, Ctx, <<0:160>>))), Ctx);
 do_op(16#34, E, Ctx) -> next(push(E, s_msg(value, Ctx, 0)), Ctx);
@@ -312,19 +316,31 @@ do_op(16#39, E, Ctx) ->
 do_op(16#3A, E, Ctx) -> next(push(E, s_msg(gas_price, Ctx, 0)), Ctx);
 do_op(16#3B, E, Ctx) ->
     {A, E1} = pop(E),
-    Code = eth_state:code(Ctx#ctx.state, eth_state:address(eth_word:to_bytes(A, 20))),
-    next(push(E1, byte_size(Code)), Ctx);
+    Addr = eth_state:address(eth_word:to_bytes(A, 20)),
+    {Extra, Ctx1} = cold_account_extra(Ctx, Addr),
+    case charge(E1, Extra) of
+        oog -> oog(E1, Ctx1);
+        {ok, E2} ->
+            Code = eth_state:code(Ctx1#ctx.state, Addr),
+            next(push(E2, byte_size(Code)), Ctx1)
+    end;
 do_op(16#3C, E, Ctx) ->
     {A, E1} = pop(E), {Dst, E2} = pop(E1), {Off, E3} = pop(E2), {Len, E4} = pop(E3),
-    case charge_mem(E4, Dst + Len) of
-        oog -> oog(E4, Ctx);
+    Addr = eth_state:address(eth_word:to_bytes(A, 20)),
+    {Extra, Ctx1} = cold_account_extra(Ctx, Addr),
+    case charge(E4, Extra) of
+        oog -> oog(E4, Ctx1);
         {ok, E5} ->
-            Cost = 3 * ((Len + 31) div 32),
-            case charge(E5, Cost) of
+            case charge_mem(E5, Dst + Len) of
+                oog -> oog(E5, Ctx1);
                 {ok, E6} ->
-                    Code = eth_state:code(Ctx#ctx.state, eth_state:address(eth_word:to_bytes(A, 20))),
-                    next(write(E6, Dst, slice_pad(Code, Off, Len)), Ctx);
-                oog -> oog(E5, Ctx)
+                    Cost = 3 * ((Len + 31) div 32),
+                    case charge(E6, Cost) of
+                        {ok, E7} ->
+                            Code = eth_state:code(Ctx1#ctx.state, Addr),
+                            next(write(E7, Dst, slice_pad(Code, Off, Len)), Ctx1);
+                        oog -> oog(E6, Ctx1)
+                    end
             end
     end;
 do_op(16#3D, E, Ctx) -> next(push(E, byte_size(E#e.retdata)), Ctx);
@@ -347,11 +363,16 @@ do_op(16#3E, E, Ctx) ->
 do_op(16#3F, E, Ctx) ->
     {A, E1} = pop(E),
     Addr = eth_state:address(eth_word:to_bytes(A, 20)),
-    Hash = case eth_state:exists(Ctx#ctx.state, Addr) of
-               true -> eth_word:from_bytes(eth_keccak:hash(eth_state:code(Ctx#ctx.state, Addr)));
-               false -> 0
-           end,
-    next(push(E1, Hash), Ctx);
+    {Extra, Ctx1} = cold_account_extra(Ctx, Addr),
+    case charge(E1, Extra) of
+        oog -> oog(E1, Ctx1);
+        {ok, E2} ->
+            Hash = case eth_state:exists(Ctx1#ctx.state, Addr) of
+                       true -> eth_word:from_bytes(eth_keccak:hash(eth_state:code(Ctx1#ctx.state, Addr)));
+                       false -> 0
+                   end,
+            next(push(E2, Hash), Ctx1)
+    end;
 
 %% block context
 do_op(16#40, E, Ctx) ->
@@ -407,7 +428,11 @@ do_op(16#53, E, Ctx) ->
 do_op(16#54, E, Ctx) ->
     {Slot, E1} = pop(E),
     Addr = s_msg(address, Ctx, <<0:160>>),
-    next(push(E1, eth_state:storage(Ctx#ctx.state, Addr, Slot)), Ctx);
+    {Extra, Ctx1} = cold_store_extra(Ctx, Addr, Slot),
+    case charge(E1, Extra) of
+        oog -> oog(E1, Ctx1);
+        {ok, E2} -> next(push(E2, eth_state:storage(Ctx1#ctx.state, Addr, Slot)), Ctx1)
+    end;
 do_op(16#55, E, Ctx) ->
     case s_msg(static, Ctx, false) of
         true -> {E#e{halt = {error, write_protection}}, Ctx};
@@ -494,8 +519,15 @@ do_op(16#FF, E, Ctx) ->
             {Ben, E1} = pop(E),
             Addr = s_msg(address, Ctx, <<0:160>>),
             Beneficiary = eth_state:address(eth_word:to_bytes(Ben, 20)),
-            State1 = transfer(Ctx#ctx.state, Addr, Beneficiary, eth_state:balance(Ctx#ctx.state, Addr)),
-            {E1#e{halt = stop}, Ctx#ctx{state = State1}}
+            State = Ctx#ctx.state,
+            State1 = transfer(State, Addr, Beneficiary, eth_state:balance(State, Addr)),
+            %% EIP-6780: the balance always moves; code/storage are deleted
+            %% only when this account was created in the same transaction.
+            State2 = case eth_state:is_created(State1, Addr) of
+                         true -> eth_state:set_destroyed(State1, Addr);
+                         false -> State1
+                     end,
+            {E1#e{halt = stop}, Ctx#ctx{state = State2}}
     end;
 
 do_op(Op, E, Ctx) -> unsupported({opcode, Op}, E, Ctx).
@@ -522,6 +554,31 @@ tri_op(Fun, E, Ctx) ->
     {B, E2} = pop(E1),
     {C, E3} = pop(E2),
     next(push(E3, Fun(A, B, C)), Ctx).
+
+%% EIP-2929 warm tracking shares the transaction-global transient map under
+%% reserved 3-tuple keys (never colliding with {Addr,Slot} TSTORE slots, and
+%% inheriting tx scope + revert-discard semantics automatically).
+%% Each returns {ExtraColdCost, Ctx1} on top of the warm base price, with the
+%% account/slot marked warmed.
+cold_account_extra(Ctx, Addr) ->
+    case maps:is_key({warm_account, Addr}, Ctx#ctx.transient) of
+        true -> {0, Ctx};
+        false -> {2500, Ctx#ctx{transient = maps:put({warm_account, Addr},
+                                                    true, Ctx#ctx.transient)}}
+    end.
+cold_store_extra(Ctx, Addr, Slot) ->
+    case maps:is_key({warm_store, Addr, Slot}, Ctx#ctx.transient) of
+        true -> {0, Ctx};
+        false -> {2000, Ctx#ctx{transient = maps:put({warm_store, Addr, Slot},
+                                                    true, Ctx#ctx.transient)}}
+    end.
+
+%% Full EIP-2929 access cost for a CALL target: 100 warm, 2600 cold.
+call_access_cost(Ctx, To) ->
+    case cold_account_extra(Ctx, To) of
+        {0, Ctx1} -> {100, Ctx1};
+        {2500, Ctx1} -> {2600, Ctx1}
+    end.
 
 push_n(N, E = #e{code = Code, pc = Pc}, Ctx) ->
     Available = max(byte_size(Code) - (Pc + 1), 0),
@@ -588,22 +645,25 @@ do_call(Kind, E, Ctx) ->
     case Static andalso Value =/= 0 of
         true -> {E7#e{halt = {error, write_protection}}, Ctx};
         false ->
-            Base = 2600 + value_cost(Value) + new_account_cost(Ctx, To, Value),
+            %% EIP-2929: cold target costs 2600, warm costs 100. The target
+            %% is warmed by the call itself (all CALL kinds).
+            {AccessCost, CtxA} = call_access_cost(Ctx, To),
+            Base = AccessCost + value_cost(Value) + new_account_cost(CtxA, To, Value),
             case charge(E7, Base) of
-                oog -> oog(E7, Ctx);
+                oog -> oog(E7, CtxA);
                 {ok, E8} ->
                     case charge_mem(E8, ArgsOff + ArgsLen) of
-                        oog -> oog(E8, Ctx);
+                        oog -> oog(E8, CtxA);
                         {ok, E9} ->
                             case charge_mem(E9, RetOff + RetLen) of
-                                oog -> oog(E9, Ctx);
+                                oog -> oog(E9, CtxA);
                                 {ok, E10} ->
                                     Args = read(E10, ArgsOff, ArgsLen),
                                     Avail = E10#e.gas,
                                     CallGas = min(GasReq, Avail - Avail div 64),
                                     {ok, E11} = charge(E10, CallGas),
                                     run_call(Kind, To, ToW, Value, Args, CallGas,
-                                             RetOff, RetLen, E11, Ctx)
+                                             RetOff, RetLen, E11, CtxA)
                             end
                     end
             end
@@ -804,10 +864,12 @@ create_with_value(_Op, Init, Value, Sender, NewAddr, State1, E1, Ctx, ChildGas) 
     case Result of
         {{ok, Code, Left, St, Logs}, ChildT} when byte_size(Code) =< 24576 ->
             St1 = eth_state:set_code(St, NewAddr, Code),
+            %% Record the creation for EIP-6780 (same-tx self-destruct).
+            St2 = eth_state:mark_created(St1, NewAddr),
             MergedT = maps:merge(Ctx#ctx.transient, ChildT),
             E2 = E1#e{gas = E1#e.gas + Left, logs = E1#e.logs ++ Logs},
             next(push(E2, eth_word:from_bytes(NewAddr)),
-                 Ctx#ctx{state = St1, transient = MergedT});
+                 Ctx#ctx{state = St2, transient = MergedT});
         {{ok, _Code, _Left, _St, _}, _ChildT} ->
             %% code too large: consume gas, fail with no deployment and no
             %% value movement (nonce from State1 is kept)

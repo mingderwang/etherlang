@@ -16,6 +16,7 @@
 -export([new/2, overrides_from_json/1,
          account/2, balance/2, nonce/2, code/2, storage/3, exists/2,
          set_balance/3, set_nonce/3, set_code/3, set_storage/4,
+         mark_created/2, is_created/2, set_destroyed/2,
          chain_id/0, address/1, address_hex/1, hex_to_bin/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -60,20 +61,29 @@ nonce(#{overlay := O} = S, Addr) ->
     end.
 
 code(#{overlay := O} = S, Addr) ->
-    case maps:get({code, Addr}, O, undefined) of
-        undefined -> base_code(block(S), Addr);
-        V -> V
+    case maps:get({destroyed, Addr}, O, false) of
+        true -> <<>>;
+        false ->
+            case maps:get({code, Addr}, O, undefined) of
+                undefined -> base_code(block(S), Addr);
+                V -> V
+            end
     end.
 
 storage(#{overlay := O} = S, Addr, Slot) ->
-    case maps:get({store, Addr, Slot}, O, undefined) of
-        undefined -> base_storage(block(S), Addr, Slot);
-        V -> V
+    case maps:get({destroyed, Addr}, O, false) of
+        true -> 0;
+        false ->
+            case maps:get({store, Addr, Slot}, O, undefined) of
+                undefined -> base_storage(block(S), Addr, Slot);
+                V -> V
+            end
     end.
 
 exists(State, Addr) ->
     A = address(Addr),
-    balance(State, A) > 0 orelse nonce(State, A) > 0 orelse code(State, A) =/= <<>>.
+    not is_destroyed(State, A) andalso
+        (balance(State, A) > 0 orelse nonce(State, A) > 0 orelse code(State, A) =/= <<>>).
 
 %% ---------------------------------------------------------------------------
 %% Writes (overlay only — never touches upstream)
@@ -84,6 +94,19 @@ set_nonce(State, Addr, V) -> overlay_put(State, {nonce, address(Addr)}, V).
 set_code(State, Addr, Code) -> overlay_put(State, {code, address(Addr)}, Code).
 set_storage(State, Addr, Slot, V) ->
     overlay_put(State, {store, address(Addr), Slot}, eth_word:mask(V)).
+
+%% EIP-6780 bookkeeping (overlay-scoped, hence transaction-scoped: revert
+%% paths restore pre-frame state which drops these markers automatically).
+%% {created, A} records successful CREATEs; {destroyed, A} records full
+%% self-destructs. Neither key can arrive via JSON overrides (only
+%% balance/nonce/code/state/stateDiff are parsed), so clients cannot forge
+%% them.
+mark_created(State, Addr) -> overlay_put(State, {created, address(Addr)}, true).
+is_created(#{overlay := O}, Addr) -> maps:get({created, Addr}, O, false).
+set_destroyed(State, Addr) ->
+    overlay_put(overlay_put(State, {destroyed, address(Addr)}, true),
+                {code, address(Addr)}, <<>>).
+is_destroyed(#{overlay := O}, Addr) -> maps:get({destroyed, Addr}, O, false).
 
 %% ---------------------------------------------------------------------------
 %% State overrides (eth_call 3rd parameter)
