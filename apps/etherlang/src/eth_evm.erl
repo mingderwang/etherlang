@@ -28,20 +28,29 @@
 %% | {revert, Output, GasLeft, State, Logs}
 %% | {error, Reason, State, Logs}
 run(Code, Msg, State, Env, Gas) when is_binary(Code) ->
-    Ctx = #ctx{state = State, env = Env, msg = Msg},
+    {Res, _Transient} = run_t(Code, Msg, State, Env, Gas, #{}),
+    Res.
+
+%% Internal run threading EIP-1153 transient storage. The transient map is
+%% transaction-global: a child frame inherits a copy of the parent map and,
+%% on success, its writes merge back (child wins); on revert/error the
+%% parent map is kept unchanged.
+run_t(Code, Msg, State, Env, Gas, Transient) when is_binary(Code) ->
+    Ctx = #ctx{state = State, env = Env, msg = Msg, transient = Transient},
     E0 = #e{code = Code, gas = max(Gas, 0), dests = valid_jumpdests(Code)},
     try exec(E0, Ctx) of
         {E1, Ctx1} ->
-            case E1#e.halt of
-                {return, Out} -> {ok, Out, E1#e.gas, Ctx1#ctx.state, E1#e.logs};
-                stop -> {ok, <<>>, E1#e.gas, Ctx1#ctx.state, E1#e.logs};
-                {revert, Out} -> {revert, Out, E1#e.gas, Ctx1#ctx.state, E1#e.logs};
-                {error, R} -> {error, R, Ctx1#ctx.state, E1#e.logs};
-                undefined -> {ok, <<>>, E1#e.gas, Ctx1#ctx.state, E1#e.logs}
-            end
+            Res = case E1#e.halt of
+                      {return, Out} -> {ok, Out, E1#e.gas, Ctx1#ctx.state, E1#e.logs};
+                      stop -> {ok, <<>>, E1#e.gas, Ctx1#ctx.state, E1#e.logs};
+                      {revert, Out} -> {revert, Out, E1#e.gas, Ctx1#ctx.state, E1#e.logs};
+                      {error, R} -> {error, R, Ctx1#ctx.state, E1#e.logs};
+                      undefined -> {ok, <<>>, E1#e.gas, Ctx1#ctx.state, E1#e.logs}
+                  end,
+            {Res, Ctx1#ctx.transient}
     catch
         Class:Reason:Stack ->
-            {error, {evm_crash, Class, Reason, hd(Stack)}, State, []}
+            {{error, {evm_crash, Class, Reason, hd(Stack)}, State, []}, Transient}
     end.
 
 %% Jump destinations: positions holding JUMPDEST that are not inside PUSH data.
@@ -368,8 +377,11 @@ do_op(16#47, E, Ctx) ->
     next(push(E, eth_state:balance(Ctx#ctx.state, s_msg(address, Ctx, <<0:160>>))), Ctx);
 do_op(16#48, E, Ctx) -> next(push(E, s_env(base_fee, Ctx, 0)), Ctx);
 do_op(16#49, E, Ctx) ->
+    %% BLOBHASH: no blob index -> versioned-hash mapping is available locally;
+    %% fall back to upstream rather than fabricating a zero (which would
+    %% silently corrupt any contract branching on blob hashes).
     {_Idx, E1} = pop(E),
-    next(push(E1, 0), Ctx);
+    unsupported({opcode, 16#49}, E1, Ctx);
 do_op(16#4A, E, Ctx) -> next(push(E, s_env(blob_base_fee, Ctx, 0)), Ctx);
 
 %% stack / memory / storage / flow
@@ -608,7 +620,16 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
                     case eth_evm_precompiles:precompile(ToW, Args) of
                         {ok, Out, Cost} ->
                             case charge(E, Cost) of
-                                {ok, E1} -> finish_call(E1, Ctx, Ctx#ctx.state, Out, RetOff, RetLen, 1, E1#e.gas);
+                                {ok, E1} ->
+                                    %% Precompiles move value exactly like a
+                                    %% regular CALL (checked first).
+                                    From = s_msg(address, Ctx, <<0:160>>),
+                                    case check_call_value(Kind, Ctx#ctx.state, From, To, Value) of
+                                        {error, insufficient_balance} ->
+                                            finish_call(E1, Ctx, Ctx#ctx.state, <<>>, RetOff, RetLen, 0, 0);
+                                        {ok, St0} ->
+                                            finish_call(E1, Ctx, St0, Out, RetOff, RetLen, 1, E1#e.gas)
+                                    end;
                                 oog -> finish_call(E, Ctx, Ctx#ctx.state, <<>>, RetOff, RetLen, 0, 0)
                             end;
                         unsupported ->
@@ -625,31 +646,44 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
                             callcode -> {eth_state:code(Ctx#ctx.state, To), CurAddr, CurAddr, Value};
                             delegatecall -> {eth_state:code(Ctx#ctx.state, To), CurAddr, CurCaller, CurValue}
                         end,
-                    StateIn = case Kind of
-                                  call -> transfer(Ctx#ctx.state, CurAddr, To, Value);
-                                  _ -> Ctx#ctx.state
-                              end,
-                    ChildStatic = Kind =:= staticcall orelse s_msg(static, Ctx, false),
-                    ChildMsg = #{address => ChildAddr, caller => ChildCaller,
-                                 origin => s_msg(origin, Ctx, <<0:160>>),
-                                 value => ChildValue, data => Args,
-                                 gas_price => s_msg(gas_price, Ctx, 0),
-                                 static => ChildStatic, depth => Depth + 1},
-                    Result = run(ChildCode, ChildMsg, StateIn, Env, CallGas),
-                    handle_child(Result, E, Ctx, StateIn, RetOff, RetLen)
+                    case check_call_value(Kind, Ctx#ctx.state, CurAddr, To, Value) of
+                        {error, insufficient_balance} ->
+                            %% Caller cannot cover Value: fail with no state
+                            %% change (same shape as the depth-limit failure).
+                            finish_call(E, Ctx, Ctx#ctx.state, <<>>, RetOff, RetLen, 0, 0);
+                        {ok, StateIn} ->
+                            ChildStatic = Kind =:= staticcall orelse s_msg(static, Ctx, false),
+                            ChildMsg = #{address => ChildAddr, caller => ChildCaller,
+                                         origin => s_msg(origin, Ctx, <<0:160>>),
+                                         value => ChildValue, data => Args,
+                                         gas_price => s_msg(gas_price, Ctx, 0),
+                                         static => ChildStatic, depth => Depth + 1},
+                            {Result, ChildT} = run_t(ChildCode, ChildMsg, StateIn,
+                                                     Env, CallGas, Ctx#ctx.transient),
+                            handle_child(Result, E, Ctx, StateIn, RetOff, RetLen, ChildT)
+                    end
             end
     end.
 
-handle_child({ok, Out, Left, St, _Logs}, E, Ctx, _StateIn, RetOff, RetLen) ->
-    finish_call(E#e{gas = E#e.gas + Left, retdata = Out}, Ctx, St, Out, RetOff, RetLen, 1, Left);
-handle_child({revert, Out, Left, _St, _Logs}, E, Ctx, StateIn, RetOff, RetLen) ->
-    finish_call(E#e{gas = E#e.gas + Left, retdata = Out}, Ctx#ctx{state = StateIn},
-                StateIn, Out, RetOff, RetLen, 0, Left);
-handle_child({error, Reason, _St, _Logs}, E, Ctx, StateIn, RetOff, RetLen) ->
+handle_child({ok, Out, Left, St, Logs}, E, Ctx, _StateIn, RetOff, RetLen, ChildT) ->
+    %% Success commits child state, child logs AND child transient writes
+    %% (merged over the parent map: the child ran later).
+    MergedT = maps:merge(Ctx#ctx.transient, ChildT),
+    E1 = E#e{gas = E#e.gas + Left, retdata = Out, logs = E#e.logs ++ Logs},
+    finish_call(E1, Ctx#ctx{state = St, transient = MergedT}, St, Out, RetOff, RetLen, 1, Left);
+handle_child({revert, Out, Left, _St, _Logs}, E, Ctx, _StateIn, RetOff, RetLen, _ChildT) ->
+    %% A revert discards the whole child frame INCLUDING the CALL value
+    %% transfer: restore the pre-call state, not the post-transfer snapshot.
+    %% Child transient writes and logs are discarded with it.
+    Pre = Ctx#ctx.state,
+    finish_call(E#e{gas = E#e.gas + Left, retdata = Out}, Ctx#ctx{state = Pre},
+                Pre, Out, RetOff, RetLen, 0, Left);
+handle_child({error, Reason, _St, _Logs}, E, Ctx, _StateIn, RetOff, RetLen, _ChildT) ->
     case Reason of
         {unsupported, What} -> unsupported(What, E, Ctx);
-        _ -> finish_call(E#e{retdata = <<>>}, Ctx#ctx{state = StateIn},
-                         StateIn, <<>>, RetOff, RetLen, 0, 0)
+        _ -> Pre = Ctx#ctx.state,
+             finish_call(E#e{retdata = <<>>}, Ctx#ctx{state = Pre},
+                         Pre, <<>>, RetOff, RetLen, 0, 0)
     end.
 
 %% Write the (truncated) child output to memory, push success flag.
@@ -678,6 +712,26 @@ transfer(State, From, To, Value) ->
     ToBal = eth_state:balance(State, To),
     S1 = eth_state:set_balance(State, From, FromBal - Value),
     eth_state:set_balance(S1, To, ToBal + Value).
+
+%% A CALL moves value before execution; staticcall/delegatecall/callcode do
+%% not move value out of the caller (callcode's net effect is zero, so doing
+%% nothing matches). A caller that cannot cover Value fails the call with no
+%% state change (mirrors the depth-limit failure shape).
+check_call_value(call, State, _From, _To, 0) ->
+    %% Zero value moves nothing: skip the balance read entirely (also keeps
+    %% view-only calls free of upstream fetches).
+    {ok, State};
+check_call_value(call, State, From, To, Value) ->
+    case can_transfer(State, From, Value) of
+        true -> {ok, transfer(State, From, To, Value)};
+        false -> {error, insufficient_balance}
+    end;
+check_call_value(_Kind, State, _From, _To, _Value) ->
+    {ok, State}.
+
+can_transfer(_State, _From, 0) -> true;
+can_transfer(State, From, Value) ->
+    eth_state:balance(State, From) >= Value.
 
 %% ---------------------------------------------------------------------------
 %% CREATE / CREATE2
@@ -729,40 +783,54 @@ run_create1(Op, Init, Salt, Value, E, Ctx) ->
             Avail = E#e.gas,
             ChildGas = Avail - Avail div 64,
             {ok, E1} = charge(E, ChildGas),
-            State2 = transfer(State1, Sender, NewAddr, Value),
-            Env = Ctx#ctx.env,
-            ChildMsg = #{address => NewAddr, caller => Sender,
-                         origin => s_msg(origin, Ctx, <<0:160>>),
-                         value => Value, data => <<>>,
-                         gas_price => s_msg(gas_price, Ctx, 0),
-                         static => false, depth => s_msg(depth, Ctx, 0) + 1},
-            Result = run(Init, ChildMsg, State2, Env, ChildGas),
-            case Result of
-                {ok, Code, Left, St, _} when byte_size(Code) =< 24576 ->
-                    St1 = eth_state:set_code(St, NewAddr, Code),
-                    next(push(E1#e{gas = E1#e.gas + Left}, eth_word:from_bytes(NewAddr)),
-                         Ctx#ctx{state = St1});
-                {ok, _Code, _Left, St, _} ->
-                    %% code too large: consume gas, fail
-                    next(push(E1#e{gas = E1#e.gas, retdata = <<>>}, 0), Ctx#ctx{state = St});
-                {revert, Out, Left, _St, _} ->
-                    next(push(E1#e{gas = E1#e.gas + Left, retdata = Out}, 0),
-                         Ctx#ctx{state = State2});
-                {error, Reason, _St, _} ->
-                    case Reason of
-                        {unsupported, What} -> unsupported(What, E1, Ctx);
-                        _ -> next(push(E1#e{retdata = <<>>}, 0), Ctx#ctx{state = State2})
-                    end
+            case can_transfer(State1, Sender, Value) of
+                false ->
+                    %% Nonce stays consumed (as in geth); no value moves.
+                    finish_call(E1, Ctx, State1, <<>>, 0, 0, 0, 0);
+                true ->
+                    create_with_value(Op, Init, Value, Sender, NewAddr, State1, E1, Ctx, ChildGas)
+            end
+    end.
+
+create_with_value(_Op, Init, Value, Sender, NewAddr, State1, E1, Ctx, ChildGas) ->
+    State2 = transfer(State1, Sender, NewAddr, Value),
+    Env = Ctx#ctx.env,
+    ChildMsg = #{address => NewAddr, caller => Sender,
+                 origin => s_msg(origin, Ctx, <<0:160>>),
+                 value => Value, data => <<>>,
+                 gas_price => s_msg(gas_price, Ctx, 0),
+                 static => false, depth => s_msg(depth, Ctx, 0) + 1},
+    Result = run_t(Init, ChildMsg, State2, Env, ChildGas, Ctx#ctx.transient),
+    case Result of
+        {{ok, Code, Left, St, Logs}, ChildT} when byte_size(Code) =< 24576 ->
+            St1 = eth_state:set_code(St, NewAddr, Code),
+            MergedT = maps:merge(Ctx#ctx.transient, ChildT),
+            E2 = E1#e{gas = E1#e.gas + Left, logs = E1#e.logs ++ Logs},
+            next(push(E2, eth_word:from_bytes(NewAddr)),
+                 Ctx#ctx{state = St1, transient = MergedT});
+        {{ok, _Code, _Left, _St, _}, _ChildT} ->
+            %% code too large: consume gas, fail with no deployment and no
+            %% value movement (nonce from State1 is kept)
+            next(push(E1#e{gas = E1#e.gas, retdata = <<>>}, 0), Ctx#ctx{state = State1});
+        {{revert, Out, Left, _St, _}, _ChildT} ->
+            %% Revert rolls back deployment AND the value transfer; the
+            %% sender nonce increment (State1) is kept.
+            next(push(E1#e{gas = E1#e.gas + Left, retdata = Out}, 0),
+                 Ctx#ctx{state = State1});
+        {{error, Reason, _St, _}, _ChildT} ->
+            case Reason of
+                {unsupported, What} -> unsupported(What, E1, Ctx);
+                _ -> next(push(E1#e{retdata = <<>>}, 0), Ctx#ctx{state = State1})
             end
     end.
 
 create_address(create, Sender, Nonce, _Salt, _Init) ->
     Enc = eth_rlp:encode([Sender, Nonce]),
-    <<_:24/binary, Addr:20/binary>> = eth_keccak:hash(Enc),
+    <<_:12/binary, Addr:20/binary>> = eth_keccak:hash(Enc),
     Addr;
 create_address(create2, Sender, _Nonce, Salt, Init) ->
     InitHash = eth_keccak:hash(Init),
-    <<_:24/binary, Addr:20/binary>> =
+    <<_:12/binary, Addr:20/binary>> =
         eth_keccak:hash(<<16#FF, Sender/binary, (eth_word:to_bytes(Salt, 32))/binary,
                          InitHash/binary>>),
     Addr.

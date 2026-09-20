@@ -132,3 +132,105 @@ selector_dispatch_wrong_selector_reverts_test() ->
     Msg = Msg0#{data => <<16#12345678:32>>},
     ?assertMatch({revert, <<>>, _, _, _},
                  eth_evm:run(Code, Msg, ?STATE, ?ENV, ?GAS)).
+
+%% ---------------------------------------------------------------------------
+%% Value-transfer + revert semantics (P0 regression set)
+%% ---------------------------------------------------------------------------
+
+%% All overlay keys a CALL/CREATE touches are seeded here so no test ever
+%% performs a lazy upstream fetch (unit tests run with no RPC client).
+-define(CALLER, <<0:160>>).
+-define(CALLEE, <<0:152, 16#0D:8>>).
+
+call_state(CallerBal, CalleeCode) ->
+    eth_state:new(0, #{{balance, ?CALLER} => CallerBal,
+                       {nonce, ?CALLER} => 0,
+                       {balance, ?CALLEE} => 0,
+                       {nonce, ?CALLEE} => 0,
+                       {code, ?CALLEE} => CalleeCode}).
+
+%% CALL stack: retlen, retoff, argslen, argsoff, value, to, gas.
+call_seq(ToByte, Value, Op) ->
+    <<16#60,0, 16#60,0, 16#60,0, 16#60,0, 16#60,Value,
+      16#60,ToByte, 16#61,16#FF,16#FF, Op>>.
+
+call_value_revert_rolls_back_test() ->
+    %% Callee immediately reverts; the 40 wei sent must come back.
+    Revert = <<16#60,0, 16#60,0, 16#FD>>,
+    Parent = <<(call_seq(16#0D, 40, 16#F1))/binary, 16#00>>,
+    {ok, _, _, St, _} = eth_evm:run(Parent, ?MSG0, call_state(100, Revert),
+                                    ?ENV, ?GAS),
+    ?assertEqual(100, eth_state:balance(St, ?CALLER)),
+    ?assertEqual(0, eth_state:balance(St, ?CALLEE)).
+
+call_insufficient_balance_fails_cleanly_test() ->
+    %% Caller holds 10, sends 40: call fails, no state change (old code
+    %% wrapped the debit to 2^256-30 and credited the callee).
+    Revert = <<16#60,0, 16#60,0, 16#FD>>,
+    Parent = <<(call_seq(16#0D, 40, 16#F1))/binary, 16#00>>,
+    {ok, _, _, St, _} = eth_evm:run(Parent, ?MSG0, call_state(10, Revert),
+                                    ?ENV, ?GAS),
+    ?assertEqual(10, eth_state:balance(St, ?CALLER)),
+    ?assertEqual(0, eth_state:balance(St, ?CALLEE)).
+
+create_revert_keeps_nonce_drops_value_test() ->
+    %% Init code reverts: value returns, nonce stays consumed, nothing deployed.
+    Init = <<16#60,0, 16#60,0, 16#FD>>,
+    <<_:12/binary, NewAddr:20/binary>> =
+        eth_keccak:hash(eth_rlp:encode([?CALLER, 5])),
+    State0 = eth_state:new(0, #{{balance, ?CALLER} => 100,
+                                {nonce, ?CALLER} => 5,
+                                {balance, NewAddr} => 0,
+                                {nonce, NewAddr} => 0,
+                                {code, NewAddr} => <<>>}),
+    %% CODECOPY 5 bytes of init from pc 15, then CREATE(value 40).
+    Parent = <<16#60,5, 16#60,15, 16#60,0, 16#39,
+               16#60,5, 16#60,0, 16#60,40, 16#F0, 16#00,
+               Init/binary>>,
+    {ok, _, _, St, _} = eth_evm:run(Parent, ?MSG0, State0, ?ENV, ?GAS),
+    ?assertEqual(6, eth_state:nonce(St, ?CALLER)),
+    ?assertEqual(100, eth_state:balance(St, ?CALLER)),
+    ?assertEqual(<<>>, eth_state:code(St, NewAddr)).
+
+%% ---------------------------------------------------------------------------
+%% EIP-1153 transient storage is transaction-global (P0 regression set)
+%% ---------------------------------------------------------------------------
+
+transient_survives_delegatecall_test() ->
+    %% Callee stores 99 transiently; parent (same address via DELEGATECALL)
+    %% reads it back. Lost entirely before the scoping fix.
+    Child = <<16#60,99, 16#60,7, 16#5D, 16#00>>,
+    Parent = <<(call_seq(16#0D, 0, 16#F4))/binary,
+               16#60,7, 16#5C, 16#60,0, 16#52, 16#60,32, 16#60,0, 16#F3>>,
+    {ok, Out, _, _, _} = eth_evm:run(Parent, ?MSG0, call_state(0, Child),
+                                     ?ENV, ?GAS),
+    ?assertEqual(99, binary:decode_unsigned(Out)).
+
+transient_discarded_on_child_revert_test() ->
+    %% Parent stores 42, child overwrites to 99 then reverts: parent must
+    %% still read 42 (child frame discarded, parent frame intact).
+    Child = <<16#60,99, 16#60,7, 16#5D, 16#60,0, 16#60,0, 16#FD>>,
+    Parent = <<16#60,42, 16#60,7, 16#5D,
+               (call_seq(16#0D, 0, 16#F4))/binary,
+               16#60,7, 16#5C, 16#60,0, 16#52, 16#60,32, 16#60,0, 16#F3>>,
+    {ok, Out, _, _, _} = eth_evm:run(Parent, ?MSG0, call_state(0, Child),
+                                     ?ENV, ?GAS),
+    ?assertEqual(42, binary:decode_unsigned(Out)).
+
+%% ---------------------------------------------------------------------------
+%% Fallback honesty + log propagation (P0 regression set)
+%% ---------------------------------------------------------------------------
+
+blobhash_falls_back_test() ->
+    %% BLOBHASH must proxy upstream (unsupported), never fabricate zero.
+    Code = <<16#60,0, 16#49, 16#00>>,
+    ?assertMatch({error, {unsupported, {opcode, 16#49}}, _, _},
+                 eth_evm:run(Code, ?MSG0, ?STATE, ?ENV, ?GAS)).
+
+child_logs_propagate_test() ->
+    %% Callee emits one LOG0; the top-level run must report it (was dropped).
+    Child = <<16#60,0, 16#60,0, 16#A0, 16#00>>,
+    Parent = <<(call_seq(16#0D, 0, 16#F1))/binary, 16#00>>,
+    {ok, _, _, _, Logs} = eth_evm:run(Parent, ?MSG0, call_state(0, Child),
+                                      ?ENV, ?GAS),
+    ?assertEqual(1, length(Logs)).
