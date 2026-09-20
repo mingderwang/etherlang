@@ -7,6 +7,12 @@ overrides — against lazily-fetched upstream state. No devp2p, no tx pool, no
 block production: the upstream node remains the source of truth for consensus
 and inclusion.
 
+## Support
+
+If etherlang is useful to you, you can support its development:
+
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/mingderwang?style=flat-square)](https://github.com/sponsors/mingderwang)
+
 ## Summary
 
 `etherlang` is a lightweight Ethereum **execution-layer-style** node written in
