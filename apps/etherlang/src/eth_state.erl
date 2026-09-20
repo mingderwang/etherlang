@@ -182,6 +182,14 @@ block_param(B) -> B.
 %% TTL is only applied to mutable tags; concrete block numbers are immutable.
 cached(Key, Fun) ->
     ensure_table(),
+    try cached_lookup(Key, Fun)
+    catch error:badarg ->
+        %% Table vanished mid-request (owner died, supervisor restarting):
+        %% serve uncached rather than killing the caller's HTTP request.
+        Fun()
+    end.
+
+cached_lookup(Key, Fun) ->
     case ets:lookup(?TAB, Key) of
         [{_, V, Exp}] ->
             case Exp =:= infinity orelse Exp > erlang:monotonic_time(millisecond) of
@@ -195,7 +203,8 @@ cached(Key, Fun) ->
 fetch_store(Key, Fun) ->
     V = Fun(),
     Exp = ttl(Key),
-    ets:insert(?TAB, {Key, V, Exp}),
+    _ = try ets:insert(?TAB, {Key, V, Exp})
+        catch error:badarg -> ok end,
     V.
 
 ttl({_, _, Block}) -> tag_ttl(Block);

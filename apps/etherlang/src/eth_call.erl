@@ -178,24 +178,38 @@ block_hash(N) ->
     ensure_blockhash_cache(),
     Key = {blockhash, N},
     Now = now_ms(),
+    try block_hash_lookup(Key, Now) of
+        {ok, _} = Ok -> Ok;
+        _ -> block_hash_fetch(Key, N)
+    catch error:badarg ->
+        %% Cache table vanished mid-request (same owner race as
+        %% eth_state_cache): serve uncached rather than dying.
+        block_hash_fetch(Key, N)
+    end.
+
+block_hash_lookup(Key, Now) ->
     case ets:lookup(?BLOCKHASH_CACHE, Key) of
         [{_, {ok, Bin}, Exp}] when Exp =:= infinity; Exp > Now ->
             {ok, Bin};
         _ ->
-            R = case eth_rpc_client:call(<<"eth_getBlockByNumber">>,
-                                         [eth_hex:encode_int(N), false]) of
-                    {ok, Block} when is_map(Block) ->
-                        case maps:get(<<"hash">>, Block, undefined) of
-                            undefined -> error;
-                            H when is_binary(H) -> {ok, eth_state:hex_to_bin(H)};
-                            _ -> error
-                        end;
-                    _ ->
-                        error
-                end,
-            ets:insert(?BLOCKHASH_CACHE, {Key, R, now_ms() + ?BLOCKHASH_TTL_MS}),
-            R
+            miss
     end.
+
+block_hash_fetch(Key, N) ->
+    R = case eth_rpc_client:call(<<"eth_getBlockByNumber">>,
+                                 [eth_hex:encode_int(N), false]) of
+            {ok, Block} when is_map(Block) ->
+                case maps:get(<<"hash">>, Block, undefined) of
+                    undefined -> error;
+                    H when is_binary(H) -> {ok, eth_state:hex_to_bin(H)};
+                    _ -> error
+                end;
+            _ ->
+                error
+        end,
+    _ = try ets:insert(?BLOCKHASH_CACHE, {Key, R, now_ms() + ?BLOCKHASH_TTL_MS})
+        catch error:badarg -> ok end,
+    R.
 
 ensure_blockhash_cache() ->
     case ets:info(?BLOCKHASH_CACHE) of

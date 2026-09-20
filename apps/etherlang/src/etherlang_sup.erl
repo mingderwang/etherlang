@@ -16,6 +16,18 @@ init([]) ->
               type => worker,
               modules => [eth_chain]},
 
+    %% Owns the eth_state_cache ETS table. Without this child the table was
+    %% created on first use by a short-lived request handler that owned it;
+    %% when that request finished, concurrent requests crashed on insert to
+    %% the dead table, killing their HTTP connections (and crash-looping the
+    %% EthStats agents downstream).
+    State = #{id => eth_state,
+              start => {eth_state, start_link, []},
+              restart => permanent,
+              shutdown => 5000,
+              type => worker,
+              modules => [eth_state]},
+
     Rpc = #{id => eth_rpc_server,
             start => {eth_rpc_server, start_link, [#{port => eth_config:listen_port()}]},
             restart => permanent,
@@ -36,4 +48,4 @@ init([]) ->
              type => worker,
              modules => [eth_sync]},
 
-    {ok, {SupFlags, [Chain, Rpc, Sync]}}.
+    {ok, {SupFlags, [State, Chain, Rpc, Sync]}}.
