@@ -1,8 +1,14 @@
 _build/
 data/
 erl_crash.dump
+rebar3.crashdump
+session-*.md
 *.beam
 .rebar3/
 doc/
 logs/
 .DS_Store
+node_modules/
+tools/*/out/
+tools/*/cache/
+tools/hardhat-test/artifacts/
