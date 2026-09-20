@@ -25,6 +25,12 @@
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
+%% How long to skip sync work after a rewind is refused below the finalized
+%% floor. While pinned, no rewind (and hence no progress past the stall) is
+%% possible, so backing off spares upstream requests and log spam; each
+%% refusal re-arms the window.
+-define(FLOOR_BACKOFF_MS, 60000).
+
 -record(st, {chain = eth_chain,
              concurrency = 8,
              body_window = 100000,
@@ -41,7 +47,8 @@
              appended = 0,
              failed = 0,
              reorgs = 0,
-             last_log = 0}).
+             last_log = 0,
+             floor_backoff_until = 0}).
 
 start_link(Cfg) -> start_link(eth_sync, maps:merge(defaults(), Cfg)).
 start_link(Name, Cfg) ->
@@ -114,14 +121,25 @@ run_once(S) ->
         {ok, HeadU} ->
             S0 = (S#st{mode = sync, budget = S#st.budget_max})#st{target = HeadU},
             track_finalized(S0#st.chain),
-            case local_head(S0#st.chain) of
-                undefined ->
-                    From = anchor(S0, HeadU),
-                    sync_range(S0, From, HeadU);
-                {HeadN, _} when HeadN > HeadU ->
-                    rewind_to_upstream(S0, HeadU);
-                {HeadN, _} ->
-                    sync_range(S0, HeadN + 1, HeadU)
+            Now = erlang:monotonic_time(millisecond),
+            %% NB: monotonic time is only meaningful relatively (it can be
+            %% negative, e.g. on macOS), so the gate must exempt the
+            %% never-armed 0 explicitly instead of relying on Now < Until.
+            case S0#st.floor_backoff_until =/= 0 andalso Now < S0#st.floor_backoff_until of
+                true ->
+                    %% Pinned below the finalized floor: skip sync work until
+                    %% the backoff expires (each refusal re-arms it).
+                    S0;
+                false ->
+                    case local_head(S0#st.chain) of
+                        undefined ->
+                            From = anchor(S0, HeadU),
+                            sync_range(S0, From, HeadU);
+                        {HeadN, _} when HeadN > HeadU ->
+                            rewind_to_upstream(S0, HeadU);
+                        {HeadN, _} ->
+                            sync_range(S0, HeadN + 1, HeadU)
+                    end
             end;
         {error, Reason} ->
             logger:warning("etherlang: upstream unreachable (~p); will retry", [Reason]),
@@ -129,17 +147,51 @@ run_once(S) ->
     end.
 
 %% Pull the upstream finalized checkpoint and record it (never moves back).
+%% The checkpoint is only accepted when it cannot brick the node: it must be
+%% at or below the local head AND match our canonical hash at that height.
+%% Accepting a checkpoint we do not have (ahead of head, or on a fork) would
+%% refuse every future rewind below it and stall sync permanently.
 track_finalized(Chain) ->
     case try eth_rpc_client:call(<<"eth_getBlockByNumber">>, [<<"finalized">>, false])
          catch _:_ -> error end of
         {ok, Block} when is_map(Block) ->
-            case eth_header:number(Block) of
-                undefined -> ok;
-                N -> eth_chain:set_finalized(Chain, N)
+            case {eth_header:number(Block), maps:get(<<"hash">>, Block, undefined)} of
+                {N, H} when is_integer(N), is_binary(H) ->
+                    maybe_set_finalized(Chain, N, string:lowercase(H));
+                _ ->
+                    ok
             end;
         _ ->
             ok
     end.
+
+maybe_set_finalized(Chain, N, H) ->
+    case try eth_chain:head(Chain) catch _:_ -> undefined end of
+        undefined ->
+            %% Nothing stored yet; finality catches up once we sync past it.
+            ok;
+        {HeadN, _} when N > HeadN ->
+            logger:warning("etherlang: ignoring finalized ~p: ahead of local head ~p",
+                           [N, HeadN]),
+            ok;
+        {_HeadN, _} ->
+            case try eth_chain:canonical_hash(Chain, N) catch _:_ -> undefined end of
+                H ->
+                    eth_chain:set_finalized(Chain, N);
+                _ ->
+                    %% Stored hashes are lowercase (see eth_header:verify/1);
+                    %% the upstream hash was lowercased by the caller.
+                    logger:warning("etherlang: ignoring finalized ~p: not on local canonical chain",
+                                   [N]),
+                    ok
+            end
+    end.
+
+%% A rewind refused below the finalized floor: count it and back off sync
+%% work for ?FLOOR_BACKOFF_MS (re-armed by each refusal).
+pin_backoff(S) ->
+    S#st{floor_backoff_until = erlang:monotonic_time(millisecond) + ?FLOOR_BACKOFF_MS,
+         failed = S#st.failed + 1}.
 
 %% Where to start when the local store is empty.
 anchor(S, HeadU) ->
@@ -177,7 +229,7 @@ rewind_to_upstream(S, HeadU) ->
 
 rewind_refused(S, {below_finality, F}) ->
     logger:error("etherlang: upstream reorg below finalized ~p; refusing", [F]),
-    S#st{failed = S#st.failed + 1};
+    pin_backoff(S);
 rewind_refused(S, Reason) ->
     logger:error("etherlang: rewind refused (~p)", [Reason]),
     S#st{failed = S#st.failed + 1}.
@@ -211,14 +263,17 @@ sync_range(S, From, To) ->
                                     rewind_refused(S, Reason)
                             end;
                         error ->
-                            S#st{failed = S#st.failed + 1}
+                            %% Covers both the below-finality give-up and the
+                            %% max-depth give-up inside ancestor_walk (each
+                            %% already logged there); back off before retrying.
+                            pin_backoff(S)
                     end;
                 {error, {bad_block, N, Reason}} ->
                     logger:error("etherlang: rejecting block ~p: ~p", [N, Reason]),
                     S#st{failed = S#st.failed + 1};
                 {error, {below_finality, F}} ->
                     logger:error("etherlang: refusing rewind below finalized ~p", [F]),
-                    S#st{failed = S#st.failed + 1};
+                    pin_backoff(S);
                 {error, Reason} ->
                     logger:error("etherlang: append failed (~p)", [Reason]),
                     S#st{failed = S#st.failed + 1}

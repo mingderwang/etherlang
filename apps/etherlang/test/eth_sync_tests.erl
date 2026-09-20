@@ -51,6 +51,14 @@ sync_full() ->
     ok = eth_test_util:wait_until(fun() -> eth_chain:finalized(Chain) =:= 20 end,
                                   50, 30000),
 
+    %% --- phase 2c: finalized AHEAD of the local head is ignored ------------
+    %% Regression: blindly recording an ahead checkpoint bricked sync — every
+    %% later rewind below the overshoot floor was refused and the head stalled
+    %% forever (live incident: finalized 11740998 vs head 11729363).
+    eth_mock_node:set_finalized(Mock, 40),
+    timer:sleep(500),
+    ?assertEqual(20, eth_chain:finalized(Chain)),
+
     %% --- phase 3: upstream reorg ------------------------------------------
     %% Upstream replaces blocks 23..30 (still linked to our block 22) with a
     %% different, taller fork (salt 1).
@@ -88,3 +96,52 @@ wait_head(Mock, Chain, Num, Timeout) ->
                        false
                end
            end, 50, Timeout).
+
+finalized_guard_test_() ->
+    {"sync: finalized is only recorded when on the local canonical chain",
+     {timeout, 60000, fun finalized_guard/0}}.
+
+finalized_guard() ->
+    ok = eth_test_util:start_apps(),
+
+    Mock = 'mock_fing',
+    Chain = 'chain_fing',
+    Sync = 'sync_fing',
+    Dir = eth_test_util:tmp_dir(),
+
+    {ok, _} = eth_mock_node:start_link(Mock),
+    {ok, _} = eth_chain:start_link(Chain, Dir),
+    eth_rpc_client:init(#{url => eth_mock_node:url(Mock), timeout_ms => 10000}),
+
+    %% Mock serves fork A (salt 1); the local node syncs it fully.
+    {_, BlocksA} = eth_test_util:make_blocks(0, 11, z0(), 1),
+    eth_mock_node:set_chain(Mock, BlocksA),
+
+    {ok, _} = eth_sync:start_link(Sync, #{chain => Chain,
+                                          concurrency => 4,
+                                          body_window => 100,
+                                          poll_interval_ms => 50,
+                                          sync_retry_ms => 50,
+                                          max_reorg_depth => 128,
+                                          sync_budget => 2048,
+                                          start_block => 0}),
+    ok = wait_head(Mock, Chain, 10, 30000),
+
+    %% Upstream switches to a competing fork (salt 0) and advertises
+    %% finalized=5 from THAT fork. 5 =< head 10, but the hash is not our
+    %% canonical block 5, so it must be ignored.
+    {_, BlocksB} = eth_test_util:make_blocks(0, 11, z0(), 0),
+    eth_mock_node:set_chain(Mock, BlocksB),
+    eth_mock_node:set_finalized(Mock, 5),
+    timer:sleep(500),
+    ?assertEqual(undefined, eth_chain:finalized(Chain)),
+
+    %% ...while a checkpoint that IS canonical is still recorded.
+    eth_mock_node:set_chain(Mock, BlocksA),
+    eth_mock_node:set_finalized(Mock, 5),
+    ok = eth_test_util:wait_until(fun() -> eth_chain:finalized(Chain) =:= 5 end,
+                                  50, 30000),
+
+    _ = try gen_server:stop(Sync) catch _:_ -> ok end,
+    _ = try gen_server:stop(Chain) catch _:_ -> ok end,
+    _ = try gen_server:stop(Mock) catch _:_ -> ok end.
