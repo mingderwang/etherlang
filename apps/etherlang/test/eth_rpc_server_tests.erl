@@ -24,9 +24,12 @@ rpc_server_case() ->
     eth_mock_node:set_chain(Mock, Blocks),
 
     %% Local store: blocks 0..3 only, header-only (Full=false).
+    %% Strip totalDifficulty like real post-merge upstream responses, which
+    %% omit the field (mock fixtures otherwise carry 0x0).
     Pairs = [begin
                  Num = eth_hex:decode(maps:get(<<"number">>, B)),
-                 {Num, header_only(B), false}
+                 NoTd = maps:remove(<<"totalDifficulty">>, header_only(B)),
+                 {Num, NoTd, false}
              end || B <- Blocks],
     {Ok, Rest} = lists:split(4, Pairs), _ = Rest,
     ok = eth_chain:append(Chain, Ok),
@@ -48,6 +51,8 @@ rpc_server_case() ->
         ?assertEqual(<<"0x2">>, maps:get(<<"number">>, B2)),
         TxsHeader = maps:get(<<"transactions">>, B2),
         ?assertEqual(true, lists:all(fun is_binary/1, TxsHeader)),
+        %% Pre-merge block passes through untouched (no totalDifficulty added)
+        ?assertEqual(false, maps:is_key(<<"totalDifficulty">>, B2)),
 
         %% Full body requested for a header-only local block -> proxied
         {ok, #{<<"result">> := B2Full}} =
@@ -125,6 +130,63 @@ rpc(Port, Payload) when is_binary(Payload) ->
     http_post(Port, Payload);
 rpc(Port, Payload) ->
     http_post(Port, thoas:encode(Payload)).
+
+%% Post-merge blocks served locally carry the Sepolia TTD as
+%% totalDifficulty (EthStats agent block-validator compat); pre-merge
+%% blocks and unknown shapes pass through untouched.
+td_compat_test_() ->
+    {timeout, 60000, fun td_compat_case/0}.
+
+td_compat_case() ->
+    ok = eth_test_util:start_apps(),
+
+    Mock = 'mock_td',
+    Chain = 'chain_td',
+    Server = 'rpc_td_server',
+    Dir = eth_test_util:tmp_dir(),
+    Port = eth_test_util:free_port(),
+
+    {ok, _} = eth_mock_node:start_link(Mock),
+    {ok, _} = eth_chain:start_link(Chain, Dir),
+    eth_rpc_client:init(#{url => eth_mock_node:url(Mock), timeout_ms => 10000}),
+
+    %% Anchor a post-merge block directly (empty store accepts any anchor).
+    %% Strip totalDifficulty to mirror real upstream responses (which omit
+    %% it); the compat shim must fill in the Sepolia TTD on serve.
+    {_, [Hi, Hi2]} = eth_test_util:make_blocks(11743600, 2, z0(), 0),
+    HiNum = eth_hex:decode(maps:get(<<"number">>, Hi)),
+    ?assert(HiNum >= 1450409),
+    HiNoTd = maps:remove(<<"totalDifficulty">>, Hi),
+    Hi2Num = eth_hex:decode(maps:get(<<"number">>, Hi2)),
+    ok = eth_chain:append(Chain, [{HiNum, HiNoTd, true}, {Hi2Num, Hi2, true}]),
+
+    {ok, _} = eth_rpc_server:start_link(Server, #{port => Port,
+                                                  chain => Chain,
+                                                  sync => 'no_such_sync_name'}),
+    try
+        {ok, #{<<"result">> := Got}} =
+            rpc(Port, #{<<"jsonrpc">> => <<"2.0">>, <<"id">> => 1,
+                        <<"method">> => <<"eth_getBlockByNumber">>,
+                        <<"params">> => [eth_hex:encode_int(HiNum), true]}),
+        ?assertEqual(<<"0x3c6568f12e8000">>, maps:get(<<"totalDifficulty">>, Got)),
+
+        {ok, #{<<"result">> := GotHash}} =
+            rpc(Port, #{<<"jsonrpc">> => <<"2.0">>, <<"id">> => 2,
+                        <<"method">> => <<"eth_getBlockByHash">>,
+                        <<"params">> => [maps:get(<<"hash">>, HiNoTd), false]}),
+        ?assertEqual(<<"0x3c6568f12e8000">>, maps:get(<<"totalDifficulty">>, GotHash)),
+
+        %% A block that already carries totalDifficulty keeps its own value.
+        {ok, #{<<"result">> := GotKept}} =
+            rpc(Port, #{<<"jsonrpc">> => <<"2.0">>, <<"id">> => 3,
+                        <<"method">> => <<"eth_getBlockByNumber">>,
+                        <<"params">> => [eth_hex:encode_int(Hi2Num), true]}),
+        ?assertEqual(<<"0x0">>, maps:get(<<"totalDifficulty">>, GotKept))
+    after
+        _ = try gen_server:stop(Server) catch _:_ -> ok end,
+        _ = try gen_server:stop(Chain) catch _:_ -> ok end,
+        _ = try gen_server:stop(Mock) catch _:_ -> ok end
+    end.
 
 header_only(B) ->
     B#{<<"transactions">> => [maps:get(<<"hash">>, T)

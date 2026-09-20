@@ -19,7 +19,14 @@ free_port() ->
 tmp_dir() -> tmp_dir(erlang:unique_integer([positive])).
 
 tmp_dir(Prefix) ->
+    %% NOTE: erlang:unique_integer/1 restarts from the same base in every
+    %% fresh VM, so directories derived from it alone COLLIDE across test
+    %% runs (stale DETS state leaked from run to run, causing phantom
+    %% missing_parent/reorg failures). The OS pid makes each VM's
+    %% directories unique.
+    PidPart = os:getpid(),
     D = filename:join("/tmp", "etherlang_test_" ++ integer_to_list(Prefix)
+                           ++ "_" ++ PidPart
                            ++ "_" ++ integer_to_list(erlang:unique_integer([positive]))),
     ok = filelib:ensure_dir(filename:join(D, "x")),
     D.

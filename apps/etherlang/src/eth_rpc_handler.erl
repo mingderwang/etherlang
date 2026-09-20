@@ -9,6 +9,17 @@
 
 -export([init/2]).
 
+%% Post-merge totalDifficulty compat (EthStats agent validator compat).
+%% Upstream omits totalDifficulty (post-merge geth-style), but classic
+%% tooling requires the field to accept a block. Post-merge the value is
+%% frozen at the terminal total difficulty, so serving the chain constant
+%% is stating a protocol fact, not fabricating data. Gated to known
+%% chains + post-merge heights only; storage is never touched (serve-time
+%% presentation), pre-merge blocks and unknown chains pass through verbatim.
+-define(SEPOLIA_CHAIN_ID, 11155111).
+-define(SEPOLIA_MERGE_BLOCK, 1450409).
+-define(SEPOLIA_TTD_HEX, <<"0x3c6568f12e8000">>). %% 17000000000000000
+
 init(Req0, State) ->
     case cowboy_req:method(Req0) of
         <<"POST">> ->
@@ -109,7 +120,7 @@ dispatch(<<"eth_getBlockByNumber">>, [NumHex, Full], State) when
         {ok, _Block, FullStored} when Full andalso not FullStored ->
             proxy(<<"eth_getBlockByNumber">>, [num_or_tag(NumHex, Num), Full]);
         {ok, Block, _} ->
-            {ok, Block};
+            {ok, with_td_compat(Block)};
         not_found ->
             proxy(<<"eth_getBlockByNumber">>, [num_or_tag(NumHex, Num), Full])
     end;
@@ -121,7 +132,7 @@ dispatch(<<"eth_getBlockByHash">>, [Hash, Full], State) when
         {ok, _Block, FullStored} when Full andalso not FullStored ->
             proxy(<<"eth_getBlockByHash">>, [Hash, Full]);
         {ok, Block, _} ->
-            {ok, Block};
+            {ok, with_td_compat(Block)};
         not_found ->
             proxy(<<"eth_getBlockByHash">>, [Hash, Full])
     end;
@@ -217,6 +228,24 @@ local_head_num(Chain) ->
         {N, _} -> N;
         undefined -> 0
     end.
+
+%% Serve-time totalDifficulty compat (see defines at top of file). Only
+%% fills the field when absent AND the block is provably post-merge on a
+%% known chain; everything else passes through untouched.
+with_td_compat(Block) when is_map(Block) ->
+    case maps:is_key(<<"totalDifficulty">>, Block) of
+        true ->
+            Block;
+        false ->
+            case {eth_state:chain_id(), eth_header:number(Block)} of
+                {?SEPOLIA_CHAIN_ID, N} when is_integer(N), N >= ?SEPOLIA_MERGE_BLOCK ->
+                    Block#{<<"totalDifficulty">> => ?SEPOLIA_TTD_HEX};
+                _ ->
+                    Block
+            end
+    end;
+with_td_compat(Other) ->
+    Other.
 
 to_bin(Term) when is_binary(Term) -> Term;
 to_bin(Term) when is_list(Term) -> list_to_binary(Term);
