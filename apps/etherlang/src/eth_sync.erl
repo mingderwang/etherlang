@@ -33,7 +33,7 @@
 
 -record(st, {chain = eth_chain,
              concurrency = 8,
-             body_window = 100000,
+             body_window = 2048,
              poll_ms = 5000,
              retry_ms = 2000,
              max_reorg = 256,
@@ -63,7 +63,7 @@ head(Name) -> gen_server:call(Name, head).
 defaults() ->
     #{chain => eth_chain,
       concurrency => 8,
-      body_window => 100000,
+      body_window => eth_config:body_window(),
       poll_interval_ms => 5000,
       sync_retry_ms => 2000,
       max_reorg_depth => 256,

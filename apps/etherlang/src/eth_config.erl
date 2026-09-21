@@ -9,6 +9,8 @@
 %%   ETH_START_BLOCK    - where to start syncing: "latest" or a block number
 %%   SYNC_CONCURRENCY   - max parallel block fetches
 %%   BODY_WINDOW        - how many most-recent blocks to store with full bodies
+%%   CHAIN_RETENTION    - max recent blocks kept in the local chain store;
+%%                        older blocks are pruned (served from upstream instead)
 %%   POLL_INTERVAL_MS   - follow-mode poll interval
 %%   SYNC_RETRY_MS      - base backoff between fetch retries
 %%   MAX_REORG_DEPTH    - ancestor walk limit when handling a reorg
@@ -18,14 +20,16 @@
 %%   EVM_ETH_CALL       - serve eth_call locally via the built-in EVM (default true)
 
 -export([upstream_url/0, listen_port/0, data_dir/0, start_block/0, concurrency/0,
-         body_window/0, poll_interval_ms/0, sync_retry_ms/0, max_reorg_depth/0,
-         http_timeout_ms/0, sync_budget/0, verify_headers/0, evm_enabled/0]).
+         body_window/0, chain_retention/0, poll_interval_ms/0, sync_retry_ms/0,
+         max_reorg_depth/0, http_timeout_ms/0, sync_budget/0, verify_headers/0,
+         evm_enabled/0]).
 
 -define(DEF_URL, "https://ethereum-sepolia-rpc.publicnode.com").
 -define(DEF_PORT, 8545).
 -define(DEF_DATA_DIR, "./data").
 -define(DEF_CONCURRENCY, 8).
--define(DEF_BODY_WINDOW, 100000).
+-define(DEF_BODY_WINDOW, 2048).
+-define(DEF_CHAIN_RETENTION, 4096).
 -define(DEF_POLL_MS, 5000).
 -define(DEF_RETRY_MS, 2000).
 -define(DEF_MAX_REORG, 256).
@@ -52,6 +56,8 @@ start_block() ->
 concurrency() -> int_env("SYNC_CONCURRENCY", concurrency, ?DEF_CONCURRENCY).
 
 body_window() -> int_env("BODY_WINDOW", body_window, ?DEF_BODY_WINDOW).
+
+chain_retention() -> int_env("CHAIN_RETENTION", chain_retention, ?DEF_CHAIN_RETENTION).
 
 poll_interval_ms() -> int_env("POLL_INTERVAL_MS", poll_interval_ms, ?DEF_POLL_MS).
 

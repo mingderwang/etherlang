@@ -20,6 +20,15 @@
 %%   hash_tab  : {{Hash}}       -> Num
 %%   meta_tab  : head           -> {Num, Hash}
 %%               finalized      -> Num
+%%               low            -> Num  (lowest block number still retained)
+%%
+%% Bounded growth: DETS files cannot exceed 2 GiB, so the store keeps only a
+%% recent window. After each append, blocks below
+%%   max(head - retention + 1, 0)
+%% are deleted from both tables (the `low' watermark makes this incremental).
+%% The `finalized' checkpoint itself is always kept so `rewind' to it stays
+%% possible. Older blocks are served from the upstream proxy instead (the RPC
+%% layer already falls back on `not_found').
 
 -export([start_link/1, start_link/2,
          head/0, head/1,
@@ -33,8 +42,14 @@
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
+%% Max keys removed per prune pass; bounds the work done in a single append if
+%% a pre-existing (unbounded) store has to catch up.
+-define(PRUNE_BATCH, 4096).
+
 -record(st, {dir, head :: undefined | {integer(), binary()},
              finalized :: undefined | integer(),
+             low = 0 :: integer(),
+             retention = 4096 :: integer(),
              verify = true :: boolean()}).
 
 start_link(Dir) -> start_link(eth_chain, Dir).
@@ -107,8 +122,21 @@ init({Name, Dir}) ->
               [{finalized, F}] when is_integer(F) -> F;
               _ -> undefined
           end,
+    Retention = max(eth_config:chain_retention(), eth_config:max_reorg_depth()),
+    %% `low' is the lowest block we may still have; seed it near the head when
+    %% absent (first start of a pre-existing store) so pruning starts in the
+    %% right place instead of walking up from zero.
+    Low = case dets:lookup(meta_tab, low) of
+              [{low, L}] when is_integer(L) -> L;
+              _ ->
+                  case Head of
+                      {HN0, _} -> max(HN0 - Retention, 0);
+                      undefined -> 0
+                  end
+          end,
     _ = Name,
-    {ok, #st{dir = Dir, head = Head, finalized = Fin,
+    {ok, #st{dir = Dir, head = Head, finalized = Fin, low = Low,
+             retention = Retention,
              verify = eth_config:verify_headers()}}.
 
 handle_call(head, _From, S) ->
@@ -146,7 +174,11 @@ handle_call({append, Blocks}, _From, S) ->
     case verify_blocks(Blocks, S#st.verify) of
         {ok, Blocks1} ->
             {Res, S1} = do_append(Blocks1, S),
-            {reply, Res, S1};
+            S2 = case Res of
+                     ok -> prune(S1);
+                     _ -> S1
+                 end,
+            {reply, Res, S2};
         {error, Reason} ->
             {reply, {error, Reason}, S}
     end;
@@ -192,7 +224,7 @@ do_append([], S) ->
 do_append([{Num, Block, Full} | Rest], #st{head = undefined} = S) ->
     %% No head yet: accept this as the anchor block (genesis or snapshot start).
     Hash = block_hash(Block),
-    do_append(Rest, insert(S, Num, Hash, Block, Full));
+    do_append(Rest, set_low(insert(S, Num, Hash, Block, Full), Num));
 do_append([{Num, Block, _Full} | _] = Blocks, #st{head = {HN, HS}} = S) ->
     Parent = block_parent(Block),
     case Num =:= HN + 1 andalso Parent =:= HS of
@@ -220,7 +252,7 @@ do_append_cont([], S) ->
     {ok, S};
 do_append_cont([{Num, Block, Full} | Rest], #st{head = undefined} = S) ->
     Hash = block_hash(Block),
-    do_append_cont(Rest, insert(S, Num, Hash, Block, Full));
+    do_append_cont(Rest, set_low(insert(S, Num, Hash, Block, Full), Num));
 do_append_cont([{Num, Block, Full} | Rest], #st{head = {HN, HS}} = S) ->
     Hash = block_hash(Block),
     Parent = block_parent(Block),
@@ -281,6 +313,49 @@ insert(S, Num, Hash, Block, Full) ->
     ok = dets:insert(hash_tab, {{Hash}, Num}),
     ok = dets:insert(meta_tab, {head, {Num, Hash}}),
     S#st{head = {Num, Hash}}.
+
+%% ---------------------------------------------------------------------------
+%% Retention / pruning
+%% ---------------------------------------------------------------------------
+
+%% Delete blocks below the retention floor, incrementally from the `low'
+%% watermark. A no-op with no head. Returns the (possibly advanced) state.
+prune(#st{head = undefined} = S) ->
+    S;
+prune(#st{head = {HN, _}, low = Low} = S) ->
+    Below = prune_below(HN, S),
+    case Below > Low of
+        true -> delete_range(S, Low, min(Below, Low + ?PRUNE_BATCH), S#st.finalized);
+        false -> S
+    end.
+
+%% Everything strictly below this number is pruned, except the finalized block
+%% itself (kept so `rewind' to the checkpoint stays possible). Keeps the head
+%% plus the most recent `retention' blocks; R is clamped >= max reorg depth at
+%% start-up, so a rewind target is never pruned.
+prune_below(HN, #st{retention = R}) ->
+    max(HN - R + 1, 0).
+
+delete_range(S, From, To, Skip) when From < To ->
+    lists:foreach(
+        fun(N) when N =:= Skip ->
+                ok;
+           (N) ->
+                case dets:lookup(num_tab, {N}) of
+                    [{{N}, {H, _, _}}] ->
+                        ok = dets:delete(hash_tab, {{H}}),
+                        ok = dets:delete(num_tab, {N});
+                    [] ->
+                        ok
+                end
+        end, lists:seq(From, To - 1)),
+    set_low(S, To);
+delete_range(S, _From, _To, _Skip) ->
+    S.
+
+set_low(S, N) ->
+    ok = dets:insert(meta_tab, {low, N}),
+    S#st{low = N}.
 
 rewind_to(#st{head = undefined} = S, _CA) ->
     S;

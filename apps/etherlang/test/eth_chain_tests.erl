@@ -179,3 +179,53 @@ finality_persistence_test() ->
     after
         gen_server:stop(NameB)
     end.
+
+%% With a tiny retention the store keeps only the most recent window (plus the
+%% finalized block) so DETS can never grow without bound.
+prune_window_test() ->
+    Name = 'chain_l',
+    Dir = eth_test_util:tmp_dir(),
+    with_prune_env(fun() ->
+        with_chain(Name, Dir, fun() ->
+            {_H, Blocks} = eth_test_util:make_blocks(0, 12, z0(), 0),
+            ok = eth_chain:append(Name, pair(Blocks, true)),
+            %% head 11, keep last 4: 8..11
+            ?assertEqual({11, hash_of(lists:nth(12, Blocks))}, eth_chain:head(Name)),
+            ?assertEqual(4, eth_chain:size(Name)),
+            ?assert(eth_chain:has_block(Name, 11)),
+            ?assert(eth_chain:has_block(Name, 8)),
+            ?assertNot(eth_chain:has_block(Name, 7)),
+            %% pruning also retired the hash index
+            ?assertEqual(not_found, eth_chain:get_by_hash(Name, hash_of(lists:nth(1, Blocks))))
+        end)
+    end).
+
+%% The finalized block is retained even as it ages out of the window, so a
+%% rewind to the checkpoint stays possible.
+prune_keeps_finalized_test() ->
+    Name = 'chain_m',
+    Dir = eth_test_util:tmp_dir(),
+    with_prune_env(fun() ->
+        with_chain(Name, Dir, fun() ->
+            {_H, Blocks} = eth_test_util:make_blocks(0, 12, z0(), 0),
+            ok = eth_chain:append(Name, pair(Blocks, true)),
+            ok = eth_chain:set_finalized(Name, 9),
+            %% append one more block to trigger a prune pass
+            {_H2, More} = eth_test_util:make_blocks(12, 1, hash_of(lists:nth(12, Blocks)), 0),
+            ok = eth_chain:append(Name, pair(More, true)),
+            ?assertEqual(4, eth_chain:size(Name)),
+            ?assert(eth_chain:has_block(Name, 9)),
+            ?assertNot(eth_chain:has_block(Name, 8)),
+            %% rewind to the finalized checkpoint still works
+            ?assertEqual(ok, eth_chain:rewind(Name, 9)),
+            ?assertEqual({9, hash_of(lists:nth(10, Blocks))}, eth_chain:head(Name))
+        end)
+    end).
+
+with_prune_env(Fun) ->
+    os:putenv("CHAIN_RETENTION", "4"),
+    os:putenv("MAX_REORG_DEPTH", "2"),
+    try Fun() after
+        os:unsetenv("CHAIN_RETENTION"),
+        os:unsetenv("MAX_REORG_DEPTH")
+    end.
