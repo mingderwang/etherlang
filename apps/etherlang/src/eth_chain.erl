@@ -49,7 +49,7 @@
 -record(st, {dir, head :: undefined | {integer(), binary()},
              finalized :: undefined | integer(),
              low = 0 :: integer(),
-             retention = 4096 :: integer(),
+             retention = 2048 :: integer(),
              verify = true :: boolean()}).
 
 start_link(Dir) -> start_link(eth_chain, Dir).

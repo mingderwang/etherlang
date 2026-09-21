@@ -29,7 +29,7 @@
 -define(DEF_DATA_DIR, "./data").
 -define(DEF_CONCURRENCY, 8).
 -define(DEF_BODY_WINDOW, 2048).
--define(DEF_CHAIN_RETENTION, 4096).
+-define(DEF_CHAIN_RETENTION, 2048).
 -define(DEF_POLL_MS, 5000).
 -define(DEF_RETRY_MS, 2000).
 -define(DEF_MAX_REORG, 256).

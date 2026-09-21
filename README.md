@@ -22,9 +22,10 @@ beacon, validators, or block production).
 
 * **Chain store** — persistent DETS-backed canonical chain (block-by-number,
   hash index, head/metadata) with append, query, reorg rewind, and restart
-  recovery. Growth is bounded by `CHAIN_RETENTION` (default 4096 blocks) so the
-  2 GiB DETS ceiling can never be reached; older blocks prune away and are
-  served from the upstream proxy instead.
+  recovery. Growth is bounded by `CHAIN_RETENTION` (default 2048 blocks; the
+  recent-window blocks carry full bodies, so this caps the store around
+  several hundred MiB) so the 2 GiB DETS ceiling can never be reached; older
+  blocks prune away and are served from the upstream proxy instead.
 * **Sync engine** — bounded-parallel gap sync from `genesis`/`<N>`/`latest`,
   header-only storage outside `BODY_WINDOW`, live polling follow, bounded
   ancestor-walk reorg handling, and a monotonic `finalized` floor that never
@@ -271,7 +272,7 @@ All settings are environment variables (see `eth_config`):
 | `ETH_START_BLOCK` | `latest` | sync start (see above) |
 | `SYNC_CONCURRENCY` | `8` | parallel block fetches |
 | `BODY_WINDOW` | `2048` | most-recent N blocks stored full-body |
-| `CHAIN_RETENTION` | `4096` | max recent blocks kept locally (older prune; clamped ≥ `MAX_REORG_DEPTH`) |
+| `CHAIN_RETENTION` | `2048` | max recent blocks kept locally (older prune; clamped ≥ `MAX_REORG_DEPTH`) |
 | `POLL_INTERVAL_MS` | `5000` | follow-mode poll interval |
 | `MAX_REORG_DEPTH` | `256` | ancestor-walk bound while resolving reorgs |
 | `HTTP_TIMEOUT_MS` | `20000` | per-request upstream timeout |
@@ -479,12 +480,14 @@ production (v1.0)** in the README.
   blobs).
 * **v0.3.1** — bounded chain store: DETS files cap at 2 GiB and the old store
   grew without bound until both nodes crashed on start (`no_more_space_on_file`
-  opening `chain.num.dets`). Added `CHAIN_RETENTION` (default 4096) with
+  opening `chain.num.dets`). Added `CHAIN_RETENTION` (default 2048) with
   incremental pruning from a persisted `low` watermark — blocks below
   `head - retention` are dropped (the finalized block is always kept, and
   retention is clamped ≥ `MAX_REORG_DEPTH`), older blocks serving from the
-  proxy. `BODY_WINDOW` default lowered 100000 → 2048. 2 new tests; suite
-  105/105.
+  proxy. Sepolia's blob-heavy blocks run ~330 KB each and every retained
+  block carries a full body, so retention 2048 caps the store near ~800 MiB
+  (4096 would leave the file too close to DETS' ceiling). `BODY_WINDOW`
+  default lowered 100000 → 2048. 2 new tests; suite 105/105.
 
 ## License
 
