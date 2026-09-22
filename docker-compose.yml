@@ -10,12 +10,15 @@ services:
       # Defaults to the free public Sepolia endpoint.
       UPSTREAM_RPC_URL: ${UPSTREAM_RPC_URL:-https://ethereum-sepolia-rpc.publicnode.com}
       RPC_LISTEN_PORT: "8545"
+      # container publishes the port to the host, so it must bind all interfaces
+      RPC_LISTEN_IP: "0.0.0.0"
       DATA_DIR: /data
       # "latest" = start from the current head (fast); a number = full history
       # back to that block; 0 = everything from genesis.
       ETH_START_BLOCK: ${ETH_START_BLOCK:-latest}
       SYNC_CONCURRENCY: ${SYNC_CONCURRENCY:-8}
-      BODY_WINDOW: ${BODY_WINDOW:-100000}
+      BODY_WINDOW: ${BODY_WINDOW:-2048}
+      CHAIN_RETENTION: ${CHAIN_RETENTION:-2048}
       POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-5000}
       MAX_REORG_DEPTH: ${MAX_REORG_DEPTH:-256}
     volumes:

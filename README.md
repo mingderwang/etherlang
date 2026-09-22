@@ -46,7 +46,7 @@ beacon, validators, or block production).
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
   in-process mock-upstream eunit suite (**103 tests, green**).
-* **Status** — v0.3.1; eunit green (105 tests) and verified live against Sepolia.
+* **Status** — v0.3.2; eunit green (110 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -133,10 +133,12 @@ code; none is guessing. Items marked DONE were closed with live verification.
 
 ### RPC surface / security
 
-10. **Open proxy, no auth/rate-limit** — binds `0.0.0.0`, anonymously relays
-    arbitrary methods (incl. `eth_send*`) upstream; unbounded batch fan-out
-    amplifies against the free public endpoint. Bind localhost by default, add
-    a batch cap + per-IP rate limiting before anything reachable.
+10. **Open proxy, no auth/rate-limit** — v0.3.2: binds `127.0.0.1` by default
+    (`RPC_LISTEN_IP`), caps JSON-RPC batches (`RPC_MAX_BATCH`), and adds a
+    per-IP token-bucket rate limit (`RPC_RATE_LIMIT`/`RPC_RATE_BURST`).
+    Remaining: no authentication at all, write methods (`eth_send*`) still
+    relay upstream untouched, and the rate limiter is per-IP only (not per
+    user/method).
 11. **Batch spec gaps** — non-object items crash the handler (500s the whole
     batch); empty batch returns `[]`; notifications get responses. Per-item
     error objects + spec-compliant empty/notification handling.
@@ -268,6 +270,10 @@ All settings are environment variables (see `eth_config`):
 |-----|---------|---------|
 | `UPSTREAM_RPC_URL` | publicnode Sepolia | sync source + proxy fallback |
 | `RPC_LISTEN_PORT` | `8545` | local JSON-RPC port |
+| `RPC_LISTEN_IP` | `127.0.0.1` | interface to bind (`0.0.0.0` exposes to the network) |
+| `RPC_MAX_BATCH` | `30` | max requests per JSON-RPC batch |
+| `RPC_RATE_LIMIT` | `30` | per-client requests/s (`0` disables) |
+| `RPC_RATE_BURST` | `100` | max burst a client may send at once |
 | `DATA_DIR` | `./data` | persisted chain store |
 | `ETH_START_BLOCK` | `latest` | sync start (see above) |
 | `SYNC_CONCURRENCY` | `8` | parallel block fetches |
@@ -443,7 +449,7 @@ production (v1.0)** in the README.
 > The session transcript (`session-ses_f506.md`, repo root) keeps the exact
 > commands behind each proof reproducible.
 
-## Release notes v0.2.1 → v0.3.1 (all verified live on Sepolia)
+## Release notes v0.2.1 → v0.3.2 (all verified live on Sepolia)
 
 * **v0.2.1** — `eth_getVersion` shim (EthStats registration compat);
   `web3_clientVersion` → `etherlang/0.2.0`; dashboard remapped to `:3001`;
@@ -488,6 +494,11 @@ production (v1.0)** in the README.
   block carries a full body, so retention 2048 caps the store near ~800 MiB
   (4096 would leave the file too close to DETS' ceiling). `BODY_WINDOW`
   default lowered 100000 → 2048. 2 new tests; suite 105/105.
+* **v0.3.2** — RPC endpoint hardening: binds `127.0.0.1` by default
+  (`RPC_LISTEN_IP`), caps JSON-RPC batch size (`RPC_MAX_BATCH`, too-large
+  batches get a single `-32600` error), and a per-source token-bucket rate
+  limit (`RPC_RATE_LIMIT`/`RPC_RATE_BURST`, excess → HTTP 429 `-32005`).
+  4 new tests; suite 110/110.
 
 ## License
 

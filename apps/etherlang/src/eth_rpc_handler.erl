@@ -23,18 +23,42 @@
 init(Req0, State) ->
     case cowboy_req:method(Req0) of
         <<"POST">> ->
-            {ok, Body, Req1} = cowboy_req:read_body(Req0, #{length => 50_000_000,
-                                                            period => 30000}),
-            Resp = handle_body(Body, State),
-            Req2 = cowboy_req:reply(200,
-                                    #{<<"content-type">> => <<"application/json">>},
-                                    Resp, Req1),
-            {ok, Req2, State};
+            case allowed(State, Req0) of
+                true ->
+                    {ok, Body, Req1} = cowboy_req:read_body(Req0, #{length => 50_000_000,
+                                                                    period => 30000}),
+                    Resp = handle_body(Body, State),
+                    Req2 = cowboy_req:reply(200,
+                                            #{<<"content-type">> => <<"application/json">>},
+                                            Resp, Req1),
+                    {ok, Req2, State};
+                false ->
+                    Req1 = cowboy_req:reply(429,
+                        #{<<"content-type">> => <<"application/json">>},
+                        thoas:encode(error_response(null, -32005,
+                                                    <<"too many requests">>)),
+                        Req0),
+                    {ok, Req1, State}
+            end;
         _ ->
             Req1 = cowboy_req:reply(405, #{<<"allow">> => <<"POST">>},
                                     <<"method not allowed">>, Req0),
             {ok, Req1, State}
     end.
+
+%% Per-source request budget. No `limits' block (tests/legacy opts) = allow.
+allowed(State, Req0) ->
+    case maps:get(limits, State, undefined) of
+        undefined ->
+            true;
+        #{tab := Tab, rate := Rate, burst := Burst} ->
+            {IP, _} = cowboy_req:peer(Req0),
+            eth_rate_limit:take(Tab, peer_key(IP), Rate, Burst)
+    end.
+
+peer_key({_, _, _, _} = IPv4) -> {ipv4, IPv4};
+peer_key(IP) when is_tuple(IP) -> {ipv6, IP};
+peer_key(_) -> unknown.
 
 %% ---------------------------------------------------------------------------
 %% JSON-RPC 2.0
@@ -43,7 +67,13 @@ init(Req0, State) ->
 handle_body(Body, State) ->
     case thoas:decode(Body) of
         {ok, List} when is_list(List) ->
-            thoas:encode([handle_one(M, State) || M <- List]);
+            case length(List) > maps:get(max_batch, State, 30) of
+                true ->
+                    thoas:encode(error_response(null, -32600,
+                                                <<"batch too large">>));
+                false ->
+                    thoas:encode([handle_one(M, State) || M <- List])
+            end;
         {ok, Map} when is_map(Map) ->
             thoas:encode(handle_one(Map, State));
         _ ->

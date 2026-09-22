@@ -5,6 +5,10 @@
 %% Environment variables (all optional):
 %%   UPSTREAM_RPC_URL   - upstream Ethereum JSON-RPC endpoint
 %%   RPC_LISTEN_PORT    - local JSON-RPC HTTP port
+%%   RPC_LISTEN_IP      - interface to bind (default 127.0.0.1; 0.0.0.0 = all)
+%%   RPC_MAX_BATCH      - max JSON-RPC batch size accepted
+%%   RPC_RATE_LIMIT     - per-client request rate in req/sec (0 disables)
+%%   RPC_RATE_BURST     - max burst of requests a client may send at once
 %%   DATA_DIR           - directory for persisted chain data (blocks, index)
 %%   ETH_START_BLOCK    - where to start syncing: "latest" or a block number
 %%   SYNC_CONCURRENCY   - max parallel block fetches
@@ -19,13 +23,18 @@
 %%   VERIFY_HEADERS     - recompute RLP+keccak header hashes on append (default true)
 %%   EVM_ETH_CALL       - serve eth_call locally via the built-in EVM (default true)
 
--export([upstream_url/0, listen_port/0, data_dir/0, start_block/0, concurrency/0,
+-export([upstream_url/0, listen_port/0, listen_ip/0, max_batch/0, rate_limit/0,
+         rate_burst/0, data_dir/0, start_block/0, concurrency/0,
          body_window/0, chain_retention/0, poll_interval_ms/0, sync_retry_ms/0,
          max_reorg_depth/0, http_timeout_ms/0, sync_budget/0, verify_headers/0,
          evm_enabled/0]).
 
 -define(DEF_URL, "https://ethereum-sepolia-rpc.publicnode.com").
 -define(DEF_PORT, 8545).
+-define(DEF_LISTEN_IP, "127.0.0.1").
+-define(DEF_MAX_BATCH, 30).
+-define(DEF_RATE_LIMIT, 30).
+-define(DEF_RATE_BURST, 100).
 -define(DEF_DATA_DIR, "./data").
 -define(DEF_CONCURRENCY, 8).
 -define(DEF_BODY_WINDOW, 2048).
@@ -39,6 +48,22 @@
 upstream_url() -> str_env("UPSTREAM_RPC_URL", upstream_url, ?DEF_URL).
 
 listen_port() -> int_env("RPC_LISTEN_PORT", listen_port, ?DEF_PORT).
+
+%% Bind address as an inet ip tuple. Defaults to loopback so the endpoint is
+%% never exposed to the network unless the operator opts in via RPC_LISTEN_IP.
+listen_ip() ->
+    case parse_ip(str_env("RPC_LISTEN_IP", listen_ip, ?DEF_LISTEN_IP)) of
+        {A, B, C, D} when is_integer(A), A >= 0, A =< 255 ->
+            {A, B, C, D};
+        _ ->
+            {127, 0, 0, 1}
+    end.
+
+max_batch() -> int_env("RPC_MAX_BATCH", max_batch, ?DEF_MAX_BATCH).
+
+rate_limit() -> int_env("RPC_RATE_LIMIT", rate_limit, ?DEF_RATE_LIMIT).
+
+rate_burst() -> int_env("RPC_RATE_BURST", rate_burst, ?DEF_RATE_BURST).
 
 data_dir() -> str_env("DATA_DIR", data_dir, ?DEF_DATA_DIR).
 
@@ -104,3 +129,13 @@ int_env(Env, Key, Default) ->
 
 parse_hex(Hex) ->
     try eth_hex:decode(Hex) catch _:_ -> latest end.
+
+parse_ip(Str) ->
+    case string:split(Str, ".", all) of
+        [A, B, C, D] ->
+            try {list_to_integer(A), list_to_integer(B),
+                 list_to_integer(C), list_to_integer(D)}
+            catch _:_ -> error
+            end;
+        _ -> error
+    end.

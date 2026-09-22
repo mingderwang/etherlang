@@ -192,6 +192,86 @@ header_only(B) ->
     B#{<<"transactions">> => [maps:get(<<"hash">>, T)
                               || T <- maps:get(<<"transactions">>, B)]}.
 
+%% ---------------------------------------------------------------------------
+%% Security limits: batch cap and per-IP rate limiting exercised over HTTP.
+%% ---------------------------------------------------------------------------
+
+batch_limit_test_() ->
+    {timeout, 60000, fun batch_limit_case/0}.
+
+batch_limit_case() ->
+    ok = eth_test_util:start_apps(),
+
+    Mock = 'mock_batch',
+    Chain = 'chain_batch',
+    Server = 'batch_limit_server',
+    Dir = eth_test_util:tmp_dir(),
+    Port = eth_test_util:free_port(),
+
+    {ok, _} = eth_mock_node:start_link(Mock),
+    {ok, _} = eth_chain:start_link(Chain, Dir),
+    eth_rpc_client:init(#{url => eth_mock_node:url(Mock), timeout_ms => 10000}),
+
+    {ok, _} = eth_rpc_server:start_link(Server, #{port => Port,
+                                                  chain => Chain,
+                                                  sync => 'no_such_sync_name',
+                                                  max_batch => 3}),
+    try
+        Req = fun(Id) -> #{<<"jsonrpc">> => <<"2.0">>, <<"id">> => Id,
+                           <<"method">> => <<"eth_blockNumber">>, <<"params">> => []} end,
+        %% 2-item batch within the cap -> array of results
+        {ok, RespList} = rpc(Port, [Req(1), Req(2)]),
+        ?assertEqual(2, length(RespList)),
+        %% 5-item batch over the cap -> single -32600 error object
+        {ok, Resp} = rpc(Port, [Req(11), Req(12), Req(13), Req(14), Req(15)]),
+        ?assertEqual(-32600, maps:get(<<"code">>, maps:get(<<"error">>, Resp)))
+    after
+        _ = try gen_server:stop(Server) catch _:_ -> ok end,
+        _ = try gen_server:stop(Chain) catch _:_ -> ok end,
+        _ = try gen_server:stop(Mock) catch _:_ -> ok end
+    end.
+
+rate_limit_test_() ->
+    {timeout, 60000, fun rate_limit_case/0}.
+
+rate_limit_case() ->
+    ok = eth_test_util:start_apps(),
+
+    Mock = 'mock_rate',
+    Chain = 'chain_rate',
+    Server = 'rate_limit_server',
+    Dir = eth_test_util:tmp_dir(),
+    Port = eth_test_util:free_port(),
+
+    {ok, _} = eth_mock_node:start_link(Mock),
+    {ok, _} = eth_chain:start_link(Chain, Dir),
+    eth_rpc_client:init(#{url => eth_mock_node:url(Mock), timeout_ms => 10000}),
+
+    {ok, _} = eth_rpc_server:start_link(Server, #{port => Port,
+                                                  chain => Chain,
+                                                  sync => 'no_such_sync_name',
+                                                  rate_limit => 1,
+                                                  rate_burst => 1}),
+    try
+        Req = #{<<"jsonrpc">> => <<"2.0">>, <<"id">> => 1,
+                <<"method">> => <<"eth_blockNumber">>, <<"params">> => []},
+        %% First request consumes the burst budget -> served
+        {ok, 200, _} = http_post_status(Port, thoas:encode(Req)),
+        %% Second within the same burst -> 429
+        {ok, 429, _} = http_post_status(Port, thoas:encode(Req))
+    after
+        _ = try gen_server:stop(Server) catch _:_ -> ok end,
+        _ = try gen_server:stop(Chain) catch _:_ -> ok end,
+        _ = try gen_server:stop(Mock) catch _:_ -> ok end
+    end.
+
+http_post_status(Port, Body) ->
+    URL = "http://127.0.0.1:" ++ integer_to_list(Port),
+    {ok, {{_, Status, _}, _, Resp}} =
+        httpc:request(post, {URL, [], "application/json", Body},
+                      [{timeout, 10000}], [{body_format, binary}]),
+    {ok, Status, Resp}.
+
 http_post(Port, Body) ->
     URL = "http://127.0.0.1:" ++ integer_to_list(Port),
     {ok, {{_, 200, _}, _, Resp}} =
