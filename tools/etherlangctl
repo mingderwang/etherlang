@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+#
+# etherlangctl - one launcher for the two local etherlang nodes.
+#
+# This encodes the node topology that used to be tribal knowledge: node A is
+# the default release tree, node B is a hand-copied second tree with its own
+# OTP name. Both bind loopback (see eth_v0.3.2 hardening) and follow Sepolia
+# from the latest block.
+#
+# Usage:
+#   ./tools/etherlangctl start|stop|restart|status
+#   ./tools/etherlangctl start|stop|restart|status <A|B|both|all>
+#
+# Examples:
+#   ./tools/etherlangctl status          # both nodes
+#   ./tools/etherlangctl start A         # just node A
+#   ./tools/etherlangctl stop both
+#
+# Env overrides (rarely needed):
+#   ETH_START_BLOCK   sync start (default latest)
+#   UPSTREAM_RPC_URL  upstream endpoint (default public Sepolia)
+#   RPC_LISTEN_IP     bind address (default 127.0.0.1 for both nodes)
+#
+# Requires: bash, curl. The release trees must be built already
+# (`rebar3 release` for A; node B is rsynced from A, see tools/README).
+set -u
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ETH_START_BLOCK=${ETH_START_BLOCK:-latest}
+UPSTREAM_RPC_URL=${UPSTREAM_RPC_URL:-https://ethereum-sepolia-rpc.publicnode.com}
+RPC_LISTEN_IP=${RPC_LISTEN_IP:-127.0.0.1}
+
+node_A() {
+    NODE=A; TREE="${ROOT}/_build/default/rel/etherlang"; PORT=8545
+}
+node_B() {
+    NODE=B; TREE="${ROOT}/_build/node2/rel/etherlang"; PORT=8546
+}
+
+# node_cmd <fn> <action> [common-env ...]
+node_cmd() {
+    local fn=$1 action=$2; shift 2
+    # shellcheck disable=SC2086
+    $fn
+    local BIN="${TREE}/bin/etherlang"
+    local DATA="${TREE}/data"
+    if [ ! -x "$BIN" ]; then
+        echo "[$NODE] missing release tree: $BIN (build with 'rebar3 release')" >&2
+        return 1
+    fi
+    case "$action" in
+        start)
+            mkdir -p "$DATA"
+            echo "[$NODE] starting on :$PORT ($TREE)"
+            ( cd "$TREE" && env "$@" \
+                UPSTREAM_RPC_URL="$UPSTREAM_RPC_URL" \
+                RPC_LISTEN_PORT="$PORT" \
+                RPC_LISTEN_IP="$RPC_LISTEN_IP" \
+                DATA_DIR="$DATA" \
+                ETH_START_BLOCK="$ETH_START_BLOCK" \
+                ./bin/etherlang daemon )
+            ;;
+        stop)
+            echo "[$NODE] stopping ($TREE)"
+            ( cd "$TREE" && ./bin/etherlang stop )
+            ;;
+        restart)
+            node_cmd "$fn" stop
+            node_cmd "$fn" start
+            ;;
+        status)
+            if ( cd "$TREE" && ./bin/etherlang ping ) | grep -q pong; then
+                HEAD=$(curl -s -m4 -X POST -H 'content-type: application/json' \
+                    -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+                    "http://127.0.0.1:${PORT}" 2>/dev/null \
+                    | sed -n 's/.*"result":"\(0x[0-9a-fA-F]*\)".*/\1/p')
+                echo "[$NODE] up on :$PORT head=$HEAD"
+            else
+                echo "[$NODE] down"
+            fi
+            ;;
+        *)
+            echo "unknown action: $action" >&2
+            return 1
+            ;;
+    esac
+}
+
+# give the daemons a moment to bind before status checks
+wait_ready() {
+    local port=$1 t=0
+    while [ $t -lt 45 ]; do
+        if curl -s -m2 -X POST -H 'content-type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+            "http://127.0.0.1:${port}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2; t=$((t + 2))
+    done
+    return 1
+}
+
+ACTION=${1:-status}
+TARGET=${2:-both}
+case "$TARGET" in
+    A|a) node_cmd node_A "$ACTION";;
+    B|b) node_cmd node_B "$ACTION";;
+    both|all)
+        node_cmd node_A "$ACTION"
+        node_cmd node_B "$ACTION"
+        if [ "$ACTION" = start ]; then wait_ready 8545; wait_ready 8546; fi
+        node_cmd node_A status
+        node_cmd node_B status
+        ;;
+    *) echo "unknown target: $TARGET (use A, B, or both)" >&2; exit 1;;
+esac

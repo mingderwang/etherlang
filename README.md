@@ -148,19 +148,22 @@ code; none is guessing. Items marked DONE were closed with live verification.
 
 ### Ops / hygiene
 
-13. **Two release trees + one hand-copied node**: Docker builds
-    `_build/prod`, the host daemon runs `_build/default`, node B is a manual
-    `_build/node2` copy with hand-edited `vm.args` + rsync'd beams. Commit a
-    single launcher script (env, ports, data-dirs, names) so the second node
-    is reproducible, not tribal knowledge.
-14. **`bin/etherlang stop` silently no-ops** in this environment (exits 0, beam
-    keeps running); stops currently go through `erl_call -a 'init stop []'`
-    with the explicit epmd address. Fix or document.
-15. **Docker image drift**: the image builds `_build/prod` while the live
-    daemons run `_build/default`; any src fix needs both trees or they skew
-    (already caused one stale-daemon and one stale-image incident). Rebuild +
-    volume policy after each src change; OTP skew (host 29.x vs `erlang:27`
-    images) wants pinning.
+13. **Two release trees + one hand-copied node**: `tools/etherlangctl` now
+    encodes the topology (node A `_build/default` on :8545, node B
+    `_build/node2` on :8546) — `start|stop|restart|status [A|B|both]`. Node B
+    is still created by rsyncing `lib/` + `releases/` from A (keep its
+    `vm.args` with `-sname etherlang2` when syncing).
+14. **`bin/etherlang stop`** works from the release tree (verified: stops the
+    beam cleanly); `tools/etherlangctl stop` wraps it. The `erl_call` epmd
+    fallback remains as a manual escape hatch when the daemon was started
+    detached outside the release tree.
+15. **Docker image drift**: Dockerfiles build `_build/prod`; `docker compose
+    build etherlang` recompiles from `apps/` so images track any src change.
+    The stale container (2 GiB-corrupt DETS, pre-retention code) was rebuilt
+    on v0.3.2 and recreated on an empty volume; old volume archived to
+    `data/container-archive-20260922/`. Policy: after src changes rebuild BOTH
+    the host releases and the image; treat the compose volume as disposable
+    (recreate on boot failure).
 
 ### Done (verified live, kept here so nobody re-opens them)
 
@@ -233,6 +236,11 @@ curl -s -X POST -H 'content-type: application/json' \
 # progress
 docker compose logs -f
 ```
+
+For the two local host daemons (the topology this repo develops on) everything
+is one command — `tools/etherlangctl start|stop|restart|status [A|B|both]` —
+which wraps the release scripts for node A (`_build/default`, :8545) and node B
+(`_build/node2`, :8546).
 
 A single `curl` using `eth_syncing` tells you where the node stands:
 
