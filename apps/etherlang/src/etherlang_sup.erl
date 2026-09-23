@@ -48,4 +48,38 @@ init([]) ->
              type => worker,
              modules => [eth_sync]},
 
-    {ok, {SupFlags, [State, Chain, Rpc, Sync]}}.
+    %% Experimental devp2p stack. Disabled by default; when enabled both
+    %% children share one persisted static node key (DATA_DIR/nodekey) so
+    %% the enode URL stays stable across restarts. Discovery only fills a
+    %% routing table for now and RLPx only speaks p2p Hello/Ping/Pong
+    %% (no eth capability / peer fetch yet); RPC sync is unchanged.
+    NodeKey = eth_nodekey:load_or_generate(eth_config:data_dir()),
+    Disc = case eth_config:discv4_enabled() of
+               true ->
+                   [#{id => eth_discv4,
+                      start => {eth_discv4, start_link,
+                                [#{port => eth_config:discv4_port(),
+                                   bootnodes => eth_config:discv4_bootnodes(),
+                                   privkey => NodeKey}]},
+                      restart => permanent,
+                      shutdown => 5000,
+                      type => worker,
+                      modules => [eth_discv4]}];
+               false ->
+                   []
+           end,
+    Peer = case eth_config:rlpx_enabled() of
+               true ->
+                   [#{id => eth_peer,
+                      start => {eth_peer, start_link,
+                                [#{port => eth_config:rlpx_port(),
+                                   privkey => NodeKey}]},
+                      restart => permanent,
+                      shutdown => 5000,
+                      type => worker,
+                      modules => [eth_peer]}];
+               false ->
+                   []
+           end,
+
+    {ok, {SupFlags, [State, Chain, Rpc, Sync] ++ Disc ++ Peer}}.

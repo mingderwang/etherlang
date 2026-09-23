@@ -29,3 +29,31 @@ long_string_test() ->
     L = binary:copy(<<"y">>, 300),
     <<16#B9, Len:16, _/binary>> = eth_rlp:encode(L),
     ?assertEqual(300, Len).
+
+decode_test() ->
+    ?assertEqual({ok, <<15>>, <<>>}, eth_rlp:decode(<<16#0F>>)),
+    ?assertEqual({ok, <<>>, <<>>}, eth_rlp:decode(<<16#80>>)),
+    ?assertEqual({ok, <<"dog">>, <<>>}, eth_rlp:decode(<<16#83, $d, $o, $g>>)),
+    ?assertEqual({ok, [<<"cat">>, <<"dog">>], <<>>},
+                 eth_rlp:decode(<<16#C8, 16#83, "cat", 16#83, "dog">>)),
+    ?assertEqual({ok, [], <<>>}, eth_rlp:decode(<<16#C0>>)),
+    ?assertEqual({error, empty}, eth_rlp:decode(<<>>)),
+    ?assertEqual({error, truncated}, eth_rlp:decode(<<16#83, $d, $o>>)).
+
+roundtrip_test() ->
+    Terms = [0, 15, 1024, <<"dog">>, <<>>, [],
+             [<<"cat">>, <<"dog">>],
+             [binary:copy(<<"x">>, 100), [1, 2, [3]]]],
+    lists:foreach(fun(T) ->
+        Enc = eth_rlp:encode(T),
+        {ok, Back, <<>>} = eth_rlp:decode(Enc),
+        %% integers decode as minimal big-endian binaries
+        Expected = normalize(T),
+        ?assertEqual(Expected, Back)
+    end, Terms).
+
+normalize(0) -> <<>>;
+normalize(I) when is_integer(I) -> binary:encode_unsigned(I);
+normalize(B) when is_binary(B) -> B;
+normalize([]) -> [];
+normalize(L) when is_list(L) -> [normalize(E) || E <- L].

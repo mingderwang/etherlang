@@ -7,15 +7,28 @@
 %% State is 25 x 64-bit lanes held in a 25-tuple; lane (X,Y) lives at index
 %% X + 5*Y + 1. Rate = 136 bytes, output = 32 bytes.
 
--export([hash/1]).
+-export([hash/1, init/0, update/2, digest/1]).
 
 -define(MASK, 16#FFFFFFFFFFFFFFFF).
 -define(RATE, 136).
 
+%% One-shot Keccak-256.
 hash(Bin) when is_binary(Bin) ->
-    S = absorb(pad(Bin), erlang:make_tuple(25, 0)),
+    digest(update(init(), Bin)).
+
+%% Incremental API for the RLPx running MAC states: init/0 starts a fresh
+%% state, update/2 absorbs input, digest/1 squeezes 32 bytes without
+%% consuming the state (further updates continue from where it left off).
+%% State is a {Lanes, Buf} tuple.
+init() -> {erlang:make_tuple(25, 0), <<>>}.
+
+update({Lanes, Buf}, Data) when is_binary(Data) ->
+    absorb_blocks(<<Buf/binary, Data/binary>>, Lanes).
+
+digest({Lanes, Buf}) ->
+    Final = absorb(pad(Buf), Lanes),
     <<Out:32/binary, _/binary>> =
-        << <<Lane:64/little>> || Lane <- tuple_to_list(S) >>,
+        << <<Lane:64/little>> || Lane <- tuple_to_list(Final) >>,
     Out.
 
 %% ---------------------------------------------------------------------------
@@ -34,6 +47,15 @@ absorb(<<Block:?RATE/binary, Rest/binary>>, S) ->
     absorb(Rest, keccak_f(xor_block(S, Block)));
 absorb(<<>>, S) ->
     S.
+
+%% Absorb whole rate blocks, keeping a short tail buffered.
+absorb_blocks(Bin, Lanes) ->
+    case Bin of
+        <<Block:?RATE/binary, Rest/binary>> ->
+            absorb_blocks(Rest, keccak_f(xor_block(Lanes, Block)));
+        Tail ->
+            {Lanes, Tail}
+    end.
 
 xor_block(S, Block) ->
     lists:foldl(

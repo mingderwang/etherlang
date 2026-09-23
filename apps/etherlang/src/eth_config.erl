@@ -22,12 +22,18 @@
 %%   SYNC_BUDGET        - max blocks fetched per sync tick (progress granularity)
 %%   VERIFY_HEADERS     - recompute RLP+keccak header hashes on append (default true)
 %%   EVM_ETH_CALL       - serve eth_call locally via the built-in EVM (default true)
+%%   DISCV4_ENABLED     - run the experimental discv4 UDP discovery server (default false)
+%%   DISCV4_PORT        - UDP port for discv4 (default 30303)
+%%   DISCV4_BOOTNODES   - comma-separated enode:// URLs used as discovery seeds
+%%   RLPX_ENABLED       - run the experimental RLPx TCP listener/peers (default false)
+%%   RLPX_PORT          - TCP port for RLPx (default 30303)
 
 -export([upstream_url/0, listen_port/0, listen_ip/0, max_batch/0, rate_limit/0,
          rate_burst/0, data_dir/0, start_block/0, concurrency/0,
          body_window/0, chain_retention/0, poll_interval_ms/0, sync_retry_ms/0,
          max_reorg_depth/0, http_timeout_ms/0, sync_budget/0, verify_headers/0,
-         evm_enabled/0]).
+         evm_enabled/0, discv4_enabled/0, discv4_port/0, discv4_bootnodes/0,
+         rlpx_enabled/0, rlpx_port/0]).
 
 -define(DEF_URL, "https://ethereum-sepolia-rpc.publicnode.com").
 -define(DEF_PORT, 8545).
@@ -109,6 +115,33 @@ evm_enabled() ->
         "no" -> false;
         _ -> true
     end.
+
+discv4_enabled() ->
+    case string:lowercase(str_env("DISCV4_ENABLED", discv4_enabled, "false")) of
+        "true" -> true;
+        "1" -> true;
+        "yes" -> true;
+        _ -> false
+    end.
+
+discv4_port() -> int_env("DISCV4_PORT", discv4_port, 30303).
+
+discv4_bootnodes() ->
+    case str_env("DISCV4_BOOTNODES", discv4_bootnodes, "") of
+        "" -> [];
+        S -> [T || T <- [string:trim(X) || X <- string:split(S, ",", all)],
+                   T =/= ""]
+    end.
+
+rlpx_enabled() ->
+    case string:lowercase(str_env("RLPX_ENABLED", rlpx_enabled, "false")) of
+        "true" -> true;
+        "1" -> true;
+        "yes" -> true;
+        _ -> false
+    end.
+
+rlpx_port() -> int_env("RLPX_PORT", rlpx_port, 30303).
 
 str_env(Env, _Key, Default) ->
     case os:getenv(Env) of
