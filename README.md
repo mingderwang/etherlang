@@ -227,6 +227,9 @@ code; none is guessing. Items marked DONE were closed with live verification.
  - [x] **Partial window fetch** — `collect_window` returns
    partial results on error/timeout instead of discarding the
    whole window (`eth_sync`) (v0.7.2).
+ - [x] **Batch spec compliance + upstream error codes** — `safe_handle_one`
+   catches crashes per-batch-item; proxy maps decode/transport errors
+   to distinct JSON-RPC codes (`eth_rpc_handler`) (v0.7.3).
 
 ---
 
