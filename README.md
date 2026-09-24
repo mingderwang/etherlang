@@ -111,29 +111,26 @@ code; none is guessing. Items marked DONE were closed with live verification.
 
 ### EVM fidelity (correctness first — these return wrong data, not clean errors)
 
-1. **Value transfer kept on child revert** (`eth_evm.erl` `run_call`/`handle_child`):
-   the `CALL` value transfer lands in `StateIn` *before* execution, and the
-   revert branches restore `StateIn` — so a child that takes value then reverts
-   still moves funds. Compounded by `transfer/3` doing no balance check
-   (underfunded `CALL` wraps to a huge balance via `set_balance` masking).
-   Fix: snapshot pre-transfer state, restore on revert, add the balance check.
-2. **EIP-1153 transient storage is frame-local, spec says tx-global**
-   (`run/5` rebuilds `#ctx{transient=#{}}` per frame; `run_call` never threads
-   the parent map). Breaks reentrancy locks across `CALL`s. Handlers are fine
-   in isolation; thread the map through child frames.
-3. **`BLOBHASH (0x49)`** — already returns `unsupported` (proxy
-    fallback) instead of fabricating `0` (`eth_evm.erl:400-405`)
-    (v0.7.0).
-4. **Gas/state simplifications**: `SSTORE` without EIP-2200/2929 warm/cold/refunds,
-   `CALL` without cold/warm/stipend subtleties, pre-EIP-6780 `SELFDESTRUCT`,
-   `MODEXP` gas undercharge (ignores exponent bit-length), dropped child-frame
-   logs. Each is a wrong-data-vs-upstream divergence, not a crash.
-5. **Precompile gaps narrowed**: `0x01` ECRECOVER, `0x06` ECADD, `0x07` ECMUL,
-   `0x08` ECPAIRING (Tate, pure Erlang), `0x09` BLAKE2b-F now execute locally,
-   each verified against live upstream (76-vector ecrecover parity, 39-vector
-   bn128/pairing parity, EIP-152 vectors byte-exact). Remaining: `0x0A` KZG —
-   deliberately deferred (needs a BLS12-381 backend, and blob data is unserved
-   anyway, so it could never trigger locally); stays on proxy fallback.
+- [x] **1. Value transfer on child revert** — revert branches restore
+   the pre-call state (`Pre = Ctx#ctx.state` in `handle_child`); `check_call_value`
+   guards the balance check before `transfer` applies (`eth_evm.erl:769-790`) (v0.7.0).
+- [x] **2. EIP-1153 transient storage** — tx-global by design; child inherits
+   `Ctx#ctx.transient`, success merges back, revert discards (all tests pass) (v0.7.0).
+- [x] **3. `BLOBHASH (0x49)`** — returns `unsupported` (proxy fallback) instead
+   of fabricating `0` (`eth_evm.erl:400-405`) (v0.7.0).
+- [x] **5. Precompile gaps** — all precompiles `0x01`–`0x09` execute locally;
+   verified against live upstream vectors. Remaining: `0x0A` KZG — deliberately
+   deferred (needs BLS12-381 backend, blob data unserved); stays on proxy fallback.
+
+### Remaining EVM fidelity gaps
+
+4. **Gas/state simplifications** — each is a wrong-data-vs-upstream divergence,
+   not a crash:
+   - `SSTORE` warm/cold cost exists (20000/2900) but **refunds not tracked**
+     (`refund` field in the `#e{}` record is never updated)
+   - `MODEXP` gas undercharges (flat `10 + 50 * byte_size(Exp)` vs EIP-2565
+     which accounts for modulus/exponent/memory widths)
+   - `CALL` has no 2300 gas stipend to prevent reentrancy after value transfers
 
 ### Sync / chain store
 
