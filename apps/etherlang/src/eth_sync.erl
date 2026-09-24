@@ -49,7 +49,9 @@
              failed = 0,
              reorgs = 0,
              last_log = 0,
-             floor_backoff_until = 0}).
+             floor_backoff_until = 0,
+             reorg_failures = 0,
+             reorg_backoff_until = 0}).
 
 start_link(Cfg) -> start_link(eth_sync, maps:merge(defaults(), Cfg)).
 start_link(Name, Cfg) ->
@@ -122,7 +124,7 @@ code_change(_OldVsn, S, _Extra) -> {ok, S}.
 run_once(S) ->
     case peer_sync_tick(S) of
         {ok, S1} ->
-            S1;
+            reset_reorg_backoff(S1);
         {error, _} ->
             rpc_sync_tick(S)
     end.
@@ -136,13 +138,18 @@ rpc_sync_tick(S) ->
             %% NB: monotonic time is only meaningful relatively (it can be
             %% negative, e.g. on macOS), so the gate must exempt the
             %% never-armed 0 explicitly instead of relying on Now < Until.
-            case S0#st.floor_backoff_until =/= 0 andalso Now < S0#st.floor_backoff_until of
+            case in_reorg_backoff(S0) of
                 true ->
-                    %% Pinned below the finalized floor: skip sync work until
-                    %% the backoff expires (each refusal re-arms it).
+                    %% Reorg backoff: skip sync work until backoff expires.
                     S0;
                 false ->
-                    case local_head(S0#st.chain) of
+                    case S0#st.floor_backoff_until =/= 0 andalso Now < S0#st.floor_backoff_until of
+                        true ->
+                            %% Pinned below the finalized floor: skip sync work until
+                            %% the backoff expires (each refusal re-arms it).
+                            S0;
+                        false ->
+                            case local_head(S0#st.chain) of
                         undefined ->
                             From = anchor(S0, HeadU),
                             sync_range(S0, From, HeadU);
@@ -151,6 +158,7 @@ rpc_sync_tick(S) ->
                         {HeadN, _} ->
                             sync_range(S0, HeadN + 1, HeadU)
                     end
+            end
             end;
         {error, Reason} ->
             logger:warning("etherlang: upstream unreachable (~p); will retry", [Reason]),
@@ -201,8 +209,28 @@ maybe_set_finalized(Chain, N, H) ->
 %% A rewind refused below the finalized floor: count it and back off sync
 %% work for ?FLOOR_BACKOFF_MS (re-armed by each refusal).
 pin_backoff(S) ->
+    N = S#st.reorg_failures + 1,
+    %% Exponential backoff capped at 5 minutes: 60s, 120s, 240s, 480s, 300s.
+    BackoffMs = min(N * ?FLOOR_BACKOFF_MS, 300000),
+    logger:warning("etherlang: reorg backoff ~p (~p consecutive failures, ~pms)",
+                   [N, BackoffMs, S#st.max_reorg]),
     S#st{floor_backoff_until = erlang:monotonic_time(millisecond) + ?FLOOR_BACKOFF_MS,
-         failed = S#st.failed + 1}.
+          reorg_backoff_until = erlang:monotonic_time(millisecond) + BackoffMs,
+          failed = S#st.failed + 1,
+          reorg_failures = N}.
+
+%% Reset reorg failure counter after successful sync progress.
+reset_reorg_backoff(S) ->
+    case S#st.reorg_failures > 0 of
+        true -> logger:notice("etherlang: reorg recovery after ~p failures", [S#st.reorg_failures]);
+        false -> ok
+    end,
+    S#st{reorg_failures = 0, reorg_backoff_until = 0}.
+
+%% Check if we're still in reorg backoff (separate from floor backoff).
+in_reorg_backoff(S) ->
+    Now = erlang:monotonic_time(millisecond),
+    S#st.reorg_backoff_until =/= 0 andalso Now < S#st.reorg_backoff_until.
 
 %% Where to start when the local store is empty.
 anchor(S, HeadU) ->
@@ -260,6 +288,7 @@ sync_range(S, From, To) ->
                     S1 = (S#st{appended = A, budget = S#st.budget - N})#st{
                             last_log = maybe_log(S, A)},
                     refresh_pool(S1),
+                    reset_reorg_backoff(S1),
                     sync_range(S1, From + N, To);
                 {reorg, CA} ->
                     logger:notice("etherlang: reorg to ~p", [CA]),
@@ -346,11 +375,25 @@ collect_window(Ref, Total, Got, Acc, Deadline, S) ->
         {Ref, N, Full, {ok, Block}} ->
             collect_window(Ref, Total, Got + 1, [{N, Block, Full} | Acc], Deadline, S);
         {Ref, _N, _Full, {error, Reason}} ->
-            {error, Reason};
+            %% Partial progress: return what we have so far instead of
+            %% discarding the whole window on first error.
+            case Acc of
+                [] -> {error, Reason};
+                _ ->
+                    logger:warning("etherlang: window fetch partial (~p/~p blocks, ~p failed)",
+                                   [Got, Total, Reason]),
+                    {ok, lists:sort(fun({A, _, _}, {B, _, _}) -> A =< B end, Acc)}
+            end;
         {'DOWN', _, process, _, _} ->
             collect_window(Ref, Total, Got, Acc, Deadline, S)
     after max(1, Deadline - Now) ->
-        {error, window_timeout}
+        case Acc of
+            [] -> {error, window_timeout};
+            _ ->
+                logger:warning("etherlang: window fetch timed out with ~p/~p blocks collected",
+                               [Got, Total]),
+                {ok, lists:sort(fun({A, _, _}, {B, _, _}) -> A =< B end, Acc)}
+        end
     end.
 
 %% ---------------------------------------------------------------------------

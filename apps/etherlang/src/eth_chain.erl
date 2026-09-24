@@ -164,6 +164,10 @@ init({Name, Dir}) ->
                   end
           end,
     _ = Name,
+    case check_consistency(NumTab, HashTab, MetaTab, Head) of
+        ok -> ok;
+        {error, Reason} -> logger:error("etherlang: chain store consistency check failed: ~p; run repair=force", [Reason])
+    end,
     {ok, #st{dir = Dir, head = Head, finalized = Fin, low = Low,
              retention = Retention,
              verify = eth_config:verify_headers(),
@@ -364,6 +368,9 @@ insert(S, Num, Hash, Block, Full) ->
     ok = dets:insert(S#st.hash_tab, {{Hash}, Num}),
     ok = dets:insert(S#st.meta_tab, {head, {Num, Hash}}),
     ok = index_txs(S, Num, Block, Full),
+    ok = dets:sync(S#st.num_tab),
+    ok = dets:sync(S#st.hash_tab),
+    ok = dets:sync(S#st.meta_tab),
     S#st{head = {Num, Hash}}.
 
 %% ---------------------------------------------------------------------------
@@ -434,6 +441,7 @@ rewind_to(#st{head = {HN, _}} = S, CA) when HN > CA ->
         undefined -> ok = dets:delete(S#st.meta_tab, head);
         {N2, H2} -> ok = dets:insert(S#st.meta_tab, {head, {N2, H2}})
     end,
+    ok = dets:sync(S#st.meta_tab),
     S#st{head = Head0};
 rewind_to(S, _CA) ->
     S.
@@ -480,3 +488,22 @@ unindex_txs(S, Block) ->
 
 block_hash(Block) -> maps:get(<<"hash">>, Block, <<>>).
 block_parent(Block) -> maps:get(<<"parentHash">>, Block, <<>>).
+
+%% ---------------------------------------------------------------------------
+%% Consistency check: validate that head hash matches num_tab/hash_tab.
+%% Called at startup after dets:open_file with repair=force.
+%% ---------------------------------------------------------------------------
+
+check_consistency(NumTab, HashTab, _MetaTab, Head) ->
+    case Head of
+        undefined -> ok;
+        {N, H} ->
+            case dets:lookup(NumTab, {N}) of
+                [{{N}, {H2, _, _}}] when H2 =:= H ->
+                    case dets:lookup(HashTab, {{H}}) of
+                        [{{H}, N}] -> ok;
+                        _ -> {error, hash_tab_mismatch}
+                    end;
+                _ -> {error, num_tab_mismatch}
+            end
+    end.
