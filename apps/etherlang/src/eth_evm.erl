@@ -40,12 +40,17 @@ run_t(Code, Msg, State, Env, Gas, Transient) when is_binary(Code) ->
     E0 = #e{code = Code, gas = max(Gas, 0), dests = valid_jumpdests(Code)},
     try exec(E0, Ctx) of
         {E1, Ctx1} ->
+            GasUsed = E0#e.gas - E1#e.gas,
+            %% EIP-2200: refunds capped at half gas used.
+            MaxRefund = GasUsed div 2,
+            Refund = min(E1#e.refund, MaxRefund),
+            FinalGas = E1#e.gas + Refund,
             Res = case E1#e.halt of
-                      {return, Out} -> {ok, Out, E1#e.gas, Ctx1#ctx.state, E1#e.logs};
-                      stop -> {ok, <<>>, E1#e.gas, Ctx1#ctx.state, E1#e.logs};
-                      {revert, Out} -> {revert, Out, E1#e.gas, Ctx1#ctx.state, E1#e.logs};
+                      {return, Out} -> {ok, Out, FinalGas, Ctx1#ctx.state, E1#e.logs};
+                      stop -> {ok, <<>>, FinalGas, Ctx1#ctx.state, E1#e.logs};
+                      {revert, Out} -> {revert, Out, FinalGas, Ctx1#ctx.state, E1#e.logs};
                       {error, R} -> {error, R, Ctx1#ctx.state, E1#e.logs};
-                      undefined -> {ok, <<>>, E1#e.gas, Ctx1#ctx.state, E1#e.logs}
+                      undefined -> {ok, <<>>, FinalGas, Ctx1#ctx.state, E1#e.logs}
                   end,
             {Res, Ctx1#ctx.transient}
     catch

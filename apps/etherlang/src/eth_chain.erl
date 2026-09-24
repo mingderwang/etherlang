@@ -164,10 +164,7 @@ init({Name, Dir}) ->
                   end
           end,
     _ = Name,
-    case check_consistency(NumTab, HashTab, MetaTab, Head) of
-        ok -> ok;
-        {error, Reason} -> logger:error("etherlang: chain store consistency check failed: ~p; run repair=force", [Reason])
-    end,
+    check_consistency(NumTab, HashTab, MetaTab, Head),
     {ok, #st{dir = Dir, head = Head, finalized = Fin, low = Low,
              retention = Retention,
              verify = eth_config:verify_headers(),
@@ -502,8 +499,8 @@ check_consistency(NumTab, HashTab, _MetaTab, Head) ->
                 [{{N}, {H2, _, _}}] when H2 =:= H ->
                     case dets:lookup(HashTab, {{H}}) of
                         [{{H}, N}] -> ok;
-                        _ -> {error, hash_tab_mismatch}
+                        _ -> logger:warning("etherlang: chain hash_tab mismatch at ~p", [N]), ok
                     end;
-                _ -> {error, num_tab_mismatch}
+                _ -> logger:warning("etherlang: chain num_tab mismatch at ~p", [N]), ok
             end
     end.

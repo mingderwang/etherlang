@@ -72,7 +72,8 @@ handle_body(Body, State) ->
                     thoas:encode(error_response(null, -32600,
                                                 <<"batch too large">>));
                 false ->
-                    thoas:encode([handle_one(M, State) || M <- List])
+                    Results = [safe_handle_one(M, State) || M <- List],
+                    thoas:encode(Results)
             end;
         {ok, Map} when is_map(Map) ->
             thoas:encode(handle_one(Map, State));
@@ -96,11 +97,29 @@ handle_one(Map, State) ->
                       <<"error">> => ErrMap};
                 {error, {upstream_error, Code, Msg}} ->
                     error_response(Id, Code, Msg);
+                {error, {invalid_params, Details}} ->
+                    error_response(Id, -32602, to_bin(Details));
+                {error, {code, Code, Msg}} ->
+                    error_response(Id, Code, to_bin(Msg));
                 {error, Reason} ->
                     error_response(Id, -32000, to_bin(Reason))
             end;
         _ ->
             error_response(Id, -32600, <<"method must be a string">>)
+    end.
+
+%% Safe handler: catches crashes so batch responses never abort
+%% the whole request (JSON-RPC spec compliance).
+safe_handle_one(M, _State) when not is_map(M) ->
+    {error, maps:get(<<"id">>, M, null), -32700, <<"invalid request: not an object">>};
+safe_handle_one(M, State) ->
+    try handle_one(M, State) of
+        Result -> Result
+    catch
+        Class:Reason:Stack ->
+            logger:warning("etherlang: batch handler crash ~p:~p~n~p",
+                           [Class, Reason, Stack]),
+            {error, maps:get(<<"id">>, M, null), -32603, <<"internal error">>}
     end.
 
 error_response(Id, Code, Msg) ->
@@ -127,10 +146,10 @@ dispatch(<<"eth_syncing">>, _Params, State) ->
     end;
 
 dispatch(<<"web3_clientVersion">>, _Params, _State) ->
-    {ok, <<"etherlang/0.2.0 (erlang)">>};
+    {ok, <<"etherlang/0.7.2 (erlang)">>};
 
 dispatch(<<"eth_getVersion">>, _Params, _State) ->
-    {ok, <<"etherlang/0.2.0 (erlang)">>};
+    {ok, <<"etherlang/0.7.2 (erlang)">>};
 
 dispatch(<<"eth_coinbase">>, _Params, _State) ->
     %% No miner/signer configured in v1; report the zero address.
@@ -362,9 +381,16 @@ proxy(Method, Params) ->
         {error, {rpc_error, Err}} when is_map(Err) ->
             Code = maps:get(<<"code">>, Err, -32000),
             Msg = maps:get(<<"message">>, Err, <<"upstream error">>),
-            {error, {upstream_error, Code, Msg}};
+            {error, {code, Code, Msg}};
+        {error, {bad_decode, DecErr}} ->
+            {error, {code, -32700, io_lib:format("decode error: ~p", [DecErr])}};
+        {error, {bad_response, _RespBin}} ->
+            {error, {code, -32700, <<"bad upstream response">>}};
+        {error, {http, Code}} ->
+            {error, {code, Code, <<"upstream HTTP error">>}};
         {error, Reason} ->
-            {error, Reason}
+            %% Transport/HTTP errors get a distinct code, not -32000.
+            {error, {code, -32603, io_lib:format("~p", [Reason])}}
     end.
 
 %% Local receipt: tx index -> block -> stored receipts -> response with
@@ -604,4 +630,5 @@ with_td_compat(Other) ->
 to_bin(Term) when is_binary(Term) -> Term;
 to_bin(Term) when is_list(Term) -> list_to_binary(Term);
 to_bin(Term) when is_atom(Term) -> atom_to_binary(Term, utf8);
+to_bin(Term) when is_integer(Term) -> integer_to_binary(Term);
 to_bin(Term) -> unicode:characters_to_binary(io_lib:format("~p", [Term])).
