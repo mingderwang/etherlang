@@ -340,8 +340,9 @@ Design (eth_call.erl + eth_state.erl + eth_evm.erl ~900 lines + precompiles):
 
 ## 11. Roadmap direction
 
-Close EVM fidelity TODOs (transient storage, cold/warm semantics, precise gas,
-better revert value/error reporting), then consider: block building from the
+Close remaining EVM fidelity gaps (SSTORE refunds, MODEXP gas per
+EIP-2565, CALL 2300 gas stipend, precise gas accounting, better
+revert value/error reporting), then consider: block building from the
 pending pool, state-trie sync toward full `eth_getBalance` independence,
 native blob transport, a second upstream with automatic failover, and state
 prefetch warmers to cut cold `eth_call` latency.
