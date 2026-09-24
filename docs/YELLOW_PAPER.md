@@ -341,7 +341,8 @@ Design (eth_call.erl + eth_state.erl + eth_evm.erl ~900 lines + precompiles):
 ## 11. Roadmap direction
 
 Close remaining EVM fidelity gaps (precise gas accounting, better
-revert value/error reporting), then consider: block building from the
-pending pool, state-trie sync toward full `eth_getBalance` independence,
-native blob transport, a second upstream with automatic failover, and state
-prefetch warmers to cut cold `eth_call` latency.
+revert value/error reporting), then address: RPC authentication,
+block building from the pending pool, state-trie sync toward full
+`eth_getBalance` independence, native blob transport, a second upstream
+with automatic failover, and state prefetch warmers to cut cold
+`eth_call` latency.
