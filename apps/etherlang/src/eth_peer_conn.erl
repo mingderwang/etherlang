@@ -7,6 +7,7 @@
 %% process; the eth_peer manager drops it via monitor.
 
 -export([start_initiator/3, start_recipient/3]).
+-export([start_initiator_unlinked/3, start_recipient_unlinked/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -24,13 +25,21 @@
              last_in}).
 
 %% Args: #{privkey, remote_id, node_id, client_id, caps, listen_port,
-%%         chain}. caps defaults to [], chain to eth_chain.
+%%         chain}. The _link variants link to the caller (tests); the
+%% plain variants are for the manager, which monitors instead so a
+%% crashing handshake cannot take the manager down with it.
 start_initiator(Manager, {Host, Port}, Args) ->
     gen_server:start_link(?MODULE, {initiator, Manager, Host, Port, Args}, []).
+
+start_initiator_unlinked(Manager, {Host, Port}, Args) ->
+    gen_server:start(?MODULE, {initiator, Manager, Host, Port, Args}, []).
 
 %% Args: same as above minus remote_id; Sock is the accepted socket.
 start_recipient(Manager, Sock, Args) ->
     gen_server:start_link(?MODULE, {recipient, Manager, Sock, Args}, []).
+
+start_recipient_unlinked(Manager, Sock, Args) ->
+    gen_server:start(?MODULE, {recipient, Manager, Sock, Args}, []).
 
 init({initiator, Manager, Host, Port, Args}) ->
     #{privkey := Priv, remote_id := RemoteID} = Args,
@@ -40,7 +49,9 @@ init({initiator, Manager, Host, Port, Args}) ->
         {ok, Sock} ->
             case eth_rlpx:initiator(Sock, Priv, RemoteID, 10000) of
                 {ok, Sess} -> finish_init(Manager, Sock, Args, Sess);
-                {error, Reason} -> {stop, Reason}
+                {error, Reason} ->
+                    logger:notice("etherlang: rlpx outbound handshake failed (~p)", [Reason]),
+                    {stop, Reason}
             end;
         {error, Reason} ->
             {stop, Reason}
@@ -49,7 +60,9 @@ init({recipient, Manager, Sock, Args}) ->
     #{privkey := Priv} = Args,
     case eth_rlpx:recipient(Sock, Priv, 10000) of
         {ok, Sess} -> finish_init(Manager, Sock, Args, Sess);
-        {error, Reason} -> {stop, Reason}
+        {error, Reason} ->
+            logger:notice("etherlang: rlpx inbound handshake failed (~p)", [Reason]),
+            {stop, Reason}
     end.
 
 finish_init(Manager, Sock, Args, Sess) ->
@@ -66,9 +79,11 @@ finish_init(Manager, Sock, Args, Sess) ->
                     Manager ! {peer_up, self(), eth_rlpx:remote_id(Sess1), Hello},
                     {ok, S1};
                 {error, Reason} ->
+                    logger:notice("etherlang: rlpx eth handshake failed (~p)", [Reason]),
                     {stop, Reason}
             end;
         {error, Reason} ->
+            logger:notice("etherlang: rlpx hello failed (~p)", [Reason]),
             {stop, Reason}
     end.
 
@@ -153,6 +168,11 @@ handle_call({get_bodies, Hashes}, _From, S) ->
 handle_call(_Req, _From, S) ->
     {reply, {error, unknown_call}, S}.
 
+handle_cast({graceful_stop, Reason}, S) ->
+    %% Spec-friendly trim: send Disconnect, give the peer 2s, then stop.
+    _ = eth_rlpx:send(S#st.sess, S#st.sock, 1, eth_rlp:encode([Reason])),
+    erlang:send_after(2000, self(), graceful_timeout),
+    {noreply, S};
 handle_cast(_Msg, S) -> {noreply, S}.
 
 handle_info(poll, #st{fetching = true} = S) ->
@@ -183,6 +203,8 @@ handle_info(ping, S) ->
         {ok, Sess1} -> {noreply, S#st{sess = Sess1}};
         {error, Reason} -> {stop, Reason, S}
     end;
+handle_info(graceful_timeout, S) ->
+    {stop, normal, S};
 handle_info(_Info, S) ->
     {noreply, S}.
 

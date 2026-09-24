@@ -70,10 +70,17 @@ init([]) ->
            end,
     Peer = case eth_config:rlpx_enabled() of
                true ->
+                   DiscName = case eth_config:discv4_enabled() of
+                                  true -> eth_discv4;
+                                  false -> undefined
+                              end,
                    [#{id => eth_peer,
                       start => {eth_peer, start_link,
                                 [#{port => eth_config:rlpx_port(),
-                                   privkey => NodeKey}]},
+                                   privkey => NodeKey,
+                                   disc => DiscName,
+                                   target => eth_config:peer_target(),
+                                   interval => eth_config:peer_dial_interval()}]},
                       restart => permanent,
                       shutdown => 5000,
                       type => worker,

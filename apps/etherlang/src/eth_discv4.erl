@@ -47,7 +47,8 @@
 %% ---------------------------------------------------------------------------
 
 start_link(Cfg) ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, Cfg, []).
+    Name = maps:get(name, Cfg, ?MODULE),
+    gen_server:start_link({local, Name}, ?MODULE, Cfg, []).
 
 status() -> status(?MODULE).
 status(Name) -> gen_server:call(Name, status).
