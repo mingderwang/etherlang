@@ -121,9 +121,9 @@ code; none is guessing. Items marked DONE were closed with live verification.
    (`run/5` rebuilds `#ctx{transient=#{}}` per frame; `run_call` never threads
    the parent map). Breaks reentrancy locks across `CALL`s. Handlers are fine
    in isolation; thread the map through child frames.
-3. **`BLOBHASH (0x49)` fabricates `0`** (`eth_evm.erl:370-372`) instead of
-   falling back like every other unsupported path. One-line fix class: return
-   `unsupported` until a real lookup exists.
+3. **`BLOBHASH (0x49)`** — already returns `unsupported` (proxy
+    fallback) instead of fabricating `0` (`eth_evm.erl:400-405`)
+    (v0.7.0).
 4. **Gas/state simplifications**: `SSTORE` without EIP-2200/2929 warm/cold/refunds,
    `CALL` without cold/warm/stipend subtleties, pre-EIP-6780 `SELFDESTRUCT`,
    `MODEXP` gas undercharge (ignores exponent bit-length), dropped child-frame
