@@ -31,6 +31,7 @@ init({Name, Opts}) ->
                                          #{chain => maps:get(chain, Opts, eth_chain),
                                            sync => maps:get(sync, Opts, eth_sync),
                                            pool => maps:get(pool, Opts, eth_txpool),
+                                           store => maps:get(store, Opts, eth_statestore),
                                            max_batch => MaxBatch,
                                            limits => #{tab => Tab, rate => Rate,
                                                        burst => Burst}}}]}]),

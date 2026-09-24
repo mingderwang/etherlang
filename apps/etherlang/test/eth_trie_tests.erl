@@ -100,4 +100,42 @@ order_test() ->
     R2 = eth_trie:root(lists:reverse(Pairs)),
     ?assertEqual(R1, R2).
 
-hex(S) -> binary:decode_hex(list_to_binary(S)).
+%% Real Sepolia eth_getProof verifies against the state root.
+real_proof_test() ->
+    Path = filename:join([filename:dirname(?FILE), "vectors",
+                          "sepolia_proof_latest.json"]),
+    {ok, Bin} = file:read_file(Path),
+    {ok, #{<<"result">> := P}} = thoas:decode(Bin),
+    Root = hex("0x4bcf8bfd58164c89ba9ca54d7497619bf13abf7f4a5ef0dcdfa8daa572261ba2"),
+    Addr = hex("0xd86e1fedb7120369ff5175b74f4413cb74fcacdb"),
+    %% Key is keccak(address).
+    Key = eth_keccak:hash(Addr),
+    Nodes = [hex(N) || N <- maps:get(<<"accountProof">>, P)],
+    {ok, Val} = eth_trie:verify_proof(Root, Key, Nodes),
+    %% Value is the RLP account [nonce, balance, storageRoot, codeHash].
+    {ok, [Nonce, Balance, _StorageRoot, CodeHash], <<>>} =
+        eth_rlp:decode(Val),
+    ?assertEqual(eth_hex:decode(maps:get(<<"nonce">>, P)),
+                 binary:decode_unsigned(Nonce)),
+    ?assertEqual(eth_hex:decode(maps:get(<<"balance">>, P)),
+                 binary:decode_unsigned(Balance)),
+    ?assertEqual(hex(maps:get(<<"codeHash">>, P)), CodeHash),
+    %% Tampered root fails.
+    <<B, Rest/binary>> = Root,
+    Bad = <<(B bxor 16#FF), Rest/binary>>,
+    ?assertMatch({error, _},
+                 eth_trie:verify_proof(Bad, Key, Nodes)),
+    %% An unrelated key must never verify to a value against this proof.
+    Absent = eth_keccak:hash(<<"no-such-account-anywhere-near">>),
+    ?assert(begin
+        case eth_trie:verify_proof(Root, Absent, Nodes) of
+            {ok, not_found} -> true;
+            {error, _} -> true;
+            _ -> false
+        end
+    end).
+
+hex(S) when is_list(S) -> hex(list_to_binary(S));
+hex(B) ->
+    H = binary:replace(B, <<"0x">>, <<>>, [global]),
+    binary:decode_hex(H).

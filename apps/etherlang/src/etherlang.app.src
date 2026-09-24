@@ -1,7 +1,7 @@
 {application, etherlang, [
     {description, "Ethereum-compatible JSON-RPC node in Erlang: gap-sync + follow from an upstream node, local EVM for eth_call, experimental discv4 discovery."},
     {vsn, "0.1.0"},
-    {registered, [etherlang_sup, eth_chain, eth_sync, eth_rpc_server, eth_discv4, eth_peer, eth_txpool]},
+    {registered, [etherlang_sup, eth_chain, eth_sync, eth_rpc_server, eth_discv4, eth_peer, eth_txpool, eth_statestore, eth_statesync]},
     {mod, {etherlang_app, []}},
     {applications, [kernel, stdlib, crypto, inets, ssl, ranch, cowboy, thoas]},
     {env, []},

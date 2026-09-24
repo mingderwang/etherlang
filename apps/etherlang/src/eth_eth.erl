@@ -12,7 +12,7 @@
 %% EIP-2124 ForkID computation against the Sepolia fork schedule is a
 %% follow-up; until then strict geth peers may drop our Status.
 
--export([caps/0, negotiate/1]).
+-export([caps/0, negotiate/1, negotiate_caps/2]).
 -export([status_data/0, status_data/1, encode_status/1, decode_status/1,
          decode_status_bin/1, check_status/2]).
 -export([serve_headers/5, verify_chain/2, verify_chain/3]).
@@ -39,7 +39,32 @@
 network_id() -> ?NETWORK_ID.
 genesis_hash() -> hex_to_bin(?GENESIS_HEX).
 
-caps() -> [{"eth", ?ETH_VERSION}].
+caps() -> [{"eth", ?ETH_VERSION}, {"snap", 1}].
+
+%% Multi-capability negotiation: shared caps sorted by name split the
+%% message space from 16. eth reserves 17 IDs (0x00-0x10), snap 8.
+%% Returns #{eth => #{version, base}, snap => #{version, base}} with only
+%% the shared entries present (highest mutually supported version wins).
+negotiate_caps(OurCaps, PeerCaps) ->
+    NormPeer = [{to_bin(N), to_int(V)} || {N, V} <- PeerCaps],
+    Shared = lists:filtermap(fun({N, VO}) ->
+        case lists:keyfind(to_bin(N), 1, NormPeer) of
+            {_, VP} -> {true, {to_bin(N), min(VO, VP)}};
+            false -> false
+        end
+    end, OurCaps),
+    {Out, _} = lists:foldl(fun({N, V}, {Acc, Base}) ->
+        Key = case N of
+                  <<"eth">> -> eth;
+                  <<"snap">> -> snap;
+                  _ -> N
+              end,
+        {Acc#{Key => #{version => V, base => Base}}, Base + cap_size(N)}
+    end, {#{}, 16}, lists:sort(Shared)),
+    Out.
+
+cap_size(<<"eth">>) -> 17;
+cap_size(_) -> 8.
 
 %% Negotiate against the peer's Hello caps [{Name, Version}]. Single shared
 %% capability assumption: eth sits at base 16 (right after p2p).
@@ -653,6 +678,7 @@ to_int(_) -> 0.
 
 to_bin(B) when is_binary(B) -> B;
 to_bin(I) when is_integer(I) -> binary:encode_unsigned(I);
+to_bin(L) when is_list(L) -> list_to_binary(L);
 to_bin(_) -> <<>>.
 
 hex_to_bin(Hex) when is_binary(Hex) ->

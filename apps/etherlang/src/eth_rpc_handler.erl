@@ -226,6 +226,31 @@ dispatch(<<"eth_getTransactionReceipt">>, [TxHash], State) when is_binary(TxHash
         not_found -> proxy(<<"eth_getTransactionReceipt">>, [TxHash])
     end;
 
+dispatch(<<"eth_getBalance">>, [Addr, _Tag], State) when is_binary(Addr) ->
+    case local_account_field(State, Addr, balance) of
+        {ok, V} -> {ok, V};
+        not_found -> proxy(<<"eth_getBalance">>, [Addr, _Tag])
+    end;
+
+dispatch(<<"eth_getTransactionCount">>, [Addr, _Tag], State) when is_binary(Addr) ->
+    case local_account_field(State, Addr, nonce) of
+        {ok, V} -> {ok, V};
+        not_found -> proxy(<<"eth_getTransactionCount">>, [Addr, _Tag])
+    end;
+
+dispatch(<<"eth_getCode">>, [Addr, _Tag], State) when is_binary(Addr) ->
+    case local_code(State, Addr) of
+        {ok, V} -> {ok, V};
+        not_found -> proxy(<<"eth_getCode">>, [Addr, _Tag])
+    end;
+
+dispatch(<<"eth_getStorageAt">>, [Addr, Slot, _Tag], State)
+  when is_binary(Addr), is_binary(Slot) ->
+    case local_storage(State, Addr, Slot) of
+        {ok, V} -> {ok, V};
+        not_found -> proxy(<<"eth_getStorageAt">>, [Addr, Slot, _Tag])
+    end;
+
 dispatch(<<"eth_sendRawTransaction">>, [RawHex], State) when is_binary(RawHex) ->
     Pool = maps:get(pool, State, eth_txpool),
     case parse_raw_tx(RawHex) of
@@ -250,6 +275,85 @@ dispatch(<<"eth_getLogs">>, [Filter], State) when is_map(Filter) ->
 
 dispatch(_Method, Params, _State) ->
     proxy(_Method, Params).
+
+%% Local account field (balance/nonce) from the snap store, keyed by
+%% address hash. Values stored as account RLP; quantities re-encoded.
+local_account_field(State, Addr, Field) ->
+    Store = maps:get(store, State, eth_statestore),
+    AHash = eth_keccak:hash(addr_bin(Addr)),
+    case (try eth_statestore:get_account(Store, AHash) catch _:_ -> not_found end) of
+        {ok, AcctRLP} ->
+            case eth_rlp:decode(AcctRLP) of
+                {ok, Acct, <<>>} when is_list(Acct) ->
+                    Idx = case Field of
+                              balance -> 1;
+                              nonce -> 0
+                          end,
+                    {ok, eth_hex:encode_int(qty(lists:nth(Idx + 1, Acct)))};
+                _ ->
+                    not_found
+            end;
+        _ ->
+            not_found
+    end.
+
+local_code(State, Addr) ->
+    Store = maps:get(store, State, eth_statestore),
+    AHash = eth_keccak:hash(addr_bin(Addr)),
+    case (try eth_statestore:get_account(Store, AHash) catch _:_ -> not_found end) of
+        {ok, AcctRLP} ->
+            case eth_rlp:decode(AcctRLP) of
+                {ok, [_, _, _, CodeHash], <<>>} ->
+                    case (try eth_statestore:get_code(Store, CodeHash)
+                          catch _:_ -> not_found end) of
+                        {ok, Code} -> {ok, bin0x(Code)};
+                        _ -> not_found
+                    end;
+                _ ->
+                    not_found
+            end;
+        _ ->
+            not_found
+    end.
+
+local_storage(State, Addr, Slot) ->
+    Store = maps:get(store, State, eth_statestore),
+    try
+        AHash = eth_keccak:hash(addr_bin(Addr)),
+        SlotHash = eth_keccak:hash(slot_bin(Slot)),
+        case eth_statestore:get_storage(Store, AHash, SlotHash) of
+            {ok, ValRLP} ->
+                case eth_rlp:decode(ValRLP) of
+                    {ok, Val, <<>>} -> {ok, eth_hex:encode_int(qty(Val))};
+                    _ -> not_found
+                end;
+            _ ->
+                not_found
+        end
+    catch _:_ ->
+        not_found
+    end.
+
+addr_bin(<<"0x", R/binary>>) ->
+    try binary:decode_hex(R) catch _:_ -> <<>> end;
+addr_bin(B) when is_binary(B), byte_size(B) =:= 20 -> B;
+addr_bin(_) -> <<>>.
+
+slot_bin(<<"0x", R/binary>>) ->
+    try pad32(binary:decode_hex(R)) catch _:_ -> error end;
+slot_bin(_) -> error.
+
+pad32(B) when byte_size(B) =:= 32 -> B;
+pad32(B) when byte_size(B) < 32 ->
+    Pad = 32 - byte_size(B),
+    <<0:(Pad * 8), B/binary>>.
+
+qty(I) when is_integer(I) -> I;
+qty(B) when is_binary(B), byte_size(B) =:= 0 -> 0;
+qty(B) when is_binary(B) -> binary:decode_unsigned(B);
+qty(_) -> 0.
+
+bin0x(Bin) -> <<"0x", (string:lowercase(binary:encode_hex(Bin)))/binary>>.
 
 %% Upstream passthrough.
 proxy(Method, Params) ->

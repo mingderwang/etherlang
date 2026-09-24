@@ -22,6 +22,7 @@
              eth,
              chain,
              pool,
+             store,
              fetching = false,
              last_in}).
 
@@ -73,6 +74,7 @@ finish_init(Manager, Sock, Args, Sess) ->
                     hello = Hello, eth = undefined,
                     chain = maps:get(chain, Args, eth_chain),
                     pool = maps:get(pool, Args, eth_txpool),
+                    store = maps:get(store, Args, eth_statestore),
                     last_in = erlang:monotonic_time(millisecond)},
             case maybe_eth(S, Args, Hello) of
                 {ok, S1} ->
@@ -92,10 +94,11 @@ finish_init(Manager, Sock, Args, Sess) ->
 %% eth capability handshake after Hello: negotiate, send our Status, await
 %% and check theirs. No shared eth → stay p2p-only.
 maybe_eth(S, _Args, Hello) ->
-    case eth_eth:negotiate(maps:get(caps, Hello, [])) of
-        {error, _} ->
+    Caps = eth_eth:negotiate_caps(eth_eth:caps(), maps:get(caps, Hello, [])),
+    case maps:find(eth, Caps) of
+        error ->
             {ok, S};
-        {ok, #{base := _} = Neg} ->
+        {ok, Neg} ->
             case eth_eth:status_data(S#st.chain) of
                 {error, _} = E ->
                     E;
@@ -104,22 +107,27 @@ maybe_eth(S, _Args, Hello) ->
                                        eth_eth:msg_status(Neg),
                                        eth_rlp:encode(eth_eth:encode_status(Our))) of
                         {ok, Sess1} ->
-                            await_status(S#st{sess = Sess1}, Neg, Our);
+                            await_status(S#st{sess = Sess1}, Neg, Our,
+                                         maps:find(snap, Caps));
                         {error, _} = E ->
                             E
                     end
             end
     end.
 
-await_status(S, #{base := Base} = Neg, Our) ->
+await_status(S, #{base := Base} = Neg, Our, SnapOpt) ->
     case eth_rlpx:recv(S#st.sess, S#st.sock, 10000) of
         {ok, Code, Data, Sess1} when Code =:= Base ->
             case eth_eth:decode_status_bin(Data) of
                 {ok, Their} ->
                     case eth_eth:check_status(Our, Their) of
                         ok ->
-                            {ok, S#st{sess = Sess1,
-                                      eth = Neg#{status => Their}}};
+                            Eth = case SnapOpt of
+                                      {ok, Snap} -> Neg#{status => Their,
+                                                         snap => Snap};
+                                      error -> Neg#{status => Their}
+                                  end,
+                            {ok, S#st{sess = Sess1, eth = Eth}};
                         {error, _} = E ->
                             E
                     end;
@@ -181,6 +189,16 @@ handle_call({get_receipts, Hashes}, _From, S) ->
             erlang:send_after(?POLL_MS, self(), poll),
             {reply, Reply, S2}
     end;
+handle_call({snap_account_range, Root, Origin, Limit}, _From, S) ->
+    snap_call(S, 0, 1,
+              eth_rlp:encode(eth_snap:encode_account_req(Root, Origin, Limit)));
+handle_call({snap_storage_range, Root, Account, Origin, Limit}, _From, S) ->
+    snap_call(S, 2, 3,
+              eth_rlp:encode(
+                eth_snap:encode_storage_req(Root, Account, Origin, Limit)));
+handle_call({snap_bytecodes, Hashes}, _From, S) ->
+    snap_call(S, 4, 5,
+              eth_rlp:encode(eth_snap:encode_bytecodes_req(Hashes)));
 handle_call(_Req, _From, S) ->
     {reply, {error, unknown_call}, S}.
 
@@ -279,6 +297,13 @@ handle_msg(Code, Data, #st{eth = #{base := Base}} = S)
 handle_msg(Code, Data, #st{eth = #{base := Base}} = S)
   when Code =:= Base + 9 ->
     serve_pooled(Data, S);
+handle_msg(Code, Data, #st{eth = #{snap := Snap}} = S) ->
+    Base = maps:get(base, Snap),
+    if Code =:= Base + 0 -> serve_account_range(Data, S, Snap);
+       Code =:= Base + 2 -> serve_storage_range(Data, S, Snap);
+       Code =:= Base + 4 -> serve_bytecodes(Data, S, Snap);
+       true -> {ok, S}
+    end;
 handle_msg(2, _Data, S) ->
     case eth_rlpx:send(S#st.sess, S#st.sock, 3, eth_rlp:encode([])) of
         {ok, Sess1} -> {ok, S#st{sess = Sess1}};
@@ -323,6 +348,74 @@ serve_bodies_req(Data, S) ->
             end;
         {error, _} ->
             {ok, S}
+    end.
+
+%% Snap serving from the leaf store. Proofs are empty: the store keeps
+%% leaves, not inner trie nodes, so strict requesters will reject these
+%% ranges (documented; full proof serving needs inner-node retention).
+serve_account_range(Data, S, Snap) ->
+    case eth_snap:decode_account_req_bin(Data) of
+        {ok, _Root, Origin, Limit} ->
+            {ok, Items} = store_account_range(S, Origin, Limit),
+            Reply = [[H || {H, _} <- Items], [A || {_, A} <- Items], []],
+            send_snap(S, Snap, 1, Reply);
+        {error, _} ->
+            {ok, S}
+    end.
+
+serve_storage_range(Data, S, Snap) ->
+    case eth_snap:decode_storage_req_bin(Data) of
+        {ok, _Root, Account, Origin, Limit} ->
+            {ok, Items} = store_storage_range(S, Account, Origin, Limit),
+            Reply = [[H || {H, _} <- Items], [V || {_, V} <- Items], []],
+            send_snap(S, Snap, 3, Reply);
+        {error, _} ->
+            {ok, S}
+    end.
+
+serve_bytecodes(Data, S, Snap) ->
+    case eth_snap:decode_bytecodes_bin(Data) of
+        {ok, Codes} ->
+            Reply = [store_code(S, H) || H <- Codes],
+            send_snap(S, Snap, 5, Reply);
+        {error, _} ->
+            {ok, S}
+    end.
+
+send_snap(S, Snap, Offset, Term) ->
+    Code = maps:get(base, Snap) + Offset,
+    case eth_rlpx:send(S#st.sess, S#st.sock, Code, eth_rlp:encode(Term)) of
+        {ok, Sess1} -> {ok, S#st{sess = Sess1}};
+        {error, Reason} -> {stop, Reason, S}
+    end.
+
+store_account_range(S, Origin, Limit) ->
+    Store = store_name(S),
+    try eth_statestore:account_range(Store, Origin, Limit, 131072) of
+        {ok, Items} -> {ok, Items}
+    catch _:_ ->
+        {ok, []}
+    end.
+
+store_storage_range(S, Account, Origin, Limit) ->
+    Store = store_name(S),
+    try eth_statestore:storage_range(Store, Account, Origin, Limit, 131072) of
+        {ok, Items} -> {ok, Items}
+    catch _:_ ->
+        {ok, []}
+    end.
+
+store_code(S, H) ->
+    Store = store_name(S),
+    case try eth_statestore:get_code(Store, H) catch _:_ -> not_found end of
+        {ok, Code} -> Code;
+        _ -> <<>>
+    end.
+
+store_name(S) ->
+    case S#st.store of
+        undefined -> eth_statestore;
+        Name -> Name
     end.
 
 serve_receipts_req(Data, S) ->
@@ -443,6 +536,28 @@ pooled_term(S, H) ->
             []
     end.
 
+%% Snap request/response round trip returning the decoded reply term
+%% (verification is the caller's job). Offsets relative to snap base.
+snap_call(S, SendOff, ExpectOff, EncReq) ->
+    case S#st.eth of
+        #{snap := Snap} ->
+            Base = maps:get(base, Snap),
+            Decode = fun(Data) ->
+                case eth_rlp:decode(Data) of
+                    {ok, Term, _} -> {ok, Term};
+                    {error, _} = E -> E
+                end
+            end,
+            {Reply, S1} = fetch_request(S#st{fetching = true}, Base + SendOff,
+                                        EncReq, Base + ExpectOff,
+                                        Decode, fun(_) -> ok end),
+            S2 = S1#st{fetching = false},
+            erlang:send_after(?POLL_MS, self(), poll),
+            {reply, Reply, S2};
+        _ ->
+            {reply, {error, no_snap}, S}
+    end.
+
 %% Outbound request/response round trip: send a request and block in the
 %% call while waiting for the matching response code (Ping is answered
 %% inline, Disconnect stops). Decode/Verify decode and check the body.
@@ -498,5 +613,6 @@ to_skip(Skip) ->
     end.
 
 eth_ready(#st{eth = undefined}) -> false;
-eth_ready(#st{eth = #{version := V, status := Their}}) ->
-    #{version => V, head => maps:get(best, Their, undefined)}.
+eth_ready(#st{eth = #{version := V, status := Their} = Eth}) ->
+    #{version => V, head => maps:get(best, Their, undefined),
+      snap => maps:is_key(snap, Eth)}.

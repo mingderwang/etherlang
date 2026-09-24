@@ -97,4 +97,23 @@ init([]) ->
              type => worker,
              modules => [eth_txpool]},
 
-    {ok, {SupFlags, [State, Chain, Rpc, Sync, Pool] ++ Disc ++ Peer}}.
+    Store = #{id => eth_statestore,
+              start => {eth_statestore, start_link, [#{dir => eth_config:data_dir()}]},
+              restart => permanent,
+              shutdown => 5000,
+              type => worker,
+              modules => [eth_statestore]},
+
+    StateSync = case eth_config:state_sync_enabled() of
+                    true ->
+                        [#{id => eth_statesync,
+                           start => {eth_statesync, start_link, [#{}]},
+                           restart => permanent,
+                           shutdown => 5000,
+                           type => worker,
+                           modules => [eth_statesync]}];
+                    false ->
+                        []
+                end,
+
+    {ok, {SupFlags, [State, Chain, Rpc, Sync, Pool, Store] ++ Disc ++ Peer ++ StateSync}}.

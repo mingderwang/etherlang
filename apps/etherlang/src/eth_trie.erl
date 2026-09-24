@@ -5,15 +5,58 @@
 %% persistence, no proofs. Keys and values are raw binaries (for tx tries:
 %% key = RLP(index), value = RLP(tx)).
 
--export([root/1]).
+-export([root/1, verify_proof/3, decode_compact/1, build/1, prove/2]).
 
 %% Root of [{Key, Value}]. Empty trie = keccak256(RLP("")).
 root([]) ->
     eth_keccak:hash(eth_rlp:encode(<<>>));
 root(Pairs) ->
-    Tree = lists:foldl(fun({K, V}, T) -> insert(T, nibbles(K), V) end,
-                       none, Pairs),
-    eth_keccak:hash(encode(Tree)).
+    eth_keccak:hash(encode(build(Pairs))).
+
+%% Build the (unhashed) tree for offline proof extraction.
+build(Pairs) ->
+    lists:foldl(fun({K, V}, T) -> insert(T, nibbles(K), V) end, none, Pairs).
+
+%% Proof nodes (RLP encodings, root first) along Key's path. For absent
+%% keys returns the nodes down to the divergence point.
+prove(Tree, Key) ->
+    collect_node(Tree, nibbles(Key), []).
+
+collect_node(none, _, Acc) ->
+    lists:reverse(Acc);
+collect_node(Node, Nibbles, Acc) ->
+    Enc = encode(Node),
+    Acc1 = [Enc | Acc],
+    case Node of
+        {leaf, _, _} ->
+            lists:reverse(Acc1);
+        {ext, EN, Child} ->
+            case split_prefix(Nibbles, EN) of
+                {ok, Rest} -> collect_child(Child, Rest, Acc1);
+                error -> lists:reverse(Acc1)
+            end;
+        {branch, C, _} ->
+            case Nibbles of
+                [] -> lists:reverse(Acc1);
+                [H | T] ->
+                    case maps:find(H, C) of
+                        {ok, Ch} -> collect_child(Ch, T, Acc1);
+                        error -> lists:reverse(Acc1)
+                    end
+            end
+    end.
+
+collect_child(Child, Nibbles, Acc) when is_tuple(Child) ->
+    collect_node(Child, Nibbles, Acc);
+collect_child(_Ref, _Nibbles, Acc) ->
+    %% Hashed reference: path continues off-tree (proof ends here).
+    lists:reverse(Acc).
+
+split_prefix(Full, Prefix) ->
+    case lists:split(length(Prefix), Full) of
+        {Prefix, Rest} -> {ok, Rest};
+        _ -> error
+    end.
 
 %% ---------------------------------------------------------------------------
 
@@ -143,7 +186,90 @@ pack([]) -> <<>>;
 pack([A, B | Rest]) ->
     <<((A bsl 4) bor B), (pack(Rest))/binary>>.
 
-%% --- nibbles --------------------------------------------------------------
+%% --- proofs --------------------------------------------------------------
+%% Verify a Merkle proof: Root (32B), Key (raw bytes), Proof (list of RLP
+%% node encodings from root to leaf). Returns {ok, Value} (<<>> for
+%% exclusion-proven absence... see below) or {error, Reason}.
+%%
+%% Exclusion is proven when traversal ends at a node that cannot contain
+%% the key (empty slot, diverging extension/leaf, or short node): returns
+%% {ok, not_found}.
+verify_proof(Root, Key, Proof) when byte_size(Root) =:= 32, is_binary(Key),
+                                    is_list(Proof) ->
+    try
+        Nodes = [{eth_keccak:hash(P), P} || P <- Proof],
+        case lists:keyfind(Root, 1, Nodes) of
+            false ->
+                {error, bad_root};
+            {Root, Enc} ->
+                {ok, Term, <<>>} = eth_rlp:decode(Enc),
+                prove_term(Term, nibbles(Key), Nodes)
+        end
+    catch _:_ ->
+        {error, bad_proof}
+    end.
+
+prove_term([Compact, Second], Nibbles, Nodes) ->
+    %% Short node: leaf carries the value, extension continues traversal.
+    {IsLeaf, Path} = decode_compact(Compact),
+    case IsLeaf of
+        true ->
+            case Path =:= Nibbles of
+                true -> {ok, Second};
+                false -> {ok, not_found}
+            end;
+        false ->
+            case starts_with(Nibbles, Path) of
+                {ok, Rest} -> prove_child(Second, Rest, Nodes);
+                error -> {ok, not_found}
+            end
+    end;
+prove_term(Branch, Nibbles, Nodes) when is_list(Branch), length(Branch) =:= 17 ->
+    case Nibbles of
+        [] ->
+            {ok, lists:nth(17, Branch)};
+        [H | T] ->
+            Child = lists:nth(H + 1, Branch),
+            prove_child(Child, T, Nodes)
+    end;
+prove_term(_, _, _) ->
+    {error, bad_node}.
+
+prove_child(<<>>, _Nibbles, _Nodes) ->
+    {ok, not_found};
+prove_child(Hash, Nibbles, Nodes) when byte_size(Hash) =:= 32 ->
+    case lists:keyfind(Hash, 1, Nodes) of
+        false ->
+            {error, missing_node};
+        {Hash, Enc} ->
+            {ok, Term, <<>>} = eth_rlp:decode(Enc),
+            prove_term(Term, Nibbles, Nodes)
+    end;
+prove_child(Embedded, Nibbles, Nodes) when is_list(Embedded) ->
+    %% Inline node (< 32 bytes when encoded): traverse directly.
+    prove_term(Embedded, Nibbles, Nodes);
+prove_child(_, _, _) ->
+    {error, bad_node}.
+
+starts_with(Full, Prefix) ->
+    case lists:split(length(Prefix), Full) of
+        {Prefix, Rest} -> {ok, Rest};
+        _ -> error
+    end.
+
+%% Decode hex-prefix compact encoding -> {IsLeaf, Nibbles}.
+decode_compact(<<>>) -> throw(bad_compact);
+decode_compact(Bin) when is_binary(Bin) ->
+    <<F:4, Rest/bits>> = Bin,
+    IsLeaf = (F band 2) =/= 0,
+    Nibbles = case F band 1 of
+                  1 ->
+                      [N || <<N:4>> <= Rest];
+                  0 ->
+                      <<_:4, R/bits>> = Rest,
+                      [N || <<N:4>> <= R]
+              end,
+    {IsLeaf, Nibbles}.
 
 nibbles(Bin) -> nibbles(Bin, []).
 nibbles(<<>>, Acc) -> lists:reverse(Acc);
