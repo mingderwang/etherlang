@@ -421,4 +421,5 @@ to_int(_) -> 0.
 
 to_bin(B) when is_binary(B) -> B;
 to_bin(I) when is_integer(I) -> binary:encode_unsigned(I);
+to_bin(L) when is_list(L) -> list_to_binary(L);
 to_bin(_) -> <<>>.

@@ -5,7 +5,7 @@
 %% the node verify a fetched block *without* trusting the upstream `hash'
 %% field, and check parent linkage cryptographically.
 
--export([hash/1, hex_hash/1, verify/1, parent_hash/1, number/1]).
+-export([hash/1, hex_hash/1, verify/1, parent_hash/1, number/1, to_rlp_list/1]).
 
 %% Ordered header layout (Ethereum JSON field names).
 %% `sha3Uncles' is the ommers hash, `miner' the beneficiary.
@@ -70,6 +70,10 @@ parent_hash(Block) -> maps:get(<<"parentHash">>, Block, undefined).
 
 number(Block) ->
     try eth_hex:decode(maps:get(<<"number">>, Block)) catch _:_ -> undefined end.
+
+%% Ordered RLP term for a header (for eth/68 BlockHeaders replies).
+to_rlp_list(Block) when is_map(Block) ->
+    header_term(Block).
 
 %% ---------------------------------------------------------------------------
 

@@ -6,7 +6,8 @@
 %% auto-dial from the discv4 table and the eth capability arrive in
 %% increment 3, so dial/3 is manual for now.
 
--export([start_link/1, dial/3, dial/4, status/0, status/1, peers/0, peers/1]).
+-export([start_link/1, dial/3, dial/4, status/0, status/1, peers/0, peers/1,
+         get_headers/4, get_headers/5]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -29,6 +30,23 @@ status(Name) -> gen_server:call(Name, status).
 
 peers() -> peers(?MODULE).
 peers(Name) -> gen_server:call(Name, peers).
+
+%% Fetch headers via the first eth-ready peer. Ref is {hash, H32} |
+%% {number, N}; Reverse is boolean.
+get_headers(Ref, Max, Skip, Reverse) -> get_headers(?MODULE, Ref, Max, Skip, Reverse).
+get_headers(Name, Ref, Max, Skip, Reverse) ->
+    case gen_server:call(Name, peers) of
+        Infos when is_list(Infos) ->
+            case [Pid || {Pid, Info} <- Infos, is_map(Info),
+                         maps:get(eth, Info, false) =/= false] of
+                [Pid | _] ->
+                    gen_server:call(Pid, {get_headers, Ref, Max, Skip, Reverse}, 20000);
+                [] ->
+                    {error, no_eth_peers}
+            end;
+        {error, _} = E ->
+            E
+    end.
 
 init(Cfg) ->
     Priv = maps:get(privkey, Cfg),
@@ -72,6 +90,10 @@ handle_info(accept, S) ->
         {ok, Sock} ->
             case eth_peer_conn:start_recipient(self(), Sock, conn_args(S, undefined)) of
                 {ok, Pid} ->
+                    %% Hand the socket to the conn: the acceptor (us) must
+                    %% not own peer sockets, and a short-lived owner would
+                    %% take the socket down with it on exit.
+                    ok = gen_tcp:controlling_process(Sock, Pid),
                     Ref = monitor(process, Pid),
                     Peers = (S#st.peers)#{Pid => #{ref => Ref}},
                     self() ! accept,
@@ -129,7 +151,8 @@ code_change(_OldVsn, S, _Extra) -> {ok, S}.
 
 conn_args(S, RemoteID) ->
     #{privkey => S#st.priv, node_id => S#st.node_id,
-      client_id => S#st.client_id, caps => [], listen_port => S#st.listen_port,
+      client_id => S#st.client_id, caps => eth_eth:caps(),
+      listen_port => S#st.listen_port,
       remote_id => RemoteID, timeout => 10000}.
 
 client_id() -> <<"etherlang/0.1.0">>.
