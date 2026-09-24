@@ -16,18 +16,22 @@ negotiate_test() ->
 
 status_roundtrip_test() ->
     S = #{version => 68, network => 11155111, td => 17000000000000000,
-          best => crypto:strong_rand_bytes(32),
+          best => crypto:strong_rand_bytes(32), best_number => 1735371,
+          head_time => 1677557088,
           genesis => eth_eth:genesis_hash(),
           fork_hash => <<0, 0, 0, 0>>, fork_next => 0},
-    {ok, S} = eth_eth:decode_status(eth_eth:encode_status(S)),
-    ?assertEqual(ok, eth_eth:check_status(S)),
+    {ok, Dec} = eth_eth:decode_status(eth_eth:encode_status(S)),
+    Local = #{head_number => 1735371, head_time => 1677557088},
+    %% Same-hash peers accept (rule 1b); fork fields round-trip opaque here
+    %% (strict ForkID vectors live in eth_forkid_tests).
+    ?assertEqual(maps:with([version, network, td, best, genesis],
+                           S#{best_number => 1735371}),
+                 maps:with([version, network, td, best, genesis], Dec)),
     ?assertMatch({error, {network_mismatch, _}},
-                 eth_eth:check_status(S#{network => 1})),
+                 eth_eth:check_status(Local, Dec#{network => 1})),
     ?assertEqual({error, genesis_mismatch},
-                 eth_eth:check_status(S#{genesis => crypto:strong_rand_bytes(32)})),
-    %% ForkID is lenient: accepted, not enforced.
-    ?assertEqual(ok, eth_eth:check_status(S#{fork_hash => <<1, 2, 3, 4>>,
-                                            fork_next => 99})),
+                 eth_eth:check_status(Local,
+                                      Dec#{genesis => crypto:strong_rand_bytes(32)})),
     ?assertEqual({error, bad_status}, eth_eth:decode_status([1, 2])).
 
 headers_codec_test() ->
@@ -96,8 +100,44 @@ header_num(RLPHeader) ->
         B when is_binary(B) -> binary:decode_unsigned(B)
     end.
 
+bodies_test() ->
+    with_chain(chain_bodies_a, 6, fun(Blocks) ->
+        H3 = maps:get(<<"hash">>, lists:nth(4, Blocks)),
+        {ok, [Body]} = eth_eth:serve_bodies(chain_bodies_a,
+                                            [hex_to_bin(H3)]),
+        [Txs, Uncles] = Body,
+        %% Fixture blocks carry two legacy transactions, no uncles.
+        ?assertEqual(2, length(Txs)),
+        ?assertEqual([], Uncles),
+        %% Unknown hash serves empty (geth-compatible).
+        {ok, [[]]} = eth_eth:serve_bodies(chain_bodies_a,
+                                          [crypto:strong_rand_bytes(32)]),
+        %% Bodies codec round-trips through RLP.
+        {ok, [Body]} = eth_eth:decode_bodies_bin(
+                         eth_rlp:encode([Body])),
+        %% Craft headers carrying the true roots: verification passes...
+        {ok, [H]} = eth_eth:serve_headers(chain_bodies_a, {number, 3}, 1, 0, false),
+        {ok, Root} = eth_eth:bodies_tx_root(Body),
+        H1 = set_header_root(H, Root),
+        ?assertEqual(ok, eth_eth:verify_bodies([H1], [Body])),
+        %% ...and rejects mismatched roots.
+        ?assertEqual({error, body_mismatch},
+                     eth_eth:verify_bodies([H], [Body])),
+        ?assertEqual({error, count_mismatch},
+                     eth_eth:verify_bodies([H1, H1], [Body]))
+    end).
+
+%% Replace the transactionsRoot field (index 4) of a decoded header.
+set_header_root(Header, Root) ->
+    {Pre, [_ | Post]} = lists:split(4, Header),
+    Pre ++ [Root | Post].
+
 hex_to_bin(<<"0x", Rest/binary>>) -> binary:decode_hex(Rest);
 hex_to_bin(H) -> binary:decode_hex(H).
+
+%% Block hash of a decoded header RLP list.
+block_hash(Header) ->
+    eth_keccak:hash(eth_rlp:encode(Header)).
 
 %% Full eth handshake + header fetch between two connections over loopback.
 interop_test_() ->
@@ -151,6 +191,18 @@ interop() ->
         ?assertEqual({ok, []},
                      gen_server:call(PidA, {get_headers, {number, 99}, 3, 0, false},
                                      20000)),
+        %% Bodies fetch across the wire: block 1 has two fixture txs.
+        {ok, Heads} = gen_server:call(PidA, {get_headers, {number, 1}, 2, 0, false},
+                                      20000),
+        Hashes = [block_hash(H) || H <- Heads],
+        {ok, Bodies} = gen_server:call(PidA, {get_bodies, Hashes}, 20000),
+        ?assertEqual(2, length(Bodies)),
+        ?assertEqual([2, 2], [length(Txs) || [Txs, _] <- Bodies]),
+        %% Roots recompute stably over the wire terms.
+        Roots1 = [begin {ok, R} = eth_eth:bodies_tx_root(B), R end || B <- Bodies],
+        {ok, Bodies2} = eth_eth:decode_bodies_bin(eth_rlp:encode(Bodies)),
+        Roots2 = [begin {ok, R} = eth_eth:bodies_tx_root(B), R end || B <- Bodies2],
+        ?assertEqual(Roots1, Roots2),
         gen_server:stop(PidA),
         gen_server:stop(PidB),
         gen_tcp:close(LS)

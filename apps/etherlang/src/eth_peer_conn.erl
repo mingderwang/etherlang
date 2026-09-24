@@ -87,19 +87,19 @@ maybe_eth(S, _Args, Hello) ->
                                        eth_eth:msg_status(Neg),
                                        eth_rlp:encode(eth_eth:encode_status(Our))) of
                         {ok, Sess1} ->
-                            await_status(S#st{sess = Sess1}, Neg);
+                            await_status(S#st{sess = Sess1}, Neg, Our);
                         {error, _} = E ->
                             E
                     end
             end
     end.
 
-await_status(S, #{base := Base} = Neg) ->
+await_status(S, #{base := Base} = Neg, Our) ->
     case eth_rlpx:recv(S#st.sess, S#st.sock, 10000) of
         {ok, Code, Data, Sess1} when Code =:= Base ->
             case eth_eth:decode_status_bin(Data) of
                 {ok, Their} ->
-                    case eth_eth:check_status(Their) of
+                    case eth_eth:check_status(Our, Their) of
                         ok ->
                             {ok, S#st{sess = Sess1,
                                       eth = Neg#{status => Their}}};
@@ -127,8 +127,25 @@ handle_call({get_headers, Ref, Max, Skip, Reverse}, _From, S) ->
             {reply, {error, no_eth}, S};
         #{base := Base} ->
             %% Suspend the poll loop while the blocking fetch owns recv.
-            {Reply, S1} = fetch_headers(S#st{fetching = true}, Base, Ref, Max,
-                                        Skip, Reverse),
+            Req = eth_eth:encode_get_headers(Ref, Max, Skip, Reverse),
+            Verify = fun(Term) -> eth_eth:verify_chain(Term, not Reverse, to_skip(Skip)) end,
+            {Reply, S1} = fetch_request(S#st{fetching = true}, Base + 3,
+                                        eth_rlp:encode(Req), Base + 4,
+                                        fun eth_eth:decode_headers_bin/1, Verify),
+            S2 = S1#st{fetching = false},
+            erlang:send_after(?POLL_MS, self(), poll),
+            {reply, Reply, S2}
+    end;
+handle_call({get_bodies, Hashes}, _From, S) ->
+    case S#st.eth of
+        undefined ->
+            {reply, {error, no_eth}, S};
+        #{base := Base} ->
+            Req = eth_eth:encode_get_bodies(Hashes),
+            {Reply, S1} = fetch_request(S#st{fetching = true}, Base + 5,
+                                        eth_rlp:encode(Req), Base + 6,
+                                        fun eth_eth:decode_bodies_bin/1,
+                                        fun(_) -> ok end),
             S2 = S1#st{fetching = false},
             erlang:send_after(?POLL_MS, self(), poll),
             {reply, Reply, S2}
@@ -195,6 +212,9 @@ handle_msg(1, _Data, _S) ->
 handle_msg(Code, Data, #st{eth = #{base := Base}} = S)
   when Code =:= Base + 3 ->
     serve_headers_req(Data, S);
+handle_msg(Code, Data, #st{eth = #{base := Base}} = S)
+  when Code =:= Base + 5 ->
+    serve_bodies_req(Data, S);
 handle_msg(2, _Data, S) ->
     case eth_rlpx:send(S#st.sess, S#st.sock, 3, eth_rlp:encode([])) of
         {ok, Sess1} -> {ok, S#st{sess = Sess1}};
@@ -223,29 +243,47 @@ serve_headers_req(Data, S) ->
             {ok, S}
     end.
 
-%% Outbound header fetch: send GetBlockHeaders and block in the call while
-%% waiting for the matching BlockHeaders (Ping is answered inline,
-%% Disconnect stops). Returns {Reply, State} so framing state survives.
-fetch_headers(S, Base, Ref, Max, Skip, Reverse) ->
-    Req = eth_eth:encode_get_headers(Ref, Max, Skip, Reverse),
-    case eth_rlpx:send(S#st.sess, S#st.sock, Base + 3, eth_rlp:encode(Req)) of
+serve_bodies_req(Data, S) ->
+    #{base := Base} = S#st.eth,
+    case eth_eth:decode_get_bodies_bin(Data) of
+        {ok, Hashes} ->
+            case eth_eth:serve_bodies(S#st.chain, Hashes) of
+                {ok, Bodies} ->
+                    case eth_rlpx:send(S#st.sess, S#st.sock,
+                                       Base + 6, eth_rlp:encode(Bodies)) of
+                        {ok, Sess1} -> {ok, S#st{sess = Sess1}};
+                        {error, Reason} -> {stop, Reason}
+                    end;
+                {error, _} ->
+                    {ok, S}
+            end;
+        {error, _} ->
+            {ok, S}
+    end.
+
+%% Outbound request/response round trip: send a request and block in the
+%% call while waiting for the matching response code (Ping is answered
+%% inline, Disconnect stops). Decode/Verify decode and check the body.
+%% Returns {Reply, State} so framing state survives.
+fetch_request(S, SendCode, EncReq, ExpectCode, Decode, Verify) ->
+    case eth_rlpx:send(S#st.sess, S#st.sock, SendCode, EncReq) of
         {ok, Sess1} ->
-            fetch_wait(S#st{sess = Sess1}, Base, Reverse, Skip,
+            fetch_wait(S#st{sess = Sess1}, ExpectCode, Decode, Verify,
                        erlang:monotonic_time(millisecond) + 15000);
         {error, _} = E ->
             {E, S}
     end.
 
-fetch_wait(S, Base, Reverse, Skip, Deadline) ->
+fetch_wait(S, ExpectCode, Decode, Verify, Deadline) ->
     Timeout = max(1, Deadline - erlang:monotonic_time(millisecond)),
     case eth_rlpx:recv(S#st.sess, S#st.sock, Timeout) of
-        {ok, Code, Data, Sess1} when Code =:= Base + 4 ->
+        {ok, Code, Data, Sess1} when Code =:= ExpectCode ->
             S1 = S#st{sess = Sess1,
                       last_in = erlang:monotonic_time(millisecond)},
-            case eth_eth:decode_headers_bin(Data) of
-                {ok, Headers} ->
-                    case eth_eth:verify_chain(Headers, not Reverse, Skip) of
-                        ok -> {{ok, Headers}, S1};
+            case Decode(Data) of
+                {ok, Term} ->
+                    case Verify(Term) of
+                        ok -> {{ok, Term}, S1};
                         {error, _} = E -> {E, S1}
                     end;
                 {error, _} = E ->
@@ -255,20 +293,26 @@ fetch_wait(S, Base, Reverse, Skip, Deadline) ->
             S1 = S#st{sess = Sess1,
                       last_in = erlang:monotonic_time(millisecond)},
             case eth_rlpx:send(Sess1, S#st.sock, 3, eth_rlp:encode([])) of
-                {ok, Sess2} -> fetch_wait(S1#st{sess = Sess2}, Base, Reverse, Skip, Deadline);
+                {ok, Sess2} -> fetch_wait(S1#st{sess = Sess2}, ExpectCode, Decode, Verify, Deadline);
                 {error, _} = E -> {E, S1}
             end;
         {ok, 1, _, Sess1} ->
             {{error, remote_disconnect}, S#st{sess = Sess1}};
         {ok, _, _, Sess1} ->
-            fetch_wait(S#st{sess = Sess1}, Base, Reverse, Skip, Deadline);
+            fetch_wait(S#st{sess = Sess1}, ExpectCode, Decode, Verify, Deadline);
         {error, timeout} ->
             case Deadline > erlang:monotonic_time(millisecond) of
-                true -> fetch_wait(S, Base, Reverse, Skip, Deadline);
+                true -> fetch_wait(S, ExpectCode, Decode, Verify, Deadline);
                 false -> {{error, timeout}, S}
             end;
         {error, _} = E ->
             {E, S}
+    end.
+
+to_skip(Skip) ->
+    case Skip of
+        I when is_integer(I) -> I;
+        _ -> 0
     end.
 
 eth_ready(#st{eth = undefined}) -> false;

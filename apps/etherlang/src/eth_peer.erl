@@ -7,7 +7,7 @@
 %% increment 3, so dial/3 is manual for now.
 
 -export([start_link/1, dial/3, dial/4, status/0, status/1, peers/0, peers/1,
-         get_headers/4, get_headers/5]).
+         get_headers/4, get_headers/5, get_bodies/1, get_bodies/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -35,14 +35,30 @@ peers(Name) -> gen_server:call(Name, peers).
 %% {number, N}; Reverse is boolean.
 get_headers(Ref, Max, Skip, Reverse) -> get_headers(?MODULE, Ref, Max, Skip, Reverse).
 get_headers(Name, Ref, Max, Skip, Reverse) ->
+    case eth_ready_peer(Name) of
+        {ok, Pid} ->
+            gen_server:call(Pid, {get_headers, Ref, Max, Skip, Reverse}, 20000);
+        {error, _} = E ->
+            E
+    end.
+
+%% Fetch bodies via the first eth-ready peer. Hashes is [H32].
+get_bodies(Hashes) -> get_bodies(?MODULE, Hashes).
+get_bodies(Name, Hashes) ->
+    case eth_ready_peer(Name) of
+        {ok, Pid} ->
+            gen_server:call(Pid, {get_bodies, Hashes}, 20000);
+        {error, _} = E ->
+            E
+    end.
+
+eth_ready_peer(Name) ->
     case gen_server:call(Name, peers) of
         Infos when is_list(Infos) ->
             case [Pid || {Pid, Info} <- Infos, is_map(Info),
                          maps:get(eth, Info, false) =/= false] of
-                [Pid | _] ->
-                    gen_server:call(Pid, {get_headers, Ref, Max, Skip, Reverse}, 20000);
-                [] ->
-                    {error, no_eth_peers}
+                [Pid | _] -> {ok, Pid};
+                [] -> {error, no_eth_peers}
             end;
         {error, _} = E ->
             E

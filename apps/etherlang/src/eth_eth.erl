@@ -14,17 +14,20 @@
 
 -export([caps/0, negotiate/1]).
 -export([status_data/0, status_data/1, encode_status/1, decode_status/1,
-         decode_status_bin/1, check_status/1]).
+         decode_status_bin/1, check_status/2]).
 -export([serve_headers/5, verify_chain/2, verify_chain/3]).
--export([msg_status/1, msg_get_headers/1, msg_headers/1]).
+-export([msg_status/1, msg_get_headers/1, msg_headers/1,
+         msg_get_bodies/1, msg_bodies/1]).
 -export([encode_get_headers/4, decode_get_headers_bin/1, decode_headers_bin/1]).
+-export([encode_get_bodies/1, decode_get_bodies_bin/1, decode_bodies_bin/1,
+         serve_bodies/2, bodies_tx_root/1, verify_bodies/2]).
 -export([network_id/0, genesis_hash/0]).
 
 -define(ETH_VERSION, 68).
 -define(NETWORK_ID, 11155111).
 -define(MAX_HEADERS, 192).
-%% Sepolia genesis.
--define(GENESIS_HEX, <<"0x25a5cc106eea7138acab3575073b331f03c96d9e154af2551adc1fdf64e2b0a3">>).
+%% Sepolia genesis (params.SepoliaGenesisHash in go-ethereum).
+-define(GENESIS_HEX, <<"0x25a5cc106eea7138acab33231d7160d69cb777ee0c2c553fcddf5138993e6dd9">>).
 %% Compat fallback TD (see eth_rpc_handler SEPOLIA_TTD_HEX).
 -define(FALLBACK_TD, 17000000000000000).
 
@@ -50,22 +53,42 @@ negotiate(PeerCaps) ->
 msg_status(#{base := B}) -> B + 0.
 msg_get_headers(#{base := B}) -> B + 3.
 msg_headers(#{base := B}) -> B + 4.
+msg_get_bodies(#{base := B}) -> B + 5.
+msg_bodies(#{base := B}) -> B + 6.
 
 %% Local Status from the chain head (Chain default eth_chain) plus the
 %% upstream latest totalDifficulty, falling back to the compat constant.
+%% ForkID is computed strictly per EIP-2124 (see eth_forkid).
 status_data() -> status_data(eth_chain).
 status_data(Chain) ->
-    case (try eth_chain:head(Chain) catch _:_ -> undefined end) of
-        {N, H} when is_integer(N) ->
+    case head_info(Chain) of
+        {ok, N, H, Time} ->
+            {FH, FN} = eth_forkid:current(eth_forkid:genesis(sepolia), eth_forkid:schedule(sepolia), N, Time),
             {ok, #{version => ?ETH_VERSION,
                    network => ?NETWORK_ID,
                    td => total_difficulty(),
-                   best => hex_to_bin(H),
+                   best => H,
                    best_number => N,
+                   head_time => Time,
                    genesis => genesis_hash(),
-                   fork_hash => <<0, 0, 0, 0>>,
-                   fork_next => 0}};
-        undefined ->
+                   fork_hash => FH,
+                   fork_next => FN}};
+        {error, _} = E ->
+            E
+    end.
+
+head_info(Chain) ->
+    case (try eth_chain:head(Chain) catch _:_ -> undefined end) of
+        {N, H} when is_integer(N), is_binary(H) ->
+            case (try eth_chain:get_by_number(Chain, N) catch _:_ -> not_found end) of
+                {ok, Block, _} ->
+                    Time = (try eth_hex:decode(maps:get(<<"timestamp">>, Block))
+                            catch _:_ -> 0 end),
+                    {ok, N, hex_to_bin(H), Time};
+                _ ->
+                    {error, no_local_head}
+            end;
+        _ ->
             {error, no_local_head}
     end.
 
@@ -92,23 +115,27 @@ decode_status_bin(Data) when is_binary(Data) ->
         {error, _} = E -> E
     end.
 
-check_status(#{network := ?NETWORK_ID, genesis := Gen} = S) ->
-    case Gen =:= genesis_hash() of
-        true ->
-            case {maps:get(fork_hash, S), maps:get(fork_next, S)} of
-                {<<0, 0, 0, 0>>, 0} ->
-                    ok;
-                {FH, FN} ->
-                    logger:info("etherlang: peer forkid ~s next ~p (accepted leniently)",
-                                [binary:encode_hex(FH), FN]),
-                    ok
+%% Check a remote Status against network/genesis plus strict ForkID
+%% validation. Local carries our head_number/head_time.
+check_status(#{best_number := HN, head_time := HT}, Remote) ->
+    check_status(#{head_number => HN, head_time => HT}, Remote);
+check_status(#{head_number := HN, head_time := HT} = _Local, Remote) ->
+    case Remote of
+        #{network := ?NETWORK_ID, genesis := Gen} ->
+            case Gen =:= genesis_hash() of
+                false ->
+                    {error, genesis_mismatch};
+                true ->
+                    eth_forkid:validate(eth_forkid:genesis(sepolia), eth_forkid:schedule(sepolia), HN, HT,
+                                        maps:get(fork_hash, Remote, <<>>),
+                                        maps:get(fork_next, Remote, 0))
             end;
-        false ->
-            {error, genesis_mismatch}
+        #{network := Net} ->
+            {error, {network_mismatch, Net}};
+        _ ->
+            {error, bad_status}
     end;
-check_status(#{network := Net}) ->
-    {error, {network_mismatch, Net}};
-check_status(_) ->
+check_status(_, _) ->
     {error, bad_status}.
 
 %% GetBlockHeaders body. Ref is {hash, H32} | {number, N};
@@ -147,6 +174,142 @@ rev01(_) -> 0.
 
 decode_ref(B) when byte_size(B) =:= 32 -> {hash, B};
 decode_ref(B) -> {number, to_int(B)}.
+
+%% --- bodies ------------------------------------------------------------
+
+encode_get_bodies(Hashes) when is_list(Hashes) -> [Hashes].
+
+decode_get_bodies_bin(Data) when is_binary(Data) ->
+    try
+        case eth_rlp:decode(Data) of
+            {ok, [Hashes], _} when is_list(Hashes) ->
+                case lists:all(fun(H) -> is_binary(H) andalso byte_size(H) =:= 32 end,
+                               Hashes) of
+                    true -> {ok, Hashes};
+                    false -> {error, bad_bodies_req}
+                end;
+            _ ->
+                {error, bad_bodies_req}
+        end
+    catch _:_ ->
+        {error, bad_bodies_req}
+    end.
+
+%% Serve bodies from Chain: [{ok, [TxsTerms, UnclesTerms]}] per hash, with
+%% [] for unknown, header-only, or unencodable bodies (geth-compatible).
+serve_bodies(Chain, Hashes) ->
+    {ok, [serve_body(Chain, H) || H <- Hashes]}.
+
+serve_body(Chain, H) ->
+    Hex = <<"0x", (string:lowercase(binary:encode_hex(H)))/binary>>,
+    case (try eth_chain:get_by_hash(Chain, Hex) catch _:_ -> not_found end) of
+        {ok, Block, true} ->
+            case maps:get(<<"transactions">>, Block, bad) of
+                [] ->
+                    [[], uncles_terms(Block)];
+                [First | _] = Txs when is_map(First) ->
+                    case body_terms(Txs) of
+                        {ok, Terms} -> [Terms, uncles_terms(Block)];
+                        {error, _} -> []
+                    end;
+                _ ->
+                    []
+            end;
+        _ ->
+            []
+    end.
+
+body_terms(Txs) ->
+    try
+        {ok, [tx_term(Tx) || Tx <- Txs]}
+    catch _:_ ->
+        {error, bad_tx}
+    end.
+
+%% Legacy txs decode back to list terms; typed stay as opaque binaries.
+tx_term(Tx) ->
+    {ok, Enc} = eth_tx:to_rlp(Tx),
+    case Enc of
+        <<16#01, _/binary>> -> Enc;
+        <<16#02, _/binary>> -> Enc;
+        _ ->
+            {ok, Term, <<>>} = eth_rlp:decode(Enc),
+            Term
+    end.
+
+uncles_terms(Block) ->
+    case maps:get(<<"uncles">>, Block, []) of
+        [] -> [];
+        Uncles when is_list(Uncles) ->
+            Terms = lists:filtermap(fun(U) ->
+                case (try eth_header:to_rlp_list(U) catch _:_ -> error end) of
+                    {ok, T} -> {true, T};
+                    _ -> false
+                end
+            end, Uncles),
+            Terms;
+        _ -> []
+    end.
+
+%% Decode a BlockBodies body: list of [Txs, Uncles] with txs as binaries
+%% (typed) or lists (legacy).
+decode_bodies_bin(Data) when is_binary(Data) ->
+    try
+        case eth_rlp:decode(Data) of
+            {ok, Bodies, _} when is_list(Bodies) ->
+                case lists:all(fun wellformed_body/1, Bodies) of
+                    true -> {ok, Bodies};
+                    false -> {error, bad_bodies}
+                end;
+            _ ->
+                {error, bad_bodies}
+        end
+    catch _:_ ->
+        {error, bad_bodies}
+    end.
+
+wellformed_body([Txs, Uncles]) when is_list(Txs), is_list(Uncles) ->
+    lists:all(fun(T) ->
+        (is_binary(T) andalso byte_size(T) > 1) orelse
+        (is_list(T) andalso T =/= [])
+    end, Txs);
+wellformed_body(_) ->
+    false.
+
+%% Transaction trie root of one wire body [Txs, _Uncles].
+bodies_tx_root([Txs, _]) ->
+    try
+        Pairs = lists:map(fun({T, I}) ->
+            {eth_rlp:encode(I), tx_bytes(T)}
+        end, lists:zip(Txs, lists:seq(0, length(Txs) - 1))),
+        {ok, eth_trie:root(Pairs)}
+    catch _:_ ->
+        {error, bad_body}
+    end.
+
+tx_bytes(B) when is_binary(B) -> B;
+tx_bytes(L) when is_list(L) -> eth_rlp:encode(L).
+
+%% Verify bodies against header RLP lists: same count and each tx-root
+%% matches the header's transactionsRoot (field index 4).
+verify_bodies(Headers, Bodies) when length(Headers) =:= length(Bodies) ->
+    try
+        lists:foreach(fun({H, B}) ->
+            {ok, Root} = bodies_tx_root(B),
+            true = tx_root_of(H) =:= Root
+        end, lists:zip(Headers, Bodies)),
+        ok
+    catch _:_ ->
+        {error, body_mismatch}
+    end;
+verify_bodies(_, _) ->
+    {error, count_mismatch}.
+
+tx_root_of(Header) when is_list(Header) ->
+    case lists:nth(5, Header) of
+        R when byte_size(R) =:= 32 -> R;
+        _ -> error
+    end.
 %% Returns {ok, [RLPHeaderList]} (possibly shorter than asked when the store
 %% cannot cover the range; at most MAX_HEADERS).
 serve_headers(Chain, BlockRef, Max, Skip, Reverse) ->
