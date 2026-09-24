@@ -2,9 +2,10 @@
 
 An Ethereum-compatible blockchain node written in Erlang, runnable in Docker.
 It syncs and serves the canonical chain (headers, bodies, **receipts**) over
-**devp2p/RLPx** with peer-first sync (RPC fallback), and ships a local
-**Erlang EVM** (`eth_evm`) that executes `eth_call` — with state overrides —
-against lazily-fetched upstream state. No tx pool, no block production: the
+**devp2p/RLPx** with peer-first sync (RPC fallback), heals **contract state**
+via snap sync, runs a pending **transaction pool** with gossip, and ships a
+local **Erlang EVM** (`eth_evm`) that executes `eth_call` — with state
+overrides — against lazily-fetched upstream state. No block production: the
 network remains the source of truth for consensus and inclusion.
 
 ## Support
@@ -37,8 +38,16 @@ beacon, validators, or block production).
 * **devp2p stack** (opt-in, off by default) — discv4 UDP discovery
   (`DISCV4_ENABLED`, k-buckets, bonding), RLPx EIP-8 handshake + framing
   (`RLPX_ENABLED`), `eth/68` Status (strict EIP-2124 ForkID)/headers/bodies/
-  receipts, auto-dial to `PEER_TARGET` with backoff, persisted node key.
-  Pure Erlang throughout (secp256k1, ECIES, MPT, snappy).
+  receipts/pooled-txs, snap/1 account/storage/code ranges, auto-dial to
+  `PEER_TARGET` with backoff, persisted node key. Pure Erlang throughout
+  (secp256k1, ECIES, MPT, snappy).
+* **Transaction pool** (always on) — signature recovery, Sepolia chain-ID,
+  gas/nonce/balance validation against head state, pending/queued nonce
+  tiers, price eviction, gossip receive + broadcast, local
+  `eth_sendRawTransaction`; pool revalidates on every sync append.
+* **State heal** (opt-in `STATE_SYNC_ENABLED`) — snap account/storage/code
+  ranges with boundary-proof verification into a persistent leaf store;
+  `eth_getBalance`/`Nonce`/`Code`/`StorageAt` served locally first.
 * **Local EVM** — pure-Erlang interpreter covering the full defined opcode set
   including Cancun (`PUSH0`/`TLOAD`/`TSTORE`/`MCOPY`) plus precompiles
   `0x01`–`0x09` (`0x0A` KZG still proxies); serves `eth_call` locally with
@@ -56,8 +65,8 @@ beacon, validators, or block production).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**166 tests, green**).
-* **Status** — v0.6.0; eunit green (166 tests) and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**185 tests, green**).
+* **Status** — v0.7.0; eunit green (185 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -150,9 +159,9 @@ code; none is guessing. Items marked DONE were closed with live verification.
 10. **Open proxy, no auth/rate-limit** — v0.3.2: binds `127.0.0.1` by default
     (`RPC_LISTEN_IP`), caps JSON-RPC batches (`RPC_MAX_BATCH`), and adds a
     per-IP token-bucket rate limit (`RPC_RATE_LIMIT`/`RPC_RATE_BURST`).
-    Remaining: no authentication at all, write methods (`eth_send*`) still
-    relay upstream untouched, and the rate limiter is per-IP only (not per
-    user/method).
+    Remaining: no authentication at all, `eth_sendTransaction` (needs keys)
+    still relays upstream untouched, and the rate limiter is per-IP only
+    (not per user/method).
 11. **Batch spec gaps** — non-object items crash the handler (500s the whole
     batch); empty batch returns `[]`; notifications get responses. Per-item
     error objects + spec-compliant empty/notification handling.
@@ -206,6 +215,12 @@ code; none is guessing. Items marked DONE were closed with live verification.
   auto-dial, root-verified bodies/receipts into the store (v0.6.0).
 - [x] **Receipts locally** — receipts store + tx index,
   `eth_getTransactionReceipt`/`eth_getLogs` served locally first (v0.6.0).
+- [x] **Transaction pool** — signature/chain/gas/nonce/balance validation,
+  pending/queued tiers, price eviction, gossip receive + broadcast,
+  `eth_sendRawTransaction` local-first (v0.7.0).
+- [x] **State heal** — snap ranges with boundary-proof verification into a
+  persistent leaf store; `eth_getBalance`/`Nonce`/`Code`/`StorageAt`
+  served locally first (v0.7.0).
 
 ---
 
@@ -326,6 +341,9 @@ All settings are environment variables (see `eth_config`):
 | `RLPX_PORT` | `30303` | TCP port for RLPx |
 | `PEER_TARGET` | `10` | desired peer count for auto-dial |
 | `PEER_DIAL_INTERVAL` | `10000` | ms between auto-dial maintenance ticks |
+| `TX_POOL_MAX` | `1024` | max pooled transactions |
+| `TX_POOL_PER_SENDER` | `16` | max pooled transactions per sender |
+| `STATE_SYNC_ENABLED` | `false` | run the snap state-heal worker |
 
 ## Local JSON-RPC methods
 
@@ -333,11 +351,14 @@ Served locally: `eth_blockNumber`, `eth_syncing`, `eth_getBlockByNumber`,
 `eth_getBlockByHash`, `eth_getBlockTransactionCountByNumber`,
 `eth_getBlockTransactionCountByHash`,
 `eth_getTransactionByBlockNumberAndIndex`, `eth_getTransactionReceipt`,
-`eth_getLogs` (address/topics filters, capped range), `eth_call` (local EVM
+`eth_getLogs` (address/topics filters, capped range), `eth_sendRawTransaction`
+(validated + pooled + gossiped), `eth_call` (local EVM
 when enabled, proxy fallback), `web3_clientVersion`, `eth_getVersion`
 (EthStats-compat shim), `eth_coinbase` (zero address), `eth_mining`
-(`false`), `eth_hashrate` (`0x0`).
-Everything else is proxied to the upstream node transparently.
+(`false`), `eth_hashrate` (`0x0`), `eth_getBalance`/`eth_getTransactionCount`/
+`eth_getCode`/`eth_getStorageAt` (local-first from the state store).
+`eth_sendTransaction` (needs keys) and everything else is proxied to the
+upstream node transparently.
 
 Notes: served blocks carry Sepolia TTD as `totalDifficulty` when upstream
 omits it (post-merge constant, v0.2.6); `eth_getBlockByNumber` requires
@@ -352,9 +373,11 @@ plus loopback devp2p stacks (discovery + RLPx + eth, real sockets); they
 cover gap sync, live follow, reorg handling + rewind, finalized-floor
 guards (never ahead of head / off-chain), persistence across restart, the
 JSON-RPC client, the JSON-RPC server (local + proxy + batch + `totalDifficulty`
-compat), receipts store + filters, peer-first sync with verified
-bodies/receipts, shift/dispatch EVM regressions, and the local `eth_call`
-override path — **166 tests, all green**.
+compat), receipts store + filters, txpool (validation/ordering/gossip/RPC),
+peer-first sync with verified
+bodies/receipts, snap state heal, shift/dispatch EVM regressions, and the
+local `eth_call`
+override path — **185 tests, all green**.
 
 ```bash
 make docker-test        # builds a test image and runs `rebar3 eunit`
@@ -419,14 +442,18 @@ apps/etherlang/src/
   eth_snappy.erl          snappy framing for capability messages
   eth_discv4.erl          UDP discovery wire + k-buckets + bonding
   eth_rlpx.erl            EIP-8 handshake + framing + Hello/Ping/Pong
-  eth_peer.erl            peer manager (listener, manual + auto-dial)
-  eth_peer_conn.erl       one RLPx connection (p2p + eth Status/headers/bodies/receipts)
-  eth_eth.erl             eth/68 capability (negotiation, Status, headers/bodies/receipts)
+  eth_peer.erl            peer manager (listener, manual + auto-dial, broadcast)
+  eth_peer_conn.erl       one RLPx connection (p2p + eth Status/headers/bodies/receipts/txs)
+  eth_eth.erl             eth/68 capability (negotiation, Status, headers/bodies/receipts/txs)
   eth_forkid.erl          EIP-2124 ForkID schedule/hash/validation
-  eth_trie.erl            hexary Merkle-Patricia root computation
-  eth_tx.erl              transaction RLP encode/decode + tx-root
+  eth_trie.erl            hexary Merkle-Patricia root/proof computation
+  eth_tx.erl              transaction RLP encode/decode + tx-root + sender recovery
+  eth_txpool.erl          pending pool (validation, ordering, eviction, gossip)
   eth_receipt.erl         receipt RLP encode/decode + roots + blooms
   eth_bloom.erl           2048-bit logs bloom
+  eth_snap.erl            snap/1 capability codecs + range verification
+  eth_statestore.erl      snap-landed state leaf store (ETS ranges + DETS)
+  eth_statesync.erl       snap heal worker (accounts/storage/codes)
   eth_nodekey.erl         persisted static node key (shared by discv4 + RLPx)
 tools/
   eth_bench.escript       concurrent eth_call/JSON-RPC load benchmark
@@ -447,7 +474,7 @@ apps/etherlang/test/
 * Local VM re-execution of full blocks to verify `stateRoot` (EVM exists;
   execution plumbing per-tx through `eth_call` is proven — block-scoped
   replay with receipts is the remaining work)
-* tx pool, `eth_getBalance` from local state
+* `eth_getBalance` from local state
 * snapshots for instant bootstrap (archive-style data-dir downloads)
 * EVM fidelity items from the TODO list (revert/value semantics, transient
   scope, gas model, remaining precompiles)
@@ -461,6 +488,9 @@ apps/etherlang/test/
   auto-dial, peer-first sync with root-verified bodies/receipts; receipts
   store + local `eth_getTransactionReceipt`/`eth_getLogs`; tx/receipt RLP
   codecs. Suite 110 → 166.
+* **v0.7.0** — txpool (validation, pending/queued tiers, eviction, gossip,
+  `eth_sendRawTransaction`); snap state sync (proofs, leaf store, heal
+  worker, local state reads). Suite 166 → 185.
 
 ## v0.2.0 release notes (tag: v0.2.0)
 

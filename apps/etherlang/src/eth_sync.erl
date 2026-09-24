@@ -259,6 +259,7 @@ sync_range(S, From, To) ->
                     A = S#st.appended + N,
                     S1 = (S#st{appended = A, budget = S#st.budget - N})#st{
                             last_log = maybe_log(S, A)},
+                    refresh_pool(S1),
                     sync_range(S1, From + N, To);
                 {reorg, CA} ->
                     logger:notice("etherlang: reorg to ~p", [CA]),
@@ -516,6 +517,7 @@ peer_append(S, Pid, Entries, NewHdrs, Hashes) ->
     case eth_chain:append(S#st.chain, Entries) of
         ok ->
             store_peer_receipts(S, Pid, NewHdrs, Hashes, Entries),
+            refresh_pool(S),
             A = S#st.appended + N,
             S1 = (S#st{appended = A, budget = S#st.budget - N})#st{
                     last_log = maybe_log(S, A)},
@@ -551,6 +553,17 @@ store_peer_receipts(S, Pid, NewHdrs, Hashes, Entries) ->
             end;
         {error, Reason} ->
             logger:debug("etherlang: peer receipts unavailable (~p)", [Reason])
+    end.
+
+%% Best-effort pool refresh after new blocks: revalidate pending
+%% transactions against the fresh head state (drops the newly stale).
+refresh_pool(S) ->
+    try
+        {HeadN, _} = eth_chain:head(S#st.chain),
+        {ok, Block, _} = eth_chain:get_by_number(S#st.chain, HeadN),
+        ok = eth_txpool:set_state(eth_state:new(Block, #{}))
+    catch _:_ ->
+        ok
     end.
 
 header_number(H) when is_list(H) ->

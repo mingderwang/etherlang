@@ -16,8 +16,8 @@ fidelity caveats are listed in README's TODO and repeated here in §9.
 etherlang is an Erlang/OTP application that speaks the Ethereum JSON-RPC
 interface. It is **not** a full Ethereum execution client:
 
-- it runs devp2p/RLPx only opt-in (peer discovery, `eth/68` sync and
-  receipts are experimental and off by default),
+- it runs devp2p/RLPx opt-in (peer discovery, `eth/68` + snap sync,
+  tx gossip), with upstream RPC as the dependable fallback,
 - it does not run the beacon chain or vote in consensus,
 - it does not execute transactions (no mempool, no miner, no authoring),
 - it does not maintain the state trie.
@@ -303,26 +303,29 @@ Design (eth_call.erl + eth_state.erl + eth_evm.erl ~900 lines + precompiles):
   edge cases, dropped child-frame logs, missing warm/cold accesses) are
   tracked in README TODO items 1–5.
 
-## 9. Known limitations (v0.6.0)
+## 9. Known limitations (v0.7.0)
 
 1. EVM fidelity gaps (see §8) — these can return *correct-looking-but-wrong*
    data on exotic code paths, hence the proxy fallback is the safety net.
-2. No consensus participation, no mempool, no authoring.
-3. devp2p is opt-in and young: discovery/RLPx/`eth` sync, auto-dial and strict
-   ForkID are implemented and loopback-tested, but live-peering breadth
-   (against diverse real clients) is not yet demonstrated — upstream RPC
-   remains the dependable fallback by design (all configurable).
+2. No consensus participation, no block production.
+3. devp2p is opt-in and young: discovery/RLPx/`eth`+snap sync, tx gossip,
+   auto-dial and strict ForkID are implemented and loopback-tested, but
+   live-peering breadth (against diverse real clients) is not yet
+   demonstrated — upstream RPC remains the dependable fallback by design
+   (all configurable).
 4. Blobs are not stored/extended; KZG `0x0A` is proxied.
 5. Header-only blocks proxy `Full=true` requests rather than serving bodies.
 6. `eth_getLogs` serves ranges capped at 1024 blocks from the receipts store;
-   wider ranges proxy upstream. Receipt serving needs the receipts store
-   populated (peer sync path); pure-RPC syncs keep proxying receipts.
-7. The state cache TTL for tags is a freshness/size trade-off; concurrent
+   wider ranges proxy upstream. Receipt/state serving needs the respective
+   stores populated (peer/snap sync paths); pure-RPC syncs keep proxying.
+7. Snap serving carries no proofs (leaf store only): strict requesters
+   reject our ranges; full proof serving needs inner-node retention.
+8. The state cache TTL for tags is a freshness/size trade-off; concurrent
    readers share it safely behind the `eth_state` owner.
 
 ## 10. Testing and the live harness
 
-- 166 eunit tests in `apps/etherlang/test/`, exercised with
+- 185 eunit tests in `apps/etherlang/test/`, exercised with
   `rebar3 eunit` (compiles to `_build/{default,node2}`).
 - Two local nodes (node A `:8545`, node B `:8546`) + a Docker deployment
   (`Dockerfile`, `docker-compose` with ethstats agents) all run the same
@@ -334,7 +337,7 @@ Design (eth_call.erl + eth_state.erl + eth_evm.erl ~900 lines + precompiles):
 ## 11. Roadmap direction
 
 Close EVM fidelity TODOs (transient storage, cold/warm semantics, precise gas,
-better revert value/error reporting), then consider: tx pool with local
-`eth_send*`, state-trie sync toward `eth_getBalance` from local state, native
-blob transport, a second upstream with automatic failover, and state prefetch
-warmers to cut cold `eth_call` latency.
+better revert value/error reporting), then consider: block building from the
+pending pool, state-trie sync toward full `eth_getBalance` independence,
+native blob transport, a second upstream with automatic failover, and state
+prefetch warmers to cut cold `eth_call` latency.
