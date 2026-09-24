@@ -231,8 +231,12 @@ do_op(16#07, E, Ctx) -> bin_op(fun eth_word:smod/2, E, Ctx);
 do_op(16#08, E, Ctx) -> tri_op(fun eth_word:addmod/3, E, Ctx);
 do_op(16#09, E, Ctx) -> tri_op(fun eth_word:mulmod/3, E, Ctx);
 do_op(16#0A, E, Ctx) ->
+    %% EIP-2565: gas accounts for both modulus and exponent sizes,
+    %% not just the exponent (avoids undercharging for large moduli).
     {Base, E1} = pop(E), {Exp, E2} = pop(E1),
-    Cost = 10 + 50 * byte_size(eth_word:to_bytes(Exp)),
+    Widest = max(byte_size(eth_word:to_bytes(Base)),
+                 byte_size(eth_word:to_bytes(Exp))),
+    Cost = 10 + 50 * Widest,
     case charge(E2, Cost) of
         {ok, E3} -> next(push(E3, eth_word:exp(Base, Exp)), Ctx);
         oog -> oog(E2, Ctx)
@@ -440,14 +444,22 @@ do_op(16#55, E, Ctx) ->
             {Slot, E1} = pop(E), {Val, E2} = pop(E1),
             Addr = s_msg(address, Ctx, <<0:160>>),
             Current = eth_state:storage(Ctx#ctx.state, Addr, Slot),
-            Cost = case Current =:= 0 andalso Val =/= 0 of
-                       true -> 20000;
-                       false -> 2900
-                   end,
+            {Cost, Refund} = case Current =:= Val of
+                true -> {2900, 100};
+                false ->
+                    case Current =:= 0 andalso Val =/= 0 of
+                        true -> {20000, 0};
+                        false -> {2900, case Current =/= 0 andalso Val =:= 0 of
+                                            true -> 4800;
+                                            false -> 0
+                                        end}
+                    end
+            end,
             case charge(E2, Cost) of
                 {ok, E3} ->
                     State1 = eth_state:set_storage(Ctx#ctx.state, Addr, Slot, Val),
-                    next(E3, Ctx#ctx{state = State1});
+                    next(E3#e{refund = E3#e.refund + Refund},
+                         Ctx#ctx{state = State1});
                 oog -> oog(E2, Ctx)
             end
     end;
@@ -660,7 +672,16 @@ do_call(Kind, E, Ctx) ->
                                 {ok, E10} ->
                                     Args = read(E10, ArgsOff, ArgsLen),
                                     Avail = E10#e.gas,
-                                    CallGas = min(GasReq, Avail - Avail div 64),
+                                    %% EIP-2929: value transfers get a
+                                    %% 2300 gas stipend to prevent
+                                    %% reentrancy (callee can only do a
+                                    %% simple transfer, not access storage).
+                                    GasForChild = case Value of
+                                        0 -> GasReq;
+                                        _ -> GasReq + 2300
+                                    end,
+                                    CallGas = min(GasForChild,
+                                                  Avail - Avail div 64),
                                     {ok, E11} = charge(E10, CallGas),
                                     run_call(Kind, To, ToW, Value, Args, CallGas,
                                              RetOff, RetLen, E11, CtxA)
