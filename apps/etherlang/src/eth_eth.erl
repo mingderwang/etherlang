@@ -17,12 +17,14 @@
          decode_status_bin/1, check_status/2]).
 -export([serve_headers/5, verify_chain/2, verify_chain/3]).
 -export([msg_status/1, msg_get_headers/1, msg_headers/1,
-         msg_get_bodies/1, msg_bodies/1, msg_get_receipts/1, msg_receipts/1]).
+         msg_get_bodies/1, msg_bodies/1, msg_get_receipts/1, msg_receipts/1,
+         msg_new_pooled_hashes/1, msg_get_pooled/1, msg_pooled/1]).
 -export([encode_get_headers/4, decode_get_headers_bin/1, decode_headers_bin/1]).
 -export([encode_get_bodies/1, decode_get_bodies_bin/1, decode_bodies_bin/1,
          serve_bodies/2, bodies_tx_root/1, verify_bodies/2]).
 -export([encode_get_receipts/1, decode_get_receipts_bin/1,
          decode_receipts_bin/1, serve_receipts/2, verify_receipts/2]).
+-export([encode_hashes/1, decode_hashes_bin/1, decode_pooled_bin/1]).
 -export([assemble_blocks/2]).
 -export([network_id/0, genesis_hash/0]).
 
@@ -60,6 +62,9 @@ msg_get_bodies(#{base := B}) -> B + 5.
 msg_bodies(#{base := B}) -> B + 6.
 msg_get_receipts(#{base := B}) -> B + 15.
 msg_receipts(#{base := B}) -> B + 16.
+msg_new_pooled_hashes(#{base := B}) -> B + 8.
+msg_get_pooled(#{base := B}) -> B + 9.
+msg_pooled(#{base := B}) -> B + 10.
 
 %% Local Status from the chain head (Chain default eth_chain) plus the
 %% upstream latest totalDifficulty, falling back to the compat constant.
@@ -368,6 +373,46 @@ assemble_block(HeaderRLP, [TxsTerms, UnclesTerms]) ->
     catch _:_ ->
         {error, bad_block}
     end.
+
+%% Pooled-transaction gossip bodies: NewPooledTransactionHashes and
+%% GetPooledTransactions are [32-byte hashes]; PooledTransactions is a
+%% list of full transaction encodings (binary for typed, list for legacy).
+encode_hashes(Hashes) when is_list(Hashes) -> [Hashes].
+
+decode_hashes_bin(Data) when is_binary(Data) ->
+    try
+        case eth_rlp:decode(Data) of
+            {ok, [Hashes], _} when is_list(Hashes) ->
+                case lists:all(fun(H) -> is_binary(H) andalso byte_size(H) =:= 32 end,
+                               Hashes) of
+                    true -> {ok, Hashes};
+                    false -> {error, bad_hashes}
+                end;
+            _ ->
+                {error, bad_hashes}
+        end
+    catch _:_ ->
+        {error, bad_hashes}
+    end.
+
+decode_pooled_bin(Data) when is_binary(Data) ->
+    try
+        case eth_rlp:decode(Data) of
+            {ok, Txs, _} when is_list(Txs) ->
+                case lists:all(fun wellformed_pooled/1, Txs) of
+                    true -> {ok, Txs};
+                    false -> {error, bad_pooled}
+                end;
+            _ ->
+                {error, bad_pooled}
+        end
+    catch _:_ ->
+        {error, bad_pooled}
+    end.
+
+wellformed_pooled(T) when is_binary(T), byte_size(T) > 1 -> true;
+wellformed_pooled(T) when is_list(T), T =/= [] -> true;
+wellformed_pooled(_) -> false.
 
 hex0x(Bin) ->
     <<"0x", (string:lowercase(binary:encode_hex(Bin)))/binary>>.

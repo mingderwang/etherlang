@@ -21,6 +21,7 @@
              hello,
              eth,
              chain,
+             pool,
              fetching = false,
              last_in}).
 
@@ -71,6 +72,7 @@ finish_init(Manager, Sock, Args, Sess) ->
             S = #st{sock = Sock, sess = Sess1, manager = Manager,
                     hello = Hello, eth = undefined,
                     chain = maps:get(chain, Args, eth_chain),
+                    pool = maps:get(pool, Args, eth_txpool),
                     last_in = erlang:monotonic_time(millisecond)},
             case maybe_eth(S, Args, Hello) of
                 {ok, S1} ->
@@ -187,6 +189,17 @@ handle_cast({graceful_stop, Reason}, S) ->
     _ = eth_rlpx:send(S#st.sess, S#st.sock, 1, eth_rlp:encode([Reason])),
     erlang:send_after(2000, self(), graceful_timeout),
     {noreply, S};
+handle_cast({broadcast_hashes, Hashes}, S) ->
+    case S#st.eth of
+        #{base := Base} ->
+            case eth_rlpx:send(S#st.sess, S#st.sock, Base + 8,
+                               eth_rlp:encode(eth_eth:encode_hashes(Hashes))) of
+                {ok, Sess1} -> {noreply, S#st{sess = Sess1}};
+                {error, Reason} -> {stop, Reason, S}
+            end;
+        _ ->
+            {noreply, S}
+    end;
 handle_cast(_Msg, S) -> {noreply, S}.
 
 handle_info(poll, #st{fetching = true} = S) ->
@@ -260,6 +273,12 @@ handle_msg(Code, Data, #st{eth = #{base := Base}} = S)
 handle_msg(Code, Data, #st{eth = #{base := Base}} = S)
   when Code =:= Base + 15 ->
     serve_receipts_req(Data, S);
+handle_msg(Code, Data, #st{eth = #{base := Base}} = S)
+  when Code =:= Base + 8 ->
+    handle_pooled_hashes(Data, S);
+handle_msg(Code, Data, #st{eth = #{base := Base}} = S)
+  when Code =:= Base + 9 ->
+    serve_pooled(Data, S);
 handle_msg(2, _Data, S) ->
     case eth_rlpx:send(S#st.sess, S#st.sock, 3, eth_rlp:encode([])) of
         {ok, Sess1} -> {ok, S#st{sess = Sess1}};
@@ -322,6 +341,106 @@ serve_receipts_req(Data, S) ->
             end;
         {error, _} ->
             {ok, S}
+    end.
+
+%% Inbound pooled-tx announcements: fetch the unknown ones and ingest
+%% them into the pool (validation inside). Best-effort; failures drop.
+handle_pooled_hashes(Data, S) ->
+    #{base := Base} = S#st.eth,
+    case eth_eth:decode_hashes_bin(Data) of
+        {ok, Hashes} ->
+            Wanted = [H || H <- Hashes, not pool_has(S, H)],
+            case Wanted of
+                [] ->
+                    {ok, S};
+                _ ->
+                    Req = eth_rlp:encode(
+                            eth_eth:encode_hashes(lists:sublist(Wanted, 128))),
+                    case eth_rlpx:send(S#st.sess, S#st.sock, Base + 9, Req) of
+                        {ok, Sess1} ->
+                            await_pooled(S#st{sess = Sess1}, Base);
+                        {error, Reason} ->
+                            {stop, Reason, S}
+                    end
+            end;
+        {error, _} ->
+            {ok, S}
+    end.
+
+await_pooled(S, Base) ->
+    case eth_rlpx:recv(S#st.sess, S#st.sock, 10000) of
+        {ok, Code, Data, Sess1} when Code =:= Base + 10 ->
+            S1 = S#st{sess = Sess1,
+                      last_in = erlang:monotonic_time(millisecond)},
+            case eth_eth:decode_pooled_bin(Data) of
+                {ok, Txs} ->
+                    lists:foreach(fun(T) -> ingest_pooled(S1, T) end, Txs),
+                    {ok, S1};
+                {error, _} ->
+                    {ok, S1}
+            end;
+        {ok, _, _, Sess1} ->
+            {ok, S#st{sess = Sess1}};
+        {error, timeout} ->
+            {ok, S};
+        {error, Reason} ->
+            {stop, Reason, S}
+    end.
+
+ingest_pooled(S, T) ->
+    Bin = case T of
+              B when is_binary(B) -> B;
+              L when is_list(L) -> eth_rlp:encode(L)
+          end,
+    case (try eth_txpool:add_raw(pool_name(S), Bin) catch _:_ -> {error, no_pool} end) of
+        {ok, _} -> ok;
+        {error, _} -> ok
+    end.
+
+pool_has(S, H) ->
+    Hex = <<"0x", (string:lowercase(binary:encode_hex(H)))/binary>>,
+    try eth_txpool:has(pool_name(S), Hex)
+    catch _:_ -> true
+    end.
+
+pool_name(S) ->
+    case S#st.pool of
+        undefined -> eth_txpool;
+        Name -> Name
+    end.
+
+%% Serve our pooled transactions by hash (empty element when unknown).
+serve_pooled(Data, S) ->
+    #{base := Base} = S#st.eth,
+    case eth_eth:decode_hashes_bin(Data) of
+        {ok, Hashes} ->
+            Txs = [pooled_term(S, H) || H <- Hashes],
+            case eth_rlpx:send(S#st.sess, S#st.sock, Base + 10,
+                               eth_rlp:encode(Txs)) of
+                {ok, Sess1} -> {ok, S#st{sess = Sess1}};
+                {error, Reason} -> {stop, Reason, S}
+            end;
+        {error, _} ->
+            {ok, S}
+    end.
+
+pooled_term(S, H) ->
+    Hex = <<"0x", (string:lowercase(binary:encode_hex(H)))/binary>>,
+    case try eth_txpool:get(pool_name(S), Hex) catch _:_ -> not_found end of
+        {ok, #{tx := Tx}} ->
+            case eth_tx:to_rlp(Tx) of
+                {ok, <<T, _/binary>> = Enc} when T =:= 16#01; T =:= 16#02; T =:= 16#03 ->
+                    Enc;
+                {ok, Enc} ->
+                    case eth_rlp:decode(Enc) of
+                        {ok, Term, <<>>} -> Term;
+                        _ -> []
+                    end;
+                {error, _} ->
+                    []
+            end;
+        _ ->
+            []
     end.
 
 %% Outbound request/response round trip: send a request and block in the

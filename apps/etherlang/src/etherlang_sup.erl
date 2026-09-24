@@ -89,4 +89,12 @@ init([]) ->
                    []
            end,
 
-    {ok, {SupFlags, [State, Chain, Rpc, Sync] ++ Disc ++ Peer}}.
+    Pool = #{id => eth_txpool,
+             start => {eth_txpool, start_link, [#{max => eth_config:tx_pool_max(),
+                                                  per_sender => eth_config:tx_pool_per_sender()}]},
+             restart => permanent,
+             shutdown => 5000,
+             type => worker,
+             modules => [eth_txpool]},
+
+    {ok, {SupFlags, [State, Chain, Rpc, Sync, Pool] ++ Disc ++ Peer}}.

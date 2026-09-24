@@ -226,6 +226,21 @@ dispatch(<<"eth_getTransactionReceipt">>, [TxHash], State) when is_binary(TxHash
         not_found -> proxy(<<"eth_getTransactionReceipt">>, [TxHash])
     end;
 
+dispatch(<<"eth_sendRawTransaction">>, [RawHex], State) when is_binary(RawHex) ->
+    Pool = maps:get(pool, State, eth_txpool),
+    case parse_raw_tx(RawHex) of
+        {ok, Bin} ->
+            case (try eth_txpool:add_raw(Pool, Bin) catch _:_ -> {error, no_pool} end) of
+                {ok, Hash} ->
+                    eth_peer:broadcast([hex_to_bin(Hash)]),
+                    {ok, Hash};
+                {error, _} = E ->
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end;
+
 dispatch(<<"eth_getLogs">>, [Filter], State) when is_map(Filter) ->
     Chain = maps:get(chain, State, eth_chain),
     case local_logs(Chain, Filter) of
@@ -427,6 +442,17 @@ tl_safe([]) -> [].
 
 norm_hex(B) when is_binary(B) -> string:lowercase(B);
 norm_hex(Other) -> Other.
+
+parse_raw_tx(<<"0x", Rest/binary>>) -> parse_raw_tx(Rest);
+parse_raw_tx(Bin) when is_binary(Bin), byte_size(Bin) > 0 ->
+    try {ok, binary:decode_hex(Bin)}
+    catch _:_ -> {error, bad_tx_hex}
+    end;
+parse_raw_tx(_) ->
+    {error, bad_tx_hex}.
+
+hex_to_bin(<<"0x", Rest/binary>>) -> binary:decode_hex(Rest);
+hex_to_bin(B) when is_binary(B) -> binary:decode_hex(B).
 
 %% Resolve a block-number reference ("latest"/"earliest"/"pending"/
 %% "finalized"/"safe" or a 0x-hex number) to an actual block number for the

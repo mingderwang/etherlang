@@ -30,6 +30,7 @@ init({Name, Opts}) ->
                                        [{"/", eth_rpc_handler,
                                          #{chain => maps:get(chain, Opts, eth_chain),
                                            sync => maps:get(sync, Opts, eth_sync),
+                                           pool => maps:get(pool, Opts, eth_txpool),
                                            max_batch => MaxBatch,
                                            limits => #{tab => Tab, rate => Rate,
                                                        burst => Burst}}}]}]),

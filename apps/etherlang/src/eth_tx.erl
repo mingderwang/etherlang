@@ -5,7 +5,7 @@
 %% EIP-4844/7702 and other types: encoding returns {error, unsupported};
 %% such bodies are served/skipped accordingly, never fabricated.
 
--export([to_rlp/1, from_rlp/1, tx_root/1]).
+-export([to_rlp/1, from_rlp/1, tx_root/1, sender/1]).
 
 %% Encode a JSON-RPC transaction map to wire bytes (type prefix included
 %% for typed transactions).
@@ -123,6 +123,56 @@ bin0x(Bin) -> <<"0x", (string:lowercase(binary:encode_hex(Bin)))/binary>>.
 to_int(I) when is_integer(I) -> I;
 to_int(B) when is_binary(B), byte_size(B) =:= 0 -> 0;
 to_int(B) when is_binary(B) -> binary:decode_unsigned(B).
+
+%% Recover the 20-byte sender address (EIP-155 legacy + EIP-2718 typed).
+sender(Tx) when is_map(Tx) ->
+    try do_sender(Tx)
+    catch _:_ -> {error, bad_signature} end.
+
+do_sender(Tx) ->
+    {Digest, RecID} = sighash(Tx),
+    R = q(Tx, <<"r">>),
+    S = q(Tx, <<"s">>),
+    {ok, Pub} = eth_secp256k1:recover(Digest, R, S, RecID),
+    {ok, binary:part(eth_keccak:hash(Pub), 12, 20)}.
+
+%% {Digest, RecoveryID} for the signature.
+sighash(Tx) ->
+    case tx_type(Tx) of
+        legacy ->
+            F = [q(Tx, <<"nonce">>), q(Tx, <<"gasPrice">>), q(Tx, <<"gas">>),
+                 addr(Tx), q(Tx, <<"value">>), data(Tx, <<"input">>)],
+            V = q(Tx, <<"v">>),
+            case V of
+                V27 when V27 =:= 27; V27 =:= 28 ->
+                    {eth_keccak:hash(eth_rlp:encode(F)), V27 - 27};
+                _ when V >= 35 ->
+                    ChainID = (V - 35) div 2,
+                    {eth_keccak:hash(eth_rlp:encode(F ++ [ChainID, 0, 0])),
+                     (V - 35) rem 2};
+                _ ->
+                    throw(bad_v)
+            end;
+        eip2930 ->
+            Pay = [q(Tx, <<"chainId">>), q(Tx, <<"nonce">>),
+                   q(Tx, <<"gasPrice">>), q(Tx, <<"gas">>),
+                   addr(Tx), q(Tx, <<"value">>), data(Tx, <<"input">>),
+                   access_list(Tx)],
+            {eth_keccak:hash(<<16#01, (eth_rlp:encode(Pay))/binary>>),
+             q(Tx, <<"v">>)};
+        eip1559 ->
+            Pay = [q(Tx, <<"chainId">>), q(Tx, <<"nonce">>),
+                   q(Tx, <<"maxPriorityFeePerGas">>),
+                   q(Tx, <<"maxFeePerGas">>),
+                   q(Tx, <<"gas">>),
+                   addr(Tx), q(Tx, <<"value">>), data(Tx, <<"input">>),
+                   access_list(Tx)],
+            {eth_keccak:hash(<<16#02, (eth_rlp:encode(Pay))/binary>>),
+             q(Tx, <<"v">>)};
+        unsupported ->
+            throw(unsupported_tx_type)
+    end.
+
 tx_root(Txs) when is_list(Txs) ->
     try
         Pairs = lists:map(fun({Tx, I}) ->

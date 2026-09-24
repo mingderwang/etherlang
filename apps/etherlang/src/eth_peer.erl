@@ -8,7 +8,7 @@
 
 -export([start_link/1, dial/3, dial/4, status/0, status/1, peers/0, peers/1,
          get_headers/4, get_headers/5, get_bodies/1, get_bodies/2,
-         get_receipts/1, get_receipts/2]).
+         get_receipts/1, get_receipts/2, broadcast/1, broadcast/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -28,7 +28,8 @@
              target = 10,
              interval = 10000,
              dialing = #{},
-             failures = #{}}).
+             failures = #{},
+             pool}).
 
 start_link(Cfg) ->
     Name = maps:get(name, Cfg, ?MODULE),
@@ -81,6 +82,13 @@ get_receipts(Name, Hashes) when is_atom(Name) ->
 get_receipts(Pid, Hashes) when is_pid(Pid) ->
     gen_server:call(Pid, {get_receipts, Hashes}, 20000).
 
+%% Announce pooled tx hashes to all connected peers (best-effort).
+broadcast(Hashes) -> broadcast(?MODULE, Hashes).
+broadcast(Name, Hashes) ->
+    try gen_server:cast(Name, {broadcast, Hashes})
+    catch _:_ -> ok
+    end.
+
 eth_ready_peer(Name) ->
     case gen_server:call(Name, peers) of
         Infos when is_list(Infos) ->
@@ -108,13 +116,14 @@ init(Cfg) ->
             Target = maps:get(target, Cfg, 10),
             Interval = maps:get(interval, Cfg, 10000),
             Chain = maps:get(chain, Cfg, eth_chain),
+            Pool = maps:get(pool, Cfg, eth_txpool),
             case Disc of
                 undefined -> ok;
                 _ -> erlang:send_after(Interval, self(), dial_tick)
             end,
             {ok, #st{priv = Priv, node_id = NodeID, client_id = client_id(),
                      listen_port = Actual, lsock = LSock,
-                     disc = Disc, chain = Chain,
+                     disc = Disc, chain = Chain, pool = Pool,
                      target = Target, interval = Interval}};
         {error, Reason} ->
             {stop, Reason}
@@ -140,6 +149,12 @@ handle_call(peers, _From, S) ->
 handle_call(_Req, _From, S) ->
     {reply, {error, unknown_call}, S}.
 
+handle_cast({broadcast, Hashes}, S) ->
+    lists:foreach(fun(Pid) ->
+        try gen_server:cast(Pid, {broadcast_hashes, Hashes})
+        catch _:_ -> ok end
+    end, maps:keys(S#st.peers)),
+    {noreply, S};
 handle_cast(_Msg, S) -> {noreply, S}.
 
 handle_info(accept, S) ->
@@ -233,6 +248,7 @@ conn_args(S, RemoteID) ->
     #{privkey => S#st.priv, node_id => S#st.node_id,
       client_id => S#st.client_id, caps => eth_eth:caps(),
       listen_port => S#st.listen_port, chain => S#st.chain,
+      pool => S#st.pool,
       remote_id => RemoteID, timeout => 10000}.
 
 %% Monitored peer entry (peer_up may arrive before dial_result).

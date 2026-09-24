@@ -29,13 +29,16 @@
 %%   RLPX_PORT          - TCP port for RLPx (default 30303)
 %%   PEER_TARGET        - desired peer count for auto-dial (default 10)
 %%   PEER_DIAL_INTERVAL - ms between auto-dial maintenance ticks (default 10000)
+%%   TX_POOL_MAX        - max pooled transactions (default 1024)
+%%   TX_POOL_PER_SENDER - max pooled transactions per sender (default 16)
 
 -export([upstream_url/0, listen_port/0, listen_ip/0, max_batch/0, rate_limit/0,
          rate_burst/0, data_dir/0, start_block/0, concurrency/0,
          body_window/0, chain_retention/0, poll_interval_ms/0, sync_retry_ms/0,
          max_reorg_depth/0, http_timeout_ms/0, sync_budget/0, verify_headers/0,
          evm_enabled/0, discv4_enabled/0, discv4_port/0, discv4_bootnodes/0,
-         rlpx_enabled/0, rlpx_port/0, peer_target/0, peer_dial_interval/0]).
+         rlpx_enabled/0, rlpx_port/0, peer_target/0, peer_dial_interval/0,
+         tx_pool_max/0, tx_pool_per_sender/0]).
 
 -define(DEF_URL, "https://ethereum-sepolia-rpc.publicnode.com").
 -define(DEF_PORT, 8545).
@@ -148,6 +151,10 @@ rlpx_port() -> int_env("RLPX_PORT", rlpx_port, 30303).
 peer_target() -> int_env("PEER_TARGET", peer_target, 10).
 
 peer_dial_interval() -> int_env("PEER_DIAL_INTERVAL", peer_dial_interval, 10000).
+
+tx_pool_max() -> int_env("TX_POOL_MAX", tx_pool_max, 1024).
+
+tx_pool_per_sender() -> int_env("TX_POOL_PER_SENDER", tx_pool_per_sender, 16).
 
 str_env(Env, _Key, Default) ->
     case os:getenv(Env) of
