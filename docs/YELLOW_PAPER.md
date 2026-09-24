@@ -1,6 +1,6 @@
 # etherlang — a yellow-paper style description
 
-**Version**: v0.3.2 (Sepolia). This document describes what the node *is*,
+**Version**: v0.7.0 (Sepolia). This document describes what the node *is*,
 its system model, trust assumptions, data structures, protocol, and the
 properties that fall out of the design. It is not a re-derivation of the
 Ethereum Yellow Paper; it is the design document for an approximately-30k-line
@@ -19,8 +19,9 @@ interface. It is **not** a full Ethereum execution client:
 - it runs devp2p/RLPx opt-in (peer discovery, `eth/68` + snap sync,
   tx gossip), with upstream RPC as the dependable fallback,
 - it does not run the beacon chain or vote in consensus,
-- it does not execute transactions (no mempool, no miner, no authoring),
-- it does not maintain the state trie.
+- it has a transaction pool (gossip, validation, `eth_sendRawTransaction`)
+  but does not mine or author blocks,
+- it maintains a bounded snap state leaf store, not a full state trie,
 
 Instead it syncs canonical blocks **from peers first** (verified headers,
 bodies and receipts over RLPx), falling back to an **upstream Ethereum node
@@ -61,8 +62,8 @@ Trust boundary (all explicit, all configurable or documented):
    upstream node for that block tag.
 
 Non-goals, stated so nobody re-opens them: block production, staking,
-blob/KZG service, per-account fee payment, ARK or mempool participation,
-validators and proposer duties, WebSocket transport.
+blob/KZG service, per-account fee payment, validators and proposer duties,
+WebSocket transport.
 
 ## 3. OTP kernel
 
@@ -276,11 +277,14 @@ owned for the lifetime of the listener.
 `eth_call` is the one reading/writing-experiment method implemented locally.
 Design (eth_call.erl + eth_state.erl + eth_evm.erl ~900 lines + precompiles):
 
-- **State model — lazy fetch + immutable overlay.** The node does not sync the
-  state trie (`eth_state`). Reads go: overlay → ETS cache → upstream JSON-RPC
+- **State model — lazy fetch + immutable overlay + snap state store.**
+  The node maintains a bounded snap state leaf store (accounts/storage/codes
+  fetched via snap sync) plus the `eth_state` cache. Reads go:
+  overlay → ETS cache → local snap store → upstream JSON-RPC
   (`eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`,
-  `eth_getStorageAt`). Cache TTL: **3 s** for tags (`latest`/`pending`/
-  `safe`/`finalized`), **unbounded** for concrete block numbers (immutable).
+  `eth_getStorageAt`). Cache TTL: **3 s** for tags
+  (`latest`/`pending`/`safe`/`finalized`), **unbounded** for concrete
+  block numbers (immutable).
   Writes (SSTORE, value transfers, CREATE'd code) only ever land in the
   **overlay** map of the in-flight call and are discarded on revert — upstream
   state can never be mutated through `eth_call`.
