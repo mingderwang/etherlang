@@ -57,7 +57,7 @@ beacon, validators, or block production).
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
   in-process mock-upstream eunit suite (**166 tests, green**).
-* **Status** — v0.5.0; eunit green (166 tests) and verified live against Sepolia.
+* **Status** — v0.6.0; eunit green (166 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -443,14 +443,15 @@ apps/etherlang/test/
 * EVM fidelity items from the TODO list (revert/value semantics, transient
   scope, gas model, remaining precompiles)
 
-## Release notes v0.4.0 → v0.5.0 (devp2p + receipts)
+## Release notes v0.4.0 → v0.6.0 (devp2p + receipts)
 
 * **v0.4.0** — KZG point-evaluation pairing fix, mainnet fixture green.
-* **v0.5.0** — devp2p stack in pure Erlang: discv4 discovery, RLPx
-  transport, `eth/68` Status/headers/bodies/receipts with strict ForkID,
+* **v0.5.0** — devp2p base in pure Erlang: discv4 discovery, RLPx
+  transport (ECIES, snappy, secp256k1 recovery), MPT.
+* **v0.6.0** — `eth/68` Status/headers/bodies/receipts with strict ForkID,
   auto-dial, peer-first sync with root-verified bodies/receipts; receipts
-  store + local `eth_getTransactionReceipt`/`eth_getLogs`; MPT, secp256k1,
-  ECIES, snappy, tx/receipt RLP codecs. Suite 110 → 166.
+  store + local `eth_getTransactionReceipt`/`eth_getLogs`; tx/receipt RLP
+  codecs. Suite 110 → 166.
 
 ## v0.2.0 release notes (tag: v0.2.0)
 
