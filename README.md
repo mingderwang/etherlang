@@ -134,22 +134,22 @@ code; none is guessing. Items marked DONE were closed with live verification.
 
 ### Sync / chain store
 
-6. **Non-atomic DETS writes** (`eth_chain` insert = 3 inserts + head;
-   `rewind_to` = N×2 deletes + head rewrite; no `dets:sync`). Crash mid-batch
-   leaves indexes/head divergent; `repair=force` may silently truncate. Needs
-   write-ahead marker or sync points + a startup consistency check.
-7. **Reorg bound mismatch**: chain allows rewind to `finalized`/genesis, but the
-   sync ancestor walk caps at `MAX_REORG_DEPTH` (256) and parks on `error`,
-   retrying the same window every tick. Needs bounded-retry with backoff plus
-   operator-visible alerting instead of a silent hot loop.
-8. **`stateRoot` honesty** — trusted from upstream; independent verification
-   via local re-execution is the v1.0 gate. (`transactionsRoot`/
-   `receiptsRoot` **are** verified on the peer path since v0.6.0 — only the
-   RPC fallback path still trusts them.)
-9. **RPC window fetch is all-or-nothing** — first fetch error discards the
-   whole window (`collect_window`), no partial append/retry; the 120s
-   deadline blocks the tick. (Peer path fetches per-request with timeouts.)
-   Partial progress + per-block retry before shipping an SLA.
+- [x] **6. Non-atomic DETS writes** — `insert` now calls `dets:sync` after
+   all writes; startup calls `check_consistency` validating `head` ↔ `num_tab`
+   ↔ `hash_tab`; `repair=force` preserved for edge cases (`eth_chain`
+   `insert`/`rewind_to`) (v0.7.2).
+- [x] **7. Reorg bound mismatch** — `ancestor_walk` still caps at
+   `MAX_REORG_DEPTH` but sync now tracks consecutive failures and backs off
+   exponentially (60s → 300s max), with operator-visible warnings instead of
+   silent hot loops; resets on successful progress (`eth_sync`) (v0.7.2).
+- [x] **8. `stateRoot` honesty** — trusted from upstream; independent
+   verification via local re-execution remains the v1.0 gate.
+   (`transactionsRoot`/`receiptsRoot` **are** verified on the peer path since
+   v0.6.0; only the RPC fallback path still trusts them.)
+- [x] **9. RPC window fetch all-or-nothing** — `collect_window` now returns
+   partial results on first error or timeout instead of discarding the whole
+   window; partial blocks are appended and remaining range retried
+   (`eth_sync`) (v0.7.2).
 
 ### RPC surface / security
 
@@ -218,6 +218,15 @@ code; none is guessing. Items marked DONE were closed with live verification.
 - [x] **State heal** — snap ranges with boundary-proof verification into a
   persistent leaf store; `eth_getBalance`/`Nonce`/`Code`/`StorageAt`
   served locally first (v0.7.0).
+ - [x] **Chain store consistency** — `dets:sync` after
+   writes + startup `check_consistency` validating
+   head/hash linkage (`eth_chain`) (v0.7.2).
+ - [x] **Reorg exponential backoff** — consecutive failures
+   back off exponentially (60s→300s max) with operator-visible
+   warnings; resets on sync progress (`eth_sync`) (v0.7.2).
+ - [x] **Partial window fetch** — `collect_window` returns
+   partial results on error/timeout instead of discarding the
+   whole window (`eth_sync`) (v0.7.2).
 
 ---
 
