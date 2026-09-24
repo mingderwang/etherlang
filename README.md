@@ -479,7 +479,7 @@ apps/etherlang/test/
 * EVM fidelity items from the TODO list (revert/value semantics, transient
   scope, gas model, remaining precompiles)
 
-## Release notes v0.4.0 → v0.6.0 (devp2p + receipts)
+## Release notes v0.4.0 → v0.7.0 (devp2p + receipts)
 
 * **v0.4.0** — KZG point-evaluation pairing fix, mainnet fixture green.
 * **v0.5.0** — devp2p base in pure Erlang: discv4 discovery, RLPx
