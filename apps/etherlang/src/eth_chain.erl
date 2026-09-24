@@ -18,6 +18,7 @@
 %% Storage layout (DETS "set" tables):
 %%   num_tab   : {{Num}}        -> {Hash, Block, Full}
 %%   hash_tab  : {{Hash}}       -> Num
+%%   receipts  : {{Num}}        -> [ReceiptMap]
 %%   meta_tab  : head           -> {Num, Hash}
 %%               finalized      -> Num
 %%               low            -> Num  (lowest block number still retained)
@@ -36,6 +37,8 @@
          rewind/1, rewind/2,
          get_by_number/1, get_by_number/2,
          get_by_hash/1, get_by_hash/2,
+         receipts/1, receipts/2, put_receipts/2, put_receipts/3,
+         tx_block/1, tx_block/2,
          canonical_hash/1, canonical_hash/2,
          highest/1, has_block/1, has_block/2, size/1,
          finalized/0, finalized/1, set_finalized/2]).
@@ -53,7 +56,9 @@
              verify = true :: boolean(),
              num_tab = num_tab,
              hash_tab = hash_tab,
-             meta_tab = meta_tab}).
+             meta_tab = meta_tab,
+             receipts_tab = receipts_tab,
+             tx_tab = tx_tab}).
 
 start_link(Dir) -> start_link(eth_chain, Dir).
 start_link(Name, Dir) when is_atom(Name) ->
@@ -83,6 +88,17 @@ get_by_number(Name, N) -> gen_server:call(Name, {get_by_number, N}).
 
 get_by_hash(H) -> get_by_hash(eth_chain, H).
 get_by_hash(Name, H) -> gen_server:call(Name, {get_by_hash, H}).
+
+%% Stored receipts for a block number: {ok, [ReceiptMap]} | not_found.
+receipts(N) -> receipts(eth_chain, N).
+receipts(Name, N) -> gen_server:call(Name, {receipts, N}).
+
+put_receipts(N, Receipts) -> put_receipts(eth_chain, N, Receipts).
+put_receipts(Name, N, Receipts) -> gen_server:call(Name, {put_receipts, N, Receipts}).
+
+%% Block number containing a transaction hash.
+tx_block(TxHash) -> tx_block(eth_chain, TxHash).
+tx_block(Name, TxHash) -> gen_server:call(Name, {tx_block, TxHash}).
 
 canonical_hash(N) -> canonical_hash(eth_chain, N).
 canonical_hash(Name, N) -> gen_server:call(Name, {canonical_hash, N}).
@@ -115,12 +131,18 @@ init({Name, Dir}) ->
     NumTab = list_to_atom(Prefix ++ "num_tab"),
     HashTab = list_to_atom(Prefix ++ "hash_tab"),
     MetaTab = list_to_atom(Prefix ++ "meta_tab"),
+    ReceiptsTab = list_to_atom(Prefix ++ "receipts_tab"),
+    TxTab = list_to_atom(Prefix ++ "tx_tab"),
     {ok, _} = dets:open_file(NumTab, [{file, filename:join(Dir, "chain.num.dets")},
                                       {type, set}, {repair, force}]),
     {ok, _} = dets:open_file(HashTab, [{file, filename:join(Dir, "chain.hash.dets")},
                                        {type, set}, {repair, force}]),
     {ok, _} = dets:open_file(MetaTab, [{file, filename:join(Dir, "chain.meta.dets")},
                                        {type, set}, {repair, force}]),
+    {ok, _} = dets:open_file(ReceiptsTab, [{file, filename:join(Dir, "chain.receipts.dets")},
+                                           {type, set}, {repair, force}]),
+    {ok, _} = dets:open_file(TxTab, [{file, filename:join(Dir, "chain.tx.dets")},
+                                     {type, set}, {repair, force}]),
     Head = case dets:lookup(MetaTab, head) of
                [{head, {N, H}}] -> {N, H};
                _ -> undefined
@@ -145,7 +167,8 @@ init({Name, Dir}) ->
     {ok, #st{dir = Dir, head = Head, finalized = Fin, low = Low,
              retention = Retention,
              verify = eth_config:verify_headers(),
-             num_tab = NumTab, hash_tab = HashTab, meta_tab = MetaTab}}.
+             num_tab = NumTab, hash_tab = HashTab, meta_tab = MetaTab,
+             receipts_tab = ReceiptsTab, tx_tab = TxTab}}.
 
 handle_call(head, _From, S) ->
     {reply, S#st.head, S};
@@ -176,6 +199,24 @@ handle_call({get_by_hash, H}, _From, S) ->
             end;
         [] ->
             {reply, not_found, S}
+    end;
+
+handle_call({receipts, N}, _From, S) ->
+    case dets:lookup(S#st.receipts_tab, {N}) of
+        [{{N}, Receipts}] -> {reply, {ok, Receipts}, S};
+        [] -> {reply, not_found, S}
+    end;
+
+handle_call({put_receipts, N, Receipts}, _From, S) when is_integer(N), is_list(Receipts) ->
+    ok = dets:insert(S#st.receipts_tab, {{N}, Receipts}),
+    {reply, ok, S};
+handle_call({put_receipts, _, _}, _From, S) ->
+    {reply, {error, bad_arg}, S};
+
+handle_call({tx_block, TxHash}, _From, S) ->
+    case dets:lookup(S#st.tx_tab, {TxHash}) of
+        [{{TxHash}, Num}] -> {reply, {ok, Num}, S};
+        [] -> {reply, not_found, S}
     end;
 
 handle_call({append, Blocks}, _From, S) ->
@@ -218,7 +259,8 @@ handle_info(_Info, S) -> {noreply, S}.
 terminate(_Reason, S) ->
     lists:foreach(fun(T) ->
                           _ = try dets:close(T) catch _:_ -> ok end
-                  end, [S#st.num_tab, S#st.hash_tab, S#st.meta_tab]),
+                  end, [S#st.num_tab, S#st.hash_tab, S#st.meta_tab,
+                        S#st.receipts_tab, S#st.tx_tab]),
     ok.
 
 code_change(_OldVsn, S, _Extra) -> {ok, S}.
@@ -310,16 +352,18 @@ reorg_rewind(S, CA) ->
     end.
 
 insert(S, Num, Hash, Block, Full) ->
-    %% If a different block already occupies Num, retire its stale hash index.
+    %% If a different block already occupies Num, retire its stale indexes.
     case dets:lookup(S#st.num_tab, {Num}) of
-        [{{Num}, {OldHash, _, _}}] when OldHash =/= Hash ->
-            ok = dets:delete(S#st.hash_tab, {{OldHash}});
+        [{{Num}, {OldHash, OldBlock, _}}] when OldHash =/= Hash ->
+            ok = dets:delete(S#st.hash_tab, {{OldHash}}),
+            ok = unindex_txs(S, OldBlock);
         _ ->
             ok
     end,
     ok = dets:insert(S#st.num_tab, {{Num}, {Hash, Block, Full}}),
     ok = dets:insert(S#st.hash_tab, {{Hash}, Num}),
     ok = dets:insert(S#st.meta_tab, {head, {Num, Hash}}),
+    ok = index_txs(S, Num, Block, Full),
     S#st{head = {Num, Hash}}.
 
 %% ---------------------------------------------------------------------------
@@ -350,9 +394,11 @@ delete_range(S, From, To, Skip) when From < To ->
                 ok;
            (N) ->
                 case dets:lookup(S#st.num_tab, {N}) of
-                    [{{N}, {H, _, _}}] ->
+                    [{{N}, {H, Block, _}}] ->
                         ok = dets:delete(S#st.hash_tab, {{H}}),
-                        ok = dets:delete(S#st.num_tab, {N});
+                        ok = dets:delete(S#st.num_tab, {N}),
+                        ok = dets:delete(S#st.receipts_tab, {N}),
+                        ok = unindex_txs(S, Block);
                     [] ->
                         ok
                 end
@@ -371,9 +417,11 @@ rewind_to(#st{head = {HN, _}} = S, CA) when HN > CA ->
     lists:foreach(
         fun(K) ->
             case dets:lookup(S#st.num_tab, {K}) of
-                [{{K}, {H, _, _}}] ->
+                [{{K}, {H, Block, _}}] ->
                     ok = dets:delete(S#st.num_tab, {K}),
-                    ok = dets:delete(S#st.hash_tab, {{H}});
+                    ok = dets:delete(S#st.hash_tab, {{H}}),
+                    ok = dets:delete(S#st.receipts_tab, {K}),
+                    ok = unindex_txs(S, Block);
                 [] ->
                     ok
             end
@@ -394,6 +442,40 @@ lookup_canonical(S, N) ->
     case dets:lookup(S#st.num_tab, {N}) of
         [{{N}, {Hash, _, _}}] -> Hash;
         [] -> undefined
+    end.
+
+index_txs(S, Num, Block, true) ->
+    case maps:get(<<"transactions">>, Block, []) of
+        Txs when is_list(Txs) ->
+            lists:foreach(fun(Tx) ->
+                case Tx of
+                    #{<<"hash">> := H} when is_binary(H) ->
+                        dets:insert(S#st.tx_tab, {{H}, Num});
+                    _ ->
+                        ok
+                end
+            end, Txs),
+            ok;
+        _ ->
+            ok
+    end;
+index_txs(_, _, _, _) ->
+    ok.
+
+unindex_txs(S, Block) ->
+    case maps:get(<<"transactions">>, Block, []) of
+        Txs when is_list(Txs) ->
+            lists:foreach(fun(Tx) ->
+                case Tx of
+                    #{<<"hash">> := H} when is_binary(H) ->
+                        dets:delete(S#st.tx_tab, {{H}});
+                    _ ->
+                        ok
+                end
+            end, Txs),
+            ok;
+        _ ->
+            ok
     end.
 
 block_hash(Block) -> maps:get(<<"hash">>, Block, <<>>).

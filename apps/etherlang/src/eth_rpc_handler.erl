@@ -219,6 +219,20 @@ dispatch(<<"eth_call">>, Params, _State) ->
             end
     end;
 
+dispatch(<<"eth_getTransactionReceipt">>, [TxHash], State) when is_binary(TxHash) ->
+    Chain = maps:get(chain, State, eth_chain),
+    case local_receipt(Chain, TxHash) of
+        {ok, Receipt} -> {ok, Receipt};
+        not_found -> proxy(<<"eth_getTransactionReceipt">>, [TxHash])
+    end;
+
+dispatch(<<"eth_getLogs">>, [Filter], State) when is_map(Filter) ->
+    Chain = maps:get(chain, State, eth_chain),
+    case local_logs(Chain, Filter) of
+        {ok, Logs} -> {ok, Logs};
+        {error, _} -> proxy(<<"eth_getLogs">>, [Filter])
+    end;
+
 dispatch(_Method, Params, _State) ->
     proxy(_Method, Params).
 
@@ -233,6 +247,186 @@ proxy(Method, Params) ->
         {error, Reason} ->
             {error, Reason}
     end.
+
+%% Local receipt: tx index -> block -> stored receipts -> response with
+%% block/tx context attached. `from' is null until ecrecover lands.
+local_receipt(Chain, TxHash) ->
+    case (try eth_chain:tx_block(Chain, TxHash) catch _:_ -> not_found end) of
+        {ok, Num} ->
+            case (try eth_chain:get_by_number(Chain, Num) catch _:_ -> not_found end) of
+                {ok, Block, true} ->
+                    case (try eth_chain:receipts(Chain, Num) catch _:_ -> not_found end) of
+                        {ok, Receipts} ->
+                            find_receipt(Block, Num, TxHash, Receipts);
+                        _ ->
+                            not_found
+                    end;
+                _ ->
+                    not_found
+            end;
+        _ ->
+            not_found
+    end.
+
+find_receipt(Block, Num, TxHash, Receipts) ->
+    Txs = maps:get(<<"transactions">>, Block, []),
+    BlockHash = maps:get(<<"hash">>, Block, undefined),
+    find_idx(BlockHash, Num, TxHash, lists:zip(Txs, Receipts), 0).
+
+find_idx(BlockHash, Num, TxHash, Pairs, Idx) ->
+    find_idx(BlockHash, Num, TxHash, Pairs, Idx, 0).
+
+find_idx(_, _, _, [], _, _) ->
+    not_found;
+find_idx(BlockHash, Num, TxHash, [{Tx, R} | Rest], Idx, PrevCum)
+  when is_map(Tx), is_map(R) ->
+    Cum = cum_value(R),
+    TxGas = Cum - PrevCum,
+    case maps:get(<<"hash">>, Tx, undefined) of
+        TxHash ->
+            {ok, receipt_response(BlockHash, Num, TxHash, Idx, Tx, R,
+                                  Cum, TxGas)};
+        _ ->
+            find_idx(BlockHash, Num, TxHash, Rest, Idx + 1, Cum)
+    end;
+find_idx(BlockHash, Num, TxHash, [_ | Rest], Idx, PrevCum) ->
+    find_idx(BlockHash, Num, TxHash, Rest, Idx + 1, PrevCum).
+
+cum_value(R) ->
+    to_int(maps:get(<<"cumulative_gas_used">>, R,
+                    maps:get(<<"cumulativeGasUsed">>, R, 0))).
+
+to_int(I) when is_integer(I) -> I;
+to_int(B) when is_binary(B) ->
+    try eth_hex:decode(B) catch _:_ -> 0 end;
+to_int(_) -> 0.
+
+receipt_response(BlockHash, Num, TxHash, Idx, Tx, R, Cum, TxGas) ->
+    Logs = enrich_logs(maps:get(<<"logs">>, R, []), BlockHash, Num, TxHash, Idx, 0),
+    #{<<"transactionHash">> => TxHash,
+      <<"transactionIndex">> => eth_hex:encode_int(Idx),
+      <<"blockHash">> => BlockHash,
+      <<"blockNumber">> => eth_hex:encode_int(Num),
+      <<"from">> => maps:get(<<"from">>, Tx, null),
+      <<"to">> => maps:get(<<"to">>, Tx, null),
+      <<"cumulativeGasUsed">> => eth_hex:encode_int(Cum),
+      <<"gasUsed">> => eth_hex:encode_int(TxGas),
+      <<"contractAddress">> => maps:get(<<"contractAddress">>, R, null),
+      <<"logs">> => Logs,
+      <<"logsBloom">> => maps:get(<<"logs_bloom">>, R, maps:get(<<"logsBloom">>, R, <<"0x">>)),
+      <<"status">> => maps:get(<<"status">>, R, <<"0x1">>),
+      <<"type">> => maps:get(<<"type">>, R, <<"0x0">>)}.
+
+enrich_logs([], _, _, _, _, _) -> [];
+enrich_logs([L | Rest], BlockHash, Num, TxHash, TxIdx, LogIdx) ->
+    [L#{<<"blockHash">> => BlockHash,
+        <<"blockNumber">> => eth_hex:encode_int(Num),
+        <<"transactionHash">> => TxHash,
+        <<"transactionIndex">> => eth_hex:encode_int(TxIdx),
+        <<"logIndex">> => eth_hex:encode_int(LogIdx),
+        <<"removed">> => false}
+     | enrich_logs(Rest, BlockHash, Num, TxHash, TxIdx, LogIdx + 1)].
+
+%% Local log filter over stored receipts. Range capped to keep scans bounded.
+-define(MAX_LOG_RANGE, 1024).
+
+local_logs(Chain, Filter) ->
+    try
+        {From, To} = log_range(Chain, Filter),
+        case To - From =< ?MAX_LOG_RANGE of
+            false -> {error, range_too_wide};
+            true ->
+                Addrs = log_addrs(maps:get(<<"address">>, Filter, undefined)),
+                Topics = maps:get(<<"topics">>, Filter, []),
+                Logs = lists:append(
+                         [block_logs(Chain, N, Addrs, Topics) ||
+                             N <- lists:seq(From, To)]),
+                {ok, Logs}
+        end
+    catch _:_ ->
+        {error, bad_filter}
+    end.
+
+log_range(Chain, Filter) ->
+    HeadN = local_head_num(Chain),
+    From = case maps:get(<<"fromBlock">>, Filter, <<"latest">>) of
+               <<"earliest">> -> 0;
+               B when is_binary(B) -> log_num(Chain, B)
+           end,
+    To = case maps:get(<<"toBlock">>, Filter, <<"latest">>) of
+             <<"earliest">> -> 0;
+             B2 when is_binary(B2) -> log_num(Chain, B2)
+         end,
+    {max(From, 0), min(To, HeadN)}.
+
+log_num(Chain, <<"latest">>) -> max(local_head_num(Chain), 0);
+log_num(Chain, <<"pending">>) -> max(local_head_num(Chain), 0);
+log_num(Chain, <<"finalized">>) -> finality_num(Chain);
+log_num(Chain, <<"safe">>) -> finality_num(Chain);
+log_num(_Chain, <<"earliest">>) -> 0;
+log_num(_Chain, Hex) -> eth_hex:decode(Hex).
+
+log_addrs(undefined) -> any;
+log_addrs(A) when is_binary(A) -> [norm_hex(A)];
+log_addrs(L) when is_list(L) -> [norm_hex(A) || A <- L].
+
+block_logs(Chain, N, Addrs, Topics) ->
+    case (try eth_chain:get_by_number(Chain, N) catch _:_ -> not_found end) of
+        {ok, Block, true} ->
+            case (try eth_chain:receipts(Chain, N) catch _:_ -> not_found end) of
+                {ok, Receipts} ->
+                    BlockHash = maps:get(<<"hash">>, Block, undefined),
+                    Txs = maps:get(<<"transactions">>, Block, []),
+                    lists:append(
+                      [receipt_logs(BlockHash, N, Tx, R, Idx, Addrs, Topics) ||
+                          {{Tx, R}, Idx} <- lists:zip(lists:zip(Txs, Receipts),
+                                                      lists:seq(0, length(Receipts) - 1))]);
+                _ ->
+                    []
+            end;
+        _ ->
+            []
+    end.
+
+receipt_logs(_BlockHash, _N, Tx, _R, _Idx, _Addrs, _Topics) when not is_map(Tx) ->
+    [];
+receipt_logs(BlockHash, N, Tx, R, Idx, Addrs, Topics) when is_map(R) ->
+    TxHash = maps:get(<<"hash">>, Tx, undefined),
+    Logs = enrich_logs(maps:get(<<"logs">>, R, []), BlockHash, N, TxHash, Idx, 0),
+    [L || L <- Logs, log_matches(L, Addrs, Topics)].
+
+log_matches(Log, any, []) -> is_map(Log);
+log_matches(Log, Addrs, Topics) ->
+    addr_matches(maps:get(<<"address">>, Log, undefined), Addrs) andalso
+    topics_match(maps:get(<<"topics">>, Log, []), Topics).
+
+addr_matches(_, any) -> true;
+addr_matches(A, Addrs) when is_binary(A) ->
+    lists:member(norm_hex(A), Addrs);
+addr_matches(_, _) -> false.
+
+topics_match(_, []) -> true;
+topics_match(Got, [null | Rest]) ->
+    topics_match(tl_safe(Got), Rest);
+topics_match(Got, [F | Rest]) when is_binary(F) ->
+    case Got of
+        [G | Gs] -> norm_hex(G) =:= norm_hex(F) andalso topics_match(Gs, Rest);
+        [] -> false
+    end;
+topics_match(Got, [Fs | Rest]) when is_list(Fs) ->
+    case Got of
+        [G | Gs] ->
+            lists:any(fun(F) -> norm_hex(G) =:= norm_hex(F) end, Fs) andalso
+            topics_match(Gs, Rest);
+        [] -> false
+    end;
+topics_match(_, _) -> false.
+
+tl_safe([_ | T]) -> T;
+tl_safe([]) -> [].
+
+norm_hex(B) when is_binary(B) -> string:lowercase(B);
+norm_hex(Other) -> Other.
 
 %% Resolve a block-number reference ("latest"/"earliest"/"pending"/
 %% "finalized"/"safe" or a 0x-hex number) to an actual block number for the

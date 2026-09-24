@@ -165,6 +165,20 @@ handle_call({get_bodies, Hashes}, _From, S) ->
             erlang:send_after(?POLL_MS, self(), poll),
             {reply, Reply, S2}
     end;
+handle_call({get_receipts, Hashes}, _From, S) ->
+    case S#st.eth of
+        undefined ->
+            {reply, {error, no_eth}, S};
+        #{base := Base} ->
+            Req = eth_eth:encode_get_receipts(Hashes),
+            {Reply, S1} = fetch_request(S#st{fetching = true}, Base + 15,
+                                        eth_rlp:encode(Req), Base + 16,
+                                        fun eth_eth:decode_receipts_bin/1,
+                                        fun(_) -> ok end),
+            S2 = S1#st{fetching = false},
+            erlang:send_after(?POLL_MS, self(), poll),
+            {reply, Reply, S2}
+    end;
 handle_call(_Req, _From, S) ->
     {reply, {error, unknown_call}, S}.
 
@@ -243,6 +257,9 @@ handle_msg(Code, Data, #st{eth = #{base := Base}} = S)
 handle_msg(Code, Data, #st{eth = #{base := Base}} = S)
   when Code =:= Base + 5 ->
     serve_bodies_req(Data, S);
+handle_msg(Code, Data, #st{eth = #{base := Base}} = S)
+  when Code =:= Base + 15 ->
+    serve_receipts_req(Data, S);
 handle_msg(2, _Data, S) ->
     case eth_rlpx:send(S#st.sess, S#st.sock, 3, eth_rlp:encode([])) of
         {ok, Sess1} -> {ok, S#st{sess = Sess1}};
@@ -279,6 +296,24 @@ serve_bodies_req(Data, S) ->
                 {ok, Bodies} ->
                     case eth_rlpx:send(S#st.sess, S#st.sock,
                                        Base + 6, eth_rlp:encode(Bodies)) of
+                        {ok, Sess1} -> {ok, S#st{sess = Sess1}};
+                        {error, Reason} -> {stop, Reason}
+                    end;
+                {error, _} ->
+                    {ok, S}
+            end;
+        {error, _} ->
+            {ok, S}
+    end.
+
+serve_receipts_req(Data, S) ->
+    #{base := Base} = S#st.eth,
+    case eth_eth:decode_get_receipts_bin(Data) of
+        {ok, Hashes} ->
+            case eth_eth:serve_receipts(S#st.chain, Hashes) of
+                {ok, Receipts} ->
+                    case eth_rlpx:send(S#st.sess, S#st.sock,
+                                       Base + 16, eth_rlp:encode(Receipts)) of
                         {ok, Sess1} -> {ok, S#st{sess = Sess1}};
                         {error, Reason} -> {stop, Reason}
                     end;

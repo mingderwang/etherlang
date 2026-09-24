@@ -18,9 +18,12 @@ peer_sync() ->
     {ok, _} = eth_chain:start_link(chain_ps_con, DirC),
     try
         {_, Blocks0} = eth_test_util:make_blocks(0, 6, z0(), 0),
-        Blocks = consistent(Blocks0),
-        ok = eth_chain:append(chain_ps_srv, pair(Blocks)),
-        ExpectHead = {5, maps:get(<<"hash">>, lists:nth(6, Blocks))},
+        {NumBlocks, NumReceipts} = consistent(Blocks0),
+        ok = eth_chain:append(chain_ps_srv, pair_blocks(NumBlocks)),
+        ok = lists:foldl(fun({N, Rs}, ok) ->
+            eth_chain:put_receipts(chain_ps_srv, N, Rs)
+        end, ok, NumReceipts),
+        ExpectHead = {5, maps:get(<<"hash">>, element(2, lists:nth(6, NumBlocks)))},
         PrivA = eth_secp256k1:generate_key(),
         PrivB = eth_secp256k1:generate_key(),
         BPort = eth_test_util:free_port(),
@@ -53,10 +56,16 @@ peer_sync() ->
                                         start_block => latest}),
         try
             ok = wait_head(chain_ps_con, ExpectHead, 400),
+            ok = wait_receipts(chain_ps_con, 5, 2, 200),
             %% Full bodies arrived too (not header-only stubs).
             {ok, Got, true} = eth_chain:get_by_number(chain_ps_con, 5),
             ?assertEqual(2, length(maps:get(<<"transactions">>, Got))),
-            ?assert(is_map(hd(maps:get(<<"transactions">>, Got))))
+            ?assert(is_map(hd(maps:get(<<"transactions">>, Got)))),
+            %% Receipts were fetched, verified, and stored.
+            {ok, Stored} = eth_chain:receipts(chain_ps_con, 5),
+            ?assertEqual(2, length(Stored)),
+            [Tx5 | _] = maps:get(<<"transactions">>, Got),
+            {ok, 5} = eth_chain:tx_block(chain_ps_con, maps:get(<<"hash">>, Tx5))
         after
             stop(sync_ps),
             stop(peer_ps_a), stop(peer_ps_b),
@@ -74,21 +83,47 @@ wait_head(Chain, Expect, N) ->
         _ -> timer:sleep(100), wait_head(Chain, Expect, N - 1)
     end.
 
-pair(Blocks) ->
-    [{eth_hex:decode(maps:get(<<"number">>, B)), B, true} || B <- Blocks].
+wait_receipts(_Chain, _Num, _Count, 0) -> error(peer_receipts_timeout);
+wait_receipts(Chain, Num, Count, N) ->
+    case eth_chain:receipts(Chain, Num) of
+        {ok, Rs} when length(Rs) =:= Count -> ok;
+        _ -> timer:sleep(100), wait_receipts(Chain, Num, Count, N - 1)
+    end.
 
-%% Fixture blocks with transactionsRoot/hash/parentHash recomputed so
-%% bodies verify against headers (fixtures ship zero roots).
+pair_blocks(NumBlocks) ->
+    [{Num, B, true} || {Num, B} <- NumBlocks].
+
+%% Fixture blocks with transactionsRoot/receiptsRoot/hash/parentHash
+%% recomputed so bodies AND receipts verify (fixtures ship zero roots).
+%% Returns {Blocks, [{Num, Receipts}]}.
 consistent(Blocks) ->
-    {Out, _} = lists:foldl(fun(B, {Acc, Parent}) ->
-        {ok, Root} = eth_tx:tx_root(maps:get(<<"transactions">>, B)),
+    {Out, Rcts, _} = lists:foldl(fun(B, {Acc, RAcc, Parent}) ->
+        Txs = maps:get(<<"transactions">>, B),
+        {ok, TxRoot} = eth_tx:tx_root(Txs),
+        Receipts = receipts_for(Txs),
+        {ok, RcRoot} = eth_receipt:receipt_root(Receipts),
         B1 = B#{<<"parentHash">> => Parent,
-                <<"transactionsRoot">> => hex0x(Root)},
+                <<"transactionsRoot">> => hex0x(TxRoot),
+                <<"receiptsRoot">> => hex0x(RcRoot)},
         {ok, H} = eth_header:hash(B1),
         B2 = B1#{<<"hash">> => hex0x(H)},
-        {[B2 | Acc], hex0x(H)}
-    end, {[], z0()}, Blocks),
-    lists:reverse(Out).
+        Num = eth_hex:decode(maps:get(<<"number">>, B2)),
+        {[{Num, B2} | Acc], [{Num, Receipts} | RAcc], hex0x(H)}
+    end, {[], [], z0()}, Blocks),
+    {lists:reverse(Out), lists:reverse(Rcts)}.
+
+receipts_for(Txs) ->
+    {Rs, _} = lists:foldl(fun(Tx, {Acc, Cum}) ->
+        Gas = tx_gas(Tx),
+        {[#{<<"type">> => <<"0x0">>, <<"status">> => <<"0x1">>,
+             <<"cumulative_gas_used">> => eth_hex:encode_int(Cum + Gas),
+             <<"logs">> => []} | Acc], Cum + Gas}
+    end, {[], 0}, Txs),
+    lists:reverse(Rs).
+
+tx_gas(#{<<"gas">> := G}) ->
+    try eth_hex:decode(G) catch _:_ -> 21000 end;
+tx_gas(_) -> 21000.
 
 hex0x(Bin) ->
     <<"0x", (string:lowercase(binary:encode_hex(Bin)))/binary>>.

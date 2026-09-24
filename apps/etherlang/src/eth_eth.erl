@@ -17,10 +17,12 @@
          decode_status_bin/1, check_status/2]).
 -export([serve_headers/5, verify_chain/2, verify_chain/3]).
 -export([msg_status/1, msg_get_headers/1, msg_headers/1,
-         msg_get_bodies/1, msg_bodies/1]).
+         msg_get_bodies/1, msg_bodies/1, msg_get_receipts/1, msg_receipts/1]).
 -export([encode_get_headers/4, decode_get_headers_bin/1, decode_headers_bin/1]).
 -export([encode_get_bodies/1, decode_get_bodies_bin/1, decode_bodies_bin/1,
          serve_bodies/2, bodies_tx_root/1, verify_bodies/2]).
+-export([encode_get_receipts/1, decode_get_receipts_bin/1,
+         decode_receipts_bin/1, serve_receipts/2, verify_receipts/2]).
 -export([assemble_blocks/2]).
 -export([network_id/0, genesis_hash/0]).
 
@@ -56,6 +58,8 @@ msg_get_headers(#{base := B}) -> B + 3.
 msg_headers(#{base := B}) -> B + 4.
 msg_get_bodies(#{base := B}) -> B + 5.
 msg_bodies(#{base := B}) -> B + 6.
+msg_get_receipts(#{base := B}) -> B + 15.
+msg_receipts(#{base := B}) -> B + 16.
 
 %% Local Status from the chain head (Chain default eth_chain) plus the
 %% upstream latest totalDifficulty, falling back to the compat constant.
@@ -367,6 +371,121 @@ assemble_block(HeaderRLP, [TxsTerms, UnclesTerms]) ->
 
 hex0x(Bin) ->
     <<"0x", (string:lowercase(binary:encode_hex(Bin)))/binary>>.
+
+%% --- receipts ----------------------------------------------------------
+%% eth/68 GetReceipts [hashes] / Receipts [[receipt...]...] (0x0f / 0x10).
+%% Receipts are RLP terms (binary for typed, list for legacy), like bodies.
+
+encode_get_receipts(Hashes) when is_list(Hashes) -> [Hashes].
+
+decode_get_receipts_bin(Data) when is_binary(Data) ->
+    try
+        case eth_rlp:decode(Data) of
+            {ok, [Hashes], _} when is_list(Hashes) ->
+                case lists:all(fun(H) -> is_binary(H) andalso byte_size(H) =:= 32 end,
+                               Hashes) of
+                    true -> {ok, Hashes};
+                    false -> {error, bad_receipts_req}
+                end;
+            _ ->
+                {error, bad_receipts_req}
+        end
+    catch _:_ ->
+        {error, bad_receipts_req}
+    end.
+
+%% Serve from the receipts store: [ReceiptTerms] per hash, [] when unknown.
+serve_receipts(Chain, Hashes) ->
+    {ok, [serve_receipt(Chain, H) || H <- Hashes]}.
+
+serve_receipt(Chain, H) ->
+    Hex = <<"0x", (string:lowercase(binary:encode_hex(H)))/binary>>,
+    N = case (try eth_chain:get_by_hash(Chain, Hex) catch _:_ -> not_found end) of
+            {ok, Block, _} ->
+                eth_header:number(Block);
+            _ ->
+                undefined
+        end,
+    case N of
+        N when is_integer(N) ->
+            case (try eth_chain:receipts(Chain, N) catch _:_ -> not_found end) of
+                {ok, Receipts} ->
+                    [receipt_term(R) || R <- Receipts];
+                _ ->
+                    []
+            end;
+        _ ->
+            []
+    end.
+
+receipt_term(R) when is_map(R) ->
+    {ok, Enc} = eth_receipt:to_rlp(R),
+    case Enc of
+        <<T, _/binary>> when T =:= 16#01; T =:= 16#02; T =:= 16#03 -> Enc;
+        _ ->
+            {ok, Term, <<>>} = eth_rlp:decode(Enc),
+            Term
+    end;
+receipt_term(B) when is_binary(B) ->
+    B.
+
+decode_receipts_bin(Data) when is_binary(Data) ->
+    try
+        case eth_rlp:decode(Data) of
+            {ok, Lists, _} when is_list(Lists) ->
+                case lists:all(fun wellformed_receipts/1, Lists) of
+                    true -> {ok, Lists};
+                    false -> {error, bad_receipts}
+                end;
+            _ ->
+                {error, bad_receipts}
+        end
+    catch _:_ ->
+        {error, bad_receipts}
+    end.
+
+wellformed_receipts(Rs) when is_list(Rs) ->
+    lists:all(fun(R) ->
+        (is_binary(R) andalso byte_size(R) > 1) orelse
+        (is_list(R) andalso R =/= [])
+    end, Rs);
+wellformed_receipts(_) ->
+    false.
+
+%% Receipt trie root of one wire receipt list.
+receipts_root(Rs) ->
+    try
+        Pairs = lists:map(fun({R, I}) ->
+            {eth_rlp:encode(I), receipt_bytes(R)}
+        end, lists:zip(Rs, lists:seq(0, length(Rs) - 1))),
+        {ok, eth_trie:root(Pairs)}
+    catch _:_ ->
+        {error, bad_receipts}
+    end.
+
+receipt_bytes(B) when is_binary(B) -> B;
+receipt_bytes(L) when is_list(L) -> eth_rlp:encode(L).
+
+%% Verify receipt lists against header RLP lists (count + receiptsRoot at
+%% field index 5).
+verify_receipts(Headers, AllReceipts) when length(Headers) =:= length(AllReceipts) ->
+    try
+        lists:foreach(fun({H, Rs}) ->
+            {ok, Root} = receipts_root(Rs),
+            true = receipts_root_of(H) =:= Root
+        end, lists:zip(Headers, AllReceipts)),
+        ok
+    catch _:_ ->
+        {error, receipts_mismatch}
+    end;
+verify_receipts(_, _) ->
+    {error, count_mismatch}.
+
+receipts_root_of(Header) when is_list(Header) ->
+    case lists:nth(6, Header) of
+        R when byte_size(R) =:= 32 -> R;
+        _ -> error
+    end.
 %% Returns {ok, [RLPHeaderList]} (possibly shorter than asked when the store
 %% cannot cover the range; at most MAX_HEADERS).
 serve_headers(Chain, BlockRef, Max, Skip, Reverse) ->

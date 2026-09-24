@@ -7,7 +7,8 @@
 %% auto-dial additionally needs DISCV4_ENABLED as the peer source.
 
 -export([start_link/1, dial/3, dial/4, status/0, status/1, peers/0, peers/1,
-         get_headers/4, get_headers/5, get_bodies/1, get_bodies/2]).
+         get_headers/4, get_headers/5, get_bodies/1, get_bodies/2,
+         get_receipts/1, get_receipts/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -67,6 +68,18 @@ get_bodies(Name, Hashes) when is_atom(Name) ->
     end;
 get_bodies(Pid, Hashes) when is_pid(Pid) ->
     gen_server:call(Pid, {get_bodies, Hashes}, 20000).
+
+%% Fetch receipts via the first eth-ready peer. Hashes is [H32].
+get_receipts(Hashes) -> get_receipts(?MODULE, Hashes).
+get_receipts(Name, Hashes) when is_atom(Name) ->
+    case eth_ready_peer(Name) of
+        {ok, Pid} ->
+            get_receipts(Pid, Hashes);
+        {error, _} = E ->
+            E
+    end;
+get_receipts(Pid, Hashes) when is_pid(Pid) ->
+    gen_server:call(Pid, {get_receipts, Hashes}, 20000).
 
 eth_ready_peer(Name) ->
     case gen_server:call(Name, peers) of

@@ -494,7 +494,7 @@ peer_fill(S, Pid, Desc) ->
                 {ok, Bodies} ->
                     case eth_eth:assemble_blocks(NewHdrs, Bodies) of
                         {ok, Entries} ->
-                            peer_append(S, Entries, length(NewHdrs));
+                            peer_append(S, Pid, Entries, NewHdrs, Hashes);
                         {error, Reason} ->
                             logger:warning("etherlang: peer bodies failed verification (~p)", [Reason]),
                             {error, bad_bodies}
@@ -511,9 +511,11 @@ ascending_new(Chain, Desc) ->
     Asc = lists:reverse(Desc),
     [H || H <- Asc, header_number(H) > HeadN].
 
-peer_append(S, Entries, N) ->
+peer_append(S, Pid, Entries, NewHdrs, Hashes) ->
+    N = length(Entries),
     case eth_chain:append(S#st.chain, Entries) of
         ok ->
+            store_peer_receipts(S, Pid, NewHdrs, Hashes, Entries),
             A = S#st.appended + N,
             S1 = (S#st{appended = A, budget = S#st.budget - N})#st{
                     last_log = maybe_log(S, A)},
@@ -526,6 +528,29 @@ peer_append(S, Entries, N) ->
         {error, Reason} ->
             logger:warning("etherlang: peer append failed (~p)", [Reason]),
             {error, Reason}
+    end.
+
+%% Best-effort receipts: fetch, verify against the headers, store per
+%% block number. Failures only warn; receipts stay proxy-served.
+store_peer_receipts(S, Pid, NewHdrs, Hashes, Entries) ->
+    case eth_peer:get_receipts(Pid, Hashes) of
+        {ok, AllReceipts} ->
+            case eth_eth:verify_receipts(NewHdrs, AllReceipts) of
+                ok ->
+                    lists:foreach(fun({{Num, _, _}, Rs}) ->
+                        Decoded = [eth_receipt:to_map(R) || R <- Rs],
+                        case [M || {ok, M} <- Decoded] of
+                            Maps when length(Maps) =:= length(Rs) ->
+                                ok = eth_chain:put_receipts(S#st.chain, Num, Maps);
+                            _ ->
+                                logger:warning("etherlang: skipping unparsable receipts for ~p", [Num])
+                        end
+                    end, lists:zip(Entries, AllReceipts));
+                {error, Reason} ->
+                    logger:warning("etherlang: peer receipts failed verification (~p)", [Reason])
+            end;
+        {error, Reason} ->
+            logger:debug("etherlang: peer receipts unavailable (~p)", [Reason])
     end.
 
 header_number(H) when is_list(H) ->
