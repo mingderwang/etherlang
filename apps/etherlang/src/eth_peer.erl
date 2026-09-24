@@ -46,23 +46,27 @@ peers(Name) -> gen_server:call(Name, peers).
 %% Fetch headers via the first eth-ready peer. Ref is {hash, H32} |
 %% {number, N}; Reverse is boolean.
 get_headers(Ref, Max, Skip, Reverse) -> get_headers(?MODULE, Ref, Max, Skip, Reverse).
-get_headers(Name, Ref, Max, Skip, Reverse) ->
+get_headers(Name, Ref, Max, Skip, Reverse) when is_atom(Name) ->
     case eth_ready_peer(Name) of
         {ok, Pid} ->
-            gen_server:call(Pid, {get_headers, Ref, Max, Skip, Reverse}, 20000);
+            get_headers(Pid, Ref, Max, Skip, Reverse);
         {error, _} = E ->
             E
-    end.
+    end;
+get_headers(Pid, Ref, Max, Skip, Reverse) when is_pid(Pid) ->
+    gen_server:call(Pid, {get_headers, Ref, Max, Skip, Reverse}, 20000).
 
 %% Fetch bodies via the first eth-ready peer. Hashes is [H32].
 get_bodies(Hashes) -> get_bodies(?MODULE, Hashes).
-get_bodies(Name, Hashes) ->
+get_bodies(Name, Hashes) when is_atom(Name) ->
     case eth_ready_peer(Name) of
         {ok, Pid} ->
-            gen_server:call(Pid, {get_bodies, Hashes}, 20000);
+            get_bodies(Pid, Hashes);
         {error, _} = E ->
             E
-    end.
+    end;
+get_bodies(Pid, Hashes) when is_pid(Pid) ->
+    gen_server:call(Pid, {get_bodies, Hashes}, 20000).
 
 eth_ready_peer(Name) ->
     case gen_server:call(Name, peers) of

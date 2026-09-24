@@ -35,23 +35,27 @@ do_call(Method, Params, Cfg, RetriesLeft) ->
                           <<"params">> => Params}),
     Headers = [{"content-type", "application/json"}],
     HttpOpts = [{timeout, Cfg#cfg.timeout_ms}, {connect_timeout, 5000}],
-    R = case httpc:request(post,
-                           {Cfg#cfg.url, Headers, "application/json", Body},
-                           HttpOpts,
-                           [{body_format, binary}]) of
-            {ok, {{_, 200, _}, _, RespBin}} ->
-                case thoas:decode(RespBin) of
-                    {ok, #{<<"error">> := Err}} -> {error, {rpc_error, Err}};
-                    {ok, #{<<"result">> := Result}} -> {ok, Result};
-                    {error, DecErr} -> {error, {bad_decode, DecErr}};
-                    _ -> {error, {bad_response, RespBin}}
-                end;
-            {ok, {{_, Code, _}, _, _}} when Code >= 500; Code =:= 429 ->
-                {transient, {http, Code}};
-            {ok, {{_, Code, _}, _, _}} ->
-                {error, {http, Code}};
-            {error, HTTPError} ->
-                {transient, HTTPError}
+    R = try
+            case httpc:request(post,
+                               {Cfg#cfg.url, Headers, "application/json", Body},
+                               HttpOpts,
+                               [{body_format, binary}]) of
+                {ok, {{_, 200, _}, _, RespBin}} ->
+                    case thoas:decode(RespBin) of
+                        {ok, #{<<"error">> := Err}} -> {error, {rpc_error, Err}};
+                        {ok, #{<<"result">> := Result}} -> {ok, Result};
+                        {error, DecErr} -> {error, {bad_decode, DecErr}};
+                        _ -> {error, {bad_response, RespBin}}
+                    end;
+                {ok, {{_, Code, _}, _, _}} when Code >= 500; Code =:= 429 ->
+                    {transient, {http, Code}};
+                {ok, {{_, Code, _}, _, _}} ->
+                    {error, {http, Code}};
+                {error, HTTPError} ->
+                    {transient, HTTPError}
+            end
+        catch C:E ->
+            {transient, {httpc_exception, C, E}}
         end,
     case R of
         {transient, _Why} when RetriesLeft > 0 ->

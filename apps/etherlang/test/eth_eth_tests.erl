@@ -127,7 +127,50 @@ bodies_test() ->
                      eth_eth:verify_bodies([H1, H1], [Body]))
     end).
 
-%% Replace the transactionsRoot field (index 4) of a decoded header.
+%% Assemble served headers+bodies back into store entries identical to
+%% the originals (hash, number, transactions). Chain data is made
+%% self-consistent first (fixtures ship zero tx-roots).
+assemble_test() ->
+    Dir = eth_test_util:tmp_dir(),
+    {ok, _} = eth_chain:start_link(chain_asm_a, Dir),
+    try
+        {_, Blocks0} = eth_test_util:make_blocks(0, 6, z0(), 0),
+        Blocks = consistent(Blocks0),
+        ok = eth_chain:append(chain_asm_a, pair(Blocks)),
+        {ok, Hdrs} = eth_eth:serve_headers(chain_asm_a, {number, 0}, 6, 0, false),
+        Hashes = [eth_keccak:hash(eth_rlp:encode(H)) || H <- Hdrs],
+        {ok, Bodies} = eth_eth:serve_bodies(chain_asm_a, Hashes),
+        {ok, Entries} = eth_eth:assemble_blocks(Hdrs, Bodies),
+        ?assertEqual(6, length(Entries)),
+        lists:foreach(fun({{Num, Block, true}, Orig}) ->
+            ?assertEqual(maps:get(<<"number">>, Orig),
+                         eth_hex:encode_int(Num)),
+            ?assertEqual(maps:get(<<"hash">>, Orig), maps:get(<<"hash">>, Block)),
+            ?assertEqual(length(maps:get(<<"transactions">>, Orig)),
+                         length(maps:get(<<"transactions">>, Block)))
+        end, lists:zip(Entries, Blocks))
+    after
+        (try gen_server:stop(chain_asm_a) catch _:_ -> ok end)
+    end.
+
+%% Fixture blocks with transactionsRoot/hash/parentHash recomputed so
+%% bodies verify against headers (fixtures ship zero roots).
+consistent(Blocks) ->
+    {Out, _} = lists:foldl(fun(B, {Acc, Parent}) ->
+        {ok, Root} = eth_tx:tx_root(maps:get(<<"transactions">>, B)),
+        B1 = B#{<<"parentHash">> => Parent,
+                <<"transactionsRoot">> => hex0x(Root)},
+        {ok, H} = eth_header:hash(B1),
+        B2 = B1#{<<"hash">> => hex0x(H)},
+        {[B2 | Acc], hex0x(H)}
+    end, {[], z0()}, Blocks),
+    lists:reverse(Out).
+
+hex0x(Bin) ->
+    <<"0x", (string:lowercase(binary:encode_hex(Bin)))/binary>>.
+
+pair(Blocks) ->
+    [{eth_hex:decode(maps:get(<<"number">>, B)), B, true} || B <- Blocks].
 set_header_root(Header, Root) ->
     {Pre, [_ | Post]} = lists:split(4, Header),
     Pre ++ [Root | Post].
@@ -209,9 +252,6 @@ interop() ->
     after
         (try gen_server:stop(chain_eth_ab) catch _:_ -> ok end)
     end.
-
-pair(Blocks) ->
-    [{eth_hex:decode(maps:get(<<"number">>, B)), B, true} || B <- Blocks].
 
 args(Priv, RemoteID, ID, Chain) ->
     #{privkey => Priv, remote_id => RemoteID, node_id => ID,

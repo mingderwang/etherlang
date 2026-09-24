@@ -208,7 +208,13 @@ handle_info(graceful_timeout, S) ->
 handle_info(_Info, S) ->
     {noreply, S}.
 
-terminate(_Reason, S) ->
+terminate(Reason, S) ->
+    case Reason of
+        normal -> ok;
+        shutdown -> ok;
+        _ -> logger:notice("etherlang: rlpx conn terminating (~p) eth=~p",
+                           [Reason, S#st.eth =/= undefined])
+    end,
     (try gen_tcp:close(S#st.sock) catch _:_ -> ok end),
     ok.
 

@@ -32,6 +32,7 @@
 -define(FLOOR_BACKOFF_MS, 60000).
 
 -record(st, {chain = eth_chain,
+             peer_mgr = eth_peer,
              concurrency = 8,
              body_window = 2048,
              poll_ms = 5000,
@@ -62,6 +63,7 @@ head(Name) -> gen_server:call(Name, head).
 
 defaults() ->
     #{chain => eth_chain,
+      peer_mgr => eth_peer,
       concurrency => 8,
       body_window => eth_config:body_window(),
       poll_interval_ms => 5000,
@@ -72,6 +74,7 @@ defaults() ->
 
 init({Name, Cfg}) ->
     S = #st{chain = maps:get(chain, Cfg),
+            peer_mgr = maps:get(peer_mgr, Cfg, eth_peer),
             concurrency = maps:get(concurrency, Cfg),
             body_window = maps:get(body_window, Cfg),
             poll_ms = maps:get(poll_interval_ms, Cfg),
@@ -117,6 +120,14 @@ code_change(_OldVsn, S, _Extra) -> {ok, S}.
 %% ---------------------------------------------------------------------------
 
 run_once(S) ->
+    case peer_sync_tick(S) of
+        {ok, S1} ->
+            S1;
+        {error, _} ->
+            rpc_sync_tick(S)
+    end.
+
+rpc_sync_tick(S) ->
     case upstream_block_number() of
         {ok, HeadU} ->
             S0 = (S#st{mode = sync, budget = S#st.budget_max})#st{target = HeadU},
@@ -377,6 +388,157 @@ below_finality(Chain, Num) ->
         F when is_integer(F) -> Num < F;
         _ -> false
     end.
+
+%% ---------------------------------------------------------------------------
+%% Peer-first sync: fetch verified headers + bodies from eth-ready peers,
+%% falling back to RPC when no peers (or peer fetches) are available.
+%% ---------------------------------------------------------------------------
+
+%% Max headers walked back per tick looking for a common ancestor.
+-define(PEER_WALK_CAP, 2048).
+
+peer_sync_tick(S) ->
+    case eth_ready_peers(S#st.peer_mgr) of
+        [] ->
+            {error, no_eth_peers};
+        Peers ->
+            S0 = (S#st{mode = sync, budget = S#st.budget_max}),
+            try_peers(S0, Peers)
+    end.
+
+eth_ready_peers(Mgr) ->
+    Infos = (try eth_peer:peers(Mgr) catch _:_ -> [] end),
+    [{Pid, Head} ||
+        {Pid, Info} <- Infos,
+        is_map(Info),
+        #{eth := Eth} <- [Info],
+        is_map(Eth),
+        #{head := Head} <- [Eth],
+        is_binary(Head)].
+
+try_peers(_S, []) ->
+    {error, peers_exhausted};
+try_peers(S, [{Pid, Best} | Rest]) ->
+    case peer_catchup(S, Pid, Best) of
+        {ok, S1} -> {ok, S1};
+        {error, _} -> try_peers(S, Rest)
+    end.
+
+%% Walk back from the peer's best hash to a local anchor, then fill forward.
+peer_catchup(S, Pid, BestHash) ->
+    Cap = min(?PEER_WALK_CAP, max(S#st.budget, 192)),
+    case walk_back(S, Pid, BestHash, Cap, []) of
+        {anchor, _N, Desc} ->
+            peer_fill(S, Pid, Desc);
+        {no_anchor, Desc} ->
+            case local_head(S#st.chain) of
+                undefined ->
+                    %% Empty store: anything contiguous appends.
+                    peer_fill(S, Pid, Desc);
+                _ ->
+                    {error, no_common_ancestor}
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+%% Descending batches (newest first) up to Cap headers.
+walk_back(_S, _Pid, _Hash, Cap, Acc) when length(Acc) >= Cap ->
+    {no_anchor, Acc};
+walk_back(S, Pid, Hash, Cap, Acc) ->
+    N = min(192, Cap - length(Acc)),
+    case eth_peer:get_headers(Pid, {hash, Hash}, N, 0, true) of
+        {ok, []} ->
+            {no_anchor, Acc};
+        {ok, Hdrs} ->
+            Acc1 = Acc ++ Hdrs,
+            case find_anchor(S#st.chain, Hdrs) of
+                {ok, Num} ->
+                    {anchor, Num, Acc1};
+                none when length(Hdrs) < N ->
+                    {no_anchor, Acc1};
+                none ->
+                    Oldest = lists:last(Hdrs),
+                    walk_back(S, Pid, parent_of(Oldest), Cap, Acc1)
+            end;
+        {error, _} = E ->
+            case Acc of
+                [] -> E;
+                _ -> {no_anchor, Acc}
+            end
+    end.
+
+find_anchor(_Chain, []) -> none;
+find_anchor(Chain, [H | T]) ->
+    Num = header_number(H),
+    Hash = header_hash(H),
+    case (try eth_chain:canonical_hash(Chain, Num) catch _:_ -> undefined end) of
+        Hash -> {ok, Num};
+        _ -> find_anchor(Chain, T)
+    end.
+
+%% Append headers newer than the anchor (ascending), with bodies.
+peer_fill(S, Pid, Desc) ->
+    Asc = ascending_new(S#st.chain, Desc),
+    Limited = lists:sublist(Asc, S#st.budget),
+    case Limited of
+        [] ->
+            BestN = case Desc of
+                        [Newest | _] -> header_number(Newest);
+                        [] -> S#st.target
+                    end,
+            {ok, S#st{mode = follow, synced = true, target = BestN}};
+        NewHdrs ->
+            Hashes = [header_hash(H) || H <- NewHdrs],
+            case eth_peer:get_bodies(Pid, Hashes) of
+                {ok, Bodies} ->
+                    case eth_eth:assemble_blocks(NewHdrs, Bodies) of
+                        {ok, Entries} ->
+                            peer_append(S, Entries, length(NewHdrs));
+                        {error, Reason} ->
+                            logger:warning("etherlang: peer bodies failed verification (~p)", [Reason]),
+                            {error, bad_bodies}
+                    end;
+                {error, _} = E ->
+                    E
+            end
+    end.
+
+%% Headers strictly newer than the local head, ascending. Unknown numbers
+%% (beyond head+1 with gaps) are kept: append validates contiguity.
+ascending_new(Chain, Desc) ->
+    HeadN = local_head_num(Chain),
+    Asc = lists:reverse(Desc),
+    [H || H <- Asc, header_number(H) > HeadN].
+
+peer_append(S, Entries, N) ->
+    case eth_chain:append(S#st.chain, Entries) of
+        ok ->
+            A = S#st.appended + N,
+            S1 = (S#st{appended = A, budget = S#st.budget - N})#st{
+                    last_log = maybe_log(S, A)},
+            {ok, S1#st{mode = gap, synced = false}};
+        {reorg, CA} ->
+            logger:notice("etherlang: peer sync reorg to ~p", [CA]),
+            {ok, S#st{reorgs = S#st.reorgs + 1}};
+        {missing_parent, _} ->
+            {error, missing_parent};
+        {error, Reason} ->
+            logger:warning("etherlang: peer append failed (~p)", [Reason]),
+            {error, Reason}
+    end.
+
+header_number(H) when is_list(H) ->
+    case lists:nth(9, H) of
+        I when is_integer(I) -> I;
+        B when is_binary(B) -> binary:decode_unsigned(B)
+    end.
+
+header_hash(H) when is_list(H) ->
+    eth_keccak:hash(eth_rlp:encode(H)).
+
+parent_of(H) when is_list(H) ->
+    hd(H).
 
 %% ---------------------------------------------------------------------------
 %% Status helpers

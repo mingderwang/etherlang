@@ -50,7 +50,10 @@
              finalized :: undefined | integer(),
              low = 0 :: integer(),
              retention = 2048 :: integer(),
-             verify = true :: boolean()}).
+             verify = true :: boolean(),
+             num_tab = num_tab,
+             hash_tab = hash_tab,
+             meta_tab = meta_tab}).
 
 start_link(Dir) -> start_link(eth_chain, Dir).
 start_link(Name, Dir) when is_atom(Name) ->
@@ -108,17 +111,21 @@ set_finalized(Name, Num) when is_integer(Num), Num >= 0 ->
 
 init({Name, Dir}) ->
     ok = filelib:ensure_dir(filename:join(Dir, "x")),
-    {ok, _} = dets:open_file(num_tab, [{file, filename:join(Dir, "chain.num.dets")},
+    Prefix = atom_to_list(Name) ++ "_",
+    NumTab = list_to_atom(Prefix ++ "num_tab"),
+    HashTab = list_to_atom(Prefix ++ "hash_tab"),
+    MetaTab = list_to_atom(Prefix ++ "meta_tab"),
+    {ok, _} = dets:open_file(NumTab, [{file, filename:join(Dir, "chain.num.dets")},
+                                      {type, set}, {repair, force}]),
+    {ok, _} = dets:open_file(HashTab, [{file, filename:join(Dir, "chain.hash.dets")},
                                        {type, set}, {repair, force}]),
-    {ok, _} = dets:open_file(hash_tab, [{file, filename:join(Dir, "chain.hash.dets")},
-                                        {type, set}, {repair, force}]),
-    {ok, _} = dets:open_file(meta_tab, [{file, filename:join(Dir, "chain.meta.dets")},
-                                        {type, set}, {repair, force}]),
-    Head = case dets:lookup(meta_tab, head) of
+    {ok, _} = dets:open_file(MetaTab, [{file, filename:join(Dir, "chain.meta.dets")},
+                                       {type, set}, {repair, force}]),
+    Head = case dets:lookup(MetaTab, head) of
                [{head, {N, H}}] -> {N, H};
                _ -> undefined
            end,
-    Fin = case dets:lookup(meta_tab, finalized) of
+    Fin = case dets:lookup(MetaTab, finalized) of
               [{finalized, F}] when is_integer(F) -> F;
               _ -> undefined
           end,
@@ -126,7 +133,7 @@ init({Name, Dir}) ->
     %% `low' is the lowest block we may still have; seed it near the head when
     %% absent (first start of a pre-existing store) so pruning starts in the
     %% right place instead of walking up from zero.
-    Low = case dets:lookup(meta_tab, low) of
+    Low = case dets:lookup(MetaTab, low) of
               [{low, L}] when is_integer(L) -> L;
               _ ->
                   case Head of
@@ -137,7 +144,8 @@ init({Name, Dir}) ->
     _ = Name,
     {ok, #st{dir = Dir, head = Head, finalized = Fin, low = Low,
              retention = Retention,
-             verify = eth_config:verify_headers()}}.
+             verify = eth_config:verify_headers(),
+             num_tab = NumTab, hash_tab = HashTab, meta_tab = MetaTab}}.
 
 handle_call(head, _From, S) ->
     {reply, S#st.head, S};
@@ -148,21 +156,21 @@ handle_call(highest, _From, #st{head = {N, _}} = S) ->
     {reply, N, S};
 
 handle_call(size, _From, S) ->
-    {reply, dets:info(num_tab, size), S};
+    {reply, dets:info(S#st.num_tab, size), S};
 
 handle_call({canonical_hash, N}, _From, S) ->
     {reply, lookup_canonical(S, N), S};
 
 handle_call({get_by_number, N}, _From, S) ->
-    case dets:lookup(num_tab, {N}) of
+    case dets:lookup(S#st.num_tab, {N}) of
         [{{N}, {_Hash, Block, Full}}] -> {reply, {ok, Block, Full}, S};
         [] -> {reply, not_found, S}
     end;
 
 handle_call({get_by_hash, H}, _From, S) ->
-    case dets:lookup(hash_tab, {H}) of
+    case dets:lookup(S#st.hash_tab, {H}) of
         [{{H}, N}] ->
-            case dets:lookup(num_tab, {N}) of
+            case dets:lookup(S#st.num_tab, {N}) of
                 [{{N}, {_Hash2, Block, Full}}] -> {reply, {ok, Block, Full}, S};
                 [] -> {reply, not_found, S}
             end;
@@ -197,7 +205,7 @@ handle_call(finalized, _From, S) ->
 handle_call({set_finalized, N}, _From, #st{finalized = F} = S) when F =/= undefined, N =< F ->
     {reply, ok, S};
 handle_call({set_finalized, N}, _From, S) ->
-    ok = dets:insert(meta_tab, {finalized, N}),
+    ok = dets:insert(S#st.meta_tab, {finalized, N}),
     {reply, ok, S#st{finalized = N}};
 
 handle_call(_Req, _From, S) ->
@@ -207,10 +215,10 @@ handle_cast(_Msg, S) -> {noreply, S}.
 
 handle_info(_Info, S) -> {noreply, S}.
 
-terminate(_Reason, _S) ->
+terminate(_Reason, S) ->
     lists:foreach(fun(T) ->
                           _ = try dets:close(T) catch _:_ -> ok end
-                  end, [num_tab, hash_tab, meta_tab]),
+                  end, [S#st.num_tab, S#st.hash_tab, S#st.meta_tab]),
     ok.
 
 code_change(_OldVsn, S, _Extra) -> {ok, S}.
@@ -231,7 +239,7 @@ do_append([{Num, Block, _Full} | _] = Blocks, #st{head = {HN, HS}} = S) ->
         true ->
             do_append_cont(Blocks, S);
         false ->
-            case dets:lookup(hash_tab, {Parent}) of
+            case dets:lookup(S#st.hash_tab, {Parent}) of
                 [{{Parent}, CA}] when is_integer(CA), CA < HN ->
                     case reorg_rewind(S, CA) of
                         {ok, S1} ->
@@ -260,7 +268,7 @@ do_append_cont([{Num, Block, Full} | Rest], #st{head = {HN, HS}} = S) ->
         true ->
             do_append_cont(Rest, insert(S, Num, Hash, Block, Full));
         false ->
-            case dets:lookup(hash_tab, {Parent}) of
+            case dets:lookup(S#st.hash_tab, {Parent}) of
                 [{{Parent}, CA}] when is_integer(CA), CA < HN ->
                     case reorg_rewind(S, CA) of
                         {ok, S1} ->
@@ -303,15 +311,15 @@ reorg_rewind(S, CA) ->
 
 insert(S, Num, Hash, Block, Full) ->
     %% If a different block already occupies Num, retire its stale hash index.
-    case dets:lookup(num_tab, {Num}) of
+    case dets:lookup(S#st.num_tab, {Num}) of
         [{{Num}, {OldHash, _, _}}] when OldHash =/= Hash ->
-            ok = dets:delete(hash_tab, {{OldHash}});
+            ok = dets:delete(S#st.hash_tab, {{OldHash}});
         _ ->
             ok
     end,
-    ok = dets:insert(num_tab, {{Num}, {Hash, Block, Full}}),
-    ok = dets:insert(hash_tab, {{Hash}, Num}),
-    ok = dets:insert(meta_tab, {head, {Num, Hash}}),
+    ok = dets:insert(S#st.num_tab, {{Num}, {Hash, Block, Full}}),
+    ok = dets:insert(S#st.hash_tab, {{Hash}, Num}),
+    ok = dets:insert(S#st.meta_tab, {head, {Num, Hash}}),
     S#st{head = {Num, Hash}}.
 
 %% ---------------------------------------------------------------------------
@@ -341,10 +349,10 @@ delete_range(S, From, To, Skip) when From < To ->
         fun(N) when N =:= Skip ->
                 ok;
            (N) ->
-                case dets:lookup(num_tab, {N}) of
+                case dets:lookup(S#st.num_tab, {N}) of
                     [{{N}, {H, _, _}}] ->
-                        ok = dets:delete(hash_tab, {{H}}),
-                        ok = dets:delete(num_tab, {N});
+                        ok = dets:delete(S#st.hash_tab, {{H}}),
+                        ok = dets:delete(S#st.num_tab, {N});
                     [] ->
                         ok
                 end
@@ -354,7 +362,7 @@ delete_range(S, _From, _To, _Skip) ->
     S.
 
 set_low(S, N) ->
-    ok = dets:insert(meta_tab, {low, N}),
+    ok = dets:insert(S#st.meta_tab, {low, N}),
     S#st{low = N}.
 
 rewind_to(#st{head = undefined} = S, _CA) ->
@@ -362,28 +370,28 @@ rewind_to(#st{head = undefined} = S, _CA) ->
 rewind_to(#st{head = {HN, _}} = S, CA) when HN > CA ->
     lists:foreach(
         fun(K) ->
-            case dets:lookup(num_tab, {K}) of
+            case dets:lookup(S#st.num_tab, {K}) of
                 [{{K}, {H, _, _}}] ->
-                    ok = dets:delete(num_tab, {K}),
-                    ok = dets:delete(hash_tab, {{H}});
+                    ok = dets:delete(S#st.num_tab, {K}),
+                    ok = dets:delete(S#st.hash_tab, {{H}});
                 [] ->
                     ok
             end
         end, lists:seq(CA + 1, HN)),
-    Head0 = case dets:lookup(num_tab, {CA}) of
+    Head0 = case dets:lookup(S#st.num_tab, {CA}) of
                 [{{CA}, {H, _, _}}] -> {CA, H};
                 [] -> undefined
             end,
     case Head0 of
-        undefined -> ok = dets:delete(meta_tab, head);
-        {N2, H2} -> ok = dets:insert(meta_tab, {head, {N2, H2}})
+        undefined -> ok = dets:delete(S#st.meta_tab, head);
+        {N2, H2} -> ok = dets:insert(S#st.meta_tab, {head, {N2, H2}})
     end,
     S#st{head = Head0};
 rewind_to(S, _CA) ->
     S.
 
-lookup_canonical(_S, N) ->
-    case dets:lookup(num_tab, {N}) of
+lookup_canonical(S, N) ->
+    case dets:lookup(S#st.num_tab, {N}) of
         [{{N}, {Hash, _, _}}] -> Hash;
         [] -> undefined
     end.

@@ -5,7 +5,8 @@
 %% the node verify a fetched block *without* trusting the upstream `hash'
 %% field, and check parent linkage cryptographically.
 
--export([hash/1, hex_hash/1, verify/1, parent_hash/1, number/1, to_rlp_list/1]).
+-export([hash/1, hex_hash/1, verify/1, parent_hash/1, number/1, to_rlp_list/1,
+         from_rlp/1]).
 
 %% Ordered header layout (Ethereum JSON field names).
 %% `sha3Uncles' is the ommers hash, `miner' the beneficiary.
@@ -74,6 +75,47 @@ number(Block) ->
 %% Ordered RLP term for a header (for eth/68 BlockHeaders replies).
 to_rlp_list(Block) when is_map(Block) ->
     header_term(Block).
+
+%% Inverse: decoded header RLP list -> JSON-style map (0x hex quantities
+%% and data, as from the RPC). Accepts binaries or integers per field.
+from_rlp(List) when is_list(List), length(List) >= 15 ->
+    from_rlp_acc(List);
+from_rlp(_) ->
+    {error, bad_header}.
+
+from_rlp_acc(List) ->
+    Kinds = [K || {K, _} <- header_fields()],
+    Names = [N || {_, N} <- header_fields()],
+    try from_zip(Kinds, Names, List, #{}) of
+        Map -> {ok, Map}
+    catch _:_ ->
+        {error, bad_header}
+    end.
+
+from_zip([], [], [], Acc) -> Acc;
+from_zip([K | Ks], [_ | Ns], [], Acc) when K =:= opt_data; K =:= opt_qty ->
+    from_zip(Ks, Ns, [], Acc);
+from_zip([data | Ks], [N | Ns], [V | Vs], Acc) ->
+    from_zip(Ks, Ns, Vs, Acc#{N => bin0x(to_bin(V))});
+from_zip([qty | Ks], [N | Ns], [V | Vs], Acc) ->
+    from_zip(Ks, Ns, Vs, Acc#{N => eth_hex:encode_int(to_int(V))});
+from_zip([opt_data | Ks], [N | Ns], [V | Vs], Acc) ->
+    from_zip(Ks, Ns, Vs, Acc#{N => bin0x(to_bin(V))});
+from_zip([opt_qty | Ks], [N | Ns], [V | Vs], Acc) ->
+    from_zip(Ks, Ns, Vs, Acc#{N => eth_hex:encode_int(to_int(V))});
+from_zip(_, _, _, _) -> throw(bad_header).
+
+to_bin(B) when is_binary(B) -> B;
+to_bin(I) when is_integer(I), I >= 0 -> binary:encode_unsigned(I);
+to_bin(_) -> throw(bad_header).
+
+to_int(I) when is_integer(I), I >= 0 -> I;
+to_int(B) when is_binary(B), byte_size(B) =:= 0 -> 0;
+to_int(B) when is_binary(B) -> binary:decode_unsigned(B);
+to_int(_) -> throw(bad_header).
+
+bin0x(<<>>) -> <<"0x">>;
+bin0x(Bin) -> <<"0x", (string:lowercase(binary:encode_hex(Bin)))/binary>>.
 
 %% ---------------------------------------------------------------------------
 

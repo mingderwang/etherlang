@@ -21,6 +21,7 @@
 -export([encode_get_headers/4, decode_get_headers_bin/1, decode_headers_bin/1]).
 -export([encode_get_bodies/1, decode_get_bodies_bin/1, decode_bodies_bin/1,
          serve_bodies/2, bodies_tx_root/1, verify_bodies/2]).
+-export([assemble_blocks/2]).
 -export([network_id/0, genesis_hash/0]).
 
 -define(ETH_VERSION, 68).
@@ -73,6 +74,23 @@ status_data(Chain) ->
                    genesis => genesis_hash(),
                    fork_hash => FH,
                    fork_next => FN}};
+        {error, no_local_head} ->
+            %% Empty store: advertise genesis, exactly like a node that has
+            %% not synced anything yet. Peers accept this as a syncing
+            %% remote (ForkID rule 2) instead of us failing the handshake.
+            GenTime = eth_forkid:genesis_time(sepolia),
+            {GH, GN} = eth_forkid:current(eth_forkid:genesis(sepolia),
+                                          eth_forkid:schedule(sepolia),
+                                          0, GenTime),
+            {ok, #{version => ?ETH_VERSION,
+                   network => ?NETWORK_ID,
+                   td => total_difficulty(),
+                   best => genesis_hash(),
+                   best_number => 0,
+                   head_time => GenTime,
+                   genesis => genesis_hash(),
+                   fork_hash => GH,
+                   fork_next => GN}};
         {error, _} = E ->
             E
     end.
@@ -310,6 +328,45 @@ tx_root_of(Header) when is_list(Header) ->
         R when byte_size(R) =:= 32 -> R;
         _ -> error
     end.
+
+%% Assemble chain-store entries from wire headers + bodies:
+%% [{Num, BlockMap, true}]. Verifies body roots against the headers, so a
+%% mismatch fails before anything reaches the chain.
+assemble_blocks(Headers, Bodies) ->
+    case verify_bodies(Headers, Bodies) of
+        ok -> assemble_each(Headers, Bodies, []);
+        {error, _} = E -> E
+    end.
+
+assemble_each([], [], Acc) -> {ok, lists:reverse(Acc)};
+assemble_each([H | Hs], [B | Bs], Acc) ->
+    case assemble_block(H, B) of
+        {ok, Entry} -> assemble_each(Hs, Bs, [Entry | Acc]);
+        {error, _} = E -> E
+    end;
+assemble_each(_, _, _) ->
+    {error, count_mismatch}.
+
+assemble_block(HeaderRLP, [TxsTerms, UnclesTerms]) ->
+    try
+        {ok, HMap} = eth_header:from_rlp(HeaderRLP),
+        Hash = eth_keccak:hash(eth_rlp:encode(HeaderRLP)),
+        Txs = [begin {ok, M} = eth_tx:from_rlp(tx_bytes(T)), M end
+               || T <- TxsTerms],
+        Uncles = [begin {ok, M} = eth_header:from_rlp(U), M end
+                  || U <- UnclesTerms],
+        Num = eth_header:number(HMap#{<<"hash">> => hex0x(Hash)}),
+        true = is_integer(Num),
+        Block = (HMap#{<<"hash">> => hex0x(Hash),
+                       <<"transactions">> => Txs,
+                       <<"uncles">> => Uncles}),
+        {ok, {Num, Block, true}}
+    catch _:_ ->
+        {error, bad_block}
+    end.
+
+hex0x(Bin) ->
+    <<"0x", (string:lowercase(binary:encode_hex(Bin)))/binary>>.
 %% Returns {ok, [RLPHeaderList]} (possibly shorter than asked when the store
 %% cannot cover the range; at most MAX_HEADERS).
 serve_headers(Chain, BlockRef, Max, Skip, Reverse) ->

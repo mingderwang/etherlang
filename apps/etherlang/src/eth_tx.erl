@@ -5,7 +5,7 @@
 %% EIP-4844/7702 and other types: encoding returns {error, unsupported};
 %% such bodies are served/skipped accordingly, never fabricated.
 
--export([to_rlp/1, tx_root/1]).
+-export([to_rlp/1, from_rlp/1, tx_root/1]).
 
 %% Encode a JSON-RPC transaction map to wire bytes (type prefix included
 %% for typed transactions).
@@ -36,7 +36,93 @@ to_rlp(Tx) when is_map(Tx) ->
             {error, unsupported_tx_type}
     end.
 
-%% Merkle root over [TxMap]: trie key = RLP(index), value = RLP(tx).
+%% Decode wire bytes to a JSON-style map (0x hex fields, type, hash).
+%% Inverse of to_rlp for legacy/2930/1559 (no `from' recovery).
+from_rlp(Bin) when is_binary(Bin) ->
+    try do_from_rlp(Bin)
+    catch _:_ -> {error, bad_tx} end.
+
+do_from_rlp(<<16#01, _/binary>> = Bin) ->
+    Rest = binary:part(Bin, 1, byte_size(Bin) - 1),
+    case eth_rlp:decode(Rest) of
+        {ok, [ChainID, Nonce, GasPrice, Gas, To, Value, Input, AL, V, R, S], <<>>} ->
+            {ok, #{<<"type">> => <<"0x1">>,
+                   <<"chainId">> => hexq(ChainID),
+                   <<"nonce">> => hexq(Nonce),
+                   <<"gasPrice">> => hexq(GasPrice),
+                   <<"gas">> => hexq(Gas),
+                   <<"to">> => hexdata(To),
+                   <<"value">> => hexq(Value),
+                   <<"input">> => hexdata(Input),
+                   <<"accessList">> => from_access_list(AL),
+                   <<"v">> => hexq(V), <<"r">> => hexq(R), <<"s">> => hexq(S),
+                   <<"hash">> => hexdata(eth_keccak:hash(Bin))}};
+        _ ->
+            {error, bad_tx}
+    end;
+do_from_rlp(<<16#02, _/binary>> = Bin) ->
+    Rest = binary:part(Bin, 1, byte_size(Bin) - 1),
+    case eth_rlp:decode(Rest) of
+        {ok, [ChainID, Nonce, MaxPrio, MaxFee, Gas, To, Value, Input, AL, V, R, S], <<>>} ->
+            {ok, #{<<"type">> => <<"0x2">>,
+                   <<"chainId">> => hexq(ChainID),
+                   <<"nonce">> => hexq(Nonce),
+                   <<"maxPriorityFeePerGas">> => hexq(MaxPrio),
+                   <<"maxFeePerGas">> => hexq(MaxFee),
+                   <<"gas">> => hexq(Gas),
+                   <<"to">> => hexdata(To),
+                   <<"value">> => hexq(Value),
+                   <<"input">> => hexdata(Input),
+                   <<"accessList">> => from_access_list(AL),
+                   <<"v">> => hexq(V), <<"r">> => hexq(R), <<"s">> => hexq(S),
+                   <<"hash">> => hexdata(eth_keccak:hash(Bin))}};
+        _ ->
+            {error, bad_tx}
+    end;
+do_from_rlp(Bin) ->
+    case eth_rlp:decode(Bin) of
+        {ok, [Nonce, GasPrice, Gas, To, Value, Input, V, R, S], <<>>} ->
+            Base = #{<<"nonce">> => hexq(Nonce),
+                     <<"gasPrice">> => hexq(GasPrice),
+                     <<"gas">> => hexq(Gas),
+                     <<"to">> => hexdata(To),
+                     <<"value">> => hexq(Value),
+                     <<"input">> => hexdata(Input),
+                     <<"v">> => hexq(V), <<"r">> => hexq(R), <<"s">> => hexq(S),
+                     <<"hash">> => hexdata(eth_keccak:hash(Bin))},
+            {ok, maybe_chain_id(Base, V)};
+        _ ->
+            {error, bad_tx}
+    end.
+
+%% EIP-155 v from large V.
+maybe_chain_id(Map, V) ->
+    I = to_int(V),
+    case I >= 35 of
+        true -> Map#{<<"chainId">> => eth_hex:encode_int((I - 35) div 2)};
+        false -> Map
+    end.
+
+from_access_list(AL) when is_list(AL) ->
+    [#{<<"address">> => hexdata(A),
+       <<"storageKeys">> => [hexdata(K) || K <- Keys]} || [A, Keys] <- AL];
+from_access_list(_) ->
+    throw(bad_tx).
+
+hexq(I) when is_integer(I) -> eth_hex:encode_int(I);
+hexq(B) when is_binary(B), byte_size(B) =:= 0 -> <<"0x0">>;
+hexq(B) when is_binary(B) -> bin0x(B);
+hexq(_) -> throw(bad_tx).
+
+hexdata(B) when is_binary(B) -> bin0x(B);
+hexdata(_) -> throw(bad_tx).
+
+bin0x(<<>>) -> <<"0x">>;
+bin0x(Bin) -> <<"0x", (string:lowercase(binary:encode_hex(Bin)))/binary>>.
+
+to_int(I) when is_integer(I) -> I;
+to_int(B) when is_binary(B), byte_size(B) =:= 0 -> 0;
+to_int(B) when is_binary(B) -> binary:decode_unsigned(B).
 tx_root(Txs) when is_list(Txs) ->
     try
         Pairs = lists:map(fun({Tx, I}) ->
