@@ -136,11 +136,14 @@ code; none is guessing. Items marked DONE were closed with live verification.
    sync ancestor walk caps at `MAX_REORG_DEPTH` (256) and parks on `error`,
    retrying the same window every tick. Needs bounded-retry with backoff plus
    operator-visible alerting instead of a silent hot loop.
-8. **`stateRoot`/`receiptsRoot` honesty** — trusted from upstream (header-sync
-   client); independent verification via local re-execution is the v1.0 gate.
-9. **Window fetch is all-or-nothing** — first fetch error discards the whole
-   window (`collect_window`), no partial append/retry; the 120s deadline blocks
-   the tick. Partial progress + per-block retry before shipping an SLA.
+8. **`stateRoot` honesty** — trusted from upstream; independent verification
+   via local re-execution is the v1.0 gate. (`transactionsRoot`/
+   `receiptsRoot` **are** verified on the peer path since v0.6.0 — only the
+   RPC fallback path still trusts them.)
+9. **RPC window fetch is all-or-nothing** — first fetch error discards the
+   whole window (`collect_window`), no partial append/retry; the 120s
+   deadline blocks the tick. (Peer path fetches per-request with timeouts.)
+   Partial progress + per-block retry before shipping an SLA.
 
 ### RPC surface / security
 
@@ -197,6 +200,12 @@ code; none is guessing. Items marked DONE were closed with live verification.
   already 100%.
 - [x] **No consensus-layer** — execution-layer-only by design; block
   production, beacon, validators are out of scope (documented), not TODO.
+- [x] **devp2p base** — discv4 discovery + RLPx transport in pure Erlang,
+  tested against geth protocol vectors (v0.5.0).
+- [x] **Peer-first sync** — `eth/68` Status/headers/bodies with strict ForkID,
+  auto-dial, root-verified bodies/receipts into the store (v0.6.0).
+- [x] **Receipts locally** — receipts store + tx index,
+  `eth_getTransactionReceipt`/`eth_getLogs` served locally first (v0.6.0).
 
 ---
 

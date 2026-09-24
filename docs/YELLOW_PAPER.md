@@ -16,15 +16,17 @@ fidelity caveats are listed in README's TODO and repeated here in §9.
 etherlang is an Erlang/OTP application that speaks the Ethereum JSON-RPC
 interface. It is **not** a full Ethereum execution client:
 
-- it does not implement devp2p/RLPx (no peer discovery, no gossip, no
-  block propagation),
+- it runs devp2p/RLPx only opt-in (peer discovery, `eth/68` sync and
+  receipts are experimental and off by default),
 - it does not run the beacon chain or vote in consensus,
 - it does not execute transactions (no mempool, no miner, no authoring),
 - it does not maintain the state trie.
 
-Instead it fetches canonical blocks from an **upstream Ethereum node over
-JSON-RPC**, validates their structural integrity (contiguous numbering and
-cryptographic parent linkage by recomputing header hashes), stores a bounded
+Instead it syncs canonical blocks **from peers first** (verified headers,
+bodies and receipts over RLPx), falling back to an **upstream Ethereum node
+over JSON-RPC**, validates their structural integrity (contiguous numbering and
+cryptographic parent linkage by recomputing header hashes, plus tx/receipt
+trie roots on the peer path), stores a bounded
 recent window of them in DETS tables, and serves that window locally while
 transparently proxying everything it does not hold to the upstream node. A
 separate, purely local EVM evaluates `eth_call` requests (reads) against
@@ -188,11 +190,17 @@ kept header-only, the handler also proxies rather than fabricating bodies.
 
 ## 6. Synchronisation (eth_sync)
 
-The synchroniser is a poll loop (`tick` → `run_once` → `send_after`). Each tick:
+The synchroniser is a poll loop (`tick` → `run_once` → `send_after`). Each
+tick tries **eth-ready peers first**, RPC second:
 
-1. `eth_blockNumber` from upstream → target `HeadU`.
-2. track `finalized` (guarded accept, §2).
-3. three branches on local head:
+* **Peer sync** — backward walk (192-header reverse batches) from a peer's
+  best hash to a local anchor, then forward fill: bodies fetched per header
+  and `transactionsRoot`-verified, receipts fetched and `receiptsRoot`-
+  verified, everything assembled and appended through the normal chain path
+  (reorg logic reused). Empty stores advertise genesis `Status`.
+* **RPC fallback** — `eth_blockNumber` from upstream → target `HeadU`,
+  `finalized` tracked with the guarded accept (§2), then three branches on
+  local head:
    - **empty store** → gap fill from `anchor` (`latest` → `max(HeadU, 0)`;
      a number → that block) up to `HeadU`.
    - **head below upstream** → `sync_range(head+1, HeadU)`.
@@ -295,21 +303,26 @@ Design (eth_call.erl + eth_state.erl + eth_evm.erl ~900 lines + precompiles):
   edge cases, dropped child-frame logs, missing warm/cold accesses) are
   tracked in README TODO items 1–5.
 
-## 9. Known limitations (v0.3.2)
+## 9. Known limitations (v0.6.0)
 
 1. EVM fidelity gaps (see §8) — these can return *correct-looking-but-wrong*
    data on exotic code paths, hence the proxy fallback is the safety net.
 2. No consensus participation, no mempool, no authoring.
-3. No devp2p: a single upstream is a SPOF by design (all configurable).
+3. devp2p is opt-in and young: discovery/RLPx/`eth` sync, auto-dial and strict
+   ForkID are implemented and loopback-tested, but live-peering breadth
+   (against diverse real clients) is not yet demonstrated — upstream RPC
+   remains the dependable fallback by design (all configurable).
 4. Blobs are not stored/extended; KZG `0x0A` is proxied.
 5. Header-only blocks proxy `Full=true` requests rather than serving bodies.
-6. `eth_getLogs` and filter APIs are not implemented locally (proxied).
+6. `eth_getLogs` serves ranges capped at 1024 blocks from the receipts store;
+   wider ranges proxy upstream. Receipt serving needs the receipts store
+   populated (peer sync path); pure-RPC syncs keep proxying receipts.
 7. The state cache TTL for tags is a freshness/size trade-off; concurrent
    readers share it safely behind the `eth_state` owner.
 
 ## 10. Testing and the live harness
 
-- 110 eunit tests in `apps/etherlang/test/`, exercised with
+- 166 eunit tests in `apps/etherlang/test/`, exercised with
   `rebar3 eunit` (compiles to `_build/{default,node2}`).
 - Two local nodes (node A `:8545`, node B `:8546`) + a Docker deployment
   (`Dockerfile`, `docker-compose` with ethstats agents) all run the same
@@ -321,6 +334,7 @@ Design (eth_call.erl + eth_state.erl + eth_evm.erl ~900 lines + precompiles):
 ## 11. Roadmap direction
 
 Close EVM fidelity TODOs (transient storage, cold/warm semantics, precise gas,
-better revert value/error reporting), then consider: native blob transport,
-`eth_getLogs` from stored receipts, a second upstream with automatic failover,
-and state prefetch warmers to cut cold `eth_call` latency.
+better revert value/error reporting), then consider: tx pool with local
+`eth_send*`, state-trie sync toward `eth_getBalance` from local state, native
+blob transport, a second upstream with automatic failover, and state prefetch
+warmers to cut cold `eth_call` latency.
