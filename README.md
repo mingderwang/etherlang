@@ -1,11 +1,11 @@
 # etherlang
 
 An Ethereum-compatible blockchain node written in Erlang, runnable in Docker.
-It syncs and serves the canonical chain (headers and bodies) and ships a
-local **Erlang EVM** (`eth_evm`) that executes `eth_call` — with state
-overrides — against lazily-fetched upstream state. No devp2p, no tx pool, no
-block production: the upstream node remains the source of truth for consensus
-and inclusion.
+It syncs and serves the canonical chain (headers, bodies, **receipts**) over
+**devp2p/RLPx** with peer-first sync (RPC fallback), and ships a local
+**Erlang EVM** (`eth_evm`) that executes `eth_call` — with state overrides —
+against lazily-fetched upstream state. No tx pool, no block production: the
+network remains the source of truth for consensus and inclusion.
 
 ## Support
 
@@ -21,32 +21,43 @@ partial — see honesty notes) and has *no* consensus-layer components (no
 beacon, validators, or block production).
 
 * **Chain store** — persistent DETS-backed canonical chain (block-by-number,
-  hash index, head/metadata) with append, query, reorg rewind, and restart
-  recovery. Growth is bounded by `CHAIN_RETENTION` (default 2048 blocks; the
+  hash index, head/metadata, **receipts**, **tx→block index**) with append,
+  query, reorg rewind, and restart recovery. Growth is bounded by
+  `CHAIN_RETENTION` (default 2048 blocks; the
   recent-window blocks carry full bodies, so this caps the store around
   several hundred MiB) so the 2 GiB DETS ceiling can never be reached; older
   blocks prune away and are served from the upstream proxy instead.
-* **Sync engine** — bounded-parallel gap sync from `genesis`/`<N>`/`latest`,
-  header-only storage outside `BODY_WINDOW`, live polling follow, bounded
-  ancestor-walk reorg handling, and a monotonic `finalized` floor that never
-  accepts checkpoints ahead of the local head or off the canonical chain.
+* **Sync engine** — **peer-first**: verified headers/bodies/receipts from
+  eth-ready peers (backward walk to a local anchor, forward fill, tx-root and
+  receipts-root verified before append), with the bounded-parallel RPC gap
+  sync as fallback; header-only storage outside `BODY_WINDOW`, live polling
+  follow, bounded ancestor-walk reorg handling, and a monotonic `finalized`
+  floor that never accepts checkpoints ahead of the local head or off the
+  canonical chain.
+* **devp2p stack** (opt-in, off by default) — discv4 UDP discovery
+  (`DISCV4_ENABLED`, k-buckets, bonding), RLPx EIP-8 handshake + framing
+  (`RLPX_ENABLED`), `eth/68` Status (strict EIP-2124 ForkID)/headers/bodies/
+  receipts, auto-dial to `PEER_TARGET` with backoff, persisted node key.
+  Pure Erlang throughout (secp256k1, ECIES, MPT, snappy).
 * **Local EVM** — pure-Erlang interpreter covering the full defined opcode set
   including Cancun (`PUSH0`/`TLOAD`/`TSTORE`/`MCOPY`) plus precompiles
   `0x01`–`0x09` (`0x0A` KZG still proxies); serves `eth_call` locally with
   standard state overrides, proxying upstream on unsupported paths. Known
   fidelity simplifications are listed under TODO.
-* **JSON-RPC server** — cowboy listener on `:8545` that answers chain/block/tx
-  queries and `eth_call` from local storage + local execution, transparently
-  proxying everything else (`eth_getBalance`, `net_*`, …) to upstream.
-* **State honesty** — `stateRoot`/`receiptsRoot` are trusted from upstream,
-  not re-executed; blocks served locally carry the Sepolia TTD as
-  `totalDifficulty` when upstream omits it (post-merge constant, serve-time
-  only — see `with_td_compat`).
+* **JSON-RPC server** — cowboy listener on `:8545` that answers chain/block/tx/
+  **receipt/log-filter** queries and `eth_call` from local storage + local
+  execution, transparently proxying everything else (`eth_getBalance`,
+  `net_*`, …) to upstream.
+* **State honesty** — `stateRoot` is trusted from upstream, not re-executed;
+  `transactionsRoot`/`receiptsRoot` **are** verified against peer-supplied
+  bodies/receipts before anything is stored; blocks served locally carry the
+  Sepolia TTD as `totalDifficulty` when upstream omits it (post-merge
+  constant, serve-time only — see `with_td_compat`).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**103 tests, green**).
-* **Status** — v0.3.2; eunit green (110 tests) and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**166 tests, green**).
+* **Status** — v0.5.0; eunit green (166 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -189,14 +200,18 @@ code; none is guessing. Items marked DONE were closed with live verification.
 
 ---
 
-## How syncing works (the "no pain" part)
+## How syncing works
 
-Implementing `devp2p`/`RLPx`/`RLP`/ethash/keccak from scratch is a big, slow
-project. For v1 we sync through a **standard Ethereum JSON-RPC endpoint**
-instead:
+Each tick the node tries **eth-ready peers first**, RPC second:
 
-* **Gap sync** — fetch blocks `start..head` in bounded parallel windows via
-  `eth_getBlockByNumber`.
+* **Peer sync** — backward walk (192-header reverse batches) from a peer's
+  best hash to a local anchor, then forward fill: bodies fetched per header,
+  `transactionsRoot` verified, blocks assembled and appended through the
+  normal chain path (reorg logic reused); receipts fetched, verified against
+  `receiptsRoot`, and stored. Empty stores advertise genesis `Status` so
+  peers accept them as syncing remotes.
+* **RPC gap sync (fallback)** — fetch blocks `start..head` in bounded
+  parallel windows via `eth_getBlockByNumber`.
   * Recent blocks (inside `BODY_WINDOW`) are stored **with full bodies**.
   * Everything older is stored **header-only** (transactions as hashes), so
     historical sync is fast and light.
@@ -205,11 +220,12 @@ instead:
   * `parentHash` linkage against the locally stored canonical hash,
   * reorg detection (up/down) with a bounded **ancestor walk** back to the
     common ancestor, then a local rewind and re-sync from `CA+1`.
-* **Follow mode** — polls `eth_blockNumber` and pulls new blocks as they
-  appear. Head is persisted, so restarts resume where they left off.
+* **Follow mode** — polls peers/`eth_blockNumber` and pulls new blocks as
+  they appear. Head is persisted, so restarts resume where they left off.
 * **State honesty** — the local EVM executes calls but never re-executes full
-  blocks, so `stateRoot`/`receiptsRoot` are *not* re-verified; they are trusted
-  from upstream. This is documented and deliberate for v1.
+  blocks, so `stateRoot` is *not* re-verified; it is trusted from upstream.
+  `transactionsRoot`/`receiptsRoot` **are** verified. This is documented and
+  deliberate for v1.
 
 The node exposes a local JSON-RPC endpoint that answers from its own store
 (blocks, head, tx counts) and **proxies everything else to the upstream
@@ -294,15 +310,24 @@ All settings are environment variables (see `eth_config`):
 | `SYNC_RETRY_MS` | `2000` | currently stored, backoff wiring pending (see TODO) |
 | `VERIFY_HEADERS` | `true` | recompute + verify each header hash locally (`false` skips) |
 | `EVM_ETH_CALL` | `true` | execute `eth_call` in the local EVM (`false` forces proxy) |
+| `DISCV4_ENABLED` | `false` | run discv4 UDP discovery (k-buckets, bonding) |
+| `DISCV4_PORT` | `30303` | UDP port for discovery |
+| `DISCV4_BOOTNODES` | `` | comma-separated `enode://` discovery seeds |
+| `RLPX_ENABLED` | `false` | run RLPx TCP listener + peers |
+| `RLPX_PORT` | `30303` | TCP port for RLPx |
+| `PEER_TARGET` | `10` | desired peer count for auto-dial |
+| `PEER_DIAL_INTERVAL` | `10000` | ms between auto-dial maintenance ticks |
 
 ## Local JSON-RPC methods
 
 Served locally: `eth_blockNumber`, `eth_syncing`, `eth_getBlockByNumber`,
 `eth_getBlockByHash`, `eth_getBlockTransactionCountByNumber`,
 `eth_getBlockTransactionCountByHash`,
-`eth_getTransactionByBlockNumberAndIndex`, `eth_call` (local EVM when enabled,
-proxy fallback), `web3_clientVersion`, `eth_getVersion` (EthStats-compat shim),
-`eth_coinbase` (zero address), `eth_mining` (`false`), `eth_hashrate` (`0x0`).
+`eth_getTransactionByBlockNumberAndIndex`, `eth_getTransactionReceipt`,
+`eth_getLogs` (address/topics filters, capped range), `eth_call` (local EVM
+when enabled, proxy fallback), `web3_clientVersion`, `eth_getVersion`
+(EthStats-compat shim), `eth_coinbase` (zero address), `eth_mining`
+(`false`), `eth_hashrate` (`0x0`).
 Everything else is proxied to the upstream node transparently.
 
 Notes: served blocks carry Sepolia TTD as `totalDifficulty` when upstream
@@ -313,12 +338,14 @@ upstream's — avoid mixing the two mid-sync.
 
 ## Tests
 
-Tests run against an **in-process mock upstream node** (no network needed);
-they cover gap sync, live follow, reorg handling + rewind, finalized-floor
+Tests run against an **in-process mock upstream node** (no network needed)
+plus loopback devp2p stacks (discovery + RLPx + eth, real sockets); they
+cover gap sync, live follow, reorg handling + rewind, finalized-floor
 guards (never ahead of head / off-chain), persistence across restart, the
 JSON-RPC client, the JSON-RPC server (local + proxy + batch + `totalDifficulty`
-compat), shift/dispatch EVM regressions, and the local `eth_call` override
-path — **103 tests, all green**.
+compat), receipts store + filters, peer-first sync with verified
+bodies/receipts, shift/dispatch EVM regressions, and the local `eth_call`
+override path — **166 tests, all green**.
 
 ```bash
 make docker-test        # builds a test image and runs `rebar3 eunit`
@@ -361,23 +388,37 @@ unsupported paths).
 ```
 apps/etherlang/src/
   etherlang_app.erl      application boot
-  etherlang_sup.erl      supervisor (state -> chain -> rpc server -> sync)
+  etherlang_sup.erl      supervisor (state -> chain -> rpc server -> sync [+ discv4/peer])
   eth_config.erl          env/config resolution
   eth_hex.erl             0x-hex encode/decode
   eth_word.erl            256-bit word arithmetic
-  eth_rlp.erl             RLP encoding
-  eth_keccak.erl          pure-Erlang Keccak-256
-  eth_header.erl          header hash recomputation + verification
-  eth_chain.erl           canonical chain store (DETS) + reorg/rewind
+  eth_rlp.erl             RLP encoding + decoding
+  eth_keccak.erl          pure-Erlang Keccak-256 (+ incremental API)
+  eth_header.erl          header hash recomputation + verification + RLP/map conversion
+  eth_chain.erl           canonical chain store (DETS) + reorg/rewind + receipts + tx index
   eth_state.erl           call-state overlay (overrides) + upstream cache
   eth_evm.erl             local EVM interpreter (full defined opcode set)
   eth_evm_precompiles.erl precompiles 0x01-0x09 (0x0A KZG proxies) + bn128 EC ops
   eth_pairing_bn128.erl Tate pairing check (EIP-197), pure Erlang
   eth_call.erl            eth_call execution incl. contract creation
   eth_rpc_client.erl      JSON-RPC client over HTTP(S) (httpc)
-  eth_sync.erl            gap + follow sync engine + finality tracking
+  eth_sync.erl            peer-first + RPC gap/follow sync engine + finality tracking
   eth_rpc_server.erl      cowboy listener
-  eth_rpc_handler.erl     JSON-RPC dispatch + upstream proxy + TD compat
+  eth_rpc_handler.erl     JSON-RPC dispatch + receipts/logs + upstream proxy + TD compat
+  eth_secp256k1.erl       keygen/sign/recovery, pure Erlang
+  eth_ecies.erl           ECIES for the RLPx handshake
+  eth_snappy.erl          snappy framing for capability messages
+  eth_discv4.erl          UDP discovery wire + k-buckets + bonding
+  eth_rlpx.erl            EIP-8 handshake + framing + Hello/Ping/Pong
+  eth_peer.erl            peer manager (listener, manual + auto-dial)
+  eth_peer_conn.erl       one RLPx connection (p2p + eth Status/headers/bodies/receipts)
+  eth_eth.erl             eth/68 capability (negotiation, Status, headers/bodies/receipts)
+  eth_forkid.erl          EIP-2124 ForkID schedule/hash/validation
+  eth_trie.erl            hexary Merkle-Patricia root computation
+  eth_tx.erl              transaction RLP encode/decode + tx-root
+  eth_receipt.erl         receipt RLP encode/decode + roots + blooms
+  eth_bloom.erl           2048-bit logs bloom
+  eth_nodekey.erl         persisted static node key (shared by discv4 + RLPx)
 tools/
   eth_bench.escript       concurrent eth_call/JSON-RPC load benchmark
   eth_call_check.escript  offline EVM sanity checks
@@ -394,14 +435,22 @@ apps/etherlang/test/
 
 ## Roadmap (not in v1)
 
-* `devp2p`/`RLPx` inbound and outbound peering and snap/header sync
 * Local VM re-execution of full blocks to verify `stateRoot` (EVM exists;
   execution plumbing per-tx through `eth_call` is proven — block-scoped
   replay with receipts is the remaining work)
-* tx pool, receipts store, `eth_getBalance` from local state
+* tx pool, `eth_getBalance` from local state
 * snapshots for instant bootstrap (archive-style data-dir downloads)
 * EVM fidelity items from the TODO list (revert/value semantics, transient
   scope, gas model, remaining precompiles)
+
+## Release notes v0.4.0 → v0.5.0 (devp2p + receipts)
+
+* **v0.4.0** — KZG point-evaluation pairing fix, mainnet fixture green.
+* **v0.5.0** — devp2p stack in pure Erlang: discv4 discovery, RLPx
+  transport, `eth/68` Status/headers/bodies/receipts with strict ForkID,
+  auto-dial, peer-first sync with root-verified bodies/receipts; receipts
+  store + local `eth_getTransactionReceipt`/`eth_getLogs`; MPT, secp256k1,
+  ECIES, snappy, tx/receipt RLP codecs. Suite 110 → 166.
 
 ## v0.2.0 release notes (tag: v0.2.0)
 
