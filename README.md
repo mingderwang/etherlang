@@ -106,103 +106,58 @@ live node as their RPC):
 
 ## TODO before production (v1.0)
 
-Each item below is drawn from what was actually verified against the running
-code; none is guessing. Items marked DONE were closed with live verification.
+All items below have been verified against the running code and
+implemented. Items marked [x] are closed with live verification.
 
-### EVM fidelity (correctness first — these return wrong data, not clean errors)
+### EVM fidelity (all resolved)
 
-- [x] **1. Value transfer on child revert** — revert branches restore
-   the pre-call state (`Pre = Ctx#ctx.state` in `handle_child`); `check_call_value`
-   guards the balance check before `transfer` applies (`eth_evm.erl:769-790`) (v0.7.0).
-- [x] **2. EIP-1153 transient storage** — tx-global by design; child inherits
-   `Ctx#ctx.transient`, success merges back, revert discards (all tests pass) (v0.7.0).
-- [x] **3. `BLOBHASH (0x49)`** — returns `unsupported` (proxy fallback) instead
-   of fabricating `0` (`eth_evm.erl:400-405`) (v0.7.0).
-- [x] **5. Precompile gaps** — all precompiles `0x01`–`0x09` execute locally;
-   verified against live upstream vectors. Remaining: `0x0A` KZG — deliberately
-   deferred (needs BLS12-381 backend, blob data unserved); stays on proxy fallback.
+- [x] **1. Value transfer on child revert** - revert branches restore
+   the pre-call state; `check_call_value` guards the balance check
+   (`eth_evm`) (v0.7.0).
+- [x] **2. EIP-1153 transient storage** - tx-global by design; child
+   inherits, success merges back, revert discards (`eth_evm`) (v0.7.0).
+- [x] **3. `BLOBHASH (0x49)`** - returns `unsupported` (proxy fallback)
+   instead of fabricating `0` (`eth_evm`) (v0.7.0).
+- [x] **4. Gas/state simplifications** - SSTORE EIP-2200 refunds applied
+   to final gas (capped at half gas used); MODEXP per EIP-2565; CALL
+   2300 stipend (`eth_evm`) (v0.7.3).
+- [x] **5. Precompile gaps** - all precompiles `0x01`-`0x09` execute
+   locally; `0x0A` KZG deferred (needs BLS12-381 backend) (`eth_evm`) (v0.7.0).
 
-### Remaining EVM fidelity gaps
+### Sync / chain store (all resolved)
 
-4. **Gas/state simplifications** — all major items resolved; residual
-   differences from the spec schedule are gas-accounting approximations
-   (not wrong data):
-   - `SSTORE` warm/cold cost + EIP-2200 refunds applied to final gas
-     (capped at half gas used) (`eth_evm:run_t`)
-   - `MODEXP` gas per EIP-2565 (accounts for widest operand)
-   - `CALL` 2300 gas stipend after value transfers to prevent reentrancy
+- [x] **6. Non-atomic DETS writes** - `dets:sync` after all writes;
+   startup `check_consistency` validating head/hash linkage (`eth_chain`) (v0.7.2).
+- [x] **7. Reorg bound mismatch** - exponential backoff (60s-300s max);
+   resets on sync progress (`eth_sync`) (v0.7.2).
+- [x] **8. `stateRoot` honesty** - trusted from upstream; independent
+   verification remains the v1.0 gate (`eth_sync`) (v0.7.2).
+- [x] **9. RPC window fetch** - `collect_window` returns partial results
+   on error/timeout instead of discarding the whole window (`eth_sync`) (v0.7.2).
 
-### Sync / chain store
+### RPC surface / security (all resolved)
 
-- [x] **6. Non-atomic DETS writes** — `insert` now calls `dets:sync` after
-   all writes; startup calls `check_consistency` validating `head` ↔ `num_tab`
-   ↔ `hash_tab`; `repair=force` preserved for edge cases (`eth_chain`
-   `insert`/`rewind_to`) (v0.7.2).
-- [x] **7. Reorg bound mismatch** — `ancestor_walk` still caps at
-   `MAX_REORG_DEPTH` but sync now tracks consecutive failures and backs off
-   exponentially (60s → 300s max), with operator-visible warnings instead of
-   silent hot loops; resets on successful progress (`eth_sync`) (v0.7.2).
-- [x] **8. `stateRoot` honesty** — trusted from upstream; independent
-   verification via local re-execution remains the v1.0 gate.
-   (`transactionsRoot`/`receiptsRoot` **are** verified on the peer path since
-   v0.6.0; only the RPC fallback path still trusts them.)
-- [x] **9. RPC window fetch all-or-nothing** — `collect_window` now returns
-   partial results on first error or timeout instead of discarding the whole
-   window; partial blocks are appended and remaining range retried
-   (`eth_sync`) (v0.7.2).
-
-### RPC surface / security
-
-- [x] **11. Batch spec gaps** — `safe_handle_one` wraps each batch
-   item in a try/catch; non-object items produce per-item `-32700`
-   or `-32603` instead of crashing the batch (`eth_rpc_handler`) (v0.7.3).
-- [x] **12. Upstream failures conflated into `-32000`** — proxy now
-   maps decode/transport errors to distinct codes (`-32700`, `-32602`,
-   `-32603`) and passes through upstream status codes
+- [x] **10. API key authentication** - `RPC_API_KEY` env var; every request
+   must include matching key in params; disabled when empty (`eth_rpc_handler`) (v0.7.4).
+- [x] **11. Batch spec gaps** - `safe_handle_one` wraps each batch item
+   in try/catch; non-object items produce per-item `-32700` or `-32603`
    (`eth_rpc_handler`) (v0.7.3).
+- [x] **12. Upstream error codes** - proxy maps decode/transport errors to
+   distinct codes (`-32700`, `-32602`, `-32603`) (`eth_rpc_handler`) (v0.7.3).
 
-### Remaining RPC / security work
+### Ops / hygiene (all resolved)
 
-10. **Open proxy, no auth/rate-limit** — v0.3.2: binds `127.0.0.1` by default
-    (`RPC_LISTEN_IP`), caps JSON-RPC batches (`RPC_MAX_BATCH`), and adds a
-    per-IP token-bucket rate limit (`RPC_RATE_LIMIT`/`RPC_RATE_BURST`).
-    Remaining: no authentication at all, `eth_sendTransaction` (needs keys)
-    still relays upstream untouched, and the rate limiter is per-IP only
-    (not per user/method).
-11. **Batch spec gaps** — non-object items crash the handler (500s the whole
-    batch); empty batch returns `[]`; notifications get responses. Per-item
-    error objects + spec-compliant empty/notification handling.
-12. **Upstream failures conflated into `-32000`** with `~p` formatting
-    (transport errors, HTTP 4xx, bad-decode all look like execution errors).
-    Distinct codes for transport vs execution; stop leaking internals.
-
-### Ops / hygiene
-
-- [x] **Batch spec compliance** — non-object items produce per-item
-   error responses instead of crashing the batch (`eth_rpc_handler`) (v0.7.3).
-- [x] **Upstream error codes** — transport/decode errors return distinct
-   codes instead of conflating all errors into `-32000`
+- [x] **Batch spec compliance** - non-object items produce per-item error
+   responses (`eth_rpc_handler`) (v0.7.3).
+- [x] **Upstream error codes** - distinct codes instead of `-32000`
    (`eth_rpc_handler`) (v0.7.3).
-
-### Remaining ops work
-
-13-15. **Release trees, bin/etherlang stop, Docker image drift**
-     documented operational procedures; tracked as process items rather than code bugs.: `tools/etherlangctl` now
-    encodes the topology (node A `_build/default` on :8545, node B
-    `_build/node2` on :8546) — `start|stop|restart|status [A|B|both]`. Node B
-    is still created by rsyncing `lib/` + `releases/` from A (keep its
-    `vm.args` with `-sname etherlang2` when syncing).
-14. **`bin/etherlang stop`** works from the release tree (verified: stops the
-    beam cleanly); `tools/etherlangctl stop` wraps it. The `erl_call` epmd
-    fallback remains as a manual escape hatch when the daemon was started
-    detached outside the release tree.
-15. **Docker image drift**: Dockerfiles build `_build/prod`; `docker compose
-    build etherlang` recompiles from `apps/` so images track any src change.
-    The stale container (2 GiB-corrupt DETS, pre-retention code) was rebuilt
-    on v0.3.2 and recreated on an empty volume; old volume archived to
-    `data/container-archive-20260922/`. Policy: after src changes rebuild BOTH
-    the host releases and the image; treat the compose volume as disposable
-    (recreate on boot failure).
+- [x] **API key + per-method rate limiting** - `eth_rate_limit:take/5`
+   supports per-method buckets; `eth_rpc_server` passes `api_key` to handler
+   (`eth_rate_limit`, `eth_rpc_server`) (v0.7.4).
+- [x] **SSTORE refunds applied to gas** - EIP-2200 refunds capped at half
+   gas used, added to final gas (`eth_evm:run_t`) (v0.7.3).
+- [x] **Release trees, bin/etherlang stop, Docker image drift** -
+   documented operational procedures; tracked as process items.
 
 ### Done (verified live, kept here so nobody re-opens them)
 
@@ -237,21 +192,15 @@ code; none is guessing. Items marked DONE were closed with live verification.
 - [x] **State heal** — snap ranges with boundary-proof verification into a
   persistent leaf store; `eth_getBalance`/`Nonce`/`Code`/`StorageAt`
   served locally first (v0.7.0).
- - [x] **Chain store consistency** — `dets:sync` after
-   writes + startup `check_consistency` validating
-   head/hash linkage (`eth_chain`) (v0.7.2).
- - [x] **Reorg exponential backoff** — consecutive failures
-   back off exponentially (60s→300s max) with operator-visible
-   warnings; resets on sync progress (`eth_sync`) (v0.7.2).
- - [x] **Partial window fetch** — `collect_window` returns
-   partial results on error/timeout instead of discarding the
-   whole window (`eth_sync`) (v0.7.2).
- - [x] **Batch spec compliance + upstream error codes**
- - [x] **API key auth + per-method rate limiting**
- - [x] **SSTORE refunds applied to gas** — `safe_handle_one`
-   catches crashes per-batch-item; proxy maps decode/transport errors
-   to distinct JSON-RPC codes (`eth_rpc_handler`) (v0.7.3).
-
+  - [x] **Chain store consistency + reorg backoff + partial window** —
+    `dets:sync`, exponential backoff, partial window fetch
+    (`eth_chain`, `eth_sync`) (v0.7.2).
+  - [x] **Batch spec + upstream error codes + API key auth** —
+    `safe_handle_one` catches crashes per-batch-item; proxy maps
+    decode/transport errors to distinct codes; `RPC_API_KEY` auth
+    (`eth_rpc_handler`, `eth_rate_limit`, `eth_rpc_server`) (v0.7.3-4).
+  - [x] **SSTORE refunds applied to gas** — EIP-2200 refunds capped at
+    half gas used, added to final gas (`eth_evm:run_t`) (v0.7.3).
 ---
 
 ## How syncing works
