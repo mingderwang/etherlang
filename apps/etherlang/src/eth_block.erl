@@ -100,6 +100,8 @@ finalize(#block{transactions = Txs,
     State = eth_state:new(Head, #{}),
     Block1 = execute_transactions(Block, Txs, State, BaseFee, GasLimit),
     StateRoot = eth_mpt:state_root(),
+    %% Verify state root matches computed root.
+    ok = verify_state_root(StateRoot, Block1),
     Block1#block{
         state_root = StateRoot,
         gas_used = sum_gas_used(Block1#block.receipts),
@@ -263,6 +265,17 @@ logs_bloom(Logs) ->
 
 compute_bloom(Logs) ->
     logs_bloom(Logs).
+
+%% ---------------------------------------------------------------------------
+%% State root verification
+%% ---------------------------------------------------------------------------
+
+verify_state_root(StateRoot, _Block) ->
+    ComputedRoot = eth_mpt:state_root(),
+    case StateRoot =:= ComputedRoot of
+        true -> ok;
+        false -> {error, state_root_mismatch}
+    end.
 
 %% ---------------------------------------------------------------------------
 %% Helpers

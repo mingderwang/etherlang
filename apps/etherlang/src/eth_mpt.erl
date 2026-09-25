@@ -79,6 +79,7 @@ clear() ->
 
 init([]) ->
     ensure_table(),
+    ensure_dets(),
     State = #st{
         accounts = #{},
         storages = #{},
@@ -293,6 +294,17 @@ ensure_table() ->
         _ -> ok
     end.
 
+ensure_dets() ->
+    Dir = "./data",
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    case dets:info(?TAB) of
+        undefined ->
+            {ok, _} = dets:open_file(?TAB, [{file, filename:join(Dir, "mpt_state.dets")},
+                                             {type, set}, {repair, force}]),
+            ok;
+        _ -> ok
+    end.
+
 load_snapshot(#st{snapshot_file = File} = S) ->
     case file:read_file(File) of
         {ok, Bin} ->
@@ -315,4 +327,10 @@ save_snapshot(S) ->
              root => S#st.root},
     ok = filelib:ensure_dir(S#st.snapshot_file),
     Bin = thoas:encode(Data),
-    file:write_file(S#st.snapshot_file, Bin).
+    file:write_file(S#st.snapshot_file, Bin),
+    %% Also persist to DETS.
+    dets:insert(?TAB, {accounts, maps:to_list(S#st.accounts)}),
+    dets:insert(?TAB, {storages, maps:to_list(S#st.storages)}),
+    dets:insert(?TAB, {code, maps:to_list(S#st.code)}),
+    dets:insert(?TAB, {root, S#st.root}),
+    dets:sync(?TAB).

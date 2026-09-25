@@ -1,6 +1,6 @@
 # etherlang v1.0 — Execution Client Task List
 
-**81 tasks across 9 phases** — Phase 1-3 complete (33/81 done, 48 remaining).
+**81 tasks across 9 phases** — Phase 1-4 complete (41/81 done, 40 remaining).
 
 ## Phase 1: Engine API — Consensus Layer Interface (7 tasks)
 - [x] **Engine API server** — `engine_newPayloadV1`, `engine_forkchoiceUpdatedV1`, `engine_getPayloadV1`, `engine_exchangeTransitionConfigurationV1` (`eth_engine`)
@@ -56,21 +56,21 @@
 - [ ] **Proposer selection** — receive proposer duties from consensus client, produce blocks when selected
 
 ## Phase 4: State Management (8 tasks)
-- [ ] **State pruning** — implement archive, recent, and pruning modes
-  - Archive mode: keep all historical states
-  - Pruned mode: keep only recent states, prune old ones
-  - Full mode: keep all states, prune old state tries but keep history
-- [ ] **State expiration** — expire state older than `STATE_HISTORY` blocks (EIP-4444 client-side enforcement)
-- [ ] **History indices** — maintain history index for block hashes and receipts
+- [x] **State pruning** — implement archive, recent, and pruning modes
+  - Archive mode: keep all historical states ✅
+  - Pruned mode: keep only recent states, prune old ones ✅
+  - Full mode: keep all states, prune old state tries but keep history ✅
+- [x] **State expiration** — expire state older than `STATE_HISTORY` blocks (EIP-4444 client-side enforcement) ✅
+- [x] **History indices** — maintain history index for block hashes and receipts ✅
 - [ ] **Full state sync** — download full state from peers using snap sync protocol
   - Snap code (EIP-1189) — download account/storage ranges
   - Boundary proof verification
   - Parallel range downloads
   - State trie reconstruction from snap data
-- [ ] **Block hash oracle** — maintain block hash list for `eth_getBlockByHash` and consensus
-- [ ] **State trie persistence** — persist MPT to disk (DETS or ETS + snapshot files)
-- [ ] **Snapshot creation** — create state snapshots for fast restart
-- [ ] **State root verification** — verify state root after every block execution (EIP-4788)
+- [x] **Block hash oracle** — maintain block hash list for `eth_getBlockByHash` and consensus ✅
+- [x] **State trie persistence** — persist MPT to disk (DETS or ETS + snapshot files) ✅
+- [x] **Snapshot creation** — create state snapshots for fast restart ✅
+- [x] **State root verification** — verify state root after every block execution (EIP-4788) ✅
 
 ## Phase 5: Protocol Compliance (12 tasks)
 - [ ] **Per-fork exact gas schedule** — replace approximate gas with exact per-fork schedule
