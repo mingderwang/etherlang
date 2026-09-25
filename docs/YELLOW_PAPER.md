@@ -1,6 +1,8 @@
 # etherlang — a yellow-paper style description
 
-**Version**: v0.7.0 (Sepolia). This document describes what the node *is*,
+**Version**: v1.0-DEV (planning).
+
+**v0.7.4 status**: read-mostly relay (see README). This document describes the v1.0 target architecture. This document describes what the node *is*,
 its system model, trust assumptions, data structures, protocol, and the
 properties that fall out of the design. It is not a re-derivation of the
 Ethereum Yellow Paper; it is the design document for an approximately-30k-line
@@ -14,27 +16,20 @@ fidelity caveats are listed in README's TODO and repeated here in §9.
 ## 1. Executive summary
 
 etherlang is an Erlang/OTP application that speaks the Ethereum JSON-RPC
-interface. It is **not** a full Ethereum execution client:
+interface. It is **v0.7.4 is a read-mostly relay** — a low-footprint
+dependency-light endpoint whose workload is proportional to *reads*, not to state.
 
-- it runs devp2p/RLPx opt-in (peer discovery, `eth/68` + snap sync,
-  tx gossip), with upstream RPC as the dependable fallback,
-- it does not run the beacon chain or vote in consensus,
-- it has a transaction pool (gossip, validation, `eth_sendRawTransaction`)
-  but does not mine or author blocks,
-- it maintains a bounded snap state leaf store, not a full state trie,
+This document describes the **v1.0 target architecture**: a complete Ethereum
+execution client that is compatible with Lighthouse, Prysm, Nimbus, Teku, and
+Lodestar. To achieve this, etherlang must become:
 
-Instead it syncs canonical blocks **from peers first** (verified headers,
-bodies and receipts over RLPx), falling back to an **upstream Ethereum node
-over JSON-RPC**, validates their structural integrity (contiguous numbering and
-cryptographic parent linkage by recomputing header hashes, plus tx/receipt
-trie roots on the peer path), stores a bounded
-recent window of them in DETS tables, and serves that window locally while
-transparently proxying everything it does not hold to the upstream node. A
-separate, purely local EVM evaluates `eth_call` requests (reads) against
-upstream-derived state, without ever mutating the chain.
+- a **full consensus-layer-compatible** node via the Engine API (EIP-3675),
+- a **full state trie** (Merkle-Patricia Trie, not a bounded snap store),
+- a **block producer** (author execution payloads when selected as proposer),
+- **geth-compatible** in all JSON-RPC methods and devp2p sub-protocols,
+- **per-fork exact** in gas scheduling and protocol behavior.
 
-The product is a low-footprint, dependency-light Ethereum-compatible endpoint
-whose workload is proportional to *reads*, not to state.
+See the README for the full v1.0 work plan.
 
 ## 2. System model and trust assumptions
 
@@ -42,11 +37,11 @@ The node is a **read-mostly relay with local cache and local verification**.
 
 Trust boundary (all explicit, all configurable or documented):
 
-1. **Canonicality** — the upstream node is the source of truth for what the
-   canonical chain is. There is a single upstream URL (`UPSTREAM_RPC_URL`).
-   The node never executes blocks, so it cannot detect a malicious upstream
-   fork by replay; it can only detect *inconsistency within* a single chain
-   (wrong hashes, broken linkage).
+1. **Canonicality** — v0.7.4: the upstream node is the source of truth.
+   **v1.0 target**: the node independently verifies canonicality via the
+   consensus layer (Engine API forkchoice updates) and local block execution.
+   The consensus client (Lighthouse, etc.) provides the canonical chain;
+   etherlang verifies and executes blocks locally.
 2. **Finality** — the `finalized` checkpoint (like `safe`) is *learned from
    the upstream node* rather than derived. It is only **accepted** when it
    satisfies a local guard: it must be at or below the local head **and** must
@@ -57,13 +52,15 @@ Trust boundary (all explicit, all configurable or documented):
    header is RLP-encoded and keccak-256 hashed locally (eth_header/eth_rlp/
    eth_keccak) before storage. The stored `hash` and the parentHash linkage are
    therefore recomputed, not copied from the wire (`eth_chain:verify_blocks/2`).
-4. **State reads** — account state (balance/nonce/code/storage) is fetched
-   lazily from upstream per read and cached; results are as trustworthy as the
-   upstream node for that block tag.
+4. **State reads** — v0.7.4: account state is fetched lazily from upstream
+   per read and cached. **v1.0 target**: state is maintained in a full
+   Merkle-Patricia Trie, enabling local verification of all state reads,
+   state proofs, and storage access.
 
-Non-goals, stated so nobody re-opens them: block production, staking,
-blob/KZG service, per-account fee payment, validators and proposer duties,
-WebSocket transport.
+Non-goals, stated so nobody re-opens them: staking,
+validators, beacon chain consensus, WebSocket transport.
+
+**Block production and consensus-layer integration are now goals** (see Phase 1-3 below).
 
 ## 3. OTP kernel
 
@@ -341,8 +338,122 @@ Design (eth_call.erl + eth_state.erl + eth_evm.erl ~900 lines + precompiles):
 ## 11. Roadmap direction
 
 Close remaining EVM fidelity gaps (precise gas accounting, better
-revert value/error reporting), then address: RPC authentication,
-block building from the pending pool, state-trie sync toward full
-`eth_getBalance` independence, native blob transport, a second upstream
-with automatic failover, and state prefetch warmers to cut cold
-`eth_call` latency.
+revert value/error reporting) → already resolved as of v0.7.4.
+
+**v1.0 target: complete execution client.** See README for the full
+9-phase plan:
+
+1. **Engine API** — `engine_newPayloadV1`, `engine_forkchoiceUpdatedV1`,
+   `engine_getPayloadV1`, `engine_exchangeTransitionConfigurationV1`
+   (JWT-authenticated, for Lighthouse/Prysm/Nimbus/Teku/Lodestar)
+2. **Full MPT state trie** — replace bounded snap store with
+   Merkle-Patricia Trie supporting state proofs, local verification,
+   and `eth_getProof`
+3. **Block production** — construct execution payloads, process
+   withdrawals (EIP-4895), compute receipts/blooms, produce blocks
+   when selected as proposer
+4. **State management** — pruning (archive/recent modes), state
+   expiration (EIP-4444), full state sync (snap code EIP-1189),
+   state root verification (EIP-4788)
+5. **Protocol compliance** — per-fork exact gas schedule, EIP-1559
+   base fee + burning, EIP-4844 blobs, EIP-4788 beacon roots,
+   EIP-3675 PoS merge, geth-compatible devp2p
+6. **JSON-RPC completeness** — debug/trace/miner/personal/admin
+   APIs, typed transactions (EIP-2718), EIP-712 signing, all `eth_*`
+   methods
+7. **Consensus integration** — tested with Lighthouse, Prysm, Nimbus,
+   Teku, Lodestar on Sepolia and mainnet
+8. **Testing** — Foundry tests, geth test vectors, differential testing
+   against geth, conformance tests, fuzz testing
+9. **Infrastructure** — Docker, monitoring, health checks, release process
+
+## 12. v1.0 Architecture — Complete Execution Client
+
+### Design goal
+
+etherlang v1.0 is a **complete Ethereum execution client** that is
+compatible with **any consensus client** that implements the Engine API
+(EIP-3675): Lighthouse, Prysm, Nimbus, Teku, Lodestar.
+
+### Architecture (v1.0)
+
+```
+ethlang (execution layer)
+├── Engine API server (JWT-authenticated)
+│   ├── engine_newPayloadV1     — receive blocks from CL
+│   ├── engine_forkchoiceUpdatedV1 — safe/finalized updates
+│   ├── engine_getPayloadV1     — return payload for CL
+│   └── engine_exchangeTransitionConfigurationV1 — negotiate
+│
+├── Block producer
+│   ├── Transaction pool → block builder
+│   ├── Block header constructor
+│   ├── State execution (MPT)
+│   ├── Receipt/log/bloom generation
+│   └── Withdrawal processing (EIP-4895)
+│
+├── Full state trie (Merkle-Patricia)
+│   ├── Account trie (balance, nonce, codeHash, storageRoot)
+│   ├── Storage trie (per-account)
+│   ├── Code storage (by keccak hash)
+│   ├── State proof generation
+│   └── State pruning (archive/recent modes)
+│
+├── Consensus interface (Engine API client)
+│   ├── Lighthouse / Prysm / Nimbus / Teku / Lodestar
+│   ├── JWT authentication
+│   └── Forkchoice sync
+│
+├── JSON-RPC server (complete API)
+│   ├── eth_* (all methods)
+│   ├── debug_* (trace APIs)
+│   ├── miner_* (no-op in PoS)
+│   ├── personal_* (key management)
+│   ├── admin_* (node management)
+│   ├── net_* (network info)
+│   └── web3_* (compatibility)
+│
+├── devp2p stack (full protocol)
+│   ├── discv5 (UDP v5 discovery)
+│   ├── rlpx (EIP-8 handshake + framing)
+│   ├── eth/68 + all sub-protocols
+│   ├── snap/1 (full snap sync)
+│   └── eth/69 (history, if needed)
+│
+└── Verification layer
+    ├── State root verification (every block)
+    ├── Receipt verification
+    ├── Per-fork exact gas schedule
+    └── Transaction validation (all fields)
+```
+
+### Trust model (v1.0)
+
+1. **Consensus client** (Lighthouse, etc.) provides the canonical chain
+   via the Engine API. etherlang validates and executes every block.
+2. **State** is maintained in a full MPT. State root is verified after
+   every block execution.
+3. **State proofs** are locally verifiable. No trust in upstream
+   for state reads.
+4. **Canonicality** is determined by the consensus layer, not upstream
+   RPC.
+5. **Block production** occurs when etherlang is selected as proposer
+   by the consensus layer.
+
+### Testing matrix (v1.0)
+
+| Consensus client | Engine API | eth/68 | forkid | Testing |
+|---|---|---|---|---|
+| Lighthouse | Required | Required | Required | Phase 7 |
+| Prysm | Required | Required | Required | Phase 7 |
+| Nimbus | Required | Required | Required | Phase 7 |
+| Teku | Required | Required | Required | Phase 7 |
+| Lodestar | Required | Required | Required | Phase 7 |
+
+### Dependencies
+
+- Pure Erlang/OTP — no external consensus libraries needed
+- No Rust, Go, or Java dependencies
+- Pure Erlang crypto (secp256k1, ECIES, keccak)
+- Pure Erlang MPT implementation
+- DETS/ETS for state storage (with snapshot files for persistence)
