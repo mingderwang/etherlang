@@ -4,6 +4,8 @@
 
 with_store(Name, Fun) ->
     Dir = eth_test_util:tmp_dir(),
+    {ok, _} = eth_mpt:start_link(),
+    ok = eth_mpt:clear(),
     {ok, _} = eth_statestore:start_link(#{name => Name, dir => Dir}),
     try Fun()
     after

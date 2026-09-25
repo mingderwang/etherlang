@@ -5,7 +5,7 @@
 %% persistence, no proofs. Keys and values are raw binaries (for tx tries:
 %% key = RLP(index), value = RLP(tx)).
 
--export([root/1, verify_proof/3, decode_compact/1, build/1, prove/2]).
+-export([root/1, verify_proof/3, decode_compact/1, build/1, prove/2, insert/3, nibbles/1]).
 
 %% Root of [{Key, Value}]. Empty trie = keccak256(RLP("")).
 root([]) ->

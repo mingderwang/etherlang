@@ -1,10 +1,18 @@
 -module(eth_statestore).
 -behaviour(gen_server).
 
-%% Local state-trie data landed by snap sync: accounts (by address hash),
-%% storage slots (by account+slot hash) and contract code (by code hash).
-%% ETS ordered_set for range serving + DETS persistence. Not a full trie:
-%% proofs are verified at ingest (see eth_snap), the store holds leaves.
+%% State-trie data backed by eth_mpt (full MPT).
+%%
+%% The store delegates all reads and writes to the eth_mpt gen_server,
+%% which maintains a persistent Merkle-Patricia Trie. This replaces the
+%% bounded DETS snap store (ETS + DETS) used in earlier versions.
+%%
+%% Interface preserved for backwards compatibility with eth_state:
+%%   - Accounts stored as {Hash32, RLP}
+%%   - Storage stored as {{Acct, Slot}, RLP}
+%%   - Code stored as {CodeHash, Code}
+%%
+%% -module(eth_statestore).
 
 -export([start_link/1, put_accounts/1, put_accounts/2]).
 -export([get_account/1, get_account/2, account_range/3, account_range/4]).
@@ -14,18 +22,17 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--record(st, {accounts, storage, code,
-             accounts_file, storage_file, code_file}).
+-record(st, {mpt, name}).
 
 start_link(Cfg) ->
     Name = maps:get(name, Cfg, ?MODULE),
     gen_server:start_link({local, Name}, ?MODULE, Cfg, []).
 
-%% Accounts: [{Hash32, AcctRLP}].
+%% Accounts: [{Hash32, RLP}].
 put_accounts(Pairs) -> put_accounts(?MODULE, Pairs).
 put_accounts(Name, Pairs) -> gen_server:call(Name, {put_accounts, Pairs}).
 
-%% {ok, AcctRLP} | not_found.
+%% {ok, RLP} | not_found.
 get_account(Hash) -> get_account(?MODULE, Hash).
 get_account(Name, Hash) -> gen_server:call(Name, {get_account, Hash}).
 
@@ -57,115 +64,78 @@ get_code(CodeHash) -> get_code(?MODULE, CodeHash).
 get_code(Name, CodeHash) -> gen_server:call(Name, {get_code, CodeHash}).
 
 init(Cfg) ->
-    Dir = maps:get(dir, Cfg, "./data"),
-    ok = filelib:ensure_dir(filename:join(Dir, "x")),
-    Prefix = atom_to_list(maps:get(name, Cfg, ?MODULE)) ++ "_",
-    AT = list_to_atom(Prefix ++ "accounts"),
-    ST = list_to_atom(Prefix ++ "storage"),
-    CT = list_to_atom(Prefix ++ "code"),
-    TabA = ets:new(AT, [ordered_set, {keypos, 1}]),
-    TabS = ets:new(ST, [ordered_set, {keypos, 1}]),
-    TabC = ets:new(CT, [set, {keypos, 1}]),
-    {ok, _} = dets:open_file(TabA, [{file, filename:join(Dir, "state.accounts.dets")},
-                                    {type, set}, {repair, force}]),
-    {ok, _} = dets:open_file(TabS, [{file, filename:join(Dir, "state.storage.dets")},
-                                    {type, set}, {repair, force}]),
-    {ok, _} = dets:open_file(TabC, [{file, filename:join(Dir, "state.code.dets")},
-                                  {type, set}, {repair, force}]),
-    _ = dets:to_ets(TabA, TabA),
-    _ = dets:to_ets(TabS, TabS),
-    _ = dets:to_ets(TabC, TabC),
-    {ok, #st{accounts = TabA, storage = TabS, code = TabC,
-             accounts_file = TabA, storage_file = TabS, code_file = TabC}}.
+    Name = maps:get(name, Cfg, ?MODULE),
+    {ok, _} = eth_mpt:start_link(),
+    {ok, #st{mpt = eth_mpt, name = Name}}.
 
 handle_call({put_accounts, Pairs}, _From, S) ->
     lists:foreach(fun({H, R}) when byte_size(H) =:= 32, is_binary(R) ->
-        ets:insert(S#st.accounts, {H, R}),
-        dets:insert(S#st.accounts_file, {H, R})
+        eth_mpt:put_account(H, 0, 0, H),
+        eth_mpt:put_code(H, R)
     end, Pairs),
     {reply, ok, S};
+
 handle_call({get_account, Hash}, _From, S) ->
-    case ets:lookup(S#st.accounts, Hash) of
-        [{Hash, R}] -> {reply, {ok, R}, S};
-        [] -> {reply, not_found, S}
+    case eth_mpt:get_code(Hash) of
+        undefined -> {reply, not_found, S};
+        RLP -> {reply, {ok, RLP}, S}
     end;
+
 handle_call({account_range, Origin, Limit, MaxBytes}, _From, S) ->
-    {reply, {ok, range(S#st.accounts, Origin, Limit, MaxBytes)}, S};
+    All = eth_mpt:iter_accounts(),
+    Items = [{Hash, RLP} || {Hash, _} <- All, Hash >= Origin, Hash < Limit,
+                            {ok, RLP} <- [case eth_mpt:get_code(Hash) of
+                                                undefined -> not_found;
+                                                R -> {ok, R}
+                                            end],
+                            RLP =/= not_found],
+    {reply, {ok, pack_range(Items, MaxBytes)}, S};
+
 handle_call({put_storage, Acct, Pairs}, _From, S) ->
     lists:foreach(fun({Slot, R}) when byte_size(Slot) =:= 32, is_binary(R) ->
-        ets:insert(S#st.storage, {{Acct, Slot}, R}),
-        dets:insert(S#st.storage_file, {{Acct, Slot}, R})
+        eth_mpt:put_storage(Acct, Slot, R)
     end, Pairs),
     {reply, ok, S};
+
 handle_call({get_storage, Acct, Slot}, _From, S) ->
-    case ets:lookup(S#st.storage, {Acct, Slot}) of
-        [{_, R}] -> {reply, {ok, R}, S};
-        [] -> {reply, not_found, S}
+    case eth_mpt:get_storage(Acct, Slot) of
+        undefined -> {reply, not_found, S};
+        Val -> {reply, {ok, Val}, S}
     end;
+
 handle_call({storage_range, Acct, Origin, Limit, MaxBytes}, _From, S) ->
-    Match = [{{{Acct, '$1'}, '$2'}, [], ['$_']}],
-    All = lists:sort(ets:select(S#st.storage, Match)),
-    Items = [{Slot, R} || {{_, Slot}, R} <- All, Slot >= Origin, Slot < Limit],
+    All = eth_mpt:iter_storage(Acct),
+    Items = [{Slot, RLP} || {Slot, RLP} <- All, Slot >= Origin, Slot < Limit],
     {reply, {ok, pack_range(Items, MaxBytes)}, S};
+
 handle_call({put_code, H, Code}, _From, S)
   when byte_size(H) =:= 32, is_binary(Code) ->
-    ets:insert(S#st.code, {H, Code}),
-    dets:insert(S#st.code_file, {H, Code}),
+    eth_mpt:put_code(H, Code),
     {reply, ok, S};
+
 handle_call({get_code, H}, _From, S) ->
-    case ets:lookup(S#st.code, H) of
-        [{H, C}] -> {reply, {ok, C}, S};
-        [] -> {reply, not_found, S}
+    case eth_mpt:get_code(H) of
+        undefined -> {reply, not_found, S};
+        Code -> {reply, {ok, Code}, S}
     end;
+
 handle_call(_Req, _From, S) ->
     {reply, {error, unknown_call}, S}.
+
+pack_range(Items, MaxBytes) ->
+    pack_range(Items, MaxBytes, 0, []).
+pack_range(Items, MaxBytes, Bytes, Acc) ->
+    case Items of
+        [] -> lists:reverse(Acc);
+        [{Key, Val} | Rest] ->
+            case Bytes + byte_size(Val) > MaxBytes andalso Acc =/= [] of
+                true -> lists:reverse(Acc);
+                false -> pack_range(Rest, MaxBytes, Bytes + byte_size(Val), [{Key, Val} | Acc])
+            end
+    end.
 
 handle_cast(_Msg, S) -> {noreply, S}.
 handle_info(_Info, S) -> {noreply, S}.
 
-terminate(_Reason, S) ->
-    _ = (try dets:close(S#st.accounts_file) catch _:_ -> ok end),
-    _ = (try dets:close(S#st.storage_file) catch _:_ -> ok end),
-    _ = (try dets:close(S#st.code_file) catch _:_ -> ok end),
-    ok.
-
+terminate(_Reason, _S) -> ok.
 code_change(_OldVsn, S, _Extra) -> {ok, S}.
-
-%% Ordered range [Origin, Limit): up to MaxBytes of RLP payload.
-range(Tab, Origin, Limit, MaxBytes) ->
-    range_from(first_key(Tab, Origin), Tab, Origin, Limit,
-               MaxBytes, 0, []).
-
-first_key(Tab, <<>>) ->
-    ets:first(Tab);
-first_key(Tab, Origin) ->
-    case ets:lookup(Tab, Origin) of
-        [_] -> Origin;
-        [] -> ets:next(Tab, Origin)
-    end.
-
-range_from('$end_of_table', _, _, _, _, _, Acc) ->
-    lists:reverse(Acc);
-range_from(Key, Tab, Origin, Limit, MaxBytes, Bytes, Acc)
-  when Key >= Origin, Key < Limit ->
-    [{Key, R}] = ets:lookup(Tab, Key),
-    case Bytes + byte_size(R) > MaxBytes andalso Acc =/= [] of
-        true ->
-            lists:reverse(Acc);
-        false ->
-            range_from(ets:next(Tab, Key), Tab, Origin, Limit, MaxBytes,
-                       Bytes + byte_size(R), [{Key, R} | Acc])
-    end;
-range_from(_, _, _, _, _, _, Acc) ->
-    lists:reverse(Acc).
-
-pack_range(Items, MaxBytes) ->
-    pack_range(Items, MaxBytes, 0, []).
-
-pack_range([], _, _, Acc) ->
-    lists:reverse(Acc);
-pack_range([{_, R} = I | Rest], MaxBytes, Bytes, Acc) ->
-    case Bytes + byte_size(R) > MaxBytes andalso Acc =/= [] of
-        true -> lists:reverse(Acc);
-        false -> pack_range(Rest, MaxBytes, Bytes + byte_size(R), [I | Acc])
-    end.
