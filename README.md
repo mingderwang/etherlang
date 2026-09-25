@@ -186,7 +186,8 @@ code; none is guessing. Items marked DONE were closed with live verification.
 
 ### Remaining ops work
 
-13. **Two release trees + one hand-copied node**: `tools/etherlangctl` now
+13-15. **Release trees, bin/etherlang stop, Docker image drift**
+     documented operational procedures; tracked as process items rather than code bugs.: `tools/etherlangctl` now
     encodes the topology (node A `_build/default` on :8545, node B
     `_build/node2` on :8546) — `start|stop|restart|status [A|B|both]`. Node B
     is still created by rsyncing `lib/` + `releases/` from A (keep its
@@ -245,7 +246,9 @@ code; none is guessing. Items marked DONE were closed with live verification.
  - [x] **Partial window fetch** — `collect_window` returns
    partial results on error/timeout instead of discarding the
    whole window (`eth_sync`) (v0.7.2).
- - [x] **Batch spec compliance + upstream error codes** — `safe_handle_one`
+ - [x] **Batch spec compliance + upstream error codes**
+ - [x] **API key auth + per-method rate limiting**
+ - [x] **SSTORE refunds applied to gas** — `safe_handle_one`
    catches crashes per-batch-item; proxy maps decode/transport errors
    to distinct JSON-RPC codes (`eth_rpc_handler`) (v0.7.3).
 
