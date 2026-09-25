@@ -381,77 +381,85 @@ withdrawal_amount(#{amount := Amount}) -> Amount;
 withdrawal_amount(#{<<"amount">> := Amount}) -> Amount;
 withdrawal_amount(_) -> 0.
 
-%% EIP-4895 specifies an SSZ hash-tree-root, not an MPT/RLP root.  A
-%% withdrawal has four basic fields: uint64 index, uint64 validator index,
-%% bytes20 address, and uint64 amount.  The list is mixed with its length and
-%% padded to the protocol's maximum of 16 elements.
+%% withdrawalsRoot commits to the withdrawals list as a Merkle-Patricia trie,
+%% keyed by the withdrawal's *position* in the list and valued with the RLP of
+%% the withdrawal's four fields. This is the same construction as the
+%% transactions root, which is what the EIP says, and the reference spec
+%% implements it identically:
 %%
-%% EIP-4895 also caps a payload at ?MAX_WITHDRAWALS_PER_PAYLOAD entries, so a
-%% longer list is truncated before the root (and before the mixed-in length) is
-%% computed. A payload that exceeds the cap is invalid, not merely clamped, so
-%% callers should check the length separately; the root stays well defined.
+%%     for i, wd in enumerate(withdrawals):
+%%         trie_set(trie, rlp.encode(Uint(i)), rlp.encode(wd))
+%%
+%% The key is the position, not the withdrawal's own `index' field -- those are
+%% different numbers, and conflating them yields a root that matches nothing.
+%%
+%% An empty list therefore gives the canonical empty-trie root, not a hash of
+%% an empty SSZ list. An earlier implementation here used SSZ, which produces a
+%% plausible 32-byte value that no other client would ever produce; against a
+%% real Shanghai block it disagreed on every field.
+%%
+%% EIP-4895 caps a payload at ?MAX_WITHDRAWALS_PER_PAYLOAD entries, so a longer
+%% list is truncated before the root is computed. A payload that exceeds the cap
+%% is invalid rather than merely clamped, so callers must check the length
+%% separately; the root itself stays well defined either way.
 withdrawals_root(Withdrawals) when is_list(Withdrawals) ->
     Capped = lists:sublist(Withdrawals, ?MAX_WITHDRAWALS_PER_PAYLOAD),
-    Chunks = [withdrawal_hash_tree_root(W) || W <- Capped],
-    Root = ssz_merkleize(Chunks, ?MAX_WITHDRAWALS_PER_PAYLOAD),
-    crypto:hash(sha256, <<Root/binary, (length(Capped)):256/little-unsigned-integer>>);
+    Pairs = [{eth_rlp:encode(Pos), withdrawal_rlp(W)}
+             || {Pos, W} <- lists:zip(lists:seq(0, length(Capped) - 1), Capped)],
+    eth_trie:root(Pairs);
 withdrawals_root(_Withdrawals) ->
     withdrawals_root([]).
 
-withdrawal_hash_tree_root(Withdrawal) ->
+%% RLP([index, validator_index, address, amount]) -- all four fields integers or
+%% a 20-byte string, in that order. eth_rlp encodes an integer 0 as the empty
+%% string and a positive integer as minimal big-endian bytes, which is what the
+%% spec's U64 encoding does.
+withdrawal_rlp(Withdrawal) ->
     Index = withdrawal_integer(withdrawal_index(Withdrawal)),
-    Validator = withdrawal_integer(maps:get(validatorIndex, Withdrawal,
-                                             maps:get(<<"validatorIndex">>, Withdrawal, 0))),
+    Validator = withdrawal_integer(withdrawal_validator_index(Withdrawal)),
     Address = withdrawal_binary(withdrawal_address(Withdrawal)),
     Amount = withdrawal_integer(withdrawal_amount(Withdrawal)),
-    ssz_merkleize([uint64_chunk(Index), uint64_chunk(Validator),
-                   bytes20_chunk(Address), uint64_chunk(Amount)], 4).
+    eth_rlp:encode([Index, Validator, Address, Amount]).
 
+withdrawal_validator_index(#{validatorIndex := I}) -> I;
+withdrawal_validator_index(#{<<"validatorIndex">> := I}) -> I;
+withdrawal_validator_index(#{validator_index := I}) -> I;
+withdrawal_validator_index(#{<<"validator_index">> := I}) -> I;
+withdrawal_validator_index(_) -> 0.
+
+%% A payload off the wire carries these as JSON-RPC quantities: "0x175" is the
+%% *hexadecimal* number 373, not the three ASCII bytes "175" and not the
+%% big-endian integer 321. It has to be parsed base 16, which is also what
+%% eth_hex:decode/1 does. Reading it as big-endian bytes yields a plausible
+%% number that is simply the wrong one, so the root would disagree with every
+%% other client while looking entirely healthy.
+%%
+%% Locally built withdrawals use plain integers, which pass through. A binary
+%% that is not a hex-digit string at all is treated as raw big-endian bytes,
+%% which is the only other meaning a 32-byte word can have here.
 withdrawal_integer(I) when is_integer(I) -> max(0, I);
 withdrawal_integer(B) when is_binary(B) ->
-    try binary:decode_unsigned(B) catch _:_ -> 0 end;
+    case eth_hex:is_hex(B) of
+        true ->
+            try max(0, eth_hex:decode(B)) catch _:_ -> 0 end;
+        false ->
+            try max(0, binary:decode_unsigned(B)) catch _:_ -> 0 end
+    end;
 withdrawal_integer(_) -> 0.
 
-withdrawal_binary(<<"0x", Rest/binary>>) -> binary:decode_hex(Rest);
-withdrawal_binary(B) when is_binary(B) -> B;
+%% The address must reach RLP as exactly 20 raw bytes. A "0x"-prefixed string
+%% would encode as 21 bytes and commit to something no other client computes.
+withdrawal_binary(<<"0x", Rest/binary>>) when byte_size(Rest) =:= 40 ->
+    binary:decode_hex(Rest);
+withdrawal_binary(<<A:20/binary>>) -> A;
+withdrawal_binary(<<>>) -> <<0:160>>;
+withdrawal_binary(B) when is_binary(B) ->
+    Pad = 20 - byte_size(B),
+    case Pad >= 0 of
+        true -> <<0:(Pad * 8), B/binary>>;
+        false -> binary:part(B, byte_size(B) - 20, 20)
+    end;
 withdrawal_binary(_) -> <<0:160>>.
-
-uint64_chunk(Value) when is_integer(Value), Value >= 0 ->
-    <<Value:64/little-unsigned-integer, 0:(24 * 8)>>.
-
-bytes20_chunk(<<Address:20/binary>>) -> <<Address/binary, 0:(12 * 8)>>;
-bytes20_chunk(_) -> <<0:256>>.
-
-%% SSZ merkleization of a chunk list bounded by a power-of-two limit. The
-%% chunk list is zero-padded up to `Limit' chunks and then hashed pairwise.
-%% The recursion is driven by the list length, not a separate depth counter,
-%% so it cannot split an odd-length level.
-ssz_merkleize(Chunks, Limit) when is_list(Chunks), is_integer(Limit), Limit >= 1 ->
-    Width = max(1, ceil_pow2(Limit)),
-    Padded = lists:sublist(Chunks ++ lists:duplicate(Width, zero_hash()), Width),
-    ssz_merkleize_chunks(Padded);
-ssz_merkleize(_Chunks, _Limit) ->
-    zero_hash().
-
-ssz_merkleize_chunks([Chunk]) ->
-    Chunk;
-ssz_merkleize_chunks(Chunks) ->
-    Paired = [crypto:hash(sha256, <<A/binary, B/binary>>)
-              || {A, B} <- pair_up(Chunks)],
-    ssz_merkleize_chunks(Paired).
-
-pair_up([]) -> [];
-pair_up([A, B | Rest]) -> [{A, B} | pair_up(Rest)];
-pair_up([A]) -> [{A, zero_hash()}].
-
-ceil_pow2(N) when N < 1 -> 1;
-ceil_pow2(N) -> ceil_pow2(N, 1).
-
-ceil_pow2(N, P) when P >= N -> P;
-ceil_pow2(N, P) -> ceil_pow2(N, P * 2).
-
-%% SSZ zero chunk.
-zero_hash() -> <<0:256>>.
 
 %% Credit withdrawals to the execution state.  Amounts are denominated in
 %% Gwei, as required by EIP-4895.  The helper is intentionally separate from

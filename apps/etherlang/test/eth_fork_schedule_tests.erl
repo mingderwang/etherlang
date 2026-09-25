@@ -165,13 +165,13 @@ configured_fork_default() ->
 %% EIP-4895 withdrawals
 %% ---------------------------------------------------------------------------
 
-%% The empty withdrawals root is the SSZ hash_tree_root of an empty list. It is
-%% a different value from the MPT empty root, so a block must not reuse it.
-empty_withdrawals_root_is_ssz_test() ->
-    R = eth_fork_schedule:withdrawals_root([]),
-    ?assertEqual(32, byte_size(R)),
-    EmptyMpt = eth_trie:root([]),
-    ?assertNotEqual(EmptyMpt, R).
+%% The empty withdrawals root is the empty Merkle-Patricia trie root -- the same
+%% commitment the transactions root makes for a block with no transactions.
+%% withdrawalsRoot was briefly implemented here as an SSZ hash-tree-root, which
+%% is a plausible 32-byte value no other client produces; eth_withdrawals_tests
+%% pins the correct construction against real Sepolia blocks.
+empty_withdrawals_root_is_the_empty_trie_test() ->
+    ?assertEqual(eth_trie:root([]), eth_fork_schedule:withdrawals_root([])).
 
 %% An empty list and a list of nothing must agree, and a single withdrawal must
 %% change the root.

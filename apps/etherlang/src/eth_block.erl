@@ -543,8 +543,9 @@ effective_gas_price(GasPrice, MaxPriorityFee, MaxFee, BaseFee) ->
 base_fee() ->
     1000000000.
 
-%% Default withdrawals root is the SSZ hash-tree-root of an empty list, not the
-%% MPT empty root; the two are different commitments.
+%% A block with no withdrawals commits to the empty trie root, which is what
+%% withdrawals_root([]) yields -- same construction as the transactions root,
+%% with no entries to insert.
 withdrawals_root() ->
     eth_fork_schedule:withdrawals_root([]).
 
