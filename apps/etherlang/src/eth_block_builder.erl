@@ -110,14 +110,19 @@ do_build(#st{base_fee = BaseFee, terminal_total_difficulty = TTD} = _S) ->
         _ -> 0
     end,
     ParentGasLimit = ?MAX_GAS,
-    {ok, Fork} = eth_fork_schedule:current_fork(Number),
+    Timestamp = erlang:system_time(second),
+    %% The fork that applies to *this* block is decided by this block's own
+    %% number and timestamp, so the timestamp has to be fixed before the fork
+    %% is selected -- a timestamped fork such as Shanghai or Cancun activates
+    %% on the timestamp, not on the height.
+    {ok, Fork} = eth_fork_schedule:current_fork(
+                   eth_fork_schedule:configured_network(), Number, Timestamp),
     BaseFee2 = case eth_fork_schedule:at_least(Fork, ?FORK_LONDON) of
         true -> eth_fork_schedule:base_fee(ParentGasUsed, ParentGasLimit, BaseFee);
         false -> undefined
     end,
     %% Select transactions respecting gas limit and the block base fee.
     Selected = select_transactions(Sorted, BaseFee2),
-    Timestamp = erlang:system_time(second),
     Miner = <<0:160>>,
     GasLimit = ?MAX_GAS,
     %% EIP-4895: get pending withdrawals.

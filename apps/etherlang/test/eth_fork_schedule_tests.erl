@@ -81,10 +81,85 @@ fork_ranking_test() ->
     ?assertEqual(false, eth_fork_schedule:at_least(istanbul, berlin)),
     ?assertEqual(true, eth_fork_schedule:at_least(deneb, shanghai)).
 
-current_fork_default_test() ->
-    {ok, Fork} = eth_fork_schedule:current_fork(1),
-    ?assertEqual(cancun, Fork),
-    ?assertEqual(Fork, eth_fork_schedule:configured_fork()).
+%% Fork selection is driven by the network's real activation points rather
+%% than by a single configured value, so a block on either side of an
+%% activation reports a different fork.
+fork_selection_test() ->
+    %% Mainnet block forks. These use a timestamp before Shanghai so that only
+    %% the block-numbered forks are in play; the interaction with a timestamped
+    %% fork is checked separately below.
+    ?assertEqual(berlin, fork(mainnet, 12964999, 1650000000)),
+    ?assertEqual(london, fork(mainnet, 12965000, 1650000000)),
+    %% Istanbul is the last fork that changes an execution rule before Berlin.
+    %% Muir Glacier only delays the difficulty bomb, so it shares Istanbul's
+    %% rank and Istanbul is what gets reported.
+    ?assertEqual(istanbul, fork(mainnet, 12243999, 1650000000)),
+    ?assertEqual(berlin, fork(mainnet, 12244000, 1650000000)),
+    %% A timestamped fork is decided by the block's timestamp, not its height,
+    %% so a block far past the activation height still gets the old rules
+    %% until its timestamp reaches it. Shanghai activates at 1681338455.
+    ?assertEqual(gray_glacier, fork(mainnet, 19000000, 1681338454)),    ?assertEqual(shanghai, fork(mainnet, 19000000, 1681338455)),
+    ?assertEqual(shanghai, fork(mainnet, 19000000, 1710338134)),
+    ?assertEqual(cancun, fork(mainnet, 19000000, 1710338135)),
+    ?assertEqual(prague, fork(mainnet, 19000000, 1746612311)).
+
+%% Sepolia is post-Berlin at genesis and post-London at genesis, so height
+%% never changes its block fork; only the timestamped forks move.
+fork_selection_sepolia_test() ->
+    ?assertEqual(london, fork(sepolia, 0, 1677557087)),
+    ?assertEqual(shanghai, fork(sepolia, 0, 1677557088)),
+    ?assertEqual(cancun, fork(sepolia, 5000000, 1706655072)),
+    ?assertEqual(cancun, fork(sepolia, 11779968, 1741159775)),
+    ?assertEqual(prague, fork(sepolia, 11779968, 1741159776)),
+    ?assertEqual(osaka, fork(sepolia, 11779968, 1760427360)),
+    ?assertEqual(amsterdam, fork(sepolia, 11779968, 1791294816)).
+
+%% A network with no schedule falls back to the ETH_FORK rules pin instead of
+%% guessing from its name.
+fork_selection_unknown_network_test() ->
+    ?assertEqual({ok, configured_fork_default()},
+                 eth_fork_schedule:current_fork(holesky, 1, 1)),
+    ?assertEqual([], eth_fork_schedule:fork_schedule(holesky)).
+
+%% The activation points in this module must agree with the EIP-2124 ForkID
+%% schedule in eth_forkid, which is derived independently from the same chain
+%% config. A fork added to one and not the other means the node would apply
+%% rules the network has not activated (or fail to apply rules it has), so the
+%% two are compared directly.
+%%
+%% Two differences are expected and are asserted explicitly rather than waved
+%% through:
+%%   * eth_forkid's gatherForks drops block 0, so a network whose forks are
+%%     all active at genesis (Sepolia) contributes no block fork to it.
+%%   * eth_forkid also lists the MergeNetsplitBlock, which splits devp2p
+%%     sessions and changes no execution rule, so it appears there and not
+%%     here. Sepolia sets it to 1735371; mainnet leaves it unset.
+schedule_agrees_with_forkid_test() ->
+    lists:foreach(fun(Network) ->
+        {ForkIdBlocks, ForkIdTimes} = eth_forkid:schedule(Network),
+        Schedule = eth_fork_schedule:fork_schedule(Network),
+        Times = [P || {time, P, _} <- Schedule],
+        ?assertEqual(usort(Times), usort(ForkIdTimes)),
+        Blocks = [P || {block, P, _} <- Schedule, P > 0],
+        Expected = usort(Blocks ++ netsplit_blocks(Network)),
+        ?assertEqual(Expected, usort(ForkIdBlocks))
+    end, [mainnet, sepolia]).
+
+netsplit_blocks(sepolia) -> [1735371];
+netsplit_blocks(mainnet) -> [].
+
+fork(Network, Number, Timestamp) ->
+    {ok, F} = eth_fork_schedule:current_fork(Network, Number, Timestamp),
+    F.
+
+usort(L) -> lists:usort(L).
+
+configured_fork_default() ->
+    case os:getenv("ETH_FORK") of
+        false -> cancun;
+        "" -> cancun;
+        Value -> list_to_atom(string:lowercase(string:trim(Value)))
+    end.
 
 %% ---------------------------------------------------------------------------
 %% EIP-4895 withdrawals

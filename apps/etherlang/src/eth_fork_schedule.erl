@@ -7,8 +7,10 @@
 
 -module(eth_fork_schedule).
 
--export([ current_fork/1,
-          current_fork/2,
+-export([ current_fork/3,
+          fork_schedule/1,
+          fork_at/3,
+          configured_network/0,
           configured_fork/0,
           at_least/2,
           base_fee/2,
@@ -40,11 +42,48 @@
 %% Fork selection
 %% ---------------------------------------------------------------------------
 
-%% The execution rules currently used by the node are selected explicitly so
-%% a node never silently guesses a fork from a stale local head.  Operators
-%% can set ETH_FORK when running a network with a different activation
-%% schedule.  The default is Cancun, the newest execution rules required by
-%% the current client baseline.
+%% Fork selection answers "which execution rules apply to this block", so it
+%% has to be driven by the same activation points the rest of the network
+%% uses. The schedule below is transcribed from go-ethereum's
+%% params/config.go (ChainID 1 and ChainID 11155111) and is exercised by a
+%% test that cross-checks it against eth_forkid's EIP-2124 data, so the two
+%% cannot drift apart silently.
+%%
+%% SCOPE -- the Merge is a total-difficulty activation, not a block number or
+%% a timestamp. A selector given only (number, timestamp) therefore cannot
+%% distinguish a pre-Merge block from a post-Merge one, and this client does
+%% not attempt to: it validates PoS execution payloads only, so Paris is the
+%% floor of the modelled range. Pre-Merge historical execution is out of
+%% scope, and for that reason Paris is the first fork reported for any block.
+%% Choosing a merge block number here would be guessing, so none is written
+%% down.
+%%
+%% ETH_NETWORK selects the network (default sepolia, matching the default
+%% upstream). ETH_FORK pins the rules outright and is the escape hatch for
+%% private or development networks that are not in the table below.
+
+configured_network() ->
+    case os:getenv("ETH_NETWORK") of
+        false -> sepolia;
+        "" -> sepolia;
+        Value -> parse_network(Value)
+    end.
+
+parse_network(Value) ->
+    case string:lowercase(string:trim(Value)) of
+        "sepolia" -> sepolia;
+        "mainnet" -> mainnet;
+        "1" -> mainnet;
+        "11155111" -> sepolia;
+        Other ->
+            logger:warning("unknown ETH_NETWORK ~p, falling back to sepolia", [Other]),
+            sepolia
+    end.
+
+%% An explicit rules pin, used for networks that have no schedule in this
+%% module. It is *not* consulted for a known network: silently overriding a
+%% real activation point would be how a node ends up applying the wrong fork
+%% rules, so ETH_FORK only applies where fork_schedule/1 has no data.
 configured_fork() ->
     case os:getenv("ETH_FORK") of
         false -> cancun;
@@ -52,15 +91,102 @@ configured_fork() ->
         Value -> parse_fork(Value)
     end.
 
-current_fork(_BlockNumber) ->
-    {ok, configured_fork()}.
+%% Activation points, ascending. Block-numbered and timestamped forks are kept
+%% apart because a block is subject to a timestamped fork when its *timestamp*
+%% reaches the activation, and a block-numbered fork when its *number* does.
+fork_schedule(mainnet) ->
+    [{block, 1150000, homestead},
+     {block, 1920000, dao},
+     {block, 2463000, tangerine},
+     {block, 2675000, spurious_dragon},
+     {block, 4370000, byzantium},
+     {block, 7280000, constantinople},
+     {block, 7280000, petersburg},
+     {block, 9069000, istanbul},
+     {block, 9200000, muir_glacier},
+     {block, 12244000, berlin},
+     {block, 12965000, london},
+     {block, 13773000, arrow_glacier},
+     {block, 15050000, gray_glacier},
+     {time, 1681338455, shanghai},
+     {time, 1710338135, cancun},
+     {time, 1746612311, prague},
+     {time, 1764798551, osaka},
+     {time, 1765290071, bpo1},
+     {time, 1767747671, bpo2}];
+%% Sepolia is a post-Berlin chain: every block-numbered fork from Homestead
+%% through London is already active at genesis, which is why its ForkID
+%% schedule contains no block fork at all. London at genesis is why Sepolia
+%% has a base fee from its first block.
+fork_schedule(sepolia) ->
+    [{block, 0, homestead},
+     {block, 0, tangerine},
+     {block, 0, spurious_dragon},
+     {block, 0, byzantium},
+     {block, 0, constantinople},
+     {block, 0, petersburg},
+     {block, 0, istanbul},
+     {block, 0, muir_glacier},
+     {block, 0, berlin},
+     {block, 0, london},
+     {time, 1677557088, shanghai},
+     {time, 1706655072, cancun},
+     {time, 1741159776, prague},
+     {time, 1760427360, osaka},
+     {time, 1761017184, bpo1},
+     {time, 1761607008, bpo2},
+     {time, 1791294816, amsterdam}];
+fork_schedule(_Other) ->
+    [].
 
-current_fork(_BlockNumber, _Chain) ->
-    {ok, configured_fork()}.
+%% The fork whose rules apply to (BlockNumber, BlockTimestamp) on Network.
+%% Returns the highest-ranked active fork; a fork is active when the block's
+%% number has reached a block activation or its timestamp has reached a time
+%% activation. Paris is the floor, per the scope note above.
+current_fork(Network, BlockNumber, BlockTimestamp)
+  when is_integer(BlockNumber), is_integer(BlockTimestamp) ->
+    case fork_schedule(Network) of
+        [] ->
+            %% No schedule for this network, so fall back to the operator's
+            %% rules pin rather than guessing from the network name.
+            {ok, configured_fork()};
+        Schedule ->
+            Active = [Fork || {Kind, Point, Fork} <- Schedule, reached(Kind, Point,
+                                                                     BlockNumber,
+                                                                     BlockTimestamp)],
+            {ok, highest_ranked(Active)}
+    end.
+
+reached(block, Point, BlockNumber, _BlockTimestamp) -> BlockNumber >= Point;
+reached(time, Point, _BlockNumber, BlockTimestamp) -> BlockTimestamp >= Point.
+
+%% Pick the highest-ranked active fork. Ties are broken towards the fork that
+%% appears earliest in the schedule, and the choice is made by explicit filter
+%% rather than by relying on the stability of lists:sort/2, because the forks
+%% that share a rank are the ones this rule exists to disambiguate. Muir
+%% Glacier only delays the difficulty bomb, so it ranks with Istanbul and
+%% Istanbul -- the fork that actually introduced the rules -- is reported.
+highest_ranked([]) -> paris;
+highest_ranked(Forks) ->
+    MaxRank = lists:max([fork_rank(F) || F <- Forks]),
+    hd([F || F <- Forks, fork_rank(F) =:= MaxRank]).
+
+%% Alias kept for callers that think of the schedule lookup as the primary
+%% operation. fork_at/3 is current_fork/3 under a clearer name.
+fork_at(Network, BlockNumber, BlockTimestamp) ->
+    current_fork(Network, BlockNumber, BlockTimestamp).
 
 parse_fork(Value) ->
     case string:lowercase(string:trim(Value)) of
+        "homestead" -> homestead;
+        "dao" -> dao;
+        "tangerine" -> tangerine;
+        "spurious_dragon" -> spurious_dragon;
+        "byzantium" -> byzantium;
+        "constantinople" -> constantinople;
+        "petersburg" -> petersburg;
         "istanbul" -> istanbul;
+        "muir_glacier" -> muir_glacier;
         "berlin" -> berlin;
         "london" -> london;
         "arrow_glacier" -> arrow_glacier;
@@ -70,10 +196,29 @@ parse_fork(Value) ->
         "shanghai" -> shanghai;
         "cancun" -> cancun;
         "deneb" -> deneb;
+        "prague" -> prague;
+        "osaka" -> osaka;
+        "bpo1" -> bpo1;
+        "bpo2" -> bpo2;
+        "amsterdam" -> amsterdam;
         _ -> cancun
     end.
 
+%% Ranks must agree with activation order, because highest_ranked/1 resolves
+%% two concurrently active forks (a block-numbered one and a timestamped one)
+%% purely by rank. Deneb is the pre-release name for Cancun and so shares its
+%% rank; the difficulty-bomb forks (Muir/Arrow/Gray Glacier) change no
+%% execution rule and share the rank of the fork that introduced the rule they
+%% delay.
+fork_rank(homestead) -> 0;
+fork_rank(dao) -> 0;
+fork_rank(tangerine) -> 0;
+fork_rank(spurious_dragon) -> 0;
+fork_rank(byzantium) -> 0;
+fork_rank(constantinople) -> 0;
+fork_rank(petersburg) -> 0;
 fork_rank(istanbul) -> 1;
+fork_rank(muir_glacier) -> 1;
 fork_rank(berlin) -> 2;
 fork_rank(london) -> 3;
 fork_rank(arrow_glacier) -> 4;
@@ -82,7 +227,12 @@ fork_rank(merge) -> 6;
 fork_rank(paris) -> 7;
 fork_rank(shanghai) -> 8;
 fork_rank(cancun) -> 9;
-fork_rank(deneb) -> 10;
+fork_rank(deneb) -> 9;
+fork_rank(prague) -> 10;
+fork_rank(osaka) -> 11;
+fork_rank(bpo1) -> 12;
+fork_rank(bpo2) -> 13;
+fork_rank(amsterdam) -> 14;
 fork_rank(_) -> 0.
 
 at_least(Fork, Feature) ->
