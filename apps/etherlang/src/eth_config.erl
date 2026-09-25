@@ -37,7 +37,7 @@
 %%   STATE_SYNC_ENABLED - run the snap state-heal worker (default false)
 
 -export([upstream_url/0, listen_port/0, listen_ip/0, max_batch/0, rate_limit/0,
-         rate_burst/0, api_key/0, data_dir/0, start_block/0, concurrency/0,
+         rate_burst/0, api_key/0, engine_port/0, data_dir/0, start_block/0, concurrency/0,
          body_window/0, chain_retention/0, poll_interval_ms/0, sync_retry_ms/0,
          max_reorg_depth/0, http_timeout_ms/0, sync_budget/0, verify_headers/0,
          evm_enabled/0, discv4_enabled/0, discv4_port/0, discv4_bootnodes/0,
@@ -82,6 +82,8 @@ rate_limit() -> int_env("RPC_RATE_LIMIT", rate_limit, ?DEF_RATE_LIMIT).
 rate_burst() -> int_env("RPC_RATE_BURST", rate_burst, ?DEF_RATE_BURST).
 
 api_key() -> str_env("RPC_API_KEY", api_key, ?DEF_API_KEY).
+
+engine_port() -> int_env("ENGINE_PORT", engine_port, 8551).
 
 data_dir() -> str_env("DATA_DIR", data_dir, ?DEF_DATA_DIR).
 

@@ -45,9 +45,34 @@ init({Name, Opts}) ->
                                "" -> "disabled";
                                _ -> "set"
                            end]),
+            %% Start Engine API on separate port
+            EnginePort = case eth_config:engine_port() of
+                             0 -> 8551;
+                             P -> P
+                         end,
+            start_engine_api(EnginePort, HandlerOpts),
             {ok, #st{listener = Name, tab = Tab}};
         {error, Reason} ->
             {stop, Reason}
+    end.
+
+%% ---------------------------------------------------------------------------
+%% Engine API listener
+%% ---------------------------------------------------------------------------
+
+start_engine_api(Port, HandlerOpts) ->
+    EngineDispatch = cowboy_router:compile([{'_',
+        [{<<"/engine">>, eth_engine_handler, HandlerOpts}]}]),
+    case cowboy:start_clear(engine_listener,
+                            [{port, Port}, {ip, eth_config:listen_ip()}],
+                            #{env => #{dispatch => EngineDispatch}}) of
+        {ok, _} ->
+            logger:notice("etherlang: Engine API listening on ~s:~p",
+                          [inet:ntoa(eth_config:listen_ip()), Port]),
+            ok;
+        {error, Reason} ->
+            logger:error("etherlang: Engine API failed to start: ~p", [Reason]),
+            ok
     end.
 
 handle_call(_Req, _From, S) -> {reply, {error, unknown_call}, S}.
@@ -57,6 +82,7 @@ handle_info(_Info, S) -> {noreply, S}.
 terminate(_Reason, #st{listener = L, tab = Tab}) ->
     _ = try cowboy:stop_listener(L) catch _:_ -> ok end,
     _ = try eth_rate_limit:stop(Tab) catch _:_ -> ok end,
+    _ = try cowboy:stop_listener(engine_listener) catch _:_ -> ok end,
     ok.
 
 code_change(_OldVsn, S, _Extra) -> {ok, S}.
