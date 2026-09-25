@@ -124,13 +124,13 @@ code; none is guessing. Items marked DONE were closed with live verification.
 
 ### Remaining EVM fidelity gaps
 
-4. **Gas/state simplifications** — each is a wrong-data-vs-upstream divergence,
-   not a crash:
-   - `SSTORE` warm/cold cost exists (20000/2900) but **refunds not tracked**
-     (`refund` field in the `#e{}` record is never updated)
-   - `MODEXP` gas undercharges (flat `10 + 50 * byte_size(Exp)` vs EIP-2565
-     which accounts for modulus/exponent/memory widths)
-   - `CALL` has no 2300 gas stipend to prevent reentrancy after value transfers
+4. **Gas/state simplifications** — all major items resolved; residual
+   differences from the spec schedule are gas-accounting approximations
+   (not wrong data):
+   - `SSTORE` warm/cold cost + EIP-2200 refunds applied to final gas
+     (capped at half gas used) (`eth_evm:run_t`)
+   - `MODEXP` gas per EIP-2565 (accounts for widest operand)
+   - `CALL` 2300 gas stipend after value transfers to prevent reentrancy
 
 ### Sync / chain store
 
@@ -153,6 +153,16 @@ code; none is guessing. Items marked DONE were closed with live verification.
 
 ### RPC surface / security
 
+- [x] **11. Batch spec gaps** — `safe_handle_one` wraps each batch
+   item in a try/catch; non-object items produce per-item `-32700`
+   or `-32603` instead of crashing the batch (`eth_rpc_handler`) (v0.7.3).
+- [x] **12. Upstream failures conflated into `-32000`** — proxy now
+   maps decode/transport errors to distinct codes (`-32700`, `-32602`,
+   `-32603`) and passes through upstream status codes
+   (`eth_rpc_handler`) (v0.7.3).
+
+### Remaining RPC / security work
+
 10. **Open proxy, no auth/rate-limit** — v0.3.2: binds `127.0.0.1` by default
     (`RPC_LISTEN_IP`), caps JSON-RPC batches (`RPC_MAX_BATCH`), and adds a
     per-IP token-bucket rate limit (`RPC_RATE_LIMIT`/`RPC_RATE_BURST`).
@@ -167,6 +177,14 @@ code; none is guessing. Items marked DONE were closed with live verification.
     Distinct codes for transport vs execution; stop leaking internals.
 
 ### Ops / hygiene
+
+- [x] **Batch spec compliance** — non-object items produce per-item
+   error responses instead of crashing the batch (`eth_rpc_handler`) (v0.7.3).
+- [x] **Upstream error codes** — transport/decode errors return distinct
+   codes instead of conflating all errors into `-32000`
+   (`eth_rpc_handler`) (v0.7.3).
+
+### Remaining ops work
 
 13. **Two release trees + one hand-copied node**: `tools/etherlangctl` now
     encodes the topology (node A `_build/default` on :8545, node B

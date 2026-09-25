@@ -1,5 +1,7 @@
 -module(eth_config).
 
+-compile(nowarn_unused_function).
+
 %% Runtime configuration for the node. Values are read from OS environment
 %% variables first, then from the application environment, then defaults.
 %% Environment variables (all optional):
@@ -9,6 +11,7 @@
 %%   RPC_MAX_BATCH      - max JSON-RPC batch size accepted
 %%   RPC_RATE_LIMIT     - per-client request rate in req/sec (0 disables)
 %%   RPC_RATE_BURST     - max burst of requests a client may send at once
+%%   RPC_API_KEY        - API key required for RPC access (empty = disabled)
 %%   DATA_DIR           - directory for persisted chain data (blocks, index)
 %%   ETH_START_BLOCK    - where to start syncing: "latest" or a block number
 %%   SYNC_CONCURRENCY   - max parallel block fetches
@@ -34,7 +37,7 @@
 %%   STATE_SYNC_ENABLED - run the snap state-heal worker (default false)
 
 -export([upstream_url/0, listen_port/0, listen_ip/0, max_batch/0, rate_limit/0,
-         rate_burst/0, data_dir/0, start_block/0, concurrency/0,
+         rate_burst/0, api_key/0, data_dir/0, start_block/0, concurrency/0,
          body_window/0, chain_retention/0, poll_interval_ms/0, sync_retry_ms/0,
          max_reorg_depth/0, http_timeout_ms/0, sync_budget/0, verify_headers/0,
          evm_enabled/0, discv4_enabled/0, discv4_port/0, discv4_bootnodes/0,
@@ -47,6 +50,7 @@
 -define(DEF_MAX_BATCH, 30).
 -define(DEF_RATE_LIMIT, 30).
 -define(DEF_RATE_BURST, 100).
+-define(DEF_API_KEY, "").
 -define(DEF_DATA_DIR, "./data").
 -define(DEF_CONCURRENCY, 8).
 -define(DEF_BODY_WINDOW, 2048).
@@ -76,6 +80,8 @@ max_batch() -> int_env("RPC_MAX_BATCH", max_batch, ?DEF_MAX_BATCH).
 rate_limit() -> int_env("RPC_RATE_LIMIT", rate_limit, ?DEF_RATE_LIMIT).
 
 rate_burst() -> int_env("RPC_RATE_BURST", rate_burst, ?DEF_RATE_BURST).
+
+api_key() -> str_env("RPC_API_KEY", api_key, ?DEF_API_KEY).
 
 data_dir() -> str_env("DATA_DIR", data_dir, ?DEF_DATA_DIR).
 

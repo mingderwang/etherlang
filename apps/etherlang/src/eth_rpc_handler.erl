@@ -72,13 +72,43 @@ handle_body(Body, State) ->
                     thoas:encode(error_response(null, -32600,
                                                 <<"batch too large">>));
                 false ->
-                    Results = [safe_handle_one(M, State) || M <- List],
+                    Results = [case check_api_key(M, State) of
+                                    false ->
+                                        error_response(
+                                          maps:get(<<"id">>, M, null),
+                                          -32500, <<"api_key required">>);
+                                    true -> safe_handle_one(M, State)
+                                end || M <- List],
                     thoas:encode(Results)
             end;
         {ok, Map} when is_map(Map) ->
-            thoas:encode(handle_one(Map, State));
+            case check_api_key(Map, State) of
+                false ->
+                    thoas:encode(error_response(
+                        maps:get(<<"id">>, Map, null), -32500,
+                        <<"api_key required">>));
+                true ->
+                    thoas:encode(handle_one(Map, State))
+            end;
         _ ->
             thoas:encode(error_response(null, -32700, <<"parse error">>))
+    end.
+
+%% API key auth: if RPC_API_KEY is set, every request must include
+%% it as the "api_key" field inside params (standard JSON-RPC convention).
+check_api_key(Map, State) ->
+    case maps:get(api_key, State, undefined) of
+        undefined -> true;
+        "" -> true;
+        Required ->
+            Params = maps:get(<<"params">>, Map, #{}),
+            case Params of
+                #{<<"api_key">> := K} when is_binary(K), K =:= Required -> true;
+                _ when is_list(Params) ->
+                    lists:any(fun(#{<<"api_key">> := Kv}) when Kv =:= Required -> true;
+                                 (_) -> false end, Params);
+                _ -> false
+            end
     end.
 
 handle_one(Map, State) ->
@@ -87,25 +117,56 @@ handle_one(Map, State) ->
         undefined ->
             error_response(Id, -32600, <<"missing method">>);
         Method when is_binary(Method) ->
-            Params = maps:get(<<"params">>, Map, []),
-            case dispatch(Method, Params, State) of
-                {ok, Result} ->
-                    #{<<"jsonrpc">> => <<"2.0">>, <<"id">> => Id,
-                      <<"result">> => Result};
-                {error, {rpc_error, ErrMap}} when is_map(ErrMap) ->
-                    #{<<"jsonrpc">> => <<"2.0">>, <<"id">> => Id,
-                      <<"error">> => ErrMap};
-                {error, {upstream_error, Code, Msg}} ->
-                    error_response(Id, Code, Msg);
-                {error, {invalid_params, Details}} ->
-                    error_response(Id, -32602, to_bin(Details));
-                {error, {code, Code, Msg}} ->
-                    error_response(Id, Code, to_bin(Msg));
-                {error, Reason} ->
-                    error_response(Id, -32000, to_bin(Reason))
+            %% Per-method rate limit check
+            case check_rate_limit(Method, State) of
+                false ->
+                    error_response(Id, -32001, <<"rate limit exceeded">>);
+                true ->
+                    %% Strip api_key from params before dispatch
+                    Map1 = case maps:get(api_key, State, undefined) of
+                               undefined -> Map;
+                               _ ->
+                                   Params = maps:get(<<"params">>, Map, #{}),
+                                   case is_map(Params) of
+                                       true ->
+                                           maps:put(<<"params">>,
+                                                     maps:remove(<<"api_key">>, Params), Map);
+                                       false -> Map
+                                   end
+                           end,
+                    handle_one_inner(Method, Id, Map1, State)
             end;
         _ ->
             error_response(Id, -32600, <<"method must be a string">>)
+    end.
+
+handle_one_inner(Method, Id, Map, State) ->
+    Params = maps:get(<<"params">>, Map, []),
+    case dispatch(Method, Params, State) of
+        {ok, Result} ->
+            #{<<"jsonrpc">> => <<"2.0">>, <<"id">> => Id,
+              <<"result">> => Result};
+        {error, {rpc_error, ErrMap}} when is_map(ErrMap) ->
+            #{<<"jsonrpc">> => <<"2.0">>, <<"id">> => Id,
+              <<"error">> => ErrMap};
+        {error, {upstream_error, Code, Msg}} ->
+            error_response(Id, Code, Msg);
+        {error, {invalid_params, Details}} ->
+            error_response(Id, -32602, to_bin(Details));
+        {error, {code, Code, Msg}} ->
+            error_response(Id, Code, to_bin(Msg));
+        {error, Reason} ->
+            error_response(Id, -32000, to_bin(Reason))
+    end.
+
+%% Per-method rate limit: each method gets its own bucket
+%% alongside the per-source bucket.
+check_rate_limit(Method, State) ->
+    case maps:get(limits, State, undefined) of
+        undefined -> true;
+        #{tab := Tab, rate := Rate, burst := Burst} ->
+            %% Per-method rate limit: each method gets its own bucket
+            eth_rate_limit:take(Tab, Method, Rate, Burst, Method)
     end.
 
 %% Safe handler: catches crashes so batch responses never abort

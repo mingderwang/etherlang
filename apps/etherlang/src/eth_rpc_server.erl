@@ -8,7 +8,8 @@
 %% Security posture (all configurable via env, see eth_config):
 %%   - binds to 127.0.0.1 by default (RPC_LISTEN_IP to override),
 %%   - caps the JSON-RPC batch size (RPC_MAX_BATCH),
-%%   - token-bucket rate limit per source IP (RPC_RATE_LIMIT/RPC_RATE_BURST).
+%%   - token-bucket rate limit per source IP (RPC_RATE_LIMIT/RPC_RATE_BURST),
+%%   - optional API key authentication (RPC_API_KEY).
 
 -export([start_link/1, start_link/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -26,20 +27,24 @@ init({Name, Opts}) ->
     Burst = maps:get(rate_burst, Opts, eth_config:rate_burst()),
     MaxBatch = maps:get(max_batch, Opts, eth_config:max_batch()),
     Tab = eth_rate_limit:start(Rate, Burst),
+    HandlerOpts = #{chain => maps:get(chain, Opts, eth_chain),
+                    sync => maps:get(sync, Opts, eth_sync),
+                    pool => maps:get(pool, Opts, eth_txpool),
+                    store => maps:get(store, Opts, eth_statestore),
+                    max_batch => MaxBatch,
+                    limits => #{tab => Tab, rate => Rate, burst => Burst},
+                    api_key => eth_config:api_key()},
     Dispatch = cowboy_router:compile([{'_',
-                                       [{"/", eth_rpc_handler,
-                                         #{chain => maps:get(chain, Opts, eth_chain),
-                                           sync => maps:get(sync, Opts, eth_sync),
-                                           pool => maps:get(pool, Opts, eth_txpool),
-                                           store => maps:get(store, Opts, eth_statestore),
-                                           max_batch => MaxBatch,
-                                           limits => #{tab => Tab, rate => Rate,
-                                                       burst => Burst}}}]}]),
+                                        [{"/", eth_rpc_handler, HandlerOpts}]}]),
     case cowboy:start_clear(Name, [{port, Port}, {ip, IP}],
                             #{env => #{dispatch => Dispatch}}) of
         {ok, _} ->
-            logger:notice("etherlang: JSON-RPC listening on ~s:~p (batch<=~p, rate ~p/s burst ~p)",
-                          [inet:ntoa(IP), Port, MaxBatch, Rate, Burst]),
+            logger:notice("etherlang: JSON-RPC listening on ~s:~p (batch<=~p, rate ~p/s burst ~p, api_key=~s)",
+                          [inet:ntoa(IP), Port, MaxBatch, Rate, Burst,
+                           case eth_config:api_key() of
+                               "" -> "disabled";
+                               _ -> "set"
+                           end]),
             {ok, #st{listener = Name, tab = Tab}};
         {error, Reason} ->
             {stop, Reason}
