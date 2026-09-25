@@ -227,6 +227,7 @@ validate_transaction(Tx, Ctx) when is_map(Tx), is_map(Ctx) ->
         ok = ensure(valid_fee_fields(Tx, GasPrice, MaxFee, MaxPriority), {error, invalid_fee}),
         ok = ensure(fee_ceiling_ok(Tx, MaxFee, MaxPriority, GasPrice, BaseFee),
                     {error, fee_too_low}),
+        ok = check_blobs(Tx, Ctx),
         Intrinsic = intrinsic_gas(Data, IsCreate, AccessList),
         ok = ensure(Gas >= Intrinsic, {error, intrinsic_gas}),
         ok = ensure(valid_signature(Tx), {error, bad_signature}),
@@ -368,27 +369,31 @@ valid_access_list(L) ->
 %% maxPriorityFeePerGas (or vice versa) is malformed.
 valid_fee_fields(Tx, GasPrice, MaxFee, MaxPriority) ->
     case tx_type(Tx) of
-        eip1559 ->
-            is_integer(MaxFee) andalso is_integer(MaxPriority) andalso
-            MaxPriority =< MaxFee;
-        _ ->
-            is_integer(GasPrice) andalso GasPrice >= 0
+        eip1559 -> valid_1559_fees(MaxFee, MaxPriority);
+        eip4844 -> valid_1559_fees(MaxFee, MaxPriority);
+        _ -> is_integer(GasPrice) andalso GasPrice >= 0
     end.
+
+valid_1559_fees(MaxFee, MaxPriority) ->
+    is_integer(MaxFee) andalso is_integer(MaxPriority) andalso
+    MaxPriority =< MaxFee.
 
 tx_type(Tx) ->
     case maps:get(<<"type">>, Tx, <<"0x0">>) of
         <<"0x0">> -> legacy;
         <<"0x1">> -> eip2930;
         <<"0x2">> -> eip1559;
+        <<"0x3">> -> eip4844;
         0 -> legacy;
         1 -> eip2930;
         2 -> eip1559;
+        3 -> eip4844;
         _ -> throw({error, unsupported_type})
     end.
 
 ensure_tx_type_supported(Tx) ->
     case tx_type(Tx) of
-        T when T =:= legacy; T =:= eip2930; T =:= eip1559 -> ok;
+        T when T =:= legacy; T =:= eip2930; T =:= eip1559; T =:= eip4844 -> ok;
         _ -> throw({error, unsupported_type})
     end.
 
@@ -400,11 +405,37 @@ ensure_tx_type_supported(Tx) ->
 fee_ceiling_ok(Tx, MaxFee, _MaxPriority, GasPrice, BaseFee) when is_integer(BaseFee) ->
     Ceiling = case tx_type(Tx) of
         eip1559 -> MaxFee;
+        eip4844 -> MaxFee;
         _ -> GasPrice
     end,
     is_integer(Ceiling) andalso Ceiling >= BaseFee;
 fee_ceiling_ok(_Tx, _MaxFee, _MaxPriority, _GasPrice, _BaseFee) ->
     true.
+
+%% EIP-4844 blob validity. Three independent rules, and they fail differently
+%% so a caller can tell *why* a blob transaction was rejected:
+%%
+%%   * the transaction must reference at least one blob, and every versioned
+%%     hash must be a well-formed KZG commitment hash;
+%%   * maxFeePerBlobGas is mandatory;
+%%   * maxFeePerBlobGas must cover the block's blob gas price, which is what
+%%     actually makes the blob purchasable. The price comes from Ctx because it
+%%     depends on the parent block's excess blob gas; when the caller cannot
+%%     supply it the floor is not checked rather than guessed.
+check_blobs(Tx, _Ctx) ->
+    case tx_type(Tx) of
+        eip4844 ->
+            ok = ensure(eth_tx:valid_versioned_hashes(Tx), {error, bad_blob_hashes}),
+            MaxFeePerBlobGas = int_field(Tx, <<"maxFeePerBlobGas">>),
+            ok = ensure(is_integer(MaxFeePerBlobGas), {error, invalid_blob_fee}),
+            case maps:get(blob_base_fee, _Ctx, undefined) of
+                undefined -> ok;
+                BlobBaseFee when is_integer(BlobBaseFee) ->
+                    ensure(MaxFeePerBlobGas >= BlobBaseFee, {error, blob_fee_too_low})
+            end;
+        _ ->
+            ok
+    end.
 
 %% Intrinsic gas: 21000 base, 32000 for contract creation, 4 per zero byte and
 %% 16 per non-zero byte of calldata, plus EIP-2930 access list costs

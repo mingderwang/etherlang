@@ -20,10 +20,16 @@ decode(Value) when is_list(Value) ->
             binary_to_integer(list_to_binary(S), 16)
     end.
 
-%% Encode an integer as "0x" hex (lowercase, no leading zeros).
+%% Encode an integer as "0x" hex (lowercase, no leading zeros). Lowercase
+%% because that is what the rest of the codebase emits -- bin0x/1 in eth_tx
+%% lowercases, and JSON peers compare hex as text -- so a quantity built here
+%% and a quantity decoded there have to agree on case.
 encode(0) -> "0x0";
 encode(Int) when is_integer(Int), Int > 0 ->
-    "0x" ++ integer_to_list(Int, 16).
+    "0x" ++ [digit(C) || C <- integer_to_list(Int, 16)].
+
+digit(C) when C >= $0, C =< $9 -> C;
+digit(C) when C >= $A, C =< $F -> C - $A + $a.
 
 %% Binary variant of encode/1 (what JSON objects carry around).
 encode_int(Int) when is_integer(Int) ->

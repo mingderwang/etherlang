@@ -102,7 +102,7 @@ handler() ->
                             <<"method">> => <<"eth_getTransactionReceipt">>,
                             <<"params">> => [H1]}),
             ?assertEqual([], maps:get(<<"logs">>, Rcpt1)),
-            ?assertEqual(<<"0xA410">>, maps:get(<<"cumulativeGasUsed">>, Rcpt1)),
+            ?assertEqual(<<"0xa410">>, maps:get(<<"cumulativeGasUsed">>, Rcpt1)),
             ?assertEqual(<<"0x5208">>, maps:get(<<"gasUsed">>, Rcpt1)),
             %% Log filter: address match.
             {ok, #{<<"result">> := Logs}} =

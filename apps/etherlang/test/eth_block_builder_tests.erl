@@ -279,12 +279,13 @@ malformed_access_list_test() ->
     ?assertEqual({error, invalid_access_list},
                  eth_block_builder:validate_transaction(BadSlot)).
 
-%% A 4844 blob transaction is not supported yet and must be refused outright
-%% rather than being treated as a legacy transaction and mangled.
+%% EIP-7702 (type 0x4) is not implemented yet and must be refused outright
+%% rather than being treated as a legacy transaction and mangled. Type 0x3
+%% *is* implemented now and is covered by eth_4844_tests.
 unsupported_type_test() ->
     {Tx, _} = signed_tx(),
     ?assertEqual({error, unsupported_type},
-                 eth_block_builder:validate_transaction(Tx#{<<"type">> => <<"0x3">>})).
+                 eth_block_builder:validate_transaction(Tx#{<<"type">> => <<"0x4">>})).
 
 %% ---------------------------------------------------------------------------
 %% Helpers

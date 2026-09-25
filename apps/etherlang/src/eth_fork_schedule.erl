@@ -17,6 +17,11 @@
           base_fee/3,
           base_fee_delta/2,
           burn_base_fee/2,
+          blob_gas_per_blob/0,
+          excess_blob_gas/2,
+          blob_base_fee/2,
+          blob_gas_price/1,
+          fake_exponential/3,
           process_withdrawals/2,
           make_withdrawal/3,
           withdrawals_root/1,
@@ -290,6 +295,60 @@ fee_delta(ParentBaseFee, ParentGasUsed, ParentGasLimit, Target) ->
 
 burn_base_fee(BaseFee, GasUsed) when is_integer(BaseFee), is_integer(GasUsed) ->
     BaseFee * GasUsed.
+
+%% ---------------------------------------------------------------------------
+%% EIP-4844 blob gas
+%% ---------------------------------------------------------------------------
+
+%% Blob gas is a separate resource from execution gas: it is metered per blob
+%% rather than per operation, it has its own per-block target, and its price
+%% moves on its own curve.
+%%
+%% SCOPE -- these are the Cancun parameters. EIP-7691 (Prague) raises the
+%% per-block blob target and adds a per-block cap, so on a network past Prague
+%% the excess-blob-gas calculation below is not the one that applies. This
+%% client does not model the later blob schedule, and saying so is preferable
+%% to silently charging the Cancun curve.
+-define(BLOB_GASPRICE_UPDATE_FRACTION, 3338477).
+-define(MIN_BLOB_GASPRICE, 1).
+-define(TARGET_BLOB_GAS_PER_BLOCK, 393216).
+
+blob_gas_per_blob() -> 131072.
+
+%% Excess blob gas carried into this block: the parent's excess plus the gas
+%% its blobs consumed, less the per-block target, floored at zero.
+excess_blob_gas(ParentExcessBlobGas, ParentBlobGasUsed)
+  when is_integer(ParentExcessBlobGas), is_integer(ParentBlobGasUsed) ->
+    max(0, ParentExcessBlobGas + ParentBlobGasUsed - ?TARGET_BLOB_GAS_PER_BLOCK);
+excess_blob_gas(_ParentExcessBlobGas, _ParentBlobGasUsed) ->
+    0.
+
+blob_base_fee(ParentExcessBlobGas, ParentBlobGasUsed) ->
+    blob_gas_price(excess_blob_gas(ParentExcessBlobGas, ParentBlobGasUsed)).
+
+%% Blob gas price as a function of excess blob gas. This is the EIP-4844
+%% fake_exponential with the minimum price as its base, so a block whose
+%% predecessors used no more than the target charges 1 wei per blob gas.
+blob_gas_price(ExcessBlobGas) when is_integer(ExcessBlobGas) ->
+    fake_exponential(?MIN_BLOB_GASPRICE, max(0, ExcessBlobGas),
+                     ?BLOB_GASPRICE_UPDATE_FRACTION);
+blob_gas_price(_ExcessBlobGas) ->
+    ?MIN_BLOB_GASPRICE.
+
+%% fake_exponential(Factor, Numerator, Denominator), as defined in EIP-4844.
+%% The series is accumulated as Factor*Denominator and repeatedly scaled by
+%% Numerator/(Denominator*i); the final division by Denominator is what makes
+%% the i=1 term come out as exactly Factor.
+fake_exponential(Factor, Numerator, Denominator)
+  when is_integer(Factor), is_integer(Numerator), is_integer(Denominator),
+       Denominator > 0 ->
+    fe(Factor, Numerator, Denominator, 1, 0, Factor * Denominator).
+
+fe(_Factor, _Numerator, Denominator, _I, Output, Acc) when Acc =< 0 ->
+    Output div Denominator;
+fe(Factor, Numerator, Denominator, I, Output, Acc) ->
+    Next = (Acc * Numerator) div (Denominator * I),
+    fe(Factor, Numerator, Denominator, I + 1, Output + Acc, Next).
 
 %% ---------------------------------------------------------------------------
 %% EIP-4895 withdrawals

@@ -23,10 +23,13 @@ decode_variants_test() ->
     ?assertEqual(eth_hex:decode(<<"0xdeadbeefdeadbeefdeadbeefdeadbeef">>),
                  eth_hex:decode(<<"0xdeadbeefdeadbeefdeadbeefdeadbeef">>)).
 
+%% Encoding is lowercase, matching the bin0x/1 form that eth_tx emits for byte
+%% fields, so a quantity and a data field built by this codebase agree on case.
 encode_format_test() ->
     ?assertEqual("0x0", eth_hex:encode(0)),
-    ?assertEqual("0x2A", eth_hex:encode(42)),
-    ?assertEqual(<<"0x2A">>, eth_hex:encode_int(42)),
+    ?assertEqual("0x2a", eth_hex:encode(42)),
+    ?assertEqual(<<"0x2a">>, eth_hex:encode_int(42)),
+    ?assertEqual(<<"0xdeadbeef">>, eth_hex:encode_int(16#deadbeef)),
     ?assertEqual("0x100", eth_hex:encode(256)).
 
 is_hex_test() ->

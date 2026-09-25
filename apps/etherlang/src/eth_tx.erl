@@ -1,11 +1,16 @@
 -module(eth_tx).
 
-%% Transaction RLP encoding (legacy, EIP-2930, EIP-1559) from JSON-RPC maps
-%% and transaction-trie root computation for body verification.
-%% EIP-4844/7702 and other types: encoding returns {error, unsupported};
-%% such bodies are served/skipped accordingly, never fabricated.
+%% Transaction RLP encoding (legacy, EIP-2930, EIP-1559, EIP-4844) from
+%% JSON-RPC maps and transaction-trie root computation for body verification.
+%% EIP-7702 and other types: encoding returns {error, unsupported}; such
+%% bodies are served/skipped accordingly, never fabricated.
 
--export([to_rlp/1, from_rlp/1, tx_root/1, sender/1]).
+-export([to_rlp/1, from_rlp/1, tx_root/1, sender/1,
+         blob_versioned_hashes/1, valid_versioned_hashes/1]).
+
+%% The first byte of every versioned hash, per EIP-4844. Only the KZG-commitment
+%% variant is defined, so a transaction carrying anything else is invalid.
+-define(VERSIONED_HASH_KZG, 16#01).
 
 %% Encode a JSON-RPC transaction map to wire bytes (type prefix included
 %% for typed transactions).
@@ -31,6 +36,17 @@ to_rlp(Tx) when is_map(Tx) ->
                               q(Tx, <<"gas">>),
                               addr(Tx), q(Tx, <<"value">>), data(Tx, <<"input">>),
                               access_list(Tx),
+                              q(Tx, <<"v">>), q(Tx, <<"r">>), q(Tx, <<"s">>)]))/binary>>};
+        eip4844 ->
+            {ok, <<16#03, (eth_rlp:encode(
+                             [q(Tx, <<"chainId">>), q(Tx, <<"nonce">>),
+                              q(Tx, <<"maxPriorityFeePerGas">>),
+                              q(Tx, <<"maxFeePerGas">>),
+                              q(Tx, <<"gas">>),
+                              addr(Tx), q(Tx, <<"value">>), data(Tx, <<"input">>),
+                              access_list(Tx),
+                              q(Tx, <<"maxFeePerBlobGas">>),
+                              blob_versioned_hashes(Tx),
                               q(Tx, <<"v">>), q(Tx, <<"r">>), q(Tx, <<"s">>)]))/binary>>};
         unsupported ->
             {error, unsupported_tx_type}
@@ -79,6 +95,28 @@ do_from_rlp(<<16#02, _/binary>> = Bin) ->
         _ ->
             {error, bad_tx}
     end;
+do_from_rlp(<<16#03, _/binary>> = Bin) ->
+    Rest = binary:part(Bin, 1, byte_size(Bin) - 1),
+    case eth_rlp:decode(Rest) of
+        {ok, [ChainID, Nonce, MaxPrio, MaxFee, Gas, To, Value, Input, AL,
+              MaxFeePerBlobGas, VersionedHashes, V, R, S], <<>>} ->
+            {ok, #{<<"type">> => <<"0x3">>,
+                   <<"chainId">> => hexq(ChainID),
+                   <<"nonce">> => hexq(Nonce),
+                   <<"maxPriorityFeePerGas">> => hexq(MaxPrio),
+                   <<"maxFeePerGas">> => hexq(MaxFee),
+                   <<"gas">> => hexq(Gas),
+                   <<"to">> => hexdata(To),
+                   <<"value">> => hexq(Value),
+                   <<"input">> => hexdata(Input),
+                   <<"accessList">> => from_access_list(AL),
+                   <<"maxFeePerBlobGas">> => hexq(MaxFeePerBlobGas),
+                   <<"blobVersionedHashes">> => [hexdata(H) || H <- VersionedHashes],
+                   <<"v">> => hexq(V), <<"r">> => hexq(R), <<"s">> => hexq(S),
+                   <<"hash">> => hexdata(eth_keccak:hash(Bin))}};
+        _ ->
+            {error, bad_tx}
+    end;
 do_from_rlp(Bin) ->
     case eth_rlp:decode(Bin) of
         {ok, [Nonce, GasPrice, Gas, To, Value, Input, V, R, S], <<>>} ->
@@ -109,9 +147,13 @@ from_access_list(AL) when is_list(AL) ->
 from_access_list(_) ->
     throw(bad_tx).
 
+%% A quantity, in the minimal hex form JSON-RPC requires ("0x0", "0x7", never
+%% "0x07"). RLP decodes an integer to a binary, so the bytes are folded back
+%% into an integer here; emitting bin0x/1 directly would produce leading zeros
+%% for any quantity whose top byte happens to be zero.
 hexq(I) when is_integer(I) -> eth_hex:encode_int(I);
 hexq(B) when is_binary(B), byte_size(B) =:= 0 -> <<"0x0">>;
-hexq(B) when is_binary(B) -> bin0x(B);
+hexq(B) when is_binary(B) -> eth_hex:encode_int(binary:decode_unsigned(B));
 hexq(_) -> throw(bad_tx).
 
 hexdata(B) when is_binary(B) -> bin0x(B);
@@ -169,6 +211,21 @@ sighash(Tx) ->
                    access_list(Tx)],
             {eth_keccak:hash(<<16#02, (eth_rlp:encode(Pay))/binary>>),
              q(Tx, <<"v">>)};
+        %% EIP-4844: the signing preimage stops at the versioned hashes. Unlike
+        %% legacy/2930/1559 there is no "unsigned" flag byte -- the type prefix
+        %% already distinguishes the preimage from the full encoding, because
+        %% the full encoding simply has three more RLP items appended.
+        eip4844 ->
+            Pay = [q(Tx, <<"chainId">>), q(Tx, <<"nonce">>),
+                   q(Tx, <<"maxPriorityFeePerGas">>),
+                   q(Tx, <<"maxFeePerGas">>),
+                   q(Tx, <<"gas">>),
+                   addr(Tx), q(Tx, <<"value">>), data(Tx, <<"input">>),
+                   access_list(Tx),
+                   q(Tx, <<"maxFeePerBlobGas">>),
+                   blob_versioned_hashes(Tx)],
+            {eth_keccak:hash(<<16#03, (eth_rlp:encode(Pay))/binary>>),
+             q(Tx, <<"v">>)};
         unsupported ->
             throw(unsupported_tx_type)
     end.
@@ -193,7 +250,7 @@ tx_type(Tx) ->
         <<"0x0">> -> legacy;
         <<"0x1">> -> eip2930;
         <<"0x2">> -> eip1559;
-        <<"0x3">> -> unsupported;
+        <<"0x3">> -> eip4844;
         <<"0x4">> -> unsupported;
         undefined ->
             case maps:is_key(<<"maxFeePerGas">>, Tx) of
@@ -247,6 +304,49 @@ access_list(Tx) ->
         _ ->
             []
     end.
+
+%% EIP-4844 blob versioned hashes, as 32-byte binaries. A transaction with no
+%% blob hashes is a malformed blob transaction rather than a valid one, but
+%% this helper only performs the shape conversion: whether a hash is
+%% well-formed, and whether the transaction pays enough for the blobs it
+%% references, are validity rules enforced by the block builder, not part of
+%% the wire codec.
+blob_versioned_hashes(Tx) ->
+    case maps:get(<<"blobVersionedHashes">>, Tx,
+                  maps:get(<<"blob_versioned_hashes">>, Tx, [])) of
+        L when is_list(L) -> [blob_versioned_hash(H) || H <- L];
+        _ -> []
+    end.
+
+%% A versioned hash is the version byte followed by the SHA-256 of the
+%% commitment, minus that hash's first byte. It commits to the blob's
+%% commitment without revealing it.
+blob_versioned_hash(<<Version, Rest/binary>>) when byte_size(Rest) =:= 31 ->
+    <<Version, Rest/binary>>;
+blob_versioned_hash(B) when is_binary(B), byte_size(B) =:= 32 ->
+    B;
+blob_versioned_hash(<<"0x", B/binary>>) when byte_size(B) =:= 64 ->
+    <<Version, Rest/binary>> = hex_bytes(B),
+    <<Version, Rest/binary>>;
+blob_versioned_hash(H) when is_integer(H), H >= 0 ->
+    <<H:256>>;
+blob_versioned_hash(_) ->
+    <<>>.
+
+%% EIP-4844 validity for the versioned hashes themselves. A blob transaction
+%% must reference at least one blob, and every referenced hash must be exactly
+%% 32 bytes, carry the KZG-commitment version byte, and be non-zero -- a
+%% zero hash would commit to nothing. The blob *gas* price floor is a separate
+%% rule that depends on the block, and lives in the block builder.
+valid_versioned_hashes(Tx) ->
+    Hashes = blob_versioned_hashes(Tx),
+    Hashes =/= [] andalso
+    lists:all(fun
+                  (<<?VERSIONED_HASH_KZG, Rest/binary>>) when byte_size(Rest) =:= 31 ->
+                      Rest =/= <<0:248>>;
+                  (_) ->
+                      false
+              end, Hashes).
 
 hex_bytes(<<"0x", Rest/binary>>) -> hex_bytes(Rest);
 hex_bytes(<<"0X", Rest/binary>>) -> hex_bytes(Rest);
