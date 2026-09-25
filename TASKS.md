@@ -1,6 +1,6 @@
 # etherlang v1.0 — Execution Client Task List
 
-**81 tasks across 9 phases** — Phase 1-4 complete (41/81 done, 40 remaining).
+**81 tasks across 9 phases** — Phase 1-5 partially complete (44/81 done, 37 remaining).
 
 ## Phase 1: Engine API — Consensus Layer Interface (7 tasks)
 - [x] **Engine API server** — `engine_newPayloadV1`, `engine_forkchoiceUpdatedV1`, `engine_getPayloadV1`, `engine_exchangeTransitionConfigurationV1` (`eth_engine`)
