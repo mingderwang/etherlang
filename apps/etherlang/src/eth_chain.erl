@@ -41,7 +41,8 @@
          tx_block/1, tx_block/2,
          canonical_hash/1, canonical_hash/2,
          highest/1, has_block/1, has_block/2, size/1,
-         finalized/0, finalized/1, set_finalized/2]).
+         finalized/0, finalized/1, set_finalized/2,
+         get_gas_used/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -120,6 +121,10 @@ finalized(Name) -> gen_server:call(Name, finalized).
 %% Advance the finalized checkpoint (monotonic; never goes backwards).
 set_finalized(Name, Num) when is_integer(Num), Num >= 0 ->
     gen_server:call(Name, {set_finalized, Num}).
+
+get_gas_used(Number) -> get_gas_used(eth_chain, Number).
+
+get_gas_used(Name, Number) -> gen_server:call(Name, {gas_used, Number}).
 
 %% ---------------------------------------------------------------------------
 %% gen_server callbacks
@@ -249,6 +254,12 @@ handle_call({set_finalized, N}, _From, #st{finalized = F} = S) when F =/= undefi
 handle_call({set_finalized, N}, _From, S) ->
     ok = dets:insert(S#st.meta_tab, {finalized, N}),
     {reply, ok, S#st{finalized = N}};
+handle_call({gas_used, N}, _From, S) ->
+    Reply = case dets:lookup(S#st.num_tab, {N}) of
+        [{{N}, {_Hash, Block, _Full}}] -> {ok, maps:get(<<"gasUsed">>, Block, 0)};
+        [] -> not_found
+    end,
+    {reply, Reply, S};
 
 handle_call(_Req, _From, S) ->
     {reply, {error, unknown_call}, S}.
@@ -504,3 +515,7 @@ check_consistency(NumTab, HashTab, _MetaTab, Head) ->
                 _ -> logger:warning("etherlang: chain num_tab mismatch at ~p", [N]), ok
             end
     end.
+
+%% ---------------------------------------------------------------------------
+%% Gas used query
+%% ---------------------------------------------------------------------------

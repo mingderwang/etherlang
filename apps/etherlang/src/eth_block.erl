@@ -92,21 +92,25 @@ new(ParentHash, Number) ->
 add_transaction(Block, Tx) ->
     Block#block{transactions = Block#block.transactions ++ [Tx]}.
 
+%% finalize/1 executes the block body against local state and then recomputes
+%% every commitment the header asserts. The state root is *verified*, not
+%% assumed: when the block already carries a declared state root (an inbound
+%% payload from the consensus layer) it must equal the root the node computed
+%% after execution, otherwise finalization fails. A block being built locally
+%% starts from the ?EMPTY_ROOT sentinel and simply adopts the computed root.
 finalize(#block{transactions = Txs,
                 gas_limit = GasLimit,
                 base_fee_per_gas = BaseFee} = Block) ->
-    Chain = eth_chain,
-    Head = eth_chain:head(Chain),
+    Head = eth_chain:head(eth_chain),
     State = eth_state:new(Head, #{}),
     Block1 = execute_transactions(Block, Txs, State, BaseFee, GasLimit),
-    StateRoot = eth_mpt:state_root(),
-    %% Verify state root matches computed root.
-    ok = verify_state_root(StateRoot, Block1),
+    ComputedRoot = eth_mpt:state_root(),
+    ok = verify_state_root(Block1#block.state_root, ComputedRoot),
     Block1#block{
-        state_root = StateRoot,
+        state_root = ComputedRoot,
         gas_used = sum_gas_used(Block1#block.receipts),
         logs_bloom = compute_bloom(Block1#block.logs),
-        receipts_root = eth_receipt:receipt_root(Block1#block.receipts),
+        receipts_root = receipts_root(Block1#block.receipts),
         transactions_root = tx_root(Block1#block.transactions)
     }.
 
@@ -254,11 +258,29 @@ to_rlp(#block{parent_hash = PH, number = N, timestamp = Ts,
 %% Roots
 %% ---------------------------------------------------------------------------
 
-tx_root(Txs) ->
-    eth_trie:root([{I, eth_tx:to_rlp(Tx)} || {I, Tx} <- lists:zip(lists:seq(1, length(Txs)), Txs)]).
+%% Transaction trie: key = RLP(index) from 0, value = the transaction's wire
+%% encoding. eth_tx:to_rlp/1 yields {ok, Bytes} and returns an error for
+%% unsupported types, so an unencodable body falls back to the empty root
+%% rather than silently contributing a tuple as a trie value.
+tx_root([]) ->
+    eth_trie:root([]);
+tx_root(Txs) when is_list(Txs) ->
+    Pairs = lists:map(
+        fun({Tx, I}) ->
+            case eth_tx:to_rlp(Tx) of
+                {ok, Bytes} -> {eth_rlp:encode(I), Bytes};
+                _ -> {eth_rlp:encode(I), <<>>}
+            end
+        end, lists:zip(Txs, lists:seq(0, length(Txs) - 1))),
+    eth_trie:root(Pairs).
 
+%% receipts_root/1 is public API and must return a bare 32-byte root, so the
+%% {ok, Root} shape of eth_receipt:receipt_root/1 is unwrapped here.
 receipts_root(Receipts) ->
-    eth_receipt:receipt_root(Receipts).
+    case eth_receipt:receipt_root(Receipts) of
+        {ok, Root} -> Root;
+        _ -> eth_trie:root([])
+    end.
 
 logs_bloom(Logs) ->
     eth_bloom:add_logs(eth_bloom:new(), Logs).
@@ -270,12 +292,28 @@ compute_bloom(Logs) ->
 %% State root verification
 %% ---------------------------------------------------------------------------
 
-verify_state_root(StateRoot, _Block) ->
-    ComputedRoot = eth_mpt:state_root(),
-    case StateRoot =:= ComputedRoot of
+%% ---------------------------------------------------------------------------
+%% State root verification
+%% ---------------------------------------------------------------------------
+
+%% verify_state_root(Declared, Computed) -> ok | {error, state_root_mismatch}
+%%
+%% A locally built block carries ?EMPTY_ROOT until finalize/1 fills it in; that
+%% sentinel means "no declaration yet" and adopts whatever was computed. A
+%% block received from the consensus layer carries a real root, and that root
+%% must match the root this node derived by executing the same transactions
+%% against the same parent state.
+verify_state_root(?EMPTY_ROOT, _Computed) ->
+    ok;
+verify_state_root(Declared, Computed) when is_binary(Declared), is_binary(Computed) ->
+    case Declared =:= Computed of
         true -> ok;
         false -> {error, state_root_mismatch}
-    end.
+    end;
+verify_state_root(Declared, _Computed) when Declared =:= undefined ->
+    ok;
+verify_state_root(_Declared, _Computed) ->
+    {error, state_root_mismatch}.
 
 %% ---------------------------------------------------------------------------
 %% Helpers
@@ -287,19 +325,25 @@ gas_used(Block) ->
 sum_gas_used(Receipts) ->
     lists:sum([maps:get(<<"cumulative_gas_used">>, R, 0) || R <- Receipts]).
 
+%% EIP-1559 effective gas price paid by the sender:
+%%   min(maxFeePerGas, baseFeePerGas + maxPriorityFeePerGas)
+%% This is the price that is actually charged and that must be reported in the
+%% receipt; it is *not* the tip. Legacy transactions use gasPrice directly.
 effective_gas_price(GasPrice, MaxPriorityFee, MaxFee, BaseFee) ->
     case BaseFee of
         undefined -> GasPrice;
         BF when is_integer(MaxFee), is_integer(MaxPriorityFee) ->
-            min(GasPrice, MaxFee) - max(MaxPriorityFee, BF);
+            min(MaxFee, BF + MaxPriorityFee);
         _ -> GasPrice
     end.
 
 base_fee() ->
     1000000000.
 
+%% Default withdrawals root is the SSZ hash-tree-root of an empty list, not the
+%% MPT empty root; the two are different commitments.
 withdrawals_root() ->
-    ?EMPTY_ROOT.
+    eth_fork_schedule:withdrawals_root([]).
 
 %% ---------------------------------------------------------------------------
 %% JSON serialization

@@ -106,31 +106,31 @@ init([]) ->
 handle_call({get_account, Addr}, _From, S) ->
     {reply, maps:get(Addr, S#st.accounts, undefined), S};
 
+%% A write invalidates the account's storage root and the state root, so both
+%% are recomputed here. recompute/1 is the single place where a state root is
+%% derived, which is what makes state_root/0 honest.
 handle_call({put_account, Addr, Balance, Nonce, CodeHash}, _From, S) ->
-    StorageRoot = compute_storage_root(Addr, S),
-    Node = #{balance => Balance, nonce => Nonce,
-             codeHash => CodeHash, storageRoot => StorageRoot},
-    Trie = eth_trie:insert(S#st.trie, nibbles(Addr), Node),
-    S1 = S#st{accounts = maps:put(Addr, Node, S#st.accounts),
-              trie = Trie},
+    Node = #{balance => Balance, nonce => Nonce, codeHash => CodeHash},
+    Accounts1 = maps:put(Addr, Node, S#st.accounts),
+    S1 = rebuild(S#st{accounts = Accounts1}),
     {reply, ok, S1};
 
 handle_call({delete_account, Addr}, _From, S) ->
-    Trie = eth_trie:insert(S#st.trie, nibbles(Addr), none),
-    S1 = S#st{accounts = maps:remove(Addr, S#st.accounts), trie = Trie},
+    S1 = rebuild(S#st{accounts = maps:remove(Addr, S#st.accounts)}),
     {reply, ok, S1};
 
 handle_call({get_storage, Addr, Slot}, _From, S) ->
     {reply, maps:get({Addr, Slot}, S#st.storages, undefined), S};
 
+%% Storage lives in a per-account trie, never in the account trie. The write
+%% therefore updates the account's storageRoot and the state root.
 handle_call({put_storage, Addr, Slot, Value}, _From, S) ->
-    Trie = eth_trie:insert(S#st.trie, storage_key(Addr, Slot), Value),
-    S1 = S#st{storages = maps:put({Addr, Slot}, Value, S#st.storages),
-              trie = Trie},
+    S1 = put_storage_state(S, Addr, Slot, Value),
     {reply, ok, S1};
 
 handle_call({delete_storage, Addr, Slot}, _From, S) ->
-    S1 = S#st{storages = maps:remove({Addr, Slot}, S#st.storages)},
+    Storages1 = maps:remove({Addr, Slot}, S#st.storages),
+    S1 = touch_account(S#st{storages = Storages1}, Addr),
     {reply, ok, S1};
 
 handle_call({put_code, CodeHash, Code}, _From, S) ->
@@ -180,17 +180,16 @@ handle_call({prove_account, Addr}, _From, S) ->
     case maps:get(Addr, S#st.accounts, undefined) of
         undefined -> {reply, {error, not_found}, S};
         _Account ->
-            Proof = eth_trie:prove(S#st.trie, nibbles(Addr)),
+            Proof = eth_trie:prove(S#st.trie, hashed_key(Addr)),
             {reply, {ok, Proof}, S}
     end;
 
 handle_call({prove_storage, Addr, Slot}, _From, S) ->
-    Proof = eth_trie:prove(S#st.trie, storage_key(Addr, Slot)),
+    Proof = eth_trie:prove(storage_trie(S, Addr), storage_hashed_key(Slot)),
     {reply, {ok, Proof}, S};
 
 handle_call(clear, _From, S) ->
-    {reply, ok, S#st{accounts = #{}, storages = #{}, code = #{},
-                      trie = none, root = eth_trie:root([])}};
+    {reply, ok, rebuild(S#st{accounts = #{}, storages = #{}, code = #{}})};
 handle_call(_Req, _From, S) ->
     {reply, {error, unknown_call}, S}.
 
@@ -240,8 +239,11 @@ prove_storage(Addr, Slot) when is_binary(Addr), is_integer(Slot) ->
 verify_proof(Root, Key, Proof) ->
     eth_trie:verify_proof(Root, Key, Proof).
 
-verify_storage_proof(Root, Addr, Slot, Proof) ->
-    eth_trie:verify_proof(Root, storage_key(Addr, Slot), Proof).
+%% Storage proofs are relative to the account's storage trie, whose keys are
+%% keccak256(slot) and do not depend on the address. Addr is retained in the
+%% signature because a caller needs it to select the right storage root.
+verify_storage_proof(Root, _Addr, Slot, Proof) ->
+    eth_trie:verify_proof(Root, storage_hashed_key(encode_slot(Slot)), Proof).
 
 snapshot() ->
     gen_server:call(?MODULE, snapshot).
@@ -268,23 +270,98 @@ size() ->
 %% Internal helpers
 %% ---------------------------------------------------------------------------
 
-nibbles(Bin) when is_binary(Bin) ->
-    nibbles(Bin, []).
-nibbles(<<>>, Acc) -> lists:reverse(Acc);
-nibbles(<<H:4, L:4, Rest/binary>>, Acc) ->
-    nibbles(Rest, [L, H | Acc]).
+%% ---------------------------------------------------------------------------
+%% State root computation
+%% ---------------------------------------------------------------------------
 
+%% The account trie is keyed by keccak256(address) and stores the RLP-encoded
+%% account [nonce, balance, storageRoot, codeHash]. Rebuilding it from the
+%% account map on every write keeps S#st.root authoritative: there is no path
+%% that can change state without changing the root.
+rebuild(S) ->
+    Pairs = [{hashed_key(Addr), encode_account(Addr, S)}
+             || Addr <- maps:keys(S#st.accounts)],
+    Trie = eth_trie:build(Pairs),
+    S#st{trie = Trie, root = eth_trie:root(Pairs)}.
 
-storage_key(Addr, Slot) ->
-    nibbles(<<Addr/binary, Slot/binary>>).
+encode_account(Addr, S) ->
+    #{nonce := Nonce, balance := Balance, codeHash := CodeHash} =
+        maps:get(Addr, S#st.accounts, #{}),
+    StorageRoot = storage_root(S, Addr),
+    eth_rlp:encode([Nonce, Balance, StorageRoot, CodeHash]).
 
-compute_storage_root(Addr, #st{storages = Storages}) ->
-    StoragePairs = [{{Addr, Slot}, Val} || {{Addr2, Slot}, Val} <- maps:to_list(Storages),
-                                             Addr2 =:= Addr],
-    case StoragePairs of
-        [] -> eth_trie:root([]);
-        _ -> eth_trie:root(StoragePairs)
+%% EIP-55 address hashing: the account trie key is keccak256 of the raw address.
+hashed_key(Addr) when is_binary(Addr) ->
+    eth_keccak:hash(Addr).
+
+%% Storage trie key is keccak256 of the 32-byte slot; the value is the RLP
+%% encoding of the integer with leading zero bytes stripped.
+storage_hashed_key(Slot) ->
+    eth_keccak:hash(encode_slot(Slot)).
+
+encode_slot(Slot) when is_integer(Slot) -> <<Slot:256>>;
+encode_slot(Slot) when is_binary(Slot) ->
+    case byte_size(Slot) of
+        32 -> Slot;
+        N when N < 32 -> <<Slot/binary, 0:(256 - N * 8)>>;
+        _ -> binary:part(Slot, byte_size(Slot) - 32, 32)
     end.
+
+storage_value(Value) when is_integer(Value) ->
+    encode_rlp_scalar(Value);
+storage_value(Value) when is_binary(Value) ->
+    case binary:decode_unsigned(Value) of
+        I -> encode_rlp_scalar(I)
+    end;
+storage_value(_) ->
+    eth_rlp:encode(<<>>).
+
+%% MPT values are minimal big-endian: strip leading zero bytes. eth_rlp:encode
+%% already emits the canonical short form for a binary, and 0 encodes as the
+%% empty string, so truncating to the first non-zero byte is sufficient.
+encode_rlp_scalar(I) when is_integer(I), I >= 0 ->
+    Bin = case I of
+        0 -> <<>>;
+        _ -> binary:encode_unsigned(I)
+    end,
+    strip_leading_zeros(Bin).
+
+strip_leading_zeros(<<0, Rest/binary>>) -> strip_leading_zeros(Rest);
+strip_leading_zeros(Bin) -> Bin.
+
+%% Per-account storage trie. Keys are hashed slots, values are minimal RLP
+%% integers, exactly as the yellow paper specifies.
+storage_trie(#st{storages = Storages}, Addr) ->
+    Pairs = [{storage_hashed_key(Slot), storage_value(Value)}
+             || {{Addr2, Slot}, Value} <- maps:to_list(Storages), Addr2 =:= Addr],
+    eth_trie:build(Pairs).
+
+storage_root(S, Addr) ->
+    Pairs = [{storage_hashed_key(Slot), storage_value(Value)}
+             || {{Addr2, Slot}, Value} <- maps:to_list(S#st.storages), Addr2 =:= Addr],
+    case Pairs of
+        [] -> eth_trie:root([]);
+        _ -> eth_trie:root(Pairs)
+    end.
+
+%% Writing storage for an account that does not exist yet creates a minimal
+%% account, because the state trie must contain a storage root for every
+%% present account.
+touch_account(S, Addr) ->
+    Accounts1 = case maps:is_key(Addr, S#st.accounts) of
+        true -> S#st.accounts;
+        false -> maps:put(Addr, #{balance => 0, nonce => 0,
+                                  codeHash => eth_keccak:hash(<<>>)},
+                            S#st.accounts)
+    end,
+    rebuild(S#st{accounts = Accounts1}).
+
+put_storage_state(S, Addr, Slot, Value) ->
+    SlotBin = encode_slot(Slot),
+    ValBin = storage_value(Value),
+    S1 = touch_account(S#st{storages = maps:put({Addr, SlotBin}, ValBin,
+                                                 S#st.storages)}, Addr),
+    S1.
 
 ensure_table() ->
     case ets:info(?TAB) of
@@ -309,12 +386,15 @@ load_snapshot(#st{snapshot_file = File} = S) ->
     case file:read_file(File) of
         {ok, Bin} ->
             case thoas:decode(Bin) of
-                {ok, #{accounts := Accounts, storages := Storages,
-                       code := Code, root := Root}} ->
-                    {ok, S#st{accounts = maps:from_list(Accounts),
-                              storages = maps:from_list(Storages),
-                              code = maps:from_list(Code),
-                              root = Root, persisted = true}};
+                {ok, #{accounts := Accounts, storages := Storages, code := Code}} ->
+                    %% The root stored in the snapshot is advisory only; it is
+                    %% recomputed so a snapshot can never resurrect a root that
+                    %% disagrees with the state it carries.
+                    Restored = S#st{accounts = maps:from_list(Accounts),
+                                    storages = maps:from_list(Storages),
+                                    code = maps:from_list(Code),
+                                    persisted = true},
+                    {ok, rebuild(Restored)};
                 _ -> {error, bad_decode}
             end;
         {error, _} -> {error, not_found}

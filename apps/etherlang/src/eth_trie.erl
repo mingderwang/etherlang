@@ -168,18 +168,27 @@ ref_at(C, I) ->
         error -> <<>>
     end.
 
-%% Hex-prefix (compact) encoding: flag nibbles pack into bytes with the
-%% path nibbles, no extra padding byte.
-compact(Nibbles, IsLeaf) ->
+%% Hex-prefix (compact) encoding.
+%%
+%% The flag nibble and the path nibbles are packed together, and a nibble of
+%% padding is added when the total would otherwise be odd:
+%%
+%%   * an odd-length path packs as  [flag | nibbles]              (even bytes)
+%%   * an even-length path packs as [flag+1, 0 | nibbles]        (even bytes)
+%%
+%% So a leaf with an empty path is the single byte 0x20, a leaf with a
+%% one-nibble path is [0x3 nibble], and a leaf with a two-nibble path is
+%% [0x20, nibble1 nibble2].
+compact([], true) -> <<16#20>>;
+compact([], false) -> <<16#00>>;
+compact([H | T], IsLeaf) ->
     F = case IsLeaf of
             true -> 2;
             false -> 0
         end,
-    case Nibbles of
-        [H | T] when length(T) rem 2 =:= 0 ->
-            pack([F + 1, H | T]);
-        _ ->
-            pack([F, 0 | Nibbles])
+    case length(T) rem 2 of
+        0 -> pack([F + 1, H | T]);
+        1 -> pack([F, 0, H | T])
     end.
 
 pack([]) -> <<>>;

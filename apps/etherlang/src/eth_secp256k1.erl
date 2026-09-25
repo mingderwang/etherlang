@@ -27,13 +27,23 @@ node_id(Priv) when byte_size(Priv) =:= 32 ->
 
 %% Sign a 32-byte digest. Returns {R, S, V} with V in {0, 1} (raw recovery
 %% id, as used by discv4 packet signatures).
+%%
+%% The OpenSSL backend makes no promise about which half of the s range it
+%% emits, so the result is canonicalized to a *low-s* signature as EIP-2
+%% requires. Negating s maps the signature onto the point (R, -s) rather than
+%% (R, s), which flips the parity of the recovery id; without flipping the
+%% parity alongside it the recovered address would not match the signer.
 sign(Digest, Priv) when byte_size(Digest) =:= 32, byte_size(Priv) =:= 32 ->
     DER = crypto:sign(ecdsa, sha256, {digest, Digest}, [Priv, secp256k1]),
-    {R, S} = der_rs(Digest, DER),
-    Pub = node_id(Priv),
-    case [V || V <- [0, 1], recover(Digest, R, S, V) =:= {ok, Pub}] of
-        [V | _] -> {R, S, V};
-        [] -> error(bad_recovery)
+    {R0, S0} = der_rs(Digest, DER),
+    {R, S, V0} =
+        case [V || V <- [0, 1], recover(Digest, R0, S0, V) =:= {ok, node_id(Priv)}] of
+            [V | _] -> {R0, S0, V};
+            [] -> error(bad_recovery)
+        end,
+    case S > ?N div 2 of
+        true -> {R, ?N - S, 1 - V0};
+        false -> {R, S, V0}
     end.
 
 %% Recover the 64-byte node id from a signature over a 32-byte digest.
