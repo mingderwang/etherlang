@@ -136,7 +136,12 @@ env_from_block(Block, BlockParam) ->
                 prevrandao => bin32(maps:get(<<"mixHash">>, Block, <<0:256>>)),
                 base_fee => uint(maps:get(<<"baseFeePerGas">>, Block, 0)),
                 blob_base_fee => uint(maps:get(<<"blobBaseFee">>, Block, 0)),
-                chain_id => eth_state:chain_id(),
+                %% The id of the network being simulated, from configuration.
+                %% eth_state:chain_id/0 asks whichever upstream endpoint is
+                %% configured, so a contract branching on CHAINID would be
+                %% answered against a different chain than the one the rest of
+                %% this env describes.
+                chain_id => eth_fork_schedule:chain_id(),
                 blockhash => blockhash_fun()},
         _ = BlockParam,
         {ok, Env}

@@ -28,33 +28,18 @@
           logs_bloom/1,
           gas_used/1,
           base_fee/0,
-          withdrawals_root/0 ]).
+          withdrawals_root/0,
+          %% The record is module-local, so without these a caller that has
+          %% finalized a block cannot read what its transactions did. A JSON-RPC
+          %% layer serving eth_getTransactionReceipt and eth_getLogs has no other
+          %% way in, which makes the accessors part of the module's contract
+          %% rather than a test convenience.
+          receipts/1,
+          logs/1,
+          fork/1 ]).
 
--record(block, {
-    parent_hash :: binary(),
-    number :: integer(),
-    timestamp :: integer(),
-    miner :: binary(),
-    difficulty :: integer(),
-    gas_limit :: integer(),
-    gas_used :: integer(),
-    transactions :: [map()],
-    receipts :: [map()],
-    logs :: [map()],
-    logs_bloom :: binary(),
-    state_root :: binary(),
-    receipts_root :: binary(),
-    transactions_root :: binary(),
-    base_fee_per_gas :: integer() | undefined,
-    blob_gas_used :: integer(),
-    excess_blob_gas :: integer(),
-    withdrawals :: [map()],
-    withdrawals_root :: binary(),
-    extra_data :: binary(),
-    nonce :: binary(),
-    mix_hash :: binary(),
-    sha3_uncles :: binary()
-}).
+-include_lib("etherlang/include/eth_block.hrl").
+
 
 -define(MAX_GAS, 30000000).
 -define(EMPTY_ROOT, <<16#56, 16#e8, 16#1f, 16#17, 16#1b, 16#cc, 16#55, 16#a6,
@@ -86,6 +71,7 @@ new(ParentHash, Number) ->
         excess_blob_gas = 0,
         withdrawals = [],
         withdrawals_root = ?EMPTY_ROOT,
+        parent_beacon_block_root = undefined,
         extra_data = <<>>,
         nonce = <<0:192>>,
         mix_hash = <<0:256>>,
@@ -98,6 +84,17 @@ new(ParentHash, Number, BaseFee) ->
 
 add_transaction(Block, Tx) ->
     Block#block{transactions = Block#block.transactions ++ [Tx]}.
+
+receipts(#block{receipts = R}) -> R.
+
+logs(#block{logs = L}) -> L.
+
+%% The fork whose rules apply to this block. Exposed because a caller deciding
+%% how to interpret a payload -- whether a beacon root is present, whether
+%% withdrawals may be non-empty -- needs the same answer execution used, not a
+%% second derivation of it that could disagree.
+fork(#block{} = Block) ->
+    fork_of(Block).
 
 %% Record the state root an inbound block declares. A locally built block leaves
 %% this at the ?EMPTY_ROOT sentinel, which finalize/1 reads as "no declaration
@@ -126,8 +123,47 @@ from_json(Map) when is_map(Map) ->
     Block2 = maybe_declare(Block1, maps:get(<<"stateRoot">>, Map, undefined)),
     Block3 = maybe_declare(Block2, maps:get(<<"transactionsRoot">>, Map, undefined),
                            transactions_root),
-    maybe_declare(Block3, maps:get(<<"receiptsRoot">>, Map, undefined),
-                  receipts_root).
+    Block4 = maybe_declare(Block3, maps:get(<<"receiptsRoot">>, Map, undefined),
+                           receipts_root),
+    Block4#block{
+        withdrawals = withdrawals_from_json(maps:get(<<"withdrawals">>, Map, [])),
+        parent_beacon_block_root =
+            maybe_word(maps:get(<<"parentBeaconBlockRoot">>, Map, undefined))
+    }.
+
+%% The parent beacon block root is 32 bytes, or absent. A payload that carries
+%% something else is a malformed one; leaving it undefined would make the
+%% EIP-4788 call silently not happen, so it is dropped to undefined only for
+%% genuinely absent values and kept as a word otherwise.
+maybe_word(undefined) -> undefined;
+maybe_word(V) when is_binary(V), byte_size(V) =:= 66 ->
+    binary:decode_hex(binary:part(V, 2, 64));
+maybe_word(V) when is_binary(V), byte_size(V) =:= 32 -> V;
+maybe_word(_) -> undefined.
+
+withdrawals_from_json(Ws) when is_list(Ws) -> [normalize_withdrawal(W) || W <- Ws];
+withdrawals_from_json(_) -> [].
+
+normalize_withdrawal(W) when is_map(W) ->
+    #{index => withdrawal_quantity(maps:get(<<"index">>, W, 0)),
+      validatorIndex => withdrawal_quantity(
+                          maps:get(<<"validatorIndex">>, W,
+                                   maps:get(<<"validator_index">>, W, 0))),
+      address => withdrawal_address_bytes(maps:get(<<"address">>, W, <<>>)),
+      amount => withdrawal_quantity(maps:get(<<"amount">>, W, 0))};
+normalize_withdrawal(_) ->
+    #{index => 0, validatorIndex => 0, address => <<0:160>>, amount => 0}.
+
+%% The wire form is a JSON-RPC quantity, so "0x175" is hexadecimal 373.
+withdrawal_quantity(V) when is_integer(V) -> max(0, V);
+withdrawal_quantity(V) when is_binary(V) ->
+    try max(0, eth_hex:decode(V)) catch _:_ -> 0 end;
+withdrawal_quantity(_) -> 0.
+
+withdrawal_address_bytes(<<A:20/binary>>) -> A;
+withdrawal_address_bytes(<<"0x", Rest/binary>>) when byte_size(Rest) =:= 40 ->
+    binary:decode_hex(Rest);
+withdrawal_address_bytes(_) -> <<0:160>>.
 
 maybe_declare(Block, undefined) -> Block;
 maybe_declare(Block, Hex) when is_binary(Hex), byte_size(Hex) =:= 66 ->
@@ -219,8 +255,22 @@ finalize_against(Block, ParentRoot, Txs, GasLimit, BaseFee) ->
             ok = eth_state:set_base_source(mpt),
             try
                 State = eth_state:new(Block#block.parent_hash, #{}),
-                {Executed, State1} = execute_transactions(Block, Txs, State, BaseFee,
-                                                           GasLimit),
+                %% System operations run in the order the forks specify: the
+                %% beacon-roots call opens the block, before any transaction can
+                %% observe it, and withdrawals close it, after the last
+                %% transaction. Both write the same overlay the transactions do,
+                %% so both are inside the state root this block declares.
+                Fork = fork_of(Block),
+                {ok, State0} = eth_fork_schedule:process_beacon_roots(
+                                  Block#block.timestamp,
+                                  Block#block.parent_beacon_block_root,
+                                  State, Fork),
+                {Executed0, StateT} = execute_transactions(Block, Txs, State0,
+                                                            BaseFee, GasLimit),
+                {ok, State1, _Applied} =
+                    eth_fork_schedule:apply_withdrawals_to_state(
+                      Executed0#block.withdrawals, StateT),
+                Executed = Executed0,
                 case eth_state:commit(State1) of
                     ok ->
                         Root = eth_mpt:state_root(),
@@ -243,6 +293,18 @@ finalize_against(Block, ParentRoot, Txs, GasLimit, BaseFee) ->
             after
                 _ = eth_state:set_base_source(Previous)
             end
+    end.
+
+%% The rules in force for this block, which decide whether the beacon-roots
+%% system call applies. There is no network here to consult, so the schedule is
+%% asked for this block's own position.
+fork_of(#block{number = Number, timestamp = Ts}) ->
+    try eth_fork_schedule:current_fork(
+          eth_fork_schedule:configured_network(), Number, Ts) of
+        Fork when is_atom(Fork) -> Fork;
+        _ -> paris
+    catch
+        _:_ -> paris
     end.
 
 %% The local MPT holds the parent's state exactly when its own root equals the
@@ -292,15 +354,12 @@ commitments(#block{} = Block, Root) ->
 %% state, so the transactions in a block cannot build on each other at all.
 execute_transactions(Block, [], State, _BF, _GL) ->
     {Block, State};
-execute_transactions(#block{number = Number, timestamp = Ts,
-                     miner = Miner, base_fee_per_gas = BaseFee,
-                     gas_limit = GL} = Block,
+execute_transactions(#block{base_fee_per_gas = BaseFee, gas_limit = GL} = Block,
                  [Tx | Rest], State, _BF, GL) ->
     GasLimitTx = uint(maps:get(<<"gas">>, Tx, GL)),
     Value = uint(maps:get(<<"value">>, Tx, 0)),
     To = to_address(maps:get(<<"to">>, Tx, <<>>)),
     Data = to_bytes(maps:get(<<"input">>, Tx, <<>>)),
-    Nonce = uint(maps:get(<<"nonce">>, Tx, 0)),
     MaxPriorityFee = uint(maps:get(<<"maxPriorityFeePerGas">>, Tx, 0)),
     MaxFee = uint(maps:get(<<"maxFeePerGas">>, Tx, 0)),
     GasPrice = uint(maps:get(<<"gasPrice">>, Tx, 0)),
@@ -313,28 +372,27 @@ execute_transactions(#block{number = Number, timestamp = Ts,
         {ok, A} -> A;
         _ -> error({cannot_finalize, unrecoverable_sender})
     end,
+    %% The EVM reads its message and environment through atom keys (s_msg/3,
+    %% s_env/3 in eth_evm). Passing the JSON-RPC spelling instead meant every
+    %% lookup missed and fell back to its default: the contract saw no
+    %% calldata at all, CALLER was the zero address, and TIMESTAMP, NUMBER,
+    %% PREVRANDAO, GASLIMIT and BASEFEE all read as 0. Nothing crashed, and
+    %% every one of those is load-bearing for the state root.
     Msg = #{
-        <<"sender">> => Sender,
-        <<"to">> => To,
-        <<"value">> => Value,
-        <<"gas">> => GasLimitTx,
-        <<"gasPrice">> => EffectiveGasPrice,
-        <<"nonce">> => Nonce,
-        <<"input">> => Data
+        caller => Sender,
+        origin => Sender,
+        address => To,
+        value => Value,
+        data => Data,
+        gas_price => EffectiveGasPrice,
+        static => false,
+        depth => 0
     },
     %% Code is read through the same state view the EVM executes against.
     %% Fetching it from a separate store would let a call run against code that
     %% the state it runs in says does not exist.
     Code = eth_state:code(State, To),
-    Env = #{
-        block => #{
-            <<"number">> => Number,
-            <<"timestamp">> => Ts,
-            <<"gasLimit">> => GL,
-            <<"baseFeePerGas">> => BaseFee
-        },
-        coinbase => Miner
-    },
+    Env = block_env(Block, State),
     {Result, GasLeft, State1, Logs} =
         try eth_evm:run(Code, Msg, State, Env, GasLimitTx) of
             {ok, _Output, GL0, St0, L0} -> {ok, GL0, St0, L0};
@@ -354,18 +412,42 @@ execute_transactions(#block{number = Number, timestamp = Ts,
                      _ -> GasLimitTx - GasLeft
                  end,
     Cumulative = Block#block.gas_used + GasCharged,
+    Index = length(Block#block.receipts),
     Block1 = Block#block{
         receipts = Block#block.receipts ++ [make_receipt(Tx, Result, GasCharged,
-                                                          Cumulative, Logs)],
+                                                          Cumulative, Logs, Index)],
         logs = Block#block.logs ++ Logs,
         gas_used = Cumulative
     },
     execute_transactions(Block1, Rest, State1, BaseFee, GL).
 
+%% The execution environment, in the shape eth_evm reads it: flat atom keys.
+%% BLOCKHASH needs a state view to resolve the requested block, so the state is
+%% carried alongside rather than looked up again by the opcode.
+block_env(#block{number = Number, timestamp = Ts, miner = Miner,
+                 gas_limit = GL, base_fee_per_gas = BaseFee,
+                 mix_hash = Mix}, State) ->
+    #{number => Number,
+      timestamp => Ts,
+      coinbase => Miner,
+      prevrandao => Mix,
+      gas_limit => GL,
+      base_fee => base_fee_of(BaseFee),
+      chain_id => eth_fork_schedule:chain_id(),
+      state => State}.
+
+base_fee_of(undefined) -> 0;
+base_fee_of(BaseFee) when is_integer(BaseFee) -> BaseFee;
+base_fee_of(_) -> 0.
+
 %% cumulative_gas_used is by definition the gas of every transaction up to and
 %% including this one, so it is threaded as a running total rather than recorded
-%% per receipt; gasUsed is this transaction's own share.
-make_receipt(Tx, Result, GasUsed, Cumulative, Logs) ->
+%% per receipt; gasUsed is this transaction's own share. logsBloom is the bloom
+%% over *this* receipt's logs -- the block's own bloom is the OR of all of them,
+%% so stamping an empty bloom here would make every receipt claim its logs were
+%% unfilterable, and a node building receipts from these would answer a
+%% filterBloom query wrongly for every block it produced.
+make_receipt(Tx, Result, GasUsed, Cumulative, Logs, Index) ->
     Status = case Result of
         ok -> 1;
         revert -> 0;
@@ -375,11 +457,11 @@ make_receipt(Tx, Result, GasUsed, Cumulative, Logs) ->
         <<"status">> => Status,
         <<"gasUsed">> => GasUsed,
         <<"cumulative_gas_used">> => Cumulative,
-        <<"logs_bloom">> => eth_bloom:new(),
+        <<"logs_bloom">> => eth_bloom:add_logs(eth_bloom:new(), Logs),
         <<"logs">> => Logs,
         <<"type">> => maps:get(<<"type">>, Tx, <<"0x0">>),
         <<"transactionHash">> => maps:get(<<"hash">>, Tx, <<>>),
-        <<"transactionIndex">> => 0
+        <<"transactionIndex">> => Index
     }.
 
 %% ---------------------------------------------------------------------------
@@ -419,6 +501,25 @@ header(#block{parent_hash = ParentHash, number = Number,
         <<"blobGasUsed">> => BG,
         <<"excessBlobGas">> => EG
     }.
+
+%% The withdrawal list, in the JSON-RPC shape from_json/1 accepts.
+withdrawal_to_json(#{index := I, validatorIndex := V, address := A,
+                      amount := Am}) ->
+    #{<<"index">> => eth_hex:encode_int(I),
+      <<"validatorIndex">> => eth_hex:encode_int(V),
+      <<"address">> => to_hex(A),
+      <<"amount">> => eth_hex:encode_int(Am)};
+withdrawal_to_json(W) when is_map(W) -> withdrawal_to_json(default_withdrawal(W));
+withdrawal_to_json(_) ->
+    #{<<"index">> => <<"0x0">>, <<"validatorIndex">> => <<"0x0">>,
+      <<"address">> => to_hex(<<0:160>>), <<"amount">> => <<"0x0">>}.
+
+default_withdrawal(#{address := A, amount := Am} = W) ->
+    #{index => maps:get(index, W, 0),
+      validatorIndex => maps:get(validatorIndex, W, 0),
+      address => A, amount => Am};
+default_withdrawal(_) ->
+    #{index => 0, validatorIndex => 0, address => <<0:160>>, amount => 0}.
 
 %% ---------------------------------------------------------------------------
 %% Hashing and serialization
@@ -557,29 +658,42 @@ withdrawals_root() ->
 %% to_json/1 is the JSON-RPC form: everything as hex. Keeping the two distinct
 %% matters because from_json/1 parses the JSON form, and a "to_json" that
 %% returned raw bytes would not round-trip through its own inverse.
-to_json(#block{} = Block) ->
-    Json = header(Block),
-    maps:map(fun
-                 (<<"parentHash">>, V) -> to_hex(V);
-                 (<<"sha3Uncles">>, V) -> to_hex(V);
-                 (<<"miner">>, V) -> to_hex(V);
-                 (<<"stateRoot">>, V) -> to_hex(V);
-                 (<<"transactionsRoot">>, V) -> to_hex(V);
-                 (<<"receiptsRoot">>, V) -> to_hex(V);
-                 (<<"logsBloom">>, V) -> to_hex(V);
-                 (<<"withdrawalsRoot">>, V) -> to_hex(V);
-                 (<<"extraData">>, V) -> to_hex(V);
-                 (<<"mixHash">>, V) -> to_hex(V);
-                 (<<"nonce">>, V) -> to_hex(V);
-                 (<<"difficulty">>, V) -> eth_hex:encode_int(V);
-                 (<<"number">>, V) -> eth_hex:encode_int(V);
-                 (<<"gasLimit">>, V) -> eth_hex:encode_int(V);
-                 (<<"gasUsed">>, V) -> eth_hex:encode_int(V);
-                 (<<"timestamp">>, V) -> eth_hex:encode_int(V);
-                 (<<"blobGasUsed">>, V) -> eth_hex:encode_int(V);
-                 (<<"excessBlobGas">>, V) -> eth_hex:encode_int(V);
-                 (_, V) -> V
-             end, Json).
+%%
+%% It also carries the two fields the header does not have -- the withdrawals
+%% list and, from Cancun, the parent beacon block root. Both are inputs to the
+%% block's state transition, so dropping them here would mean a block that came
+%% off the wire could not be replayed: it would finalize against a state with
+%% no withdrawals credited and no beacon root recorded, and agree with nothing.
+to_json(#block{withdrawals = Ws, parent_beacon_block_root = PBR} = Block) ->
+    maps:merge(
+      maps:map(fun
+                   (<<"parentHash">>, V) -> to_hex(V);
+                   (<<"sha3Uncles">>, V) -> to_hex(V);
+                   (<<"miner">>, V) -> to_hex(V);
+                   (<<"stateRoot">>, V) -> to_hex(V);
+                   (<<"transactionsRoot">>, V) -> to_hex(V);
+                   (<<"receiptsRoot">>, V) -> to_hex(V);
+                   (<<"logsBloom">>, V) -> to_hex(V);
+                   (<<"withdrawalsRoot">>, V) -> to_hex(V);
+                   (<<"extraData">>, V) -> to_hex(V);
+                   (<<"mixHash">>, V) -> to_hex(V);
+                   (<<"nonce">>, V) -> to_hex(V);
+                   (<<"difficulty">>, V) -> eth_hex:encode_int(V);
+                   (<<"number">>, V) -> eth_hex:encode_int(V);
+                   (<<"gasLimit">>, V) -> eth_hex:encode_int(V);
+                   (<<"gasUsed">>, V) -> eth_hex:encode_int(V);
+                   (<<"timestamp">>, V) -> eth_hex:encode_int(V);
+                   (<<"blobGasUsed">>, V) -> eth_hex:encode_int(V);
+                   (<<"excessBlobGas">>, V) -> eth_hex:encode_int(V);
+                   (_, V) -> V
+               end, header(Block)),
+      #{
+        <<"withdrawals">> => [withdrawal_to_json(W) || W <- Ws],
+        <<"parentBeaconBlockRoot">> => case PBR of
+            undefined -> undefined;
+            _ -> to_hex(PBR)
+        end
+      }).
 
 %% Hex is emitted lowercase. The chain store indexes blocks by the canonical
 %% lowercase hash eth_header produces, and a lookup built from uppercase hex

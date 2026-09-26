@@ -11,6 +11,8 @@
           fork_schedule/1,
           fork_at/3,
           configured_network/0,
+          chain_id/0,
+          chain_id/1,
           configured_fork/0,
           at_least/2,
           base_fee/2,
@@ -31,6 +33,13 @@
           add_beacon_root_to_state/2,
           get_beacon_root_from_state/1,
           beacon_root_contract/0,
+          system_address/0,
+          beacon_root_slots/1,
+          history_buffer_length/0,
+          store_beacon_root/3,
+          read_beacon_root/2,
+          process_beacon_roots/4,
+          apply_withdrawals_to_state/2,
           gas_cost/3,
           gas_cost/4 ]).
 
@@ -42,6 +51,20 @@
         <<16#00, 16#0F, 16#3d, 16#f6, 16#D7, 16#32, 16#80, 16#7E,
           16#f1, 16#31, 16#9f, 16#B7, 16#B8, 16#bB, 16#85, 16#22,
           16#d0, 16#Be, 16#ac, 16#02>>).
+%% EIP-4788: the only caller permitted to write the beacon-roots ring buffers,
+%% 0xfffffffffffffffffffffffffffffffffffffffe.
+%%
+%% Written as a value rather than as `<<255:152, 16#fe>>' because an integer
+%% bitstring segment is padded on the *left* with zeros: `<<255:152>>' is
+%% 18 zero bytes followed by 0xff, which is 0x0000...00ff, not 0xff...ff. That
+%% literal produced the address 0x000000000000000000000000000000000000FFFE, and
+%% since the deployed beacon-roots contract's very first instruction is
+%% `caller == 0xff..fe', every system call reverted and the ring buffers were
+%% never written. The failure was silent by construction: the EIP says a failed
+%% system call is to be ignored, so the block still validated.
+-define(SYSTEM_ADDRESS, <<((1 bsl 152) - 1):152, 16#fe>>).
+-define(HISTORY_BUFFER_LENGTH, 8191).
+-define(BEACON_ROOTS_GAS, 30000000).
 
 %% ---------------------------------------------------------------------------
 %% Fork selection
@@ -84,6 +107,19 @@ parse_network(Value) ->
             logger:warning("unknown ETH_NETWORK ~p, falling back to sepolia", [Other]),
             sepolia
     end.
+
+%% The chain id of the configured network, from configuration rather than from a
+%% peer. eth_state:chain_id/0 fetches eth_chainId over RPC and caches it, which
+%% is fine for a query but not for execution: a state transition that blocks on
+%% an HTTP round trip can be stalled, or altered, by whoever answers it, and
+%% CHAINID is a constant of the network being executed. The id is also part of
+%% the signing preimage of every EIP-155 and typed transaction, so one that moved
+%% with the upstream endpoint's mood would change which transactions are valid.
+chain_id() ->
+    chain_id(configured_network()).
+
+chain_id(mainnet) -> 1;
+chain_id(sepolia) -> 11155111.
 
 %% An explicit rules pin, used for networks that have no schedule in this
 %% module. It is *not* consulted for a known network: silently overriding a
@@ -477,6 +513,40 @@ apply_withdrawals(Withdrawals) when is_list(Withdrawals) ->
 apply_withdrawals(_) ->
     {error, bad_withdrawals}.
 
+%% The state-overlay form, which is what block execution needs.
+%%
+%% apply_withdrawals/1 writes straight to the MPT, so a credit made during block
+%% processing would sit outside the overlay and outside the state root -- the
+%% balance would exist on disk but not in the commitment the block declares. A
+%% withdrawal is part of the block's state transition, so it belongs in the same
+%% overlay its transactions write to.
+%%
+%% Amounts arrive in Gwei and are credited in wei. Two withdrawals to the same
+%% address must accumulate, so each read is taken from the state as it stands
+%% after the previous one rather than from a snapshot.
+apply_withdrawals_to_state(Withdrawals, State) when is_list(Withdrawals) ->
+    apply_withdrawals_to_state(Withdrawals, State, 0);
+apply_withdrawals_to_state(_Withdrawals, State) ->
+    {ok, State, 0}.
+
+apply_withdrawals_to_state([], State, N) ->
+    {ok, State, N};
+apply_withdrawals_to_state([Withdrawal | Rest], State, N) ->
+    case withdrawal_binary(withdrawal_address(Withdrawal)) of
+        <<Address:20/binary>> ->
+            Amount = withdrawal_integer(withdrawal_amount(Withdrawal)) * 1000000000,
+            Balance = eth_state:balance(State, Address) + Amount,
+            %% A withdrawal can be the first thing to touch an account. Creating
+            %% it does not raise its nonce, and the EIP-1052 empty-code hash is
+            %% what every other node would record.
+            Nonce = eth_state:nonce(State, Address),
+            State1 = eth_state:set_balance(State, Address, Balance),
+            State2 = eth_state:set_nonce(State1, Address, Nonce),
+            apply_withdrawals_to_state(Rest, State2, N + 1);
+        _ ->
+            {error, bad_withdrawal_address, State, N}
+    end.
+
 apply_withdrawal(Withdrawal) ->
     Address = withdrawal_binary(withdrawal_address(Withdrawal)),
     case byte_size(Address) of
@@ -503,20 +573,143 @@ account_triple(_) ->
 beacon_root_contract() ->
     ?BEACON_ROOTS_ADDRESS.
 
-%% Store the parent beacon block root at the timestamp key used by the
-%% beacon-roots system contract.  This is not the BLOCKHASH opcode: EIP-4788
-%% stores a 32-byte root under the parent beacon block timestamp.
-add_beacon_root_to_state(Timestamp, Root) when is_integer(Timestamp),
-                                                is_binary(Root) ->
-    case byte_size(Root) of
-        32 -> eth_mpt:put_storage(?BEACON_ROOTS_ADDRESS,
-                                  <<Timestamp:256/little-unsigned-integer>>, Root);
-        _ -> {error, invalid_beacon_root}
+system_address() ->
+    ?SYSTEM_ADDRESS.
+
+history_buffer_length() ->
+    ?HISTORY_BUFFER_LENGTH.
+
+%% The contract keeps two ring buffers, not one. Slot `ts mod 8191' holds the
+%% timestamp that wrote there and slot `ts mod 8191 + 8191' holds the beacon
+%% root; `get' re-reads the timestamp and reverts if it does not match, which is
+%% what stops a skipped slot sharing a ring index from returning a stale root.
+%%
+%% A single buffer keyed by the full timestamp looks like a reasonable encoding
+%% and is what an earlier version here did. It is also unreachable: the contract
+%% only ever touches these two ranges, so every lookup would miss.
+%%
+%% Verified against Sepolia: at the latest block, storage[ts mod 8191] is exactly
+%% ts and storage[ts mod 8191 + 8191] is exactly parentBeaconBlockRoot.
+beacon_root_slots(Timestamp) when is_integer(Timestamp) ->
+    Index = Timestamp rem ?HISTORY_BUFFER_LENGTH,
+    {Index, Index + ?HISTORY_BUFFER_LENGTH}.
+
+%% Write the (timestamp, root) pair for this block. Kept separate from the system
+%% call below because the EIP permits a client to set the slots directly; doing
+%% so is only equivalent where the deployed code is the specified code, which is
+%% why process_beacon_roots/3 prefers to actually run it.
+store_beacon_root(Timestamp, Root, State) when is_integer(Timestamp),
+                                             is_binary(Root),
+                                             byte_size(Root) =:= 32 ->
+    {TimestampSlot, RootSlot} = beacon_root_slots(Timestamp),
+    S1 = eth_state:set_storage(State, ?BEACON_ROOTS_ADDRESS, TimestampSlot,
+                               Timestamp),
+    S2 = eth_state:set_storage(S1, ?BEACON_ROOTS_ADDRESS, RootSlot, Root),
+    {ok, S2};
+store_beacon_root(_Timestamp, _Root, _State) ->
+    {error, invalid_beacon_root}.
+
+%% The read side, mirroring the contract's `get' before it reverts on a
+%% timestamp mismatch. The root is returned as a 32-byte word so a caller can
+%% tell "no root" from "the zero root".
+read_beacon_root(Timestamp, State) when is_integer(Timestamp) ->
+    {TimestampSlot, RootSlot} = beacon_root_slots(Timestamp),
+    case eth_state:storage(State, ?BEACON_ROOTS_ADDRESS, TimestampSlot) of
+        Timestamp ->
+            {ok, word(eth_state:storage(State, ?BEACON_ROOTS_ADDRESS, RootSlot))};
+        _ ->
+            {error, unknown_timestamp}
     end.
 
-get_beacon_root_from_state(Timestamp) when is_integer(Timestamp) ->
-    eth_mpt:get_storage(?BEACON_ROOTS_ADDRESS,
-                        <<Timestamp:256/little-unsigned-integer>>).
+%% A storage slot holds a word, and this codebase has two representations of
+%% one: the EVM's stack is integers, so a value written by the deployed contract
+%% comes back from eth_state:storage/3 as an integer, while store_beacon_root/3
+%% above hands it a 32-byte binary. Both are reachable -- process_beacon_roots/4
+%% runs the contract, and the direct write is the EIP's permitted shortcut -- so
+%% the read side normalizes both instead of handling only the shape its author
+%% happened to test. Before the system address was corrected nothing ever wrote
+%% through the EVM, so the integer clause was unreachable and this did not show.
+word(<<>>) -> <<0:256>>;
+word(V) when is_binary(V) -> V;
+word(V) when is_integer(V) -> <<V:256/unsigned-big>>.
+
+%% The EIP-4788 system operation, run at the start of every block whose
+%% timestamp is at or after the fork.
+%%
+%% This executes the contract's code as the system caller rather than writing
+%% the two slots directly. The EIP allows the shortcut, but only where the code
+%% at BEACON_ROOTS_ADDRESS is the code the EIP specifies; on a network that
+%% deployed something else, hardcoding the slots would silently commit to a
+%% state nobody else computed. The spec also requires the call to complete or
+%% fail silently, and requires it not to count against the block gas limit --
+%% so the gas it uses is not added to gas_used.
+%%
+%% Returns the state unchanged when the fork is not active, when the parent
+%% beacon root is the zero placeholder, or when there is no code at the address.
+process_beacon_roots(Timestamp, Root, State, Fork) ->
+    case beacon_roots_active(Root, Fork) of
+        false ->
+            {ok, State};
+        true ->
+            Code = eth_state:code(State, ?BEACON_ROOTS_ADDRESS),
+            case Code of
+                <<>> ->
+                    %% "if no code exists at BEACON_ROOTS_ADDRESS, the call must
+                    %% fail silently"
+                    {ok, State};
+                _ ->
+                    Msg = #{caller => ?SYSTEM_ADDRESS,
+                            origin => ?SYSTEM_ADDRESS,
+                            address => ?BEACON_ROOTS_ADDRESS,
+                            value => 0,
+                            data => Root,
+                            gas_price => 0,
+                            static => false,
+                            depth => 0},
+                    Env = #{timestamp => Timestamp, number => 0,
+                            coinbase => <<0:160>>, prevrandao => <<0:256>>,
+                            gas_limit => 0, base_fee => 0,
+                            chain_id => chain_id(),
+                            state => State},
+                    %% The call must "execute to completion" or "fail silently",
+                    %% so neither outcome is an error here -- and neither is
+                    %% charged to the block's gas limit, which is why the gas
+                    %% left over is discarded.
+                    try eth_evm:run(Code, Msg, State, Env, ?BEACON_ROOTS_GAS) of
+                        {ok, _Out, _GasLeft, St, _Logs} -> {ok, St};
+                        {revert, _Out, _GasLeft, _St, _Logs} -> {ok, State};
+                        {error, _Reason, _St, _Logs} -> {ok, State}
+                    catch
+                        _:_ -> {ok, State}
+                    end
+            end
+    end.
+
+%% Cancun and later. A parent beacon block root of all zeros is the genesis
+%% placeholder and must not trigger the call.
+beacon_roots_active(undefined, _Fork) -> false;
+beacon_roots_active(<<0:256>>, _Fork) -> false;
+beacon_roots_active(<<Root:32/binary>>, _Fork) when Root == <<0:256>> -> false;
+beacon_roots_active(_Root, Fork) ->
+    lists:member(Fork, [cancun, prague, osaka, amsterdam, bpo1, bpo2, bpo3, bpo4, bpo5]).
+
+add_beacon_root_to_state(Timestamp, Root) ->
+    {TimestampSlot, _RootSlot} = beacon_root_slots(Timestamp),
+    case Root of
+        <<R:32/binary>> ->
+            eth_mpt:put_storage(?BEACON_ROOTS_ADDRESS,
+                                <<TimestampSlot:256>>, R);
+        _ ->
+            {error, invalid_beacon_root}
+    end.
+
+get_beacon_root_from_state(Timestamp) ->
+    {TimestampSlot, RootSlot} = beacon_root_slots(Timestamp),
+    case eth_mpt:get_storage(?BEACON_ROOTS_ADDRESS,
+                              <<TimestampSlot:256>>) of
+        Timestamp -> eth_mpt:get_storage(?BEACON_ROOTS_ADDRESS, <<RootSlot:256>>);
+        _ -> {error, unknown_timestamp}
+    end.
 
 add_beacon_root(Timestamp, Root) ->
     try add_beacon_root_to_state(Timestamp, Root)

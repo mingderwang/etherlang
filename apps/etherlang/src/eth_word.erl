@@ -14,6 +14,13 @@
 -define(MASK, 16#FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF).
 -define(MOD, 16#10000000000000000000000000000000000000000000000000000000000000000).
 
+%% Coerce to a 256-bit word. A 32-byte binary is already exactly one word and is
+%% returned unchanged: storage values arrive in both shapes (the EVM's stack
+%% holds integers, while anything read out of a trie or handed over as a hash is
+%% a 32-byte binary), and rejecting the binary shape here raised badarith deep
+%% inside set_storage rather than at the boundary that knew the value was meant
+%% to be a word.
+mask(<<Word:32/binary>>) -> Word;
 mask(X) -> X band ?MASK.
 
 add(A, B) -> (A + B) band ?MASK.
