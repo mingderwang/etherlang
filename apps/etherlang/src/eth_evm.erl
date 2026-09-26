@@ -772,7 +772,15 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
                                 oog -> finish_call(E, Ctx, Ctx#ctx.state, <<>>, RetOff, RetLen, 0, 0)
                             end;
                         unsupported ->
-                            unsupported({precompile, ToW}, E, Ctx)
+                            unsupported({precompile, ToW}, E, Ctx);
+                        %% A precompile that ran and failed. This is a halt, not
+                        %% a fallback: the EIP says the call fails and the frame's
+                        %% gas is gone. The error form carries no gas figure, and
+                        %% handle_child/7's error clause adds nothing back, so the
+                        %% whole allowance is consumed -- which is the point. (0x0A
+                        %% is the only precompile that returns this today.)
+                        {error, Reason} ->
+                            {E#e{halt = {error, Reason}}, Ctx}
                     end;
                 false ->
                     CurAddr = s_msg(address, Ctx, <<0:160>>),

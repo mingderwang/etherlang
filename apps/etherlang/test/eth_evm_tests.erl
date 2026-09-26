@@ -306,7 +306,7 @@ call_family_warm_target_costs_one_hundred_test() ->
 call_optional_terms_follow_the_specification_test() ->
     NoValue = call_gas(16#F1, cold, funded),
     WithValue = call_gas(16#F1, cold, funded_with_value),
-    NewAccount = call_gas(16#F1, cold, absent_account),
+    NewAccount = call_gas(16#F1, cold, empty_account),
     ?assertEqual(NoValue + 9000, WithValue),
     ?assertEqual(WithValue + 25000, NewAccount).
 
@@ -319,19 +319,34 @@ call_gas(Op, Warm, Account) ->
                  cold -> <<>>;
                  warm -> <<16#60,16#0D, 16#31, 16#50>>
              end,
-    {State, Value} = case Account of
-                         funded -> {call_state(1000000, <<16#00>>), 0};
-                         funded_with_value -> {call_state(1000000, <<16#00>>), 40};
-                         absent_account ->
-                             {eth_state:new(0, #{{balance, ?CALLER} => 1000000,
-                                                 {nonce, ?CALLER} => 0}), 40}
-                     end,
-    Code = <<Warmup/binary, (call_seq(16#0D, Value, Op))/binary, 16#00>>,
+    {State, Value, ToByte} = case Account of
+                                funded -> {call_state(1000000, <<16#00>>), 0, 16#0D};
+                                funded_with_value ->
+                                    {call_state(1000000, <<16#00>>), 40, 16#0D};
+                                empty_account ->
+                                    {empty_target_state(), 40, 16#0E}
+                            end,
+    Code = <<Warmup/binary, (call_seq(ToByte, Value, Op))/binary, 16#00>>,
     {ok, _, Left, _, _} = eth_evm:run(Code, ?MSG0, State, ?ENV, ?GAS),
     ?GAS - Left - prologue_gas() - warmup_cost(Warm).
 
 warmup_cost(cold) -> 0;
 warmup_cost(warm) -> warmup_gas().
+
+%% The 25000 new-account term applies when the destination does not exist, and
+%% eth_state:exists/2 answers it from the overlay -- by reading the balance, the
+%% nonce *and* the code. So the address has to be seeded as present and empty
+%% rather than left out: an address with no entries at all sends the EVM upstream,
+%% and a unit test that reaches the network is a test that hangs when the node is
+%% offline. That is the whole content of this fixture, and the reason 0x0E rather
+%% than 0x0D: 0x0D is funded, and a funded account is not a new one.
+empty_target_state() ->
+    Empty = <<0:152, 16#0E:8>>,
+    eth_state:new(0, #{{balance, ?CALLER} => 1000000,
+                       {nonce, ?CALLER} => 0,
+                       {balance, Empty} => 0,
+                       {nonce, Empty} => 0,
+                       {code, Empty} => <<>>}).
 
 %% Gas the seven pushed arguments cost, measured by running them and stopping.
 prologue_gas() ->
@@ -465,3 +480,167 @@ selfdestruct_same_tx_destroys_test() ->
     ?assertEqual(<<>>, eth_state:code(St, NewAddr)),
     ?assertEqual(0, eth_state:storage(St, NewAddr, 1)),
     ?assertEqual(false, eth_state:exists(St, NewAddr)).
+
+%% ---------------------------------------------------------------------------
+%% EIP-4844 point evaluation (0x0A) is reachable from execution
+%% ---------------------------------------------------------------------------
+%%
+%% eth_kzg implements 0x0A and is verified against mainnet exec-specs fixtures,
+%% but for a long time nothing in src/ called it: is_precompile(10) was false, so
+%% the module was reachable only from its own tests. These run the real fixture
+%% through the EVM, because a precompile that works in isolation and is not
+%% dispatched is not a precompile.
+
+%% Real mainnet transaction 0xcb3dc8..., copied from eth_kzg_tests. The same
+%% 192 bytes as that module's fixture, reached here by CALL rather than directly.
+kzg_mainnet_input() ->
+    <<16#018156B94FE9735E573BAB36DAD05D60FEB720D424CCD20AAF719343C31E4246:256,
+      16#019123BCB9D06356701F7BE08B4494625B87A7B02EDC566126FB81F6306E915F:256,
+      16#6C2EB1E94C2532935B8465351BA1BD88EABE2B3FA1AADFF7D1CD816E8315BD38:256,
+      16#A9546D41993E10DF2A7429B8490394EA9EE62807BAE6F326D1044A51581306F58D4B9DFD5931E044688855280FF3799E:384,
+      16#A2EA83D9391E0EE42E0C650ACC7A1F842A7D385189485DDB4FD54ADE3D9FD50D608167DCA6C776AAD4B8AD5C20691BFE:384>>.
+
+%% The success output is FIELD_ELEMENTS_PER_BLOB then BLS_MODULUS, each a 32-byte
+%% big-endian integer: 4096 = 0x1000, so 30 zero bytes then 0x10 0x00.
+kzg_success_output() ->
+    <<4096:256,
+      16#73EDA753299D7D483339D80809A1D80553BDA402FFFE5BFEFFFFFFFF00000001:256>>.
+
+%% 0x0A returns that 64-byte value when the proof verifies, and the EVM has to
+%% deliver it through the normal call return path.
+kzg_point_evaluation_is_reachable_from_the_evm_test() ->
+    {ok, Out, GasLeft, _, _} = eth_evm:run(kzg_caller(10, kzg_mainnet_input()),
+                                           ?MSG0, eth_state:new(0, #{}),
+                                           ?ENV, ?GAS),
+    ?assertEqual(kzg_success_output(), Out),
+    ?assert(?GAS - GasLeft > 50000).
+
+%% ...and it costs 50000, pinned without any hand arithmetic: the same code
+%% against 0x04 IDENTITY differs only in the precompile, and 0x04's own cost
+%% (15 + 3 per word, per EIP-161) is subtracted. So the difference is exactly
+%% 50000 - 33, whatever the prologue, the CODECOPY, the memory expansion and the
+%% EIP-2929 access cost happen to be -- none of which this test has to know.
+kzg_costs_fifty_thousand_test() ->
+    Kzg = ?GAS - gas_left(kzg_caller(10, kzg_mainnet_input())),
+    Identity = ?GAS - gas_left(kzg_caller(4, kzg_mainnet_input())),
+    ?assertEqual(50000 - (15 + 3 * 6), Kzg - Identity).
+
+%% A failed point evaluation is a halt that consumes the frame's gas, not a
+%% fallback to another node. The proof here is the real one with its last byte
+%% flipped, so the pairing check fails on a genuine input.
+kzg_failure_halts_and_consumes_the_frame_test() ->
+    Good = kzg_mainnet_input(),
+    <<Head:191/binary, Last>> = Good,
+    Bad = <<Head/binary, (Last bxor 1)>>,
+    {error, {kzg, point_evaluation_failed}, _, _} =
+        eth_evm:run(kzg_caller(10, Bad), ?MSG0, eth_state:new(0, #{}),
+                    ?ENV, ?GAS),
+    ok.
+
+%% ...and the halt is not the `unsupported' shape that eth_call answers with a
+%% fallback. If it were, a local failure would be reported as another node's
+%% answer, which is the specific thing this wiring exists to prevent.
+kzg_failure_is_not_reported_as_unsupported_test() ->
+    Good = kzg_mainnet_input(),
+    <<Head:191/binary, Last>> = Good,
+    Bad = <<Head/binary, (Last bxor 1)>>,
+    {error, Reason, _, _} = eth_evm:run(kzg_caller(10, Bad), ?MSG0,
+                                        eth_state:new(0, #{}), ?ENV, ?GAS),
+    ?assertEqual({kzg, point_evaluation_failed}, Reason),
+    %% `unsupported' is the shape eth_call answers with an upstream fallback.
+    ?assertNotMatch({unsupported, _}, Reason).
+
+%% Both frames differ only in the precompile address, so a difference in outcome
+%% is attributable to the precompile and not to the surrounding code.
+gas_left(Code) ->
+    {ok, _, GasLeft, _, _} = eth_evm:run(Code, ?MSG0, eth_state:new(0, #{}),
+                                         ?ENV, ?GAS),
+    GasLeft.
+
+%% Code that CODECOPYs a 192-byte input to memory, CALLs precompile `Precompile'
+%% asking for 64 bytes of return data, and RETURNs those 64 bytes. The input's
+%% offset within the code is the length of the prefix, so the prefix is built
+%% first and measured.
+kzg_caller(Precompile, Input) ->
+    Len = byte_size(Input),
+    %% CALL pops gas, to, value, argsOffset, argsLength, retOffset, retLength --
+    %% so they are pushed in the reverse of that. Getting this order wrong is
+    %% silent: the call still succeeds, it just asks the precompile for no input
+    %% and returns 192 bytes of nothing, and the precompile rejects a short input.
+    Args = <<16#60,64, 16#60,0, 16#60,Len, 16#60,0, 16#60,0,
+             16#60,Precompile, 16#61,16#FF,16#FF>>,
+    %% CODECOPY pops destOffset, offset, size, so size is pushed first. `offset'
+    %% is an offset into the code, and the input is spliced in after the prefix,
+    %% so the prefix has to measure itself before the offset is known.
+    Copy = <<16#60,Len, 16#60,0, 16#60,0, 16#39>>,
+    Suffix = <<16#60,64, 16#60,0, 16#F3>>,
+    %% A CALL returns to the instruction after it, so the code that runs next has
+    %% to be the code -- not the data. Putting the input between the CALL and the
+    %% RETURN means the CALL succeeds and then the input is executed as
+    %% instructions, which fails on a pop from an empty stack some bytes in. The
+    %% input is therefore appended last and CODECOPY reads it from there.
+    Offset = byte_size(Copy) + byte_size(Args) + 1 + byte_size(Suffix),
+    Prefix = <<16#60,Len, 16#60,Offset, 16#60,0, 16#39, Args/binary, 16#F1>>,
+    <<Prefix/binary, Suffix/binary, Input/binary>>.
+
+%% The gas half of that claim, which the top-level result cannot show: run/5's
+%% error form carries no gas figure, so "consumes the frame's gas" is not
+%% observable from outside a failed frame. It is observable from a frame that
+%% *called* into the failure, and that is the case that matters -- a refund to the
+%% caller is the bug this guards.
+%%
+%% One parent, two children. The parent hands the child almost all of its gas and
+%% then does a 20000-gas SSTORE.
+%%
+%%   child succeeds  the child's unspent gas is refunded, the parent can afford
+%%                   the store, and the store happens
+%%   child fails     the parent gets nothing back, cannot afford the store, and
+%%                   halts out of gas with the store unwritten
+%%
+%% Same parent code, same parent budget, only the child's code differs, so the
+%% outcome difference is attributable to the refund.
+kzg_failure_refunds_nothing_to_its_caller_test() ->
+    Good = kzg_caller(10, kzg_mainnet_input()),
+    Bad = kzg_caller(10, corrupt_last_byte(kzg_mainnet_input())),
+    %% Succeeding: the child refunded its remainder, so the parent could afford
+    %% the SSTORE and read its own value back.
+    ?assertEqual({ok, 255}, kzg_refund_probe(Good)),
+    %% Failing: nothing came back, and the SSTORE -- the very next real opcode --
+    %% cost 20000 more than the parent had. `charge/2' runs before the write, so
+    %% the halt is proof the store never happened. The reason reads out_of_gas
+    %% rather than the KZG failure, because that failure was one frame down and
+    %% only its consequence reaches here.
+    ?assertEqual({error, out_of_gas}, kzg_refund_probe(Bad)).
+
+%% One parent, used for both cases: CALL the child at 0x0D with 999000 gas, then
+%% SSTORE 255 at slot 0, read it back and return it. The two runs differ only in
+%% the child's code, so the outcome difference is attributable to the refund.
+kzg_refund_probe(ChildCode) ->
+    Parent = <<16#60,0, 16#60,0, 16#60,0, 16#60,0, 16#60,0,
+               16#60,16#0D, 16#62,16#0F,16#42,40,
+               16#F1,
+               16#60,255, 16#60,0, 16#55,
+               16#60,0, 16#54, 16#60,0, 16#52,
+               16#60,32, 16#60,0, 16#F3>>,
+    case eth_evm:run(Parent, ?MSG0, kzg_parent_state(ChildCode), ?ENV, ?GAS) of
+        {ok, <<Value:256>>, _, _, _} -> {ok, Value};
+        {error, Reason, _, _} -> {error, Reason}
+    end.
+
+%% The slot is seeded to 0 and the parent only ever writes 255, so "unchanged" and
+%% "written" are distinguishable without a sentinel. Seeding also matters for a
+%% reason beyond clarity: eth_state reads an unseeded slot by fetching upstream,
+%% so a test that leaves it out does not fail, it hangs.
+kzg_parent_state(ChildCode) ->
+    eth_state:new(0, #{{balance, ?CALLER} => 10000000,
+                       {nonce, ?CALLER} => 0,
+                       {store, ?CALLER, 0} => 0,
+                       {balance, ?CALLEE} => 0,
+                       {nonce, ?CALLEE} => 0,
+                       {code, ?CALLEE} => ChildCode}).
+
+%% Flip one bit of the proof. Same length, so this exercises a real pairing
+%% failure rather than the short-input check.
+corrupt_last_byte(Bin) ->
+    <<Head:(byte_size(Bin) - 1)/binary, Last>> = Bin,
+    <<Head/binary, (Last bxor 1)>>.

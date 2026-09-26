@@ -88,9 +88,25 @@ ecrecover_short_input_test() ->
     {ok, Out, _} = eth_evm_precompiles:precompile(1, <<1:256>>),
     ?assertEqual(<<>>, Out).
 
-unknown_precompile_test() ->
-    ?assertEqual(false, eth_evm_precompiles:is_precompile(10)),
-    ?assertEqual(unsupported, eth_evm_precompiles:precompile(10, <<>>)).
+%% The precompile set is 0x01..0x0A and nothing else. 0x0A used to be missing
+%% from it, which is why eth_kzg -- a complete point evaluation verified against
+%% mainnet exec-specs fixtures -- was unreachable from execution.
+precompile_set_is_one_through_ten_test() ->
+    ?assertEqual([true, true, true, true, true, true, true, true, true, true],
+                 [eth_evm_precompiles:is_precompile(N) || N <- lists:seq(1, 10)]),
+    ?assertNot(eth_evm_precompiles:is_precompile(0)),
+    ?assertNot(eth_evm_precompiles:is_precompile(11)),
+    ?assertEqual(unsupported, eth_evm_precompiles:precompile(11, <<>>)).
+
+%% A precompile that is not implemented returns `unsupported', which eth_call
+%% turns into an upstream fallback. A precompile that ran and rejected its input
+%% must not, because that would substitute another node's verdict for this one's.
+%% 0x0A is the first precompile with the second behaviour, so the distinction is
+%% pinned here rather than left to the reader of two case clauses.
+kzg_failure_is_not_a_fallback_test() ->
+    ?assertEqual({error, {kzg, point_evaluation_failed}},
+                 eth_evm_precompiles:precompile(10, <<>>)),
+    ?assertNotEqual(unsupported, eth_evm_precompiles:precompile(10, <<>>)).
 
 %% ---------------------------------------------------------------------------
 %% EIP-152 BLAKE2b-F vectors (inputs built from parts, outputs verbatim).

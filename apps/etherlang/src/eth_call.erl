@@ -74,7 +74,12 @@ do_call(Tx, BlockParam, Overrides) ->
 run_precompile(AddrInt, Data) ->
     case eth_evm_precompiles:precompile(AddrInt, Data) of
         {ok, Out, _Cost} -> {ok, hex(Out)};
-        unsupported -> {error, fallback}
+        unsupported -> {error, fallback};
+        %% The precompile ran and rejected the input. That is this node's
+        %% answer, not a gap in it, so it must not become a fallback: proxying
+        %% would replace a local failure with whatever another node says about
+        %% the same call.
+        {error, Reason} -> {error, {precompile_failed, Reason}}
     end.
 
 %% eth_call straight to a precompile address (0x01..0x09) executes the

@@ -3,8 +3,8 @@
 %% EVM precompiled contracts. Implemented: 0x01 ECRECOVER, 0x02 SHA256,
 %% 0x03 RIPEMD160, 0x04 IDENTITY, 0x05 MODEXP, 0x06 ECADD, 0x07 ECMUL,
 %% 0x08 ECPAIRING (Tate, pure Erlang), 0x09 BLAKE2b-F (EIP-152).
-%% 0x0A KZG stays unsupported (BLS12-381 backend + blobs unserved) so
-%% callers fall back upstream.
+%% 0x0A is EIP-4844's point evaluation, which eth_kzg implements against
+%% BLS12-381 and the real trusted setup.
 
 -export([precompile/2, is_precompile/1]).
 
@@ -17,6 +17,7 @@ is_precompile(6) -> true;
 is_precompile(7) -> true;
 is_precompile(8) -> true;
 is_precompile(9) -> true;
+is_precompile(10) -> true;
 is_precompile(_) -> false.
 
 %% -> {ok, Output, GasCost} | unsupported
@@ -39,8 +40,33 @@ precompile(8, Data) ->
     eth_pairing_bn128:check_pairing(Data);
 precompile(9, Data) ->
     blake2f(Data);
+precompile(10, Data) ->
+    point_evaluation(Data);
 precompile(_, _) ->
     unsupported.
+
+%% EIP-4844: 50000 gas, and the success output is FIELD_ELEMENTS_PER_BLOB
+%% followed by BLS_MODULUS, each a 32-byte big-endian integer.
+%%
+%% The distinction from `unsupported' is the whole point of this clause.
+%% `unsupported' means "this node cannot run this, ask someone else", and
+%% eth_call turns it into an upstream fallback. A point evaluation that fails is
+%% not that: the input is invalid, the answer is a hard failure that consumes the
+%% frame's gas, and falling back would substitute another node's verdict for this
+%% one's. So a failure is reported as {error, {kzg, _}} and the EVM halts.
+%%
+%% The reason is deliberately not carried through from eth_kzg, which collapses
+%% every failure mode to a bare `unsupported'. Each of those modes has its own
+%% fixture in eth_kzg_tests -- short input, out-of-range z or y, a versioned hash
+%% that does not match the commitment, a point not on the curve, a point not in
+%% the subgroup, and a proof that does not verify -- so they are pinned there,
+%% where the input that caused each one is visible. What the precompile needs to
+%% know is only whether the evaluation succeeded.
+point_evaluation(Data) ->
+    case eth_kzg:point_evaluation(Data) of
+        {ok, Out, Cost} -> {ok, Out, Cost};
+        unsupported -> {error, {kzg, point_evaluation_failed}}
+    end.
 
 words(<<>>) -> 0;
 words(Bin) -> (byte_size(Bin) + 31) div 32.

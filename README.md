@@ -50,9 +50,10 @@ beacon, validators, or block production).
   `eth_getBalance`/`Nonce`/`Code`/`StorageAt` served locally first.
 * **Local EVM** — pure-Erlang interpreter covering the full defined opcode set
   including Cancun (`PUSH0`/`TLOAD`/`TSTORE`/`MCOPY`) plus precompiles
-  `0x01`–`0x09` (`0x0A` KZG still proxies); serves `eth_call` locally with
-  standard state overrides, proxying upstream on unsupported paths. Known
-  fidelity simplifications are listed under TODO.
+  `0x01`–`0x0A`; serves `eth_call` locally with standard state overrides,
+  proxying upstream only on paths this node does not implement — a precompile
+  that runs and *rejects* its input is a local answer, not a gap, and is not
+  proxied. Known fidelity simplifications are listed under TODO.
 * **JSON-RPC server** — cowboy listener on `:8545` that answers chain/block/tx/
   **receipt/log-filter** queries and `eth_call` from local storage + local
   execution, transparently proxying everything else (`eth_getBalance`,
@@ -211,7 +212,7 @@ Blocks are built and executed, but the node does not author them: it never recei
 - [x] **Block builder** — construct execution payloads from the transaction pool
   - Select transactions from pending pool (by gas price / priority fee) ✅
   - Respect block gas limit ✅
-  - Handle blob transactions (EIP-4844) (partial — no KZG commitment verification)
+  - Handle blob transactions (EIP-4844) (partial — point evaluation runs locally; no KZG commitment verification)
   - Compute gas used, receipts, logs, bloom filter ✅
 - [ ] **Block header** — construct full block header:
   - Parent hash, uncle hash, fee recipient, state root, receipts root
@@ -281,7 +282,8 @@ EIP-1559, EIP-4788, EIP-4895 and EIP-2935 are implemented, and the two system-co
 - [ ] **EIP-4844 (blobs)** — blob transactions support (partial)
   - Blob transaction type (0x03) ✅
   - Blob gas pricing ✅
-  - KZG commitment verification — **not implemented**; an invalid commitment is not rejected
+  - KZG point evaluation `0x0A` is dispatched and runs locally — `eth_kzg` was reachable only from its own tests until now, and a failed evaluation halts and refunds nothing rather than falling back upstream
+  - KZG **commitment** verification — **not implemented**; `eth_kzg` has no `blob_to_kzg_commitment/1`, so an invalid commitment is not rejected. Not attempted: the `g1_lin` derivation and its test vector must come from the spec, and neither was obtainable here, so an unverifiable implementation would be worse than none
   - Blob data propagation — not implemented
 - [x] **EIP-4788 (beacon roots)** — store beacon block roots in state ✅
   - Executes the deployed contract's code as `0xff..fe` each post-Cancun block, rather than writing the two slots directly
@@ -437,7 +439,7 @@ Where the work actually stands:
 | Transaction validation (nonce, balance, chain ID, gas limit, intrinsic gas, signature) | done — one validator, called on the peer path before execution, with the offending transaction's index reported |
 | Transaction state effects (nonce, value, gas purchase, coinbase tip, base-fee burn) | done — the sender is charged the ceiling and refunded the effective price, the recipient gets the tip only, the base fee is burned. Not checked against real prestate |
 | EIP-161 empty accounts, EIP-170 code size | done |
-| KZG commitment verification (EIP-4844) | **not done** |
+| KZG commitment verification (EIP-4844) | **not done** — point evaluation `0x0A` runs locally; `blob_to_kzg_commitment/1` is absent, so a commitment is not checked against its blob |
 | Snap sync and proof-verified state reconstruction | **not done** |
 | Merge detection via TTD | done — a `{ttd, N, Fork}` activation kind, gated on the block's own total difficulty, with mainnet's and Sepolia's TTDs in the schedule. `TERMINAL_BLOCK_HASH` is still not handled |
 
