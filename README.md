@@ -66,8 +66,8 @@ beacon, validators, or block production).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**185 tests, green**).
-* **Status** — v0.7.0; eunit green (185 tests) and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**418 tests, green**).
+* **Status** — v0.7.0; eunit green (418 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -166,24 +166,41 @@ implemented. Items marked [x] are closed with live verification.
 
 This is the full plan to make etherlang a **production-grade, consensus-layer-compatible** Ethereum execution client. It replaces the current "read-mostly relay" architecture with a full execution layer that can work with Lighthouse, Prysm, Nimbus, Teku, or Lodestar.
 
-### Phase 1: Engine API — Consensus Layer Interface ✅ COMPLETE
+### Phase 1: Engine API — Consensus Layer Interface (partial)
 
-The Engine API (EIP-3675 / Cancun) is what lets a consensus client (Lighthouse, Prysm, etc.) delegate block execution to etherlang. Implemented and passing all tests.
+The Engine API (EIP-3675 / Cancun) is what lets a consensus client (Lighthouse, Prysm, etc.) delegate block execution to etherlang. All four V1 methods are served over real HTTP, with the response shapes the specification defines and a JWT check on every request. What they cannot do is validate a payload, and without a payload decoder they no longer imply that they can.
 
-- [x] **Engine API server** — `engine_newPayloadV1`, `engine_forkchoiceUpdatedV1`, `engine_getPayloadV1`, `engine_exchangeTransitionConfigurationV1` (`eth_engine`)
-  - `engine_newPayloadV1`: receive and validate execution payload from CL (parent hash, block number)
-  - `engine_forkchoiceUpdatedV1`: handle safe/finalized forkchoice updates
-  - `engine_getPayloadV1`: return the payload for the CL to broadcast
-  - `engine_exchangeTransitionConfigurationV1`: negotiate engine version
-  - Return correct status codes (`VALID`, `INVALID`, `SYNCING`, `ACCEPTED`, `SECURITY_ERROR`)
-- [x] **Engine API HTTP endpoint** — `eth_engine_handler.erl` serves `POST /engine` on port 8551 with JWT auth support
-- [x] **Payload validation** — parent hash and block number checks
-  - The declared state root is compared against the root recomputed after execution (Phase 4), and the receipts and transactions roots against the ones derived from the block's own body (Phase 5)
+This section previously said the phase was complete and passing all tests, and that the declared state root was compared against the recomputed one. All three were false: there was no test file for the engine at all, and the root checks — real and tested — live in `eth_block:finalize/1`, which the engine never called. This is the node's only interface to the consensus layer, so it is worth being exact.
+
+- [ ] **Engine API server** — `engine_newPayloadV1`, `engine_forkchoiceUpdatedV1`, `engine_getPayloadV1`, `engine_exchangeTransitionConfigurationV1` (`eth_engine`)
+  - `engine_newPayloadV1` checks only that `parentHash` is present and is 32 bytes of DATA, then answers **`SYNCING`** — the specification's status for a payload whose requisite data for acceptance or validation is missing, which is this node exactly. It does not decode the header, execute the transactions, or check the state root, the transactions root, the receipts root, `gasUsed`, the blob-gas fields, or that `blockHash` is `Keccak256(RLP(header))`
+  - It does not answer `ACCEPTED` either, which is a deliberate change. `ACCEPTED` is in the enum and so looks like the right answer for a received-but-unvalidated payload, but the specification makes it a claim with preconditions — non-empty transactions, a valid `blockHash`, a non-canonical payload, known and well-formed ancestors. None is checked here, so `ACCEPTED` is as unsupported as `VALID`
+  - `engine_forkchoiceUpdatedV1` records the client's `headBlockHash`, `safeBlockHash` and `finalizedBlockHash`, and answers **`SYNCING`** for any head it has not itself validated. Per the specification that method's `VALID` *is* the verdict on executing the block, so the previous unconditional `VALID` was the claim this node actually made: a block reported valid without executing it, decoding it, or checking one of its three roots. `VALID` is still returned for the one case with nothing to judge — no head claimed and no payload to build on
+  - Ancestry, existence and checkpoint checks against the local chain are **not** performed; the hashes are recorded as the block hashes the specification defines them to be, which is what they used to lose by being resolved to block numbers
+  - `engine_getPayloadV1` takes the specification's `payloadId` and answers `-38001 Unknown payload` for all of them, because the builder that would issue one (`eth_block_builder`) is not started (see Phase 3). It used to take no argument and return the last payload the client had itself submitted — not a block this node built, and not necessarily one it believes is valid, which is a block a consensus client would have broadcast
+  - `engine_exchangeTransitionConfigurationV1` returns the `TransitionConfigurationV1` object, which is the entire purpose of the method. It used to return a bare `VALID`, so the client received no configuration from the one call that exists to hand it over
+  - `eth_engine` never calls `eth_block`, `eth_mpt` or `eth_tx` and never compares a root. That was checked by grep rather than assumed
+  - **Missing methods**: no V2/V3 variants, which Cancun and Prague both require and a Lighthouse client on either fork will call; no `engine_getPayloadBodiesByHashV1` or `engine_getPayloadBodiesByRangeV1`, which Lighthouse requires; no `engine_notifyHeaders`; no `payloadAttributes` handling, so the node can never return a `payloadId` and cannot author a block at all
+- [x] **Engine API HTTP endpoint** — `eth_engine_handler.erl` serves `POST /engine` on port 8551, reads its arguments positionally as the specification defines them, and shapes every response as the specification does
+- [x] **Engine API authentication** — `eth_jwt` implements HS256 against `src/engine/authentication.md`: `alg: none` rejected, `iat` required and bounded to ±60 seconds, unrecognized claims ignored, a hex-encoded 256-bit secret read from `DATA_DIR/jwt.hex` and generated on first start. A node with no secret refuses the port rather than serving it open
+- [x] **Engine API test coverage** — `eth_engine_tests.erl`, 38 tests: the status each method may honestly return, the key and hex forms a real request carries, the state actually being kept, the response shapes, the authentication rules, and the HTTP surface end to end through a real listener
+- [ ] **Payload validation** — the root checks exist in `eth_block:finalize/1` and the engine does not use them:
+  - The declared state root is compared against the root recomputed after execution (Phase 4), and the receipts and transactions roots against the ones derived from the block's own body (Phase 5) — real, and in `eth_block:finalize/1`
   - All three are reported as `{verified, Root} | {unverified, Reason}` verdicts in the `Verification` map. None of them is reported as a bare root: a recomputed value under a key named after a header field is indistinguishable from a confirmed one, and that is how a wrong receipts root passed unchecked until Phase 5
   - A block whose parent's state this node does not hold locally still gets its transactions root checked, since that root covers only the block's own transaction list. Its receipts root is reported `{unverified, not_executed}`
-- [x] **Transition configuration** — echoes `TERMINAL_TOTAL_DIFFICULTY` and `TERMINAL_BLOCK_HASH` back to the consensus client. `TERMINAL_TOTAL_DIFFICULTY` is now also *interpreted*: fork selection takes a block's total difficulty and activates Paris at the TTD (see EIP-3675 in Phase 5). `TERMINAL_BLOCK_HASH` is still only passed through.
-- [x] **Engine API authentication** — JWT secret via `JWT_SECRET` env var, HMAC-SHA256 verification
-- [x] **Engine API server startup** — `eth_rpc_server` starts separate cowboy listener on port 8551
+  - **But `eth_engine` never calls `finalize/1`**, and no payload-to-`#block{}` decoder exists, so none of this is reachable from the engine's entry point. The verification is implemented; the engine is not wired to it
+- [x] **Transition configuration** — the configuration is parsed as what the specification says it is (a hex `QUANTITY`, decoded as hex) and returned to the client. An absent total difficulty is reported as `2^256-1`, the value the specification mandates for an undecided one. It was decoded as base 10, so every real value raised `badarg` and became `SECURITY_ERROR`; no network with a non-trivial terminal total difficulty could exchange its configuration at all. `TERMINAL_TOTAL_DIFFICULTY` is also *interpreted*: fork selection activates Paris at it (see EIP-3675 in Phase 5). `TERMINAL_BLOCK_HASH` is still only passed through.
+- [x] **Engine API server startup** — `eth_rpc_server` starts a separate cowboy listener on port 8551, and `eth_engine` is a supervised child started before it. `eth_engine` was declared in `etherlang.app.src`'s `registered` list — which asserts a process is running — but nothing started it, so every engine method in a real node was answering from a gen_server that did not exist
+
+**What the engine could not do before this pass.** Each of these was found by running it, not by reading it, and the documentation claimed otherwise:
+
+- `newPayloadV1` **crashed on every payload**: `#st.payloads` had no default and `init/1` never set it, so the `maps:put/3` that stored the payload raised `badmap` inside a `try` that turned it into `INVALID`. The method refused everything and returned a plausible status
+- **No field lookup could ever match.** Every lookup used a *string* key; a decoded JSON object has *binary* keys. Over HTTP nothing was read at all: `newPayload` saw no `parentHash`, `forkchoiceUpdated` saw no head, the configuration kept its old values — and all three returned well-formed statuses
+- **Every write to the engine's state was discarded**: `save_state` returned the *old* state, and the call still answered `VALID`
+- **The head was stored in the wrong position of the wrong shape**, so the parent-hash check compared against `undefined` and could not reject anything
+- **The handler could not match its own module**: two handlers matched the *strings* `"VALID"`/`"SYNCING"` against *binary* return values, so neither matched a clause and both raised `case_clause`
+- **Every method read the wrong parameter shape.** All four take their arguments positionally as `params[n]`; three read them as named-key objects, so every well-formed request was answered `invalid params`. That is why the engine could be visibly broken without a payload decoder being the cause: it never got as far as needing one
+- **Responses were not the specification's shapes**, and **the port was unauthenticated**
 
 ### Phase 2: Full State Trie — Replace Bounded Snap Store ✅ COMPLETE
 
@@ -243,7 +260,7 @@ Blocks arriving from a peer are executed for real, but the node does not author 
 - [x] **Withdrawals** — process beacon block withdrawals (EIP-4895) ✅
 - [ ] **Beacon requests** — handle `engine_notifyHeaders` and beacon root requests
   - The execution side is done and verified against Sepolia; the engine-API plumbing is not
-- [x] **Execution payload building** — integrate with consensus client's `engine_getPayload` flow ✅
+- [ ] **Execution payload building** — integrate with consensus client's `engine_getPayload` flow. Not done. `engine_getPayloadV1` takes the specification's `payloadId` and reports it unknown, because no payload is ever built: `eth_block_builder` is not started, and `forkchoiceUpdated` has no `payloadAttributes` handling so it can never return a `payloadId` to build against
 - [ ] **Proposer selection** — receive proposer duties from consensus client, produce blocks when selected
 
 ### Phase 4: State Management (partial)
@@ -461,7 +478,9 @@ Where the work actually stands:
 | Change | State |
 |---|---|
 | Bounded DETS snap store → full MPT state trie | done |
-| Engine API server for CL communication | done (transition config values are passed through, not interpreted) |
+| Engine API server for CL communication | **served, authenticated, tested, and unable to validate** — all four V1 methods answer with the specification's response shapes and a JWT is required, but `newPayload` checks only `parentHash` and answers `SYNCING`, `forkchoiceUpdated` answers `SYNCING` for any head this node has not itself validated, and `getPayload` reports every `payloadId` unknown because the builder is not started. No `payloadAttributes` handling, so the node cannot author a block. No V2/V3, no `getPayloadBodiesBy*`, no `notifyHeaders` |
+| Engine API test coverage | 36 tests in `eth_engine_tests.erl`; there were none before, and `newPayload` crashed on every payload while the documentation reported it as passing |
+| RPC method coverage | 20 methods dispatched. `eth_estimateGas`, `eth_feeHistory`, `eth_getTransactionByHash`, `eth_maxPriorityFeePerGas`, `eth_createAccessList`, `eth_getBlockReceipts`, `eth_getProof` and `eth_accounts` are absent entirely |
 | Block execution: receipts, logs, bloom, state root, EIP-4788, EIP-4895, EIP-2935 | done, and the two system-contract EIPs verified against live Sepolia data |
 | Block authoring (proposer duties) | **not done** — the node builds and executes blocks but is never selected to author one |
 | Per-fork exact gas schedule | **not done** — the EVM charges one flat, fork-unaware table, correct for Cancun-era rules and wrong for every earlier fork. A fork-parameterized table (`eth_fork_schedule:gas_cost/3,4`) exists and is unit-tested but nothing in the execution path calls it; comparing the two showed the fork table was itself wrong for 19 of the 256 opcodes (now corrected, and pinned by a whole-table test) and that the live table was charging 3 gas over EIP-2929 on every `CALL`, `CALLCODE` and `STATICCALL` (now fixed). Still absent from both: per-fork branching, EIP-150 pre-Berlin access costs, and EIP-3529 refunds. Whether the gas schedule is the *only* reason this node's state roots do not match the network's is unverified: it cannot be checked end-to-end without real prestate |
@@ -689,7 +708,7 @@ compat), receipts store + filters, txpool (validation/ordering/gossip/RPC),
 peer-first sync with verified
 bodies/receipts, snap state heal, shift/dispatch EVM regressions, and the
 local `eth_call`
-override path — **185 tests, all green**.
+override path — **418 tests, all green**.
 
 ```bash
 make docker-test        # builds a test image and runs `rebar3 eunit`

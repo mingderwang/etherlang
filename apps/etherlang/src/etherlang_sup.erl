@@ -28,6 +28,24 @@ init([]) ->
               type => worker,
               modules => [eth_state]},
 
+    %% eth_engine was listed in the .app.src `registered' list -- a declaration
+    %% that a process is running -- but was not a child here, so nothing ever
+    %% started it. The /engine listener that eth_rpc_server mounts answered every
+    %% method from a gen_server that did not exist: `whereis(eth_engine)' was
+    %% undefined, so newPayload and forkchoiceUpdated returned SYNCING and
+    %% getPayload and exchangeTransitionConfiguration returned an error. The
+    %% methods were reachable over HTTP and none of them had a backend.
+    %%
+    %% Started before eth_rpc_server so the secret exists before the port that
+    %% authenticates against it is listening.
+    Engine = #{id => eth_engine,
+               start => {eth_engine, start_link,
+                         [#{data_dir => eth_config:data_dir()}]},
+               restart => permanent,
+               shutdown => 5000,
+               type => worker,
+               modules => [eth_engine]},
+
     Rpc = #{id => eth_rpc_server,
             start => {eth_rpc_server, start_link, [#{port => eth_config:listen_port()}]},
             restart => permanent,
@@ -116,4 +134,4 @@ init([]) ->
                         []
                 end,
 
-    {ok, {SupFlags, [State, Chain, Rpc, Sync, Pool, Store] ++ Disc ++ Peer ++ StateSync}}.
+    {ok, {SupFlags, [State, Chain, Engine, Rpc, Sync, Pool, Store] ++ Disc ++ Peer ++ StateSync}}.
