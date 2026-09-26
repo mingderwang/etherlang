@@ -644,3 +644,128 @@ kzg_parent_state(ChildCode) ->
 corrupt_last_byte(Bin) ->
     <<Head:(byte_size(Bin) - 1)/binary, Last>> = Bin,
     <<Head/binary, (Last bxor 1)>>.
+
+%% ---------------------------------------------------------------------------
+
+%% ---------------------------------------------------------------------------
+%% EIP-3860: both creators pay for the init code
+%% ---------------------------------------------------------------------------
+%%
+%% do_create/3 charged CREATE2 its hashing term and CREATE nothing at all, so
+%% deploying a large contract cost nothing for the code that was about to run,
+%% and CREATE2 was short two thirds of what it owes. gasUsed is a receipt field,
+%% so this is a receipts-root difference on every CREATE and CREATE2 in a block.
+%%
+%% The expectations are differences rather than totals, so no part of this has to
+%% know what the pushes, the CODECOPY, the memory expansion or the access terms
+%% cost. Two things had to be held constant for a difference to mean anything,
+%% and both were confounds in the first version of this test:
+%%
+%%   - The parent's own work. It CODECOPYs a fixed-size buffer whatever the
+%%     length under test, so its memory expansion and copy cost are the same in
+%%     every run. Copying exactly `Len' bytes instead would have added a
+%%     quadratic memory term to the number being measured.
+%%   - The child's own work. The buffer starts with `PUSH1 0 PUSH1 0 RETURN' and
+%%     the rest is padding the child never reaches, because RETURN halts the
+%%     frame. So the child costs the same whatever `Len' says. PUSH0 would have
+%%     been the obvious padding and is the wrong choice: it is an instruction,
+%%     so the child's cost would have scaled with the length under test.
+%%
+%% The baseline is a 4-byte init code rather than an empty one, because an empty
+%% init code executes no instruction while every other case executes the RETURN
+%% and that difference would land in the number. So what is measured here is the
+%% marginal cost of each word *after* the first.
+
+create_pays_two_per_initcode_word_test() ->
+    ?assertEqual(2, marginal_word_cost(create, 33)),
+    ?assertEqual(2, marginal_word_cost(create, 64)),
+    ?assertEqual(4, marginal_word_cost(create, 65)),
+    ?assertEqual(6, marginal_word_cost(create, 128)).
+
+create2_pays_eight_per_initcode_word_test() ->
+    ?assertEqual(8, marginal_word_cost(create2, 33)),
+    ?assertEqual(8, marginal_word_cost(create2, 64)),
+    ?assertEqual(16, marginal_word_cost(create2, 65)),
+    ?assertEqual(24, marginal_word_cost(create2, 128)).
+
+%% ...so the gap between the two creators is the hashing term, 6 a word, on top of
+%% a constant 3. Everything else cancels -- the shared 2 for the init code, the
+%% parent's memory and copy, the child's execution. The 3 does not, and is not
+%% noise: CREATE2 takes a salt where CREATE takes nothing, so its parent pushes
+%% one more argument and that PUSH1 is 3 gas. It is a real, fixed difference
+%% between the two opcodes rather than an artefact, so it is stated rather than
+%% fitted away.
+%%
+%% This is the assertion an edit would fail if it made the two disagree about the
+%% shared half while leaving each one's own total correct.
+create_and_create2_differ_only_by_the_hashing_term_test() ->
+    [?assertEqual({Len, Gap}, {Len, 6 * Words + 3})
+     || Len <- [4, 32, 33, 64, 96, 128],
+        Words <- [initcode_words(Len)],
+        Gap <- [create_cost(create2, Len) - create_cost(create, Len)]].
+
+initcode_words(Len) -> (Len + 31) div 32.
+
+marginal_word_cost(Op, Len) -> create_cost(Op, Len) - create_cost(Op, 4).
+
+%% Gas used by a parent that CODECOPYs the buffer to offset 0, issues Op over
+%% `Len' bytes of it, and stops.
+create_cost(Op, Len) ->
+    Init = binary:part(init_code_buffer(), 0, Len),
+    ?GAS - create_probe_left(Op, Init, create_parent(Op, Len)).
+
+create_parent(Op, Len) ->
+    Buffer = init_code_buffer(),
+    BLen = byte_size(Buffer),
+    Args = case Op of
+               create ->
+                   %% CREATE pops value, offset, length.
+                   <<16#60,Len, 16#60,0, 16#60,0, 16#F0>>;
+               create2 ->
+                   %% CREATE2 pops value, offset, length, salt.
+                   <<16#60,0, 16#60,Len, 16#60,0, 16#60,0, 16#F5>>
+           end,
+    Copy = <<16#60,BLen, 16#60,0, 16#60,0, 16#39>>,
+    Stop = <<16#00>>,
+    Offset = byte_size(Copy) + byte_size(Args) + byte_size(Stop),
+    <<16#60,BLen, 16#60,Offset, 16#60,0, 16#39, Args/binary,
+      Stop/binary, Buffer/binary>>.
+
+%% Big enough for the longest length below, fixed so the parent's memory does
+%% not move with it.
+init_code_buffer() -> <<16#60,0, 16#60,0, 16#F3, (padding(160 - 3))/binary>>.
+
+padding(0) -> <<>>;
+padding(N) -> <<16#5F, (padding(N - 1))/binary>>.
+
+%% eth_state:exists/2 reads the balance, the nonce and the code of the address
+%% about to be created, and an address with no entries sends the EVM upstream --
+%% where a unit test hangs rather than fails. So the address is computed here
+%% from the same public keccak and rlp the node uses, and seeded as empty. That
+%% duplicates the derivation rather than checking it; the derivation itself is
+%% pinned separately by create_revert_keeps_nonce_drops_value_test/0.
+create_probe_left(Op, Init, Code) ->
+    State = create_probe_state(Op, Init),
+    case eth_evm:run(Code, ?MSG0, State, ?ENV, ?GAS) of
+        {ok, _, Left, _, _} -> Left;
+        {error, Reason, _, _} -> erlang:error({create_probe_failed, Op, Reason})
+    end.
+
+create_probe_state(Op, Init) ->
+    Nonce = 0,
+    Addr = created_address(Op, Nonce, Init),
+    eth_state:new(0, #{{balance, ?CALLER} => 10000000,
+                       {nonce, ?CALLER} => Nonce,
+                       {balance, Addr} => 0,
+                       {nonce, Addr} => 0,
+                       {code, Addr} => <<>>}).
+
+created_address(create, Nonce, _Init) ->
+    <<_:12/binary, Addr:20/binary>> =
+        eth_keccak:hash(eth_rlp:encode([?CALLER, Nonce])),
+    Addr;
+created_address(create2, _Nonce, Init) ->
+    H = eth_keccak:hash(Init),
+    <<_:12/binary, Addr:20/binary>> =
+        eth_keccak:hash(<<16#FF, ?CALLER/binary, 0:256, H/binary>>),
+    Addr.

@@ -896,9 +896,25 @@ do_create(Op, E, Ctx) ->
             case charge_mem(E4, Off + Len) of
                 oog -> oog(E4, Ctx);
                 {ok, E5} ->
+                    %% EIP-3860 (Shanghai) charges both creators 2 gas per
+                    %% 32-byte word of init code, to put a price on the work a
+                    %% large init code can force before it runs a single
+                    %% instruction. CREATE2 additionally hashes the init code at
+                    %% KECCAK256's 6 per word, so it pays 8 where CREATE pays 2.
+                    %%
+                    %% Neither term was charged here: do_create/3 billed CREATE2's
+                    %% hashing and nothing for CREATE at all. So deploying a large
+                    %% contract -- which then gets to execute init code whose
+                    %% hashing the block has already paid for -- was free, and
+                    %% CREATE2 was undercharged by two thirds.
+                    %%
+                    %% Charged unconditionally, because this module has no fork and
+                    %% applies one schedule to every block; the Shanghai condition
+                    %% belongs with the per-fork branching that is still missing.
+                    Words = (Len + 31) div 32,
                     Extra = case Op of
-                                create2 -> 6 * ((Len + 31) div 32);
-                                _ -> 0
+                                create2 -> 8 * Words;
+                                _ -> 2 * Words
                             end,
                     case charge(E5, Extra) of
                         oog -> oog(E5, Ctx);
