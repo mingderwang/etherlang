@@ -49,6 +49,18 @@ run_t(Code, Msg, State, Env, Gas, Transient) when is_binary(Code) ->
                       {return, Out} -> {ok, Out, FinalGas, Ctx1#ctx.state, E1#e.logs};
                       stop -> {ok, <<>>, FinalGas, Ctx1#ctx.state, E1#e.logs};
                       {revert, Out} -> {revert, Out, FinalGas, Ctx1#ctx.state, E1#e.logs};
+                      %% No gas figure on the error form, and that is deliberate.
+                      %% An exceptional halt consumes the whole allowance of the
+                      %% frame it happened in -- INVALID, a jump to a
+                      %% non-JUMPDEST, a write in a static frame, an
+                      %% out-of-gas condition -- so there is no remainder to
+                      %% report. A caller that needs the number derives it: the
+                      %% top-level caller charges the full limit, and
+                      %% handle_child/7's error clause adds nothing back,
+                      %% which is what stops a child that threw from refunding
+                      %% gas it never spent. This is also why {revert, ...} is
+                      %% a separate case: a revert returns its remainder, since
+                      %% the frame unwound normally.
                       {error, R} -> {error, R, Ctx1#ctx.state, E1#e.logs};
                       undefined -> {ok, <<>>, FinalGas, Ctx1#ctx.state, E1#e.logs}
                   end,
@@ -187,9 +199,15 @@ base_cost(16#3F) -> 100;
 base_cost(16#40) -> 20;
 base_cost(Op) when Op >= 16#41, Op =< 16#46 -> 2;
 base_cost(16#47) -> 5;
-base_cost(16#48) -> 2;
-base_cost(16#49) -> 3;
-base_cost(16#4A) -> 2;
+%% BASEFEE, BLOBHASH and BLOBBASEFEE are 20 each. These were 2, 3 and 2, which
+%% is the price of ADDRESS-family opcodes; the three were grouped with the
+%% 0x41-0x46 block by range, and that block is 2. The error is not a rounding
+%% difference: a contract that reads the base fee in a loop was being charged a
+%% twelfth of the real price, which is the difference between a block that
+%% out-of-gas at the intended depth and one that runs.
+base_cost(16#48) -> 20;
+base_cost(16#49) -> 20;
+base_cost(16#4A) -> 20;
 base_cost(16#50) -> 2;
 base_cost(16#51) -> 3;
 base_cost(16#52) -> 3;

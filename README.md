@@ -262,10 +262,13 @@ State is stored in a trie, persisted, prunable, and its root recomputed and chec
 EIP-1559, EIP-4788, EIP-4895 and EIP-2935 are implemented, and the two system-contract EIPs are verified against the real bytecode Sepolia has deployed and against real block state. The per-fork gas schedule is not, so the state roots this node computes are not expected to match the network's. It has not been established that the gas schedule is the *only* remaining divergence — that cannot be checked end-to-end without real prestate.
 
 - [ ] **Per-fork exact gas schedule** — replace approximate gas with exact per-fork schedule
-  - Fork *selection* is driven by real activation points (`current_fork/3`); the per-fork *gas table* is what is missing
+  - Fork *selection* is driven by real activation points (`current_fork/3`); the per-fork *gas table* is what's missing
+  - **A fork-parameterized table exists and is dead code.** `eth_fork_schedule:gas_cost/3,4` takes a fork atom, is exported and has its own unit tests — and nothing in the execution path calls it. The EVM charges `eth_evm:base_cost/1`, which takes no fork. So the tests on the fork-aware table prove nothing about execution, and the two tables have been free to disagree because nothing ever compared them. Wiring the table up is the start of this task, not the end of it
   - Istanbul, Berlin, London, Arrow Glacier, Gray Glacier, Merge, Bellatrix, Paris, Shanghai, Cancun, Deneb
   - Each fork's exact gas costs for all opcodes
   - The catch-all `base_cost(_) -> 3` is still a fallback for an unassigned opcode. It silently priced `RETURN`/`REVERT`/`INVALID`/`SELFDESTRUCT` at 3 gas each until they were given 0 — an unassigned opcode is still a guess rather than an error
+  - Fixed: `BASEFEE`/`BLOBHASH`/`BLOBBASEFEE` at 2/3/2 instead of 20/20/20. A contract reading the base fee in a loop was charged a tenth of the real price
+  - Missing: EIP-3860's init-code word cost inside `CREATE`/`CREATE2`; it is counted in the transaction's intrinsic gas but not by the opcode
   - Dynamic base fee calculation (EIP-1559)
   - Blob gas accounting (EIP-4844)
 - [x] **EIP-1559** — base fee calculation and burning ✅
@@ -419,7 +422,7 @@ Where the work actually stands:
 | Engine API server for CL communication | done (transition config values are passed through, not interpreted) |
 | Block execution: receipts, logs, bloom, state root, EIP-4788, EIP-4895, EIP-2935 | done, and the two system-contract EIPs verified against live Sepolia data |
 | Block authoring (proposer duties) | **not done** — the node builds and executes blocks but is never selected to author one |
-| Per-fork exact gas schedule | **not done** — one approximate schedule for all forks. Whether this is the *only* reason the state roots this node computes do not match the network's is unverified: it cannot be checked end-to-end without real prestate |
+| Per-fork exact gas schedule | **not done** — the EVM charges one flat, fork-unaware table. A fork-parameterized table (`eth_fork_schedule:gas_cost/3,4`) exists, is exported and is unit-tested, but nothing in the execution path calls it, so it is dead code and the two tables were never compared. Whether an approximate schedule is the *only* reason this node's state roots do not match the network's is unverified: it cannot be checked end-to-end without real prestate |
 | Honest stateRoot verification | done for the current block; historical blocks are not re-executed |
 | Receipt verification on the peer path | done — a peer's `receiptsRoot` is recomputed from the executed body and compared, and reported as `{verified, Root} \| {unverified, Reason}` |
 | Transaction validation (nonce, balance, chain ID, gas limit, intrinsic gas, signature) | done — one validator, called on the peer path before execution, with the offending transaction's index reported |
@@ -429,7 +432,7 @@ Where the work actually stands:
 | Snap sync and proof-verified state reconstruction | **not done** |
 | Merge detection via TTD | **not done** — Paris is the floor unconditionally |
 
-Because the gas schedule is approximate, etherlang can execute blocks and report a state root, but that root is not expected to equal the one the network computed. The exact per-fork gas table and KZG commitment verification are listed above and are not done. It is not established that the gas schedule is the *only* remaining divergence, because that cannot be checked without real prestate.
+Because the gas schedule is approximate, etherlang can execute blocks and report a state root, but that root is not expected to equal the one the network computed. The exact per-fork gas table and KZG commitment verification are listed above and are not done. Note that the fork-parameterized gas table that *looks* finished is not reachable from execution, so the gap is wider than its tests suggest. It is not established that the gas schedule is the *only* remaining divergence, because that cannot be checked without real prestate.
 
 **Dependencies:** None — this is pure Erlang/OTP, no external consensus libraries needed.
 

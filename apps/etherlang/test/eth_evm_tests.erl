@@ -259,6 +259,50 @@ balance_cold_then_warm_test() ->
     ?assertEqual(?GAS - 2710, GasLeft).
 
 %% ---------------------------------------------------------------------------
+%% Environment-reading opcodes cost 20, not 2
+%% ---------------------------------------------------------------------------
+
+%% BASEFEE, BLOBHASH and BLOBBASEFEE were priced at 2, 3 and 2. That is not a
+%% rounding difference: 2 is the price of the ADDRESS family, and these three
+%% were pulled into that block by a range clause. A contract that reads the
+%% base fee in a loop -- which is most DeFi code that computes what a swap is
+%% worth -- was charged a tenth of the real price, so it ran roughly ten times
+%% deeper before hitting the gas limit than it should have, and a block's
+%% gasUsed came out low by that factor. The two implemented ones are measured
+%% through the gas they leave behind; BLOBHASH is measured by the boundary,
+%% because the EVM refuses to execute it and so never reports a remainder.
+
+basefee_costs_20_test() ->
+    %% BASEFEE + STOP.
+    {ok, _, GasLeft, _, _} = eth_evm:run(<<16#48, 16#00>>, ?MSG0, ?STATE, ?ENV, ?GAS),
+    ?assertEqual(?GAS - 20, GasLeft).
+
+blobbasefee_costs_20_test() ->
+    {ok, _, GasLeft, _, _} = eth_evm:run(<<16#4A, 16#00>>, ?MSG0, ?STATE, ?ENV, ?GAS),
+    ?assertEqual(?GAS - 20, GasLeft).
+
+blobhash_costs_20_test() ->
+    %% PUSH1 the index (3), then BLOBHASH. At 20 gas the opcode is reached and
+    %% reports `unsupported`; one gas short, the charge itself fails and the
+    %% run is out-of-gas instead. That boundary is the cost, and it is the only
+    %% place BLOBHASH's price is observable at all, since the opcode never
+    %% executes and so never returns a gas remainder.
+    Code = <<16#60,0, 16#49>>,
+    ?assertMatch({error, {unsupported, {opcode, 16#49}}, _, _},
+                 eth_evm:run(Code, ?MSG0, ?STATE, ?ENV, 23)),
+    ?assertMatch({error, out_of_gas, _, _},
+                 eth_evm:run(Code, ?MSG0, ?STATE, ?ENV, 22)).
+
+%% A base fee read costs the same whatever the environment says, so the price
+%% cannot be moved by choosing a base fee.
+basefee_cost_does_not_depend_on_the_value_test() ->
+    {ok, _, Absent, _, _} = eth_evm:run(<<16#48, 16#00>>, ?MSG0, ?STATE, ?ENV, ?GAS),
+    Env = #{base_fee => 1000000000},
+    {ok, _, Present, _, _} = eth_evm:run(<<16#48, 16#00>>, ?MSG0, ?STATE, Env, ?GAS),
+    ?assertEqual(Absent, Present),
+    ?assertEqual(?GAS - 20, Present).
+
+%% ---------------------------------------------------------------------------
 %% EIP-6780 SELFDESTRUCT (P0 regression set)
 %% ---------------------------------------------------------------------------
 

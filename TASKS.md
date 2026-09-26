@@ -86,6 +86,8 @@
 ## Phase 5: Protocol Compliance (12 tasks)
 - [ ] **Per-fork exact gas schedule** — replace approximate gas with exact per-fork schedule
   - Fork *selection* is done and driven by real network activation points (`current_fork/3`; Paris is the modelled floor, the Merge being a TTD activation rather than a block number). What is not done is the per-fork *gas table*: `eth_evm` still carries one approximate schedule, so opcode costs are wrong on every fork and are not bit-exact against any of them.
+  - **There is a fork-parameterized table and it is dead code.** `eth_fork_schedule:gas_cost/3,4` (over `base_gas_cost/3` and `dynamic_gas_cost/3`) takes a fork atom, is exported, and has its own unit tests — and nothing in the execution path calls it. The EVM charges `eth_evm:base_cost/1`, which takes no fork. Only the tests exercise the fork-aware table, so it passing proves nothing about execution.
+  - This matters for two reasons. It means the task is further from done than "one approximate schedule" suggests: wiring it up is not the remaining work, it is the *start* of it. And it means the two tables have been free to disagree, because nothing ever compared them. They do — see the entries fixed below, and `eth_evm` lacks EIP-150's pre-Berlin access costs and EIP-3860's init-code word cost entirely.
   - Istanbul, Berlin, London, Arrow Glacier, Gray Glacier, Merge, Bellatrix, Paris, Shanghai, Cancun, Deneb
   - Each fork's exact gas costs for all opcodes
   - Dynamic base fee calculation (EIP-1559), Blob gas accounting (EIP-4844)
@@ -146,6 +148,9 @@
 - [ ] **EVM opcode fidelity** — bit-exact EVM for all opcodes
   - The gas schedule is approximate and shared across all forks, so opcode costs are wrong everywhere. **Unverified** as the sole cause of root divergence: the per-fork exact schedule has not been ruled out as the only remaining difference, because that cannot be checked end-to-end without real prestate
   - The catch-all `base_cost(_) -> 3` remains a fallback for any opcode with no assigned cost. It silently mispriced the four halting opcodes `RETURN`/`REVERT`/`INVALID`/`SELFDESTRUCT` at 3 gas each until they were given 0; an unassigned opcode is still a guess rather than an error
+  - Fixed: `BASEFEE`, `BLOBHASH` and `BLOBBASEFEE` cost 2, 3 and 2. They cost 20 each, and 2 is the price of the `ADDRESS` family that a range clause had swept them into. A contract reading the base fee in a loop was charged a tenth of the real price, so it ran about ten times deeper than intended and the block's `gasUsed` came out low by that factor
+  - Checked and already correct, not guesses: `LOG0`–`LOG4` (a flat 375 base plus `375 * topics` plus `8 * len`, which is right), EIP-2929 warm/cold access (100 base plus 2500/2000 charged from the transient set), and exceptional-halt gas (a frame that throws reports no remainder, and `handle_child/7` adds nothing back, so a failed sub-call cannot refund gas it never spent)
+  - Missing: EIP-3860's 2-gas-per-word init-code cost inside `CREATE`/`CREATE2`. `eth_tx:initcode_gas/2` has it for the *transaction's* intrinsic cost, so it is counted once and not again by the opcode
   - Run Foundry/vmtests to verify opcode correctness
   - Run generalStateTests to verify state transitions
   - Fix any divergences found
