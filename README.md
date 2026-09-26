@@ -176,8 +176,9 @@ The Engine API (EIP-3675 / Cancun) is what lets a consensus client (Lighthouse, 
   - `engine_exchangeTransitionConfigurationV1`: negotiate engine version
   - Return correct status codes (`VALID`, `INVALID`, `SYNCING`, `ACCEPTED`, `SECURITY_ERROR`)
 - [x] **Engine API HTTP endpoint** — `eth_engine_handler.erl` serves `POST /engine` on port 8551 with JWT auth support
-- [x] **Payload validation** — parent hash and block number checks; storage root and receipts root deferred to Phase 4
-- [x] **Transition configuration** — handles `TERMINAL_TOTAL_DIFFICULTY` and `TERMINAL_BLOCK_HASH`
+- [x] **Payload validation** — parent hash and block number checks
+  - The declared state root is compared against the root recomputed after execution (Phase 4). The receipts root is not: a peer can declare any value and the node will not notice (see Phase 5)
+- [x] **Transition configuration** — echoes `TERMINAL_TOTAL_DIFFICULTY` and `TERMINAL_BLOCK_HASH` back to the consensus client. The values are passed through, not interpreted: nothing in execution evaluates a total difficulty against the TTD to decide that the merge has happened (see EIP-3675 in Phase 5).
 - [x] **Engine API authentication** — JWT secret via `JWT_SECRET` env var, HMAC-SHA256 verification
 - [x] **Engine API server startup** — `eth_rpc_server` starts separate cowboy listener on port 8551
 
@@ -198,36 +199,39 @@ The current `eth_state` uses a bounded DETS-backed snap leaf store. A complete e
 - [x] **`eth_getProof`** — `eth_mpt:prove_account/1`, `prove_storage/2`, `verify_proof/3`
 - [x] **`eth_getStorageAt`** — `eth_mpt:get_storage/2` with proof verification
 - [x] **Snapshot/restore** — `eth_mpt:snapshot/0`, `restore/1` for fast restart
+  - Serializes the whole in-memory account, storage and code tables. It grows with total state and is written on demand, not per block
 - [x] **Persistence** — DETS-backed via `eth_mpt:init/1` with snapshot files
 
-### Phase 3: Block Production ✅ COMPLETE
+### Phase 3: Block Production (partial)
 
-Current etherlang never mines or authors blocks. A complete execution client produces blocks when selected as a proposer by the consensus layer. Implemented and passing all tests.
+Blocks are built and executed, but the node does not author them: it never receives proposer duties, so a locally built block is a construct for testing rather than something the network would accept. Execution is real — receipts, logs, bloom, state root — but the gas schedule is approximate, so the state roots it produces do not match the network's.
 
 - [x] **Block builder** — construct execution payloads from the transaction pool
   - Select transactions from pending pool (by gas price / priority fee) ✅
   - Respect block gas limit ✅
-  - Handle blob transactions (EIP-4844) (deferred)
+  - Handle blob transactions (EIP-4844) (partial — no KZG commitment verification)
   - Compute gas used, receipts, logs, bloom filter ✅
 - [ ] **Block header** — construct full block header:
   - Parent hash, uncle hash, fee recipient, state root, receipts root
   - Logs bloom, difficulty (0 in PoS), number, gas limit, gas used
   - Timestamp, extra data, base fee, blob gas used, excess blob gas
-  - Withdrawal root (EIP-4895)
-  - Request hash (EIP-4788)
-- [ ] **Block execution** — execute transactions in order within the block
-  - Apply each transaction (value transfer, contract creation, contract call)
-  - Update state trie after each transaction
-  - Collect receipts and logs
-  - Track gas used and refunds
-- [ ] **Withdrawals** — process beacon block withdrawals (EIP-4895)
-- [ ] **Beacon requests** — handle `engine_notifyHeaders` and beacon root requests (EIP-4788)
+  - Withdrawal root (EIP-4895) ✅
+  - Requests hash (EIP-7685) — not implemented
+- [x] **Block execution** — execute transactions in order within the block ✅
+  - Apply each transaction (value transfer, contract creation, contract call) ✅
+  - Update state trie after each transaction ✅
+  - Collect receipts and logs ✅
+  - Track gas used and refunds ✅
+  - Gas costs are approximate, not per-fork exact
+- [x] **Withdrawals** — process beacon block withdrawals (EIP-4895) ✅
+- [ ] **Beacon requests** — handle `engine_notifyHeaders` and beacon root requests
+  - The execution side is done and verified against Sepolia; the engine-API plumbing is not
 - [x] **Execution payload building** — integrate with consensus client's `engine_getPayload` flow ✅
 - [ ] **Proposer selection** — receive proposer duties from consensus client, produce blocks when selected
 
-### Phase 4: State Management ✅ COMPLETE
+### Phase 4: State Management (partial)
 
-Full state management is needed to handle state growth, pruning, and historical queries. Implemented and passing all tests.
+State is stored in a trie, persisted, prunable, and its root recomputed and checked after every block. What is absent is snap sync and proof-verified boundary reconstruction, so the trie can only be built by executing blocks the node already has.
 
 - [x] **State pruning** — implement archive, recent, and pruning modes
   - Archive mode: keep all historical states ✅
@@ -243,52 +247,61 @@ Full state management is needed to handle state growth, pruning, and historical 
 - [x] **Block hash oracle** — maintain block hash list for `eth_getBlockByHash` and consensus ✅
 - [x] **State trie persistence** — persist MPT to disk (DETS or ETS + snapshot files) ✅
 - [x] **Snapshot creation** — create state snapshots for fast restart ✅
-- [x] **State root verification** — verify state root after every block execution (EIP-4788) ✅
+  - A dump of the in-memory maps written on demand, not a persistent trie; a node relying on it is no faster to restart than one that replays
+- [x] **State root verification** — recompute the state root after block execution and report `{verified, Root}` or `{unverified, Reason}` ✅
+  - A block the node built itself is reported unverified rather than stamped with a root it cannot justify
+  - Historical blocks are not re-executed, so local agreement with previously accepted roots is not re-established
 
-### Phase 5: Protocol Compliance
+### Phase 5: Protocol Compliance (partial)
 
-Full protocol compliance for geth-to-geth interoperability.
+EIP-4788, EIP-4895 and EIP-1559 are implemented and verified against live Sepolia data. The per-fork gas schedule is not, which is the reason the state roots this node computes do not match the network's.
 
 - [ ] **Per-fork exact gas schedule** — replace approximate gas with exact per-fork schedule
   - Istanbul, Berlin, London, Arrow Glacier, Gray Glacier, Merge, Bellatrix, Paris, Shanghai, Cancun, Deneb
   - Each fork's exact gas costs for all opcodes
   - Dynamic base fee calculation (EIP-1559)
   - Blob gas accounting (EIP-4844)
-- [ ] **EIP-1559** — base fee calculation and burning
-  - Compute base fee per block
-  - Burn base fee (update state trie)
-  - Priority fee handling
-- [ ] **EIP-4844 (blobs)** — blob transactions support
-  - Blob transaction type (0x03)
-  - Blob gas pricing
-  - KZG commitment verification
-  - Blob data propagation
-- [ ] **EIP-4788 (beacon roots)** — store beacon block roots in state
-  - `BLOCKHASH` opcode returns beacon block root
-  - Beacon root contract (0x0000000000000000000000000000000000000000000000000000000000000000)
-  - Beacon root storage in state trie
-- [ ] **EIP-4895 (withdrawals)** — process withdrawals from beacon block
-  - Withdrawal schedule
-  - Withdrawal root in block header
-  - Process withdrawals in execution payload
-- [ ] **EIP-3675 (PoS merge)** — full PoS execution engine
-  - `TERMINAL_TOTAL_DIFFICULTY` handling
-  - `TERMINAL_BLOCK_HASH` handling
-  - PoW difficulty = 0 after merge
+- [x] **EIP-1559** — base fee calculation and burning ✅
+  - Compute base fee per block ✅
+  - Burn base fee (update state trie) ✅
+  - Priority fee handling ✅
+- [ ] **EIP-4844 (blobs)** — blob transactions support (partial)
+  - Blob transaction type (0x03) ✅
+  - Blob gas pricing ✅
+  - KZG commitment verification — **not implemented**; an invalid commitment is not rejected
+  - Blob data propagation — not implemented
+- [x] **EIP-4788 (beacon roots)** — store beacon block roots in state ✅
+  - Executes the deployed contract's code as `0xff..fe` each post-Cancun block, rather than writing the two slots directly
+  - Two ring regions 8191 apart: `ts mod 8191` for the timestamp, `+ 8191` for the root
+  - Skips the all-zero genesis placeholder; fails silently on no code, revert, or exception; not charged to the block gas limit
+  - Verified against Sepolia by running the bytecode from `eth_getCode` and requiring the slots a real block's state contains
+  - `BLOCKHASH` returning the beacon root is a separate opcode concern, not implemented
+- [x] **EIP-4895 (withdrawals)** — process withdrawals from beacon block ✅
+  - Withdrawal schedule ✅
+  - Withdrawal root in block header ✅ (an MPT root keyed by `rlp(position)`, not an SSZ hash)
+  - Process withdrawals in execution payload ✅ (through the state overlay, so the credits are inside the state root)
+- [ ] **EIP-3675 (PoS merge)** — full PoS execution engine (partial)
+  - PoW difficulty = 0 after merge ✅
+  - `TERMINAL_TOTAL_DIFFICULTY` handling — carried through config but never evaluated against a total difficulty
+  - `TERMINAL_BLOCK_HASH` handling — not implemented
+  - Nothing decides that a chain has crossed the merge; Paris is the floor unconditionally, so a pre-merge block would run under post-merge rules
 - [ ] **Geth-compatible devp2p** — full protocol compliance
   - `eth/68` with all sub-protocols (status, new block, tx announcements)
   - `eth/69` (history) if needed
   - Snap protocol (`snap/1`) full compliance
   - `discv5` discovery (UDP v5) instead of `discv4`
   - Full `Status` message with fork compatibility
-- [ ] **stateRoot honest verification** — re-execute every block locally and verify the state root matches (this was previously deferred)
+- [x] **stateRoot honest verification** — verify the state root after block execution ✅
+  - Reports `{verified, Root}` or `{unverified, Reason}`; a locally built block is never stamped
+  - Historical blocks are not re-executed, so agreement with previously accepted roots is not re-established
 - [ ] **Receipt verification** — verify transaction receipts on the peer path
+  - Receipts are built during execution, but one arriving from a peer is never recomputed and compared
 - [ ] **Full transaction validation** — validate every transaction in every block
-  - Signature verification (secp256k1)
-  - Nonce checking
-  - Balance checking
-  - Chain ID checking
-  - Gas limit checking
+  - Signature verification (secp256k1) — the sender is recovered and an unrecoverable one fails finalization, but an invalid signature does not reject the transaction
+  - Nonce checking — not implemented
+  - Balance checking — not implemented
+  - Chain ID checking — not implemented
+  - Gas limit checking — not implemented
 
 ### Phase 6: JSON-RPC API Completion
 
@@ -377,19 +390,27 @@ Full integration with consensus clients.
 
 ### Current Status
 
-**v0.7.4** is a read-mostly relay. It is NOT a complete execution client and is NOT compatible with Lighthouse or any consensus client. The work above is the path to get there.
+**v0.7.4** was a read-mostly relay. It is NOT a complete execution client and is NOT compatible with Lighthouse or any consensus client.
 
-**Key architectural changes required:**
-1. Replace bounded DETS snap store → full MPT state trie
-2. Add Engine API server for CL communication
-3. Implement block production/authoring
-4. Add per-fork exact gas schedule
-5. Verify stateRoot honestly (not trusted from upstream)
-6. Add full JSON-RPC API completeness
+Where the work actually stands:
+
+| Change | State |
+|---|---|
+| Bounded DETS snap store → full MPT state trie | done |
+| Engine API server for CL communication | done (transition config values are passed through, not interpreted) |
+| Block execution: receipts, logs, bloom, state root, EIP-4788, EIP-4895 | done, and EIP-4788/4895 verified against live Sepolia data |
+| Block authoring (proposer duties) | **not done** — the node builds and executes blocks but is never selected to author one |
+| Per-fork exact gas schedule | **not done** — one approximate schedule for all forks. This is the single reason the state roots this node computes do not match the network's |
+| Honest stateRoot verification | done for the current block; historical blocks are not re-executed |
+| Receipt verification on the peer path | **not done** |
+| Transaction validation (nonce, balance, chain ID, gas limit) | **not done** |
+| KZG commitment verification (EIP-4844) | **not done** |
+| Snap sync and proof-verified state reconstruction | **not done** |
+| Merge detection via TTD | **not done** — Paris is the floor unconditionally |
+
+Because the gas schedule is approximate, etherlang can execute blocks and report a state root, but that root will not equal the one the network computed. Everything needed to *close* that gap — exact per-fork gas, full transaction validation, receipt verification — is listed above and none of it is done.
 
 **Dependencies:** None — this is pure Erlang/OTP, no external consensus libraries needed.
-
-### Done (verified live, kept here so nobody re-opens them)
 
 ### Done (verified live, kept here so nobody re-opens them)
 
@@ -410,8 +431,21 @@ Full integration with consensus clients.
 - [x] **`eth_chain_tests`/`eth_sync_tests` flakes** — root-caused to the
   `tmp_dir` reuse above, not network timing; deterministic suites were
   already 100%.
-- [x] **No consensus-layer** — execution-layer-only by design; block
-  production, beacon, validators are out of scope (documented), not TODO.
+- [x] **EIP-4788 beacon roots** — runs the deployed contract's code rather than
+  writing the ring-buffer slots directly. Verified by executing the bytecode from
+  `eth_getCode` with a real Sepolia block's timestamp and parent beacon root, and
+  requiring the two slots that block's state actually contains. Doing this
+  surfaced four defects that had made the EIP a silent no-op, the worst being a
+  system address of `0x0000...00FFFE` instead of `0xff..fe` — the contract's
+  first instruction rejected every call, and because the EIP requires a failed
+  call to be ignored, the block still validated.
+- [x] **EIP-4895 withdrawals** — applied through the state overlay so the credits
+  land inside the block's state root. `withdrawalsRoot` is the MPT root keyed by
+  `rlp(position)`, not an SSZ merkleization hash; verified against two real
+  Sepolia blocks.
+- [x] **No consensus-layer** — execution-layer-only by design; validators are out
+  of scope (documented), not TODO. Block *authoring* is in scope and is listed
+  above as not done.
 - [x] **devp2p base** — discv4 discovery + RLPx transport in pure Erlang,
   tested against geth protocol vectors (v0.5.0).
 - [x] **Peer-first sync** — `eth/68` Status/headers/bodies with strict ForkID,
