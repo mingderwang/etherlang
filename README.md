@@ -58,9 +58,9 @@ beacon, validators, or block production).
   execution, transparently proxying everything else (`eth_getBalance`,
   `net_*`, …) to upstream.
 * **State honesty** — `stateRoot` is trusted from upstream, not re-executed;
-  `transactionsRoot`/`receiptsRoot` **are** verified against peer-supplied
-  bodies/receipts before anything is stored; blocks served locally carry the
-  Sepolia TTD as `totalDifficulty` when upstream omits it (post-merge
+  `transactionsRoot`/`receiptsRoot` **are** verified against the block's own
+  body at finalization and reported as explicit verdicts; blocks served locally
+  carry the Sepolia TTD as `totalDifficulty` when upstream omits it (post-merge
   constant, serve-time only — see `with_td_compat`).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
@@ -177,7 +177,9 @@ The Engine API (EIP-3675 / Cancun) is what lets a consensus client (Lighthouse, 
   - Return correct status codes (`VALID`, `INVALID`, `SYNCING`, `ACCEPTED`, `SECURITY_ERROR`)
 - [x] **Engine API HTTP endpoint** — `eth_engine_handler.erl` serves `POST /engine` on port 8551 with JWT auth support
 - [x] **Payload validation** — parent hash and block number checks
-  - The declared state root is compared against the root recomputed after execution (Phase 4). The receipts root is not: a peer can declare any value and the node will not notice (see Phase 5)
+  - The declared state root is compared against the root recomputed after execution (Phase 4), and the receipts and transactions roots against the ones derived from the block's own body (Phase 5)
+  - All three are reported as `{verified, Root} | {unverified, Reason}` verdicts in the `Verification` map. None of them is reported as a bare root: a recomputed value under a key named after a header field is indistinguishable from a confirmed one, and that is how a wrong receipts root passed unchecked until Phase 5
+  - A block whose parent's state this node does not hold locally still gets its transactions root checked, since that root covers only the block's own transaction list. Its receipts root is reported `{unverified, not_executed}`
 - [x] **Transition configuration** — echoes `TERMINAL_TOTAL_DIFFICULTY` and `TERMINAL_BLOCK_HASH` back to the consensus client. The values are passed through, not interpreted: nothing in execution evaluates a total difficulty against the TTD to decide that the merge has happened (see EIP-3675 in Phase 5).
 - [x] **Engine API authentication** — JWT secret via `JWT_SECRET` env var, HMAC-SHA256 verification
 - [x] **Engine API server startup** — `eth_rpc_server` starts separate cowboy listener on port 8551
@@ -254,7 +256,7 @@ State is stored in a trie, persisted, prunable, and its root recomputed and chec
 
 ### Phase 5: Protocol Compliance (partial)
 
-EIP-4788, EIP-4895 and EIP-1559 are implemented and verified against live Sepolia data. The per-fork gas schedule is not, which is the reason the state roots this node computes do not match the network's.
+EIP-1559, EIP-4788, EIP-4895 and EIP-2935 are implemented, and the two system-contract EIPs are verified against the real bytecode Sepolia has deployed and against real block state. The per-fork gas schedule is not, which is the reason the state roots this node computes do not match the network's.
 
 - [ ] **Per-fork exact gas schedule** — replace approximate gas with exact per-fork schedule
   - Istanbul, Berlin, London, Arrow Glacier, Gray Glacier, Merge, Bellatrix, Paris, Shanghai, Cancun, Deneb
@@ -276,6 +278,11 @@ EIP-4788, EIP-4895 and EIP-1559 are implemented and verified against live Sepoli
   - Skips the all-zero genesis placeholder; fails silently on no code, revert, or exception; not charged to the block gas limit
   - Verified against Sepolia by running the bytecode from `eth_getCode` and requiring the slots a real block's state contains
   - `BLOCKHASH` returning the beacon root is a separate opcode concern, not implemented
+- [x] **EIP-2935 (block hash history)** — store the last 8191 parent hashes in state ✅
+  - Executes the deployed contract's code at `0x0000F90827F1C53a10cb7A02335B175320002935` as `0xff..fe` each Prague-or-later block, passing the block's own parent hash
+  - The ring is keyed by **block number** (`(number - 1) mod 8191`), not by timestamp as EIP-4788's is. The two rings are separate accounts with separate keying, and conflating them writes a slot no other client reads
+  - The public getter answers for the 8191 block numbers in `[number - 8191, number - 1]` and reverts outside it; `read_parent_hash/3` mirrors that window so a caller using the shortcut gets the same answers the on-chain getter would
+  - Verified against Sepolia by running the bytecode from `eth_getCode` with a real block's number and parent hash, requiring the slot that block's state really contains, and exercising the getter's window boundaries
 - [x] **EIP-4895 (withdrawals)** — process withdrawals from beacon block ✅
   - Withdrawal schedule ✅
   - Withdrawal root in block header ✅ (an MPT root keyed by `rlp(position)`, not an SSZ hash)
@@ -398,11 +405,11 @@ Where the work actually stands:
 |---|---|
 | Bounded DETS snap store → full MPT state trie | done |
 | Engine API server for CL communication | done (transition config values are passed through, not interpreted) |
-| Block execution: receipts, logs, bloom, state root, EIP-4788, EIP-4895 | done, and EIP-4788/4895 verified against live Sepolia data |
+| Block execution: receipts, logs, bloom, state root, EIP-4788, EIP-4895, EIP-2935 | done, and the two system-contract EIPs verified against live Sepolia data |
 | Block authoring (proposer duties) | **not done** — the node builds and executes blocks but is never selected to author one |
 | Per-fork exact gas schedule | **not done** — one approximate schedule for all forks. This is the single reason the state roots this node computes do not match the network's |
 | Honest stateRoot verification | done for the current block; historical blocks are not re-executed |
-| Receipt verification on the peer path | **not done** |
+| Receipt verification on the peer path | done — a peer's `receiptsRoot` is recomputed from the executed body and compared, and reported as `{verified, Root} \| {unverified, Reason}` |
 | Transaction validation (nonce, balance, chain ID, gas limit) | **not done** |
 | KZG commitment verification (EIP-4844) | **not done** |
 | Snap sync and proof-verified state reconstruction | **not done** |
@@ -493,8 +500,9 @@ Each tick the node tries **eth-ready peers first**, RPC second:
   they appear. Head is persisted, so restarts resume where they left off.
 * **State honesty** — the local EVM executes calls but never re-executes full
   blocks, so `stateRoot` is *not* re-verified; it is trusted from upstream.
-  `transactionsRoot`/`receiptsRoot` **are** verified. This is documented and
-  deliberate for v1.
+  `transactionsRoot`/`receiptsRoot` are derived from the block's own body and
+  **are** checked. Where a block is finalized, all three are reported as
+  `{verified, Root} | {unverified, Reason}` verdicts rather than as bare roots.
 
 The node exposes a local JSON-RPC endpoint that answers from its own store
 (blocks, head, tx counts) and **proxies everything else to the upstream

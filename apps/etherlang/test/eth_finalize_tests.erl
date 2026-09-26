@@ -32,7 +32,15 @@ finalize_test_() ->
      {"commit preserves unmentioned fields",
       fun commit_preserves_unmentioned_fields/0},
      {"carries declared commitments through from_json",
-      fun from_json_carries_declared_commitments/0}].
+      fun from_json_carries_declared_commitments/0},
+     %% The other two commitments are verifiable too, and were not being checked.
+     {"detects a receipts root mismatch", fun detects_receipts_root_mismatch/0},
+     {"detects a transactions root mismatch",
+      fun detects_transactions_root_mismatch/0},
+     {"confirms a correct receipts root", fun confirms_correct_receipts_root/0},
+     {"the transactions root needs no state", fun tx_root_needs_no_state/0},
+     {"content roots are reported as verdicts",
+      fun content_roots_are_verdicts/0}].
 
 %% Each case gets a fresh MPT and a fresh chain store, and leaves the global
 %% base-source setting as it found it: it is process-wide, so a leaked change
@@ -217,9 +225,100 @@ commit_preserves_unmentioned_fields() ->
     end).
 
 %% ---------------------------------------------------------------------------
-%% Inbound payloads
+%% The content-derived commitments
 %% ---------------------------------------------------------------------------
 
+%% The receipts root is a Merkle root over the block's own receipts, so executing
+%% the body produces it and a peer cannot choose it freely. Checking it means
+%% comparing it against what the peer declared, which is what this now does.
+%%
+%% Reporting only the recomputed value -- the previous behaviour -- was not
+%% verification: the number in the report was one this node had just computed,
+%% under a key that read as though it had been confirmed, so a block declaring
+%% any receipts root at all passed.
+detects_receipts_root_mismatch() ->
+    with_ctx(fun() ->
+        ok = eth_mpt:put_account(?ADDR_A, 1000, 7, ?EMPTY_CODE_HASH),
+        Parent = store_parent(eth_mpt:state_root()),
+        Lying = inbound(Parent, #{<<"receiptsRoot">> => hex(<<16#77:256>>)}),
+        {ok, _Finalized, V} = eth_block:finalize(Lying),
+        ?assertMatch({unverified, {mismatch, receipts_root, <<16#77:256>>, _}},
+                     maps:get(receipts_root, V))
+    end).
+
+%% The same for the transactions root, which is even easier to get wrong because
+%% it depends on nothing but the block's own transaction list.
+detects_transactions_root_mismatch() ->
+    with_ctx(fun() ->
+        ok = eth_mpt:put_account(?ADDR_A, 1000, 7, ?EMPTY_CODE_HASH),
+        Parent = store_parent(eth_mpt:state_root()),
+        Lying = inbound(Parent, #{<<"transactionsRoot">> => hex(<<16#66:256>>)}),
+        {ok, _Finalized, V} = eth_block:finalize(Lying),
+        ?assertMatch({unverified, {mismatch, transactions_root, <<16#66:256>>, _}},
+                     maps:get(transactions_root, V))
+    end).
+
+%% The positive case, so the check is not merely always-fail. A block with no
+%% transactions has empty-trie roots for both, and declaring those is correct.
+confirms_correct_receipts_root() ->
+    with_ctx(fun() ->
+        ok = eth_mpt:put_account(?ADDR_A, 1000, 7, ?EMPTY_CODE_HASH),
+        Parent = store_parent(eth_mpt:state_root()),
+        Correct = inbound(Parent, #{<<"receiptsRoot">> => hex(eth_trie:root([])),
+                                    <<"transactionsRoot">> => hex(eth_trie:root([]))}),
+        {ok, _Finalized, V} = eth_block:finalize(Correct),
+        ?assertEqual({verified, eth_trie:root([])}, maps:get(receipts_root, V)),
+        ?assertEqual({verified, eth_trie:root([])},
+                     maps:get(transactions_root, V))
+    end).
+
+%% The transactions root covers only the block's own transaction list, so unlike
+%% the state root it is verifiable with no state at all. A node whose parent's
+%% state it does not hold must still check it -- refusing to execute is a reason
+%% to skip the state root, not a reason to wave the whole block through.
+tx_root_needs_no_state() ->
+    with_ctx(fun() ->
+        Parent = store_parent(<<16#44:256>>),
+        {ok, _Finalized, V} =
+            eth_block:finalize(inbound(Parent, #{})),
+        ?assertEqual({unverified, state_not_local}, maps:get(state_root, V)),
+        ?assertEqual({verified, eth_trie:root([])},
+                     maps:get(transactions_root, V)),
+        %% Receipts do come out of execution, so this one genuinely cannot be
+        %% checked here, and saying so beats reporting a root nobody derived.
+        ?assertEqual({unverified, not_executed}, maps:get(receipts_root, V))
+    end).
+
+%% Every entry has to be a verdict. A bare 32-byte root in a key named after a
+%% header field is indistinguishable, to a reader, from a confirmed value, and
+%% that ambiguity is what the previous shape relied on.
+content_roots_are_verdicts() ->
+    with_ctx(fun() ->
+        ok = eth_mpt:put_account(?ADDR_A, 1000, 7, ?EMPTY_CODE_HASH),
+        Parent = store_parent(eth_mpt:state_root()),
+        {ok, _Finalized, V} = eth_block:finalize(inbound(Parent, #{})),
+        lists:foreach(
+          fun(Key) ->
+              ?assertMatch({V1, _} when V1 =:= verified; V1 =:= unverified,
+                           maps:get(Key, V))
+          end,
+          [state_root, transactions_root, receipts_root])
+    end).
+
+%% An inbound block, built the way a peer's arrives: from_json/1 over a JSON-RPC
+%% header map. Constructing one through the record instead would bypass exactly
+%% the path where a peer's declared roots get read, which is the path under test.
+inbound(ParentHash, Overrides) ->
+    Base = #{<<"parentHash">> => hex(ParentHash),
+             <<"number">> => <<"0x1">>,
+             <<"timestamp">> => <<"0x64">>,
+             <<"gasLimit">> => <<"0x1c9c380">>,
+             <<"baseFeePerGas">> => <<"0x3b9aca00">>},
+    eth_block:from_json(maps:merge(Base, Overrides)).
+
+%% ---------------------------------------------------------------------------
+%% Inbound payloads
+%% ---------------------------------------------------------------------------
 %% A block arriving from the wire states its commitments. They are carried
 %% through unchanged, because checking them is the point -- rewriting them from
 %% local state first would make the comparison vacuous.

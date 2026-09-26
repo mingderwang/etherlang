@@ -39,6 +39,12 @@
           store_beacon_root/3,
           read_beacon_root/2,
           process_beacon_roots/4,
+          history_storage_address/0,
+          history_serve_window/0,
+          history_slot/1,
+          store_parent_hash/3,
+          read_parent_hash/3,
+          process_history/4,
           apply_withdrawals_to_state/2,
           gas_cost/3,
           gas_cost/4 ]).
@@ -65,6 +71,15 @@
 -define(SYSTEM_ADDRESS, <<((1 bsl 152) - 1):152, 16#fe>>).
 -define(HISTORY_BUFFER_LENGTH, 8191).
 -define(BEACON_ROOTS_GAS, 30000000).
+-define(HISTORY_GAS, 30000000).
+%% EIP-2935 HISTORY_STORAGE_ADDRESS, 0x0000F90827F1C53a10cb7A02335B175320002935.
+%% Spelled byte by byte for the same reason as ?BEACON_ROOTS_ADDRESS above: an
+%% address assembled from a single integer literal is easy to get silently wrong,
+%% and this one has to match the contract the network actually deployed.
+-define(HISTORY_STORAGE_ADDRESS,
+        <<16#00, 16#00, 16#F9, 16#08, 16#27, 16#F1, 16#C5, 16#3a,
+          16#10, 16#cb, 16#7A, 16#02, 16#33, 16#5B, 16#17, 16#53,
+          16#20, 16#00, 16#29, 16#35>>).
 
 %% ---------------------------------------------------------------------------
 %% Fork selection
@@ -651,37 +666,50 @@ process_beacon_roots(Timestamp, Root, State, Fork) ->
         false ->
             {ok, State};
         true ->
-            Code = eth_state:code(State, ?BEACON_ROOTS_ADDRESS),
-            case Code of
-                <<>> ->
-                    %% "if no code exists at BEACON_ROOTS_ADDRESS, the call must
-                    %% fail silently"
-                    {ok, State};
-                _ ->
-                    Msg = #{caller => ?SYSTEM_ADDRESS,
-                            origin => ?SYSTEM_ADDRESS,
-                            address => ?BEACON_ROOTS_ADDRESS,
-                            value => 0,
-                            data => Root,
-                            gas_price => 0,
-                            static => false,
-                            depth => 0},
-                    Env = #{timestamp => Timestamp, number => 0,
-                            coinbase => <<0:160>>, prevrandao => <<0:256>>,
-                            gas_limit => 0, base_fee => 0,
-                            chain_id => chain_id(),
-                            state => State},
-                    %% The call must "execute to completion" or "fail silently",
-                    %% so neither outcome is an error here -- and neither is
-                    %% charged to the block's gas limit, which is why the gas
-                    %% left over is discarded.
-                    try eth_evm:run(Code, Msg, State, Env, ?BEACON_ROOTS_GAS) of
-                        {ok, _Out, _GasLeft, St, _Logs} -> {ok, St};
-                        {revert, _Out, _GasLeft, _St, _Logs} -> {ok, State};
-                        {error, _Reason, _St, _Logs} -> {ok, State}
-                    catch
-                        _:_ -> {ok, State}
-                    end
+            run_system_call(Root, Timestamp, 0, State,
+                            ?BEACON_ROOTS_ADDRESS, ?BEACON_ROOTS_GAS)
+    end.
+
+%% The shape both system operations share: call the contract as the system
+%% caller with the given calldata, and treat every outcome as "the block
+%% proceeds" because each EIP says a failed call is to be ignored.
+%%
+%% Timestamp and BlockNumber are passed separately because the two contracts
+%% disagree about which of them they use: the beacon-roots contract derives its
+%% ring index from TIMESTAMP and never reads NUMBER, while the EIP-2935 contract
+%% derives its ring index from NUMBER and never reads TIMESTAMP. Supplying a real
+%% block's timestamp while pinning the number to 0 (or the reverse) states that
+%% the unused opcode is genuinely unobserved by the deployed code, rather than
+%% feeding it a value that would only be right by accident.
+run_system_call(Calldata, Timestamp, BlockNumber, State, Address, Gas) ->
+    Code = eth_state:code(State, Address),
+    case Code of
+        <<>> ->
+            %% "if no code exists at ... ADDRESS, the call must fail silently"
+            {ok, State};
+        _ ->
+            Msg = #{caller => ?SYSTEM_ADDRESS,
+                    origin => ?SYSTEM_ADDRESS,
+                    address => Address,
+                    value => 0,
+                    data => Calldata,
+                    gas_price => 0,
+                    static => false,
+                    depth => 0},
+            Env = #{timestamp => Timestamp, number => BlockNumber,
+                    coinbase => <<0:160>>, prevrandao => <<0:256>>,
+                    gas_limit => 0, base_fee => 0,
+                    chain_id => chain_id(),
+                    state => State},
+            %% The call must "execute to completion" or "fail silently", so
+            %% neither outcome is an error here -- and neither is charged to the
+            %% block's gas limit, which is why the gas left over is discarded.
+            try eth_evm:run(Code, Msg, State, Env, Gas) of
+                {ok, _Out, _GasLeft, St, _Logs} -> {ok, St};
+                {revert, _Out, _GasLeft, _St, _Logs} -> {ok, State};
+                {error, _Reason, _St, _Logs} -> {ok, State}
+            catch
+                _:_ -> {ok, State}
             end
     end.
 
@@ -720,6 +748,95 @@ get_beacon_root(Timestamp) ->
     try get_beacon_root_from_state(Timestamp)
     catch exit:{noproc, _} -> {error, state_unavailable}
     end.
+
+%% ---------------------------------------------------------------------------
+%% EIP-2935 block hash history
+%% ---------------------------------------------------------------------------
+
+history_storage_address() ->
+    ?HISTORY_STORAGE_ADDRESS.
+
+%% HISTORY_SERVE_WINDOW. The ring has this many slots, which is why the contract
+%% can serve 8191 block hashes out of 8191 storage slots rather than one per
+%% block.
+history_serve_window() ->
+    ?HISTORY_BUFFER_LENGTH.
+
+%% The ring index for a parent block number.
+%%
+%% Note that this is the *block number* mod 8191, not the timestamp. The
+%% beacon-roots ring above is keyed by timestamp; reusing that keying here would
+%% be a plausible-looking mistake that the two EIPs do not share. The distinction
+%% is visible in the deployed contract: its write path computes
+%% `(block.number - 1) mod 8191` and never touches TIMESTAMP.
+history_slot(ParentNumber) when is_integer(ParentNumber), ParentNumber >= 0 ->
+    ParentNumber rem ?HISTORY_BUFFER_LENGTH;
+history_slot(_ParentNumber) ->
+    {error, invalid_block_number}.
+
+%% Write the parent hash into the ring directly, for the same reason
+%% store_beacon_root/3 exists: the EIP permits it, and process_history/4 prefers
+%% running the deployed code because the shortcut is only equivalent when that
+%% code is the code the EIP specifies.
+store_parent_hash(ParentNumber, ParentHash, State)
+  when is_integer(ParentNumber), is_binary(ParentHash),
+       byte_size(ParentHash) =:= 32 ->
+    case history_slot(ParentNumber) of
+        {error, _} = E -> E;
+        Slot ->
+            {ok, eth_state:set_storage(State, ?HISTORY_STORAGE_ADDRESS,
+                                       Slot, ParentHash)}
+    end;
+store_parent_hash(_ParentNumber, _ParentHash, _State) ->
+    {error, invalid_parent_hash}.
+
+%% The public read, mirroring the contract's `get': a block number in the
+%% trailing 8191-block window resolves to the hash of *its* parent.
+%%
+%% The window is [BlockNumber - 8191, BlockNumber - 1]. Outside it the contract
+%% reverts, and this returns an error rather than a hash so a caller cannot
+%% mistake "outside the window" for "this block had no parent recorded". Within
+%% it a slot that was never written reads as zero, which is indistinguishable
+%% from a genuine parent hash of zero -- so a client must treat a zero result as
+%% absent, exactly as it must for the beacon-roots ring.
+read_parent_hash(QueryNumber, BlockNumber, State)
+  when is_integer(QueryNumber), is_integer(BlockNumber) ->
+    Parent = BlockNumber - 1,
+    case {QueryNumber > Parent, BlockNumber - QueryNumber > ?HISTORY_BUFFER_LENGTH} of
+        {true, _} -> {error, block_number_in_future};
+        {_, true} -> {error, block_number_too_old};
+        {false, false} ->
+            {ok, word(eth_state:storage(State, ?HISTORY_STORAGE_ADDRESS,
+                                        QueryNumber rem ?HISTORY_BUFFER_LENGTH))}
+    end;
+read_parent_hash(_QueryNumber, _BlockNumber, _State) ->
+    {error, invalid_block_number}.
+
+%% The EIP-2935 system operation, run at the start of every Prague-or-later
+%% block: the block being processed calls HISTORY_STORAGE_ADDRESS as the system
+%% caller, passing its own parent's hash, and the contract records that hash at
+%% ring index (block.number - 1) mod 8191.
+%%
+%% As with EIP-4788 above, this executes the contract's code rather than writing
+%% the slot directly, so that a network which deployed something else at the
+%% address is handled by that code instead of being silently disagreed with. The
+%% EIP's escape hatches are the same: no code means fail silently, a revert or
+%% error means fail silently, and the 30M gas is not charged to the block's gas
+%% limit.
+process_history(ParentHash, BlockNumber, State, Fork) ->
+    case history_active(Fork) of
+        false ->
+            {ok, State};
+        true ->
+            run_system_call(ParentHash, 0, BlockNumber, State,
+                            ?HISTORY_STORAGE_ADDRESS, ?HISTORY_GAS)
+    end.
+
+%% Prague and later. Unlike EIP-4788 there is no zero-placeholder exemption: the
+%% parent hash of a real block is never the genesis placeholder here, and the
+%% contract is specified to store whatever it is handed.
+history_active(Fork) ->
+    lists:member(Fork, [prague, osaka, amsterdam, bpo1, bpo2, bpo3, bpo4, bpo5]).
 
 %% ---------------------------------------------------------------------------
 %% Gas schedule

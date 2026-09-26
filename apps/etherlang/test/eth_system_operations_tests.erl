@@ -26,6 +26,10 @@
 -define(BEACON, <<16#00, 16#0F, 16#3d, 16#f6, 16#D7, 16#32, 16#80, 16#7E,
                   16#f1, 16#31, 16#9f, 16#B7, 16#B8, 16#bB, 16#85, 16#22,
                   16#d0, 16#Be, 16#ac, 16#02>>).
+%% EIP-2935 HISTORY_STORAGE_ADDRESS, 0x0000F90827F1C53a10cb7A02335B175320002935.
+-define(HISTORY, <<16#00, 16#00, 16#F9, 16#08, 16#27, 16#F1, 16#C5, 16#3a,
+                   16#10, 16#cb, 16#7A, 16#02, 16#33, 16#5B, 16#17, 16#53,
+                   16#20, 16#00, 16#29, 16#35>>).
 %% 0xfffffffffffffffffffffffffffffffffffffffe. Built from the value, because
 %% `<<255:152, 16#fe>>' is 0x000000000000000000000000000000000000FFFE: an
 %% integer bitstring segment is left-padded with zeros, so the byte pattern one
@@ -68,6 +72,40 @@
                     16#d5, 16#a2, 16#8f, 16#52, 16#6a, 16#d3, 16#2a, 16#a8,
                     16#87, 16#8d, 16#72, 16#ab, 16#a8, 16#0b, 16#45, 16#5b>>).
 
+%% The EIP-2935 runtime bytecode, read from eth_getCode at
+%% 0x0000F908...002935 on Sepolia, for the same reason as ?BEACON_RUNTIME above.
+%%
+%% This contract is worth running rather than reimplementing, because its write
+%% path and its getter disagree in a way that is easy to get wrong by reading the
+%% EIP rather than the code. The EIP describes the ring as being keyed by block
+%% number, while the EIP-4788 ring right next door in this same file is keyed by
+%% timestamp; an implementation that reused the beacon-roots keying here would
+%% write to a slot no other client reads, and -- like the earlier 4788 single-ring
+%% bug -- would fail silently. Its getter also enforces a 8191-block window and
+%% reverts outside it, which no amount of reading the prose would pin down as
+%% [number - 8191, number - 1] rather than some other span.
+-define(HISTORY_RUNTIME,
+        binary:decode_hex(<<"3373fffffffffffffffffffffffffffffffffffffffe14"
+                            "60465760203603604257"
+                            "5f35600143038111604257611fff81430311604257611fff9"
+                            "006545f5260205ff35b5f5ffd5b5f35611fff60014303065500">>)).
+
+%% One real Sepolia block, and the parent hash its post-state records.
+%%
+%% Block 0xb3ca35 = 11782709. (11782709 - 1) rem 8191 = 4050, and reading that
+%% block's state back showed slot 4050 holding exactly this parent hash. The same
+%% invariant was re-checked at two further blocks (11782756 and 11782757, ring
+%% slots 4097 and 4098), so this is a property of the ring and not a coincidence
+%% about one slot.
+-define(REAL_NUMBER, 11782709).
+-define(REAL_TS_2935, 1790382492).
+-define(REAL_PARENT,
+        <<16#6a, 16#fa, 16#ff, 16#32, 16#ce, 16#f6, 16#9b, 16#0e,
+          16#4b, 16#fd, 16#85, 16#9c, 16#72, 16#80, 16#66, 16#54,
+          16#e1, 16#e6, 16#cb, 16#38, 16#9d, 16#9e, 16#fe, 16#1c,
+          16#91, 16#a8, 16#ea, 16#69, 16#17, 16#cd, 16#91, 16#ec>>).
+-define(REAL_SLOT, 4050).
+
 system_operations_test_() ->
     [{"two ring buffers, not one", fun slots_are_two_ring_buffers/0},
      {"history length is 8191", fun history_buffer_length_is_8191/0},
@@ -98,7 +136,32 @@ system_operations_test_() ->
      {"receipts carry their own index", fun receipts_carry_their_index/0},
      {"receipt bloom covers that receipt's logs",
       fun receipt_bloom_covers_its_logs/0},
-     {"execution logs and EVM log tuples agree", fun logs_reach_the_receipt/0}].
+     {"execution logs and EVM log tuples agree", fun logs_reach_the_receipt/0},
+     %% EIP-2935 block hash history.
+     {"the history ring is keyed by block number",
+      fun history_ring_is_keyed_by_block_number/0},
+     {"the history window is 8191 blocks", fun history_window_is_8191/0},
+     {"reproduces a real Sepolia parent hash",
+      fun history_reproduces_real_sepolia_block/0},
+     {"the deployed getter serves the parent hash",
+      fun history_getter_serves_parent_hash/0},
+     {"the getter refuses a block that is not yet in the ring",
+      fun history_getter_refuses_future_block/0},
+     {"the getter refuses a block past the window",
+      fun history_getter_refuses_block_past_window/0},
+     {"the oldest block in the window still answers",
+      fun history_getter_serves_oldest_in_window/0},
+     {"read_parent_hash mirrors the contract's window",
+      fun read_parent_hash_mirrors_the_window/0},
+     {"no history call before Prague", fun no_history_call_before_prague/0},
+     {"a missing history contract fails silently",
+      fun missing_history_contract_fails_silently/0},
+     {"the history call is wired into finalize",
+      fun history_call_is_wired_into_finalize/0},
+     {"the beacon-roots call is wired into finalize too",
+      fun beacon_roots_are_wired_into_finalize/0},
+     {"the block transition reads the scheduled fork",
+      fun block_fork_follows_the_schedule/0}].
 
 %% ---------------------------------------------------------------------------
 %% Fixture
@@ -318,9 +381,258 @@ no_call_before_cancun() ->
     end).
 
 %% ---------------------------------------------------------------------------
-%% EIP-4895 withdrawals
+%% EIP-2935 block hash history
 %% ---------------------------------------------------------------------------
 
+%% The two system-contract rings in this file are keyed by different things, and
+%% conflating them is the specific mistake available here. Beacon roots (4788) are
+%% keyed by the block *timestamp*; parent hashes (2935) are keyed by the block
+%% *number*. An implementation that reached for beacon_root_slots/1 when indexing
+%% the history ring would compute a slot that no other client has ever written,
+%% and the block would still validate.
+history_ring_is_keyed_by_block_number() ->
+    ?assertEqual(8191, eth_fork_schedule:history_serve_window()),
+    ?assertEqual(?REAL_SLOT, eth_fork_schedule:history_slot(?REAL_NUMBER - 1)),
+    %% The same block, indexed the other EIP's way. Block 0xb3ca35 has timestamp
+    %% 1790382492, so the beacon-roots ring for it is keyed by 1790382492 while
+    %% this ring is keyed by 11782708. Three different numbers, and the two
+    %% contracts write to two different slots of two different accounts. An
+    %% implementation that reached for beacon_root_slots/1 here would write
+    %% 1903, a slot the EIP-2935 contract never reads.
+    {BeaconSlot, _RootSlot} = eth_fork_schedule:beacon_root_slots(?REAL_TS_2935),
+    ?assertEqual(1903, BeaconSlot),
+    ?assertNotEqual(BeaconSlot, ?REAL_SLOT).
+
+%% HISTORY_SERVE_WINDOW. Both the ring length and the width of the window the
+%% getter will answer for come from it, so the two cannot drift apart.
+history_window_is_8191() ->
+    %% The getter answers for exactly 8191 block numbers: the 8191 just below the
+    %% current one. Verified on Sepolia -- a query for the current number and one
+    %% for number-8192 both revert, while number-1 and number-8191 both answer.
+    ?assertEqual(8191, eth_fork_schedule:history_serve_window()).
+
+%% The decisive test, as for 4788: run the bytecode the chain actually has
+%% deployed at HISTORY_STORAGE_ADDRESS, and require the slot that a real
+%% Sepolia block's state really contains.
+history_reproduces_real_sepolia_block() ->
+    with_ctx(fun() ->
+        State = install_history_contract(blank()),
+        {ok, S1} = eth_fork_schedule:process_history(
+                     ?REAL_PARENT, ?REAL_NUMBER, State, prague),
+        ?assertEqual(?REAL_SLOT,
+                     eth_fork_schedule:history_slot(?REAL_NUMBER - 1)),
+        ?assertEqual(binary:decode_unsigned(?REAL_PARENT),
+                     eth_state:storage(S1, ?HISTORY, ?REAL_SLOT))
+    end).
+
+%% The other direction: the deployed getter, called the way anyone may call it,
+%% has to return that same word for a block number inside the window. This is a
+%% separate code path in the contract from the one above -- a different entry
+%% point, reached by CALLER *not* being the system address -- and it is reached
+%% by a branch condition on calldata size, so it is not implied by the write
+%% path having worked.
+history_getter_serves_parent_hash() ->
+    with_ctx(fun() ->
+        State = install_history_contract(blank()),
+        {ok, S1} = eth_fork_schedule:process_history(
+                     ?REAL_PARENT, ?REAL_NUMBER, State, prague),
+        ?assertMatch({ok, ?REAL_PARENT},
+                     history_get(?REAL_NUMBER - 1, ?REAL_NUMBER, S1))
+    end).
+
+%% Outside the window the contract reverts, and a client that answered anyway
+%% would serve a ring slot that has been overwritten by an unrelated block, since
+%% the ring is 8191 slots wide and the entry for that index belongs to some block
+%% 8191 or more steps back.
+history_getter_refuses_future_block() ->
+    with_ctx(fun() ->
+        State = install_history_contract(blank()),
+        %% The block being processed is not in the ring yet; only its parent is.
+        ?assertMatch({revert, _},
+                     history_get(?REAL_NUMBER, ?REAL_NUMBER, State)),
+        ?assertEqual({error, block_number_in_future},
+                     eth_fork_schedule:read_parent_hash(
+                       ?REAL_NUMBER, ?REAL_NUMBER, State))
+    end).
+
+history_getter_refuses_block_past_window() ->
+    with_ctx(fun() ->
+        State = install_history_contract(blank()),
+        %% One past the 8191 the window covers.
+        Old = ?REAL_NUMBER - 1 - 8191,
+        ?assertMatch({revert, _},
+                     history_get(Old, ?REAL_NUMBER, State)),
+        ?assertEqual({error, block_number_too_old},
+                     eth_fork_schedule:read_parent_hash(
+                       Old, ?REAL_NUMBER, State))
+    end).
+
+%% The boundary is inclusive, and off-by-one here is not cosmetic: accepting one
+%% block too many serves a slot that has been recycled.
+history_getter_serves_oldest_in_window() ->
+    with_ctx(fun() ->
+        State = install_history_contract(blank()),
+        Oldest = ?REAL_NUMBER - 1 - 8191 + 1,
+        ?assertMatch({ok, _}, history_get(Oldest, ?REAL_NUMBER, State)),
+        ?assertMatch({ok, _},
+                     eth_fork_schedule:read_parent_hash(
+                       Oldest, ?REAL_NUMBER, State))
+    end).
+
+%% read_parent_hash/3 is a shortcut around the contract, so it has to agree with
+%% the contract about the window -- otherwise a caller using the shortcut gets
+%% answers the on-chain getter would refuse, and vice versa.
+read_parent_hash_mirrors_the_window() ->
+    with_ctx(fun() ->
+        State = install_history_contract(blank()),
+        {ok, S1} = eth_fork_schedule:process_history(
+                     ?REAL_PARENT, ?REAL_NUMBER, State, prague),
+        ?assertEqual({ok, ?REAL_PARENT},
+                     eth_fork_schedule:read_parent_hash(
+                       ?REAL_NUMBER - 1, ?REAL_NUMBER, S1)),
+        ?assertEqual({error, block_number_in_future},
+                     eth_fork_schedule:read_parent_hash(
+                       ?REAL_NUMBER, ?REAL_NUMBER, S1)),
+        ?assertEqual({error, block_number_too_old},
+                     eth_fork_schedule:read_parent_hash(
+                       ?REAL_NUMBER - 8192, ?REAL_NUMBER, S1))
+    end).
+
+%% Prague is the fork that activates EIP-2935. Cancun blocks must not write the
+%% ring, or this client's state root would disagree with every other client's
+%% from the fork boundary onward.
+no_history_call_before_prague() ->
+    with_ctx(fun() ->
+        State = install_history_contract(blank()),
+        ?assertEqual({ok, State},
+                     eth_fork_schedule:process_history(
+                       ?REAL_PARENT, ?REAL_NUMBER, State, cancun)),
+        ?assertEqual(0, eth_state:storage(State, ?HISTORY, ?REAL_SLOT))
+    end).
+
+%% "if no code exists at HISTORY_STORAGE_ADDRESS, the call must fail silently".
+missing_history_contract_fails_silently() ->
+    with_ctx(fun() ->
+        State = blank(),
+        ?assertEqual({ok, State},
+                     eth_fork_schedule:process_history(
+                       ?REAL_PARENT, ?REAL_NUMBER, State, prague))
+    end).
+
+%% The cases above call eth_fork_schedule directly. This one goes through
+%% finalize/1, because the wiring is a separate thing to get right: a system call
+%% that exists but is never invoked from the block transition leaves every
+%% function-level case green while the state root stays wrong.
+%%
+%% It also pins the ordering claim. EIP-2935 and EIP-4788 both run before the
+%% block's transactions, and the parent hash this block records is the one named
+%% in its own header -- not the parent's, and not the parent's parent. Getting
+%% that off by one hop would still write a plausible 32-byte word, just not the
+%% right one, and the mismatch would only surface as a wrong state root.
+history_call_is_wired_into_finalize() ->
+    with_ctx(fun() ->
+        Hash = eth_keccak:hash(?HISTORY_RUNTIME),
+        ok = eth_mpt:put_code(Hash, ?HISTORY_RUNTIME),
+        ok = eth_mpt:put_account(?HISTORY, 0, 1, Hash),
+        Parent = store_parent(eth_mpt:state_root()),
+        %% Timestamp 1790382492 is past Prague on Sepolia, so the fork selector
+        %% the block transition consults really does have EIP-2935 active.
+        Block = (eth_block:new(Parent, ?REAL_NUMBER))#block{
+                   timestamp = ?REAL_TS_2935},
+        {ok, _Finalized, V} = eth_block:finalize(Block),
+        ?assertMatch({verified, _}, maps:get(state_root, V)),
+        %% The word recorded is this block's own declared parent hash. The real
+        %% Sepolia vector is exercised above against the real parent hash; here
+        %% the point is that finalize/1 hands the header's parentHash to the
+        %% contract rather than something else -- a different parent, or the
+        %% block's own hash, would both write a plausible 32-byte word.
+        ?assertEqual(Parent, mpt_word(?HISTORY, ?REAL_SLOT))
+    end).
+
+%% The same gap for EIP-4788, which was dead for the same reason and by the same
+%% route. Its cases above call eth_fork_schedule directly, so nothing asserted
+%% that finalize/1 makes the call at all -- and a block that never wrote its
+%% beacon root computes a state root no other client computes, which is exactly
+%% the failure this module exists to catch.
+beacon_roots_are_wired_into_finalize() ->
+    with_ctx(fun() ->
+        Hash = eth_keccak:hash(?BEACON_RUNTIME),
+        ok = eth_mpt:put_code(Hash, ?BEACON_RUNTIME),
+        ok = eth_mpt:put_account(?BEACON, 0, 1, Hash),
+        Parent = store_parent(eth_mpt:state_root()),
+        Block = (eth_block:new(Parent, ?REAL_NUMBER))#block{
+                   timestamp = ?REAL_TS,
+                   parent_beacon_block_root = ?REAL_ROOT},
+        {ok, _Finalized, V} = eth_block:finalize(Block),
+        ?assertMatch({verified, _}, maps:get(state_root, V)),
+        {TsSlot, RootSlot} = eth_fork_schedule:beacon_root_slots(?REAL_TS),
+        ?assertEqual({3311, 11502}, {TsSlot, RootSlot}),
+        ?assertEqual(?REAL_TS, binary:decode_unsigned(mpt_word(?BEACON, TsSlot))),
+        ?assertEqual(?REAL_ROOT, mpt_word(?BEACON, RootSlot))
+    end).
+
+%% eth_block:fork/1 is the single input that decides which system calls a block%% makes, and it used to answer `paris' for every block at every fork. paris is
+%% in neither EIP's active-fork list, so both system calls were skipped
+%% everywhere -- and no test noticed, because the EIP-4788 and EIP-2935 cases
+%% call eth_fork_schedule with an explicit fork and never go through this.
+%%
+%% Asserted against the schedule rather than against a literal fork name: which
+%% fork a given timestamp lands in is configuration that may change, but the fact
+%% that the block transition reads it correctly is the property here.
+block_fork_follows_the_schedule() ->
+    with_ctx(fun() ->
+        Network = eth_fork_schedule:configured_network(),
+        {ok, After} = eth_fork_schedule:current_fork(
+                        Network, ?REAL_NUMBER, ?REAL_TS_2935),
+        {ok, Before} = eth_fork_schedule:current_fork(
+                         Network, 1, ?TS),
+        %% Not a fixed expectation, but the two must differ, and neither may be
+        %% the pre-fork answer this used to return for everything.
+        ?assertNotEqual(Before, After),
+        Late = (eth_block:new(<<"0x1">>, ?REAL_NUMBER))#block{
+                  timestamp = ?REAL_TS_2935},
+        Early = (eth_block:new(<<"0x1">>, 1))#block{timestamp = ?TS},
+        ?assertEqual(After, eth_block:fork(Late)),
+        ?assertEqual(Before, eth_block:fork(Early))
+    end).
+
+%% Call the deployed contract the way the network would: a caller that is not the
+%% system address, asking about a block number.
+%%
+%% eth_evm:run returns the frame's full result tuple; what this contract's caller
+%% observes is just the returned data, and whether the call succeeded at all.
+%% Reducing it here keeps the window assertions below about the contract's
+%% behaviour instead of about the interpreter's calling convention.
+history_get(QueryNumber, AtBlockNumber, State) ->
+    Msg = #{caller => ?PROBE,
+            origin => ?PROBE,
+            address => ?HISTORY,
+            value => 0,
+            data => <<QueryNumber:256>>,
+            gas_price => 0,
+            static => false,
+            depth => 0},
+    Env = #{timestamp => ?TS, number => AtBlockNumber,
+            coinbase => <<0:160>>, prevrandao => <<0:256>>,
+            gas_limit => 0, base_fee => 0,
+            chain_id => eth_fork_schedule:chain_id(),
+            state => State},
+    case eth_evm:run(?HISTORY_RUNTIME, Msg, State, Env, 30000000) of
+        {ok, Out, _Gas, _St, _Logs} -> {ok, Out};
+        {revert, Out, _Gas, _St, _Logs} -> {revert, Out}
+    end.
+
+install_history_contract(State) ->
+    Hash = eth_keccak:hash(?HISTORY_RUNTIME),
+    ok = eth_mpt:put_code(Hash, ?HISTORY_RUNTIME),
+    %% The EIP specifies nonce 1 for this account, matching the beacon-roots
+    %% contract, so the account is installed the same way here.
+    ok = eth_mpt:put_account(?HISTORY, 0, 1, Hash),
+    eth_state:set_code(State, ?HISTORY, ?HISTORY_RUNTIME).
+
+%% ---------------------------------------------------------------------------
+%% EIP-4895 withdrawals
+%% ---------------------------------------------------------------------------
 %% Amounts arrive in Gwei; balances are denominated in wei. Crediting the number
 %% as given would overpay every recipient by a factor of a billion -- a wrong
 %% state root, and a wrong one a balance query would report confidently.
@@ -573,6 +885,21 @@ probe_value(Calldata, Parent, Number, Timestamp) ->
         <<Word:256/unsigned-big>> -> Word;
         <<>> -> 0;
         Other -> binary:decode_unsigned(Other)
+    end.
+
+%% A committed storage word, normalised to 32 bytes. The MPT returns a slot's
+%% contents with leading zero bytes stripped, so comparing a raw read against a
+%% full 32-byte word would fail on any value that happens to start with a zero --
+%% which is one value in 256, and is the case for the beacon-roots timestamp.
+%%
+%% The padding is on the left, because the stripped bytes are the leading ones.
+%% Padding on the right instead would leave a value that compares equal only when
+%% the leading byte happened to be non-zero, which is precisely the case a
+%% hand-written assertion would be tested against.
+mpt_word(Addr, Slot) ->
+    case eth_mpt:get_storage(Addr, <<Slot:256>>) of
+        <<>> -> <<0:256>>;
+        Bytes -> <<0:((32 - byte_size(Bytes)) * 8), Bytes/binary>>
     end.
 
 %% Finalize a block carrying N identical calls to the installed contract.

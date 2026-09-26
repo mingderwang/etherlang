@@ -49,7 +49,8 @@
 - [x] **Block execution** — execute transactions in order within the block ✅
   - Each transaction is applied against the state the previous one produced; the EVM reads its message and environment through atom keys, and the caller is always the recovered signer rather than any `from` the payload declares
   - Receipts carry their own `transactionIndex` and a bloom filter over their own logs; the block's bloom is the OR of the receipts'
-  - EIP-4788 runs before the transactions and EIP-4895 withdrawals after, both into the same overlay
+  - EIP-2935 and EIP-4788 run before the transactions and EIP-4895 withdrawals after, all into the same overlay
+  - Which of those apply is decided by the block's own scheduled fork, read from the fork schedule rather than hardcoded
   - An EVM crash is an exceptional halt that consumes the whole gas limit and discards the frame, which is recorded as an error and not as a revert
   - The state root is recomputed from the committed trie afterwards
   - **Not** a full state transition: the gas schedule is approximate rather than per-fork exact, so the roots this produces do not match the network's
@@ -98,6 +99,11 @@
   - The ring buffer is two regions 8191 apart, `ts mod 8191` for the timestamp and `+ 8191` for the root. A single buffer keyed by the full timestamp is a plausible encoding and is unreachable — the contract only ever touches these two ranges.
   - Skips the all-zero root (the Cancun genesis placeholder), and fails silently on no code, on revert, or on an exception, as the EIP requires.
   - Not charged against the block gas limit; leftover gas is discarded.
+- [x] **EIP-2935 (block hash history)** — store the last 8191 parent hashes in state ✅
+  - Runs the deployed contract's code at `0x0000F90827F1C53a10cb7A02335B175320002935` as `0xff..fe` on every Prague-or-later block, handing it the block's own parent hash. The same reasoning as 4788 for running the code rather than writing the slot directly.
+  - The ring is keyed by **block number** (`(number - 1) mod 8191`). EIP-4788's ring next to it is keyed by timestamp, and the two are different accounts with different keying; reusing the beacon-roots helper here would write a slot the contract never reads, and — like the earlier 4788 single-ring defect — fail silently.
+  - The public getter answers only for block numbers in `[number - 8191, number - 1]` and reverts outside it. `read_parent_hash/3` enforces the same window, so the shortcut cannot hand back answers the on-chain getter would refuse.
+  - Verified against Sepolia by running the bytecode from `eth_getCode`: a real block's parent hash lands in the slot that block's state really contains (re-checked at three separate ring slots), and the getter's window boundaries were confirmed by reverting queries one step past each end.
   - Verified against Sepolia: the runtime bytecode fetched from `eth_getCode` reproduces the slots a real block's state actually contains.
   - `BLOCKHASH` returning the beacon root is a separate opcode concern and is not part of this item.
 - [x] **EIP-4895 (withdrawals)** — process withdrawals from beacon block ✅
@@ -117,8 +123,10 @@
   - `eth_block:finalize/1` returns `{ok, Block, Verification}` where `Verification.state_root` is `{verified, Root}` or `{unverified, Reason}`. A block the node built itself has no root to check against and is reported unverified; it is never stamped with a root the node cannot justify.
   - The state root is recomputed from the committed trie rather than carried over from the parent.
   - **Not** done: this verifies the node's own execution, not agreement with the network. Blocks arriving from a peer are executed and their declared root compared, but nothing re-executes historical blocks to confirm the local trie still reproduces the roots it once accepted. A locally built block stays unverified indefinitely.
-- [ ] **Receipt verification** — verify transaction receipts on the peer path
-  - Receipts are *built* during execution (per-transaction index, cumulative gas, own bloom, logs) and the block's receipts root is derived from them, but a receipt arriving from a peer is never recomputed and compared. A peer can declare any receipts root and the node will not notice.
+- [x] **Receipt verification** — verify transaction receipts on the peer path ✅
+  - Receipts are *built* during execution (per-transaction index, cumulative gas, own bloom, logs), and the block's declared `receiptsRoot` is recomputed from them and compared. The transactions root is checked the same way.
+  - Both are reported as `{verified, Root} | {unverified, Reason}`, not as a bare root. Reporting only the recomputed value — which is what this did — is not verification: a peer could declare any receipts root and the report would show a self-consistent number under a key that read as though it had been confirmed.
+  - The transactions root depends on nothing but the block's own transaction list, so it is checked even when the parent's state is not held locally and the body cannot be executed. The receipts root genuinely needs execution, and is reported `{unverified, not_executed}` on that path rather than guessed.
 - [ ] **Full transaction validation** — validate every transaction in every block
   - A transaction's sender is recovered from its signature rather than read from the payload, and a sender that cannot be recovered makes finalization fail rather than falling back to a declared address
   - **Not** done: nonce, balance, chain ID and gas limit are not checked against the pre-state, and an invalid signature does not cause the transaction to be rejected — a block whose transaction does not check out is executed anyway

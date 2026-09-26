@@ -188,9 +188,11 @@ uint_or_undefined(V) -> uint(V).
 %% header asserts. The commitments are not equally trustworthy, so they are
 %% reported separately.
 %%
-%%   * gas_used, logs_bloom, transactions_root and receipts_root all derive
-%%     from the block's own contents, so recomputing them is meaningful and a
-%%     declared value that disagrees is a real error.
+%%   * transactions_root and receipts_root derive from the block's own contents
+%%     (the transaction list, and the receipts those transactions produced), so a
+%%     node that executed the body can recompute both and check them. This one
+%%     did compute them and did not check them, which reported a self-consistent
+%%     number under a name that reads as if it had been confirmed.
 %%
 %%   * state_root is different. A genuine post-state root exists only if the
 %%     node holds the *parent's* state locally, executes against it, and writes
@@ -204,12 +206,14 @@ uint_or_undefined(V) -> uint(V).
 %% verifies the declared root or explains why it could not.
 %%
 %% Returns {ok, Block, Verification}, where
-%%   Verification :: #{state_root := {verified, Root} | {unverified, Reason},
-%%                    transactions_root := Root,
-%%                    receipts_root := Root,
-%%                    gas_used := Gas}
+%%   Verification :: #{state_root      := {verified, Root} | {unverified, Reason},
+%%                    transactions_root := {verified, Root} | {unverified, Reason},
+%%                    receipts_root     := {verified, Root} | {unverified, Reason},
+%%                    gas_used          := Gas}
 %% A caller that must not accept an unverifiable block reads this map rather
-%% than trusting the block's state_root field.
+%% than trusting the block's own root fields. Every entry is a verdict on a
+%% declared value, never the recomputed value presented as if it were the
+%% declared one.
 finalize(#block{transactions = Txs,
                 gas_limit = GasLimit,
                 base_fee_per_gas = BaseFee} = Block) ->
@@ -247,24 +251,43 @@ finalize_against(Block, ParentRoot, Txs, GasLimit, BaseFee) ->
             %% Executing here would produce a root over whatever subset of the
             %% state happens to be local. Publishing that as the block's state
             %% root is the worst outcome available: a plausible value that is
-            %% silently wrong. The content-derived commitments are still
-            %% meaningful, so they are still recomputed.
-            {ok, commitments(Block), #{state_root => {unverified, state_not_local}}};
+            %% silently wrong. The transactions root is the exception -- it
+            %% covers only the block's own transaction list, so it is verifiable
+            %% without the parent's state and is checked here. The receipts root
+            %% is not, because receipts come out of execution.
+            {ok, commitments(Block),
+             #{state_root => {unverified, state_not_local},
+               transactions_root =>
+                   check_transactions_root(Block#block.transactions_root,
+                                           tx_root(Block#block.transactions)),
+               receipts_root => {unverified, not_executed}}};
         true ->
             Previous = eth_state:base_source(),
             ok = eth_state:set_base_source(mpt),
             try
                 State = eth_state:new(Block#block.parent_hash, #{}),
                 %% System operations run in the order the forks specify: the
-                %% beacon-roots call opens the block, before any transaction can
-                %% observe it, and withdrawals close it, after the last
-                %% transaction. Both write the same overlay the transactions do,
-                %% so both are inside the state root this block declares.
+                %% two system-contract calls open the block, before any
+                %% transaction can observe them, and withdrawals close it, after
+                %% the last transaction. All three write the same overlay the
+                %% transactions do, so all three are inside the state root this
+                %% block declares.
+                %%
+                %% The two system calls are not ordered relative to each other:
+                %% neither is charged to the block gas limit and they write
+                %% disjoint storage in disjoint accounts, so either order gives
+                %% the same state. The parent hash is recorded first so a
+                %% transaction in this block can already read this block's own
+                %% parent through the history contract.
                 Fork = fork_of(Block),
+                {ok, StateH} = eth_fork_schedule:process_history(
+                                  Block#block.parent_hash,
+                                  Block#block.number,
+                                  State, Fork),
                 {ok, State0} = eth_fork_schedule:process_beacon_roots(
                                   Block#block.timestamp,
                                   Block#block.parent_beacon_block_root,
-                                  State, Fork),
+                                  StateH, Fork),
                 {Executed0, StateT} = execute_transactions(Block, Txs, State0,
                                                             BaseFee, GasLimit),
                 {ok, State1, _Applied} =
@@ -278,16 +301,26 @@ finalize_against(Block, ParentRoot, Txs, GasLimit, BaseFee) ->
                                              check_state_root(Executed#block.state_root,
                                                               Root),
                                          transactions_root =>
-                                             tx_root(Executed#block.transactions),
+                                             check_transactions_root(
+                                               Executed#block.transactions_root,
+                                               tx_root(Executed#block.transactions)),
                                          receipts_root =>
-                                             receipts_root(Executed#block.receipts),
+                                             check_receipts_root(
+                                               Executed#block.receipts_root,
+                                               receipts_root(Executed#block.receipts)),
                                          gas_used => Executed#block.gas_used},
                         {ok, commitments(Executed, Root), Verification};
                     {error, Reason} ->
                         {ok, commitments(Executed),
                          #{state_root => {unverified, {commit_failed, Reason}},
-                           transactions_root => tx_root(Executed#block.transactions),
-                           receipts_root => receipts_root(Executed#block.receipts),
+                           transactions_root =>
+                               check_transactions_root(
+                                 Executed#block.transactions_root,
+                                 tx_root(Executed#block.transactions)),
+                           receipts_root =>
+                               check_receipts_root(
+                                 Executed#block.receipts_root,
+                                 receipts_root(Executed#block.receipts)),
                            gas_used => Executed#block.gas_used}}
                 end
             after
@@ -295,12 +328,22 @@ finalize_against(Block, ParentRoot, Txs, GasLimit, BaseFee) ->
             end
     end.
 
-%% The rules in force for this block, which decide whether the beacon-roots
-%% system call applies. There is no network here to consult, so the schedule is
-%% asked for this block's own position.
+%% The rules in force for this block, which decide which system calls apply.
+%% There is no network here to consult, so the schedule is asked for this block's
+%% own position.
+%%
+%% current_fork/3 answers {ok, Fork}. This used to match that against a bare-atom
+%% pattern, which can never match, so every block was reported as `paris' --
+%% including blocks at Cancun and later. paris is in neither EIP-4788's nor
+%% EIP-2935's active-fork list, so both system calls were skipped for every
+%% block at every fork, and the computed state root disagreed with every other
+%% client's. Nothing caught it, because the tests for those calls invoke
+%% eth_fork_schedule directly with an explicit fork argument and so never go
+%% through this.
 fork_of(#block{number = Number, timestamp = Ts}) ->
     try eth_fork_schedule:current_fork(
           eth_fork_schedule:configured_network(), Number, Ts) of
+        {ok, Fork} when is_atom(Fork) -> Fork;
         Fork when is_atom(Fork) -> Fork;
         _ -> paris
     catch
@@ -330,6 +373,35 @@ check_state_root(Declared, Computed) when is_binary(Declared) ->
     end;
 check_state_root(_Declared, _Computed) ->
     {unverified, invalid_declared_root}.
+
+%% The receipts and transactions roots are verifiable without any local state:
+%% both are Merkle roots over the block's own contents, so a node that executed
+%% the body can recompute them and compare. Reporting only the recomputed value
+%% -- which is what this used to do -- is not verification at all: a block
+%% declaring a wrong receipts root passed silently, because the number the
+%% caller saw was the one this node had just computed rather than the one that
+%% was claimed. The verdict carries the computed root, so a caller that wants the
+%% value still has it, and says which of the two it is.
+check_receipts_root(Declared, Computed) when is_binary(Computed) ->
+    check_commitment(receipts_root, Declared, Computed).
+
+check_transactions_root(Declared, Computed) when is_binary(Computed) ->
+    check_commitment(transactions_root, Declared, Computed).
+
+%% ?EMPTY_ROOT is the sentinel from new/2 for a block this node built itself,
+%% which has no declaration to check. Treating it as a declaration would report
+%% every locally authored block as a mismatch against the empty trie.
+check_commitment(_Which, ?EMPTY_ROOT, Computed) ->
+    {verified, Computed};
+check_commitment(_Which, undefined, Computed) ->
+    {verified, Computed};
+check_commitment(Which, Declared, Computed) when is_binary(Declared) ->
+    case Declared =:= Computed of
+        true -> {verified, Computed};
+        false -> {unverified, {mismatch, Which, Declared, Computed}}
+    end;
+check_commitment(Which, _Declared, _Computed) ->
+    {unverified, {invalid_declared, Which}}.
 
 %% Recompute the content-derived commitments. The block's own state_root field is
 %% left alone here; it is only set by commitments/2, and only once a root has
