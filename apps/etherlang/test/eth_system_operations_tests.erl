@@ -161,7 +161,9 @@ system_operations_test_() ->
      {"the beacon-roots call is wired into finalize too",
       fun beacon_roots_are_wired_into_finalize/0},
      {"the block transition reads the scheduled fork",
-      fun block_fork_follows_the_schedule/0}].
+      fun block_fork_follows_the_schedule/0},
+     {"the block transition reads the block's total difficulty",
+      fun block_fork_uses_the_blocks_total_difficulty/0}].
 
 %% ---------------------------------------------------------------------------
 %% Fixture
@@ -595,6 +597,54 @@ block_fork_follows_the_schedule() ->
         ?assertEqual(After, eth_block:fork(Late)),
         ?assertEqual(Before, eth_block:fork(Early))
     end).
+
+%% The Merge is a total-difficulty activation, so a block has to carry its total
+%% difficulty and fork/1 has to pass it on. Two things can go wrong: the field
+%% never being read off the wire, and a real 0 being mistaken for "absent" --
+%% which matters because Sepolia's TERMINAL_TOTAL_DIFFICULTY is 0, so a node
+%% conflating them would report a post-Merge chain as pre-Merge forever.
+%%
+%% The timestamp is deliberately before Shanghai. A post-Shanghai timestamp is
+%% answered by Cancun or later whether or not the total difficulty is known, so a
+%% test using one would compare two identical answers and pass whether the wiring
+%% existed or not. The discriminator is asserted first, so the test cannot
+%% silently become vacuous if the schedule moves.
+block_fork_uses_the_blocks_total_difficulty() ->
+    with_ctx(fun() ->
+        Network = eth_fork_schedule:configured_network(),
+        Number = ?REAL_NUMBER,
+        PreShanghai = 1660000000,
+        Crossing = case Network of
+                       mainnet -> 58750000000000000000001;
+                       _ -> 0
+                   end,
+
+        Base = #{<<"number">> => eth_hex:encode_int(Number),
+                 <<"timestamp">> => eth_hex:encode_int(PreShanghai)},
+        With = eth_block:from_json(
+                 maps:put(<<"totalDifficulty">>, eth_hex:encode_int(Crossing), Base)),
+        Without = eth_block:from_json(Base),
+
+        %% Read off the wire, and 0 is a number rather than an absence.
+        ?assertEqual(Crossing, With#block.total_difficulty),
+        ?assertEqual(undefined, Without#block.total_difficulty),
+
+        %% Precondition: at this block the two total difficulties really do give
+        %% different forks, so the assertions below are not comparing a value
+        %% with itself.
+        ?assertNotEqual(fork_td(Network, Number, PreShanghai, undefined),
+                        fork_td(Network, Number, PreShanghai, Crossing)),
+
+        %% And fork/1 honours whichever the block carries.
+        ?assertEqual(fork_td(Network, Number, PreShanghai, Crossing),
+                     eth_block:fork(With)),
+        ?assertEqual(fork_td(Network, Number, PreShanghai, undefined),
+                     eth_block:fork(Without))
+    end).
+
+fork_td(Network, Number, Timestamp, TD) ->
+    {ok, F} = eth_fork_schedule:current_fork(Network, Number, Timestamp, TD),
+    F.
 
 %% Call the deployed contract the way the network would: a caller that is not the
 %% system address, asking about a block number.

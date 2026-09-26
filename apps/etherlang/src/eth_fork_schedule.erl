@@ -8,6 +8,7 @@
 -module(eth_fork_schedule).
 
 -export([ current_fork/3,
+          current_fork/4,
           fork_schedule/1,
           fork_at/3,
           configured_network/0,
@@ -92,14 +93,26 @@
 %% test that cross-checks it against eth_forkid's EIP-2124 data, so the two
 %% cannot drift apart silently.
 %%
-%% SCOPE -- the Merge is a total-difficulty activation, not a block number or
-%% a timestamp. A selector given only (number, timestamp) therefore cannot
-%% distinguish a pre-Merge block from a post-Merge one, and this client does
-%% not attempt to: it validates PoS execution payloads only, so Paris is the
-%% floor of the modelled range. Pre-Merge historical execution is out of
-%% scope, and for that reason Paris is the first fork reported for any block.
-%% Choosing a merge block number here would be guessing, so none is written
-%% down.
+%% SCOPE -- the Merge is a total-difficulty activation, not a block number or a
+%% timestamp, and leaving it out was a real gap rather than a scoping
+%% decision. A selector given only (number, timestamp) reports the highest
+%% *pre*-Merge fork it can see, so a mainnet block from 15537394 (the Merge) to
+%% the Shanghai timestamp came back as gray_glacier: executed under a
+%% difficulty bomb that had already been halted, at a difficulty that should
+%% have been zero. Silent, and wrong for every post-Merge block before
+%% Shanghai.
+%%
+%% The fix is to write down what the network actually uses. EIP-3675 activates
+%% on total difficulty, and TERMINAL_TOTAL_DIFFICULTY is a constant of the
+%% network rather than a guess about a block number, so a `{ttd, N, Fork}` entry
+%% is data in the same sense `{block, N, Fork}` is. current_fork/4 takes the
+%% block's total difficulty and honours it.
+%%
+%% current_fork/3, which has no total difficulty to offer, keeps the old
+%% behaviour and reports the pre-Merge fork. That is the honest direction to
+%% fail: an unknown total difficulty must not be read as "the merge happened",
+%% or a node would apply PoS rules to a block it has not established is
+%% post-Merge. Callers that hold a total difficulty must pass it.
 %%
 %% ETH_NETWORK selects the network (default sepolia, matching the default
 %% upstream). ETH_FORK pins the rules outright and is the escape hatch for
@@ -164,6 +177,13 @@ fork_schedule(mainnet) ->
      {block, 12965000, london},
      {block, 13773000, arrow_glacier},
      {block, 15050000, gray_glacier},
+     %% EIP-3675. The Merge is reached by total difficulty, not by a block
+     %% number, so this is the activation point the network actually uses and
+     %% the only one that distinguishes a pre-Merge block from a post-Merge one.
+     %% 58750000000000000000000 is mainnet's TERMINAL_TOTAL_DIFFICULTY: the
+     %% block that takes total difficulty to this value is the first PoS block,
+     %% and Paris applies to it and everything after.
+     {ttd, 58750000000000000000000, paris},
      {time, 1681338455, shanghai},
      {time, 1710338135, cancun},
      {time, 1746612311, prague},
@@ -175,7 +195,8 @@ fork_schedule(mainnet) ->
 %% schedule contains no block fork at all. London at genesis is why Sepolia
 %% has a base fee from its first block.
 fork_schedule(sepolia) ->
-    [{block, 0, homestead},
+    [{ttd, 0, paris},
+     {block, 0, homestead},
      {block, 0, tangerine},
      {block, 0, spurious_dragon},
      {block, 0, byzantium},
@@ -199,7 +220,15 @@ fork_schedule(_Other) ->
 %% Returns the highest-ranked active fork; a fork is active when the block's
 %% number has reached a block activation or its timestamp has reached a time
 %% activation. Paris is the floor, per the scope note above.
-current_fork(Network, BlockNumber, BlockTimestamp)
+current_fork(Network, BlockNumber, BlockTimestamp) ->
+    current_fork(Network, BlockNumber, BlockTimestamp, undefined).
+
+%% The total difficulty is what the Merge turns on, so a caller that knows it
+%% must say so. `undefined' means "not known", which is treated as "the merge
+%% has not been shown to have happened" rather than the other way round: a
+%% caller that guessed post-merge would execute a pre-Merge block's uncle
+%% header and difficulty bomb under PoS rules and never know it had.
+current_fork(Network, BlockNumber, BlockTimestamp, BlockTotalDifficulty)
   when is_integer(BlockNumber), is_integer(BlockTimestamp) ->
     case fork_schedule(Network) of
         [] ->
@@ -207,14 +236,24 @@ current_fork(Network, BlockNumber, BlockTimestamp)
             %% rules pin rather than guessing from the network name.
             {ok, configured_fork()};
         Schedule ->
-            Active = [Fork || {Kind, Point, Fork} <- Schedule, reached(Kind, Point,
-                                                                     BlockNumber,
-                                                                     BlockTimestamp)],
+            Active = [Fork || {Kind, Point, Fork} <- Schedule,
+                               reached(Kind, Point, BlockNumber, BlockTimestamp,
+                                       BlockTotalDifficulty)],
             {ok, highest_ranked(Active)}
     end.
 
-reached(block, Point, BlockNumber, _BlockTimestamp) -> BlockNumber >= Point;
-reached(time, Point, _BlockNumber, BlockTimestamp) -> BlockTimestamp >= Point.
+reached(block, Point, BlockNumber, _BlockTimestamp, _BlockTotalDifficulty) ->
+    BlockNumber >= Point;
+reached(time, Point, _BlockNumber, BlockTimestamp, _BlockTotalDifficulty) ->
+    BlockTimestamp >= Point;
+%% EIP-3675: the block that brings total difficulty to TERMINAL_TOTAL_DIFFICULTY
+%% is the first block of the PoS chain. Greater-or-equal, not greater: the
+%% transition block is itself post-Merge, and treating it as the last PoW block
+%% would put it under both rule sets.
+reached(ttd, _Point, _BlockNumber, _BlockTimestamp, undefined) -> false;
+reached(ttd, Point, _BlockNumber, _BlockTimestamp, TotalDifficulty)
+  when is_integer(TotalDifficulty) ->
+    TotalDifficulty >= Point.
 
 %% Pick the highest-ranked active fork. Ties are broken towards the fork that
 %% appears earliest in the schedule, and the choice is made by explicit filter

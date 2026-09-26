@@ -180,7 +180,7 @@ The Engine API (EIP-3675 / Cancun) is what lets a consensus client (Lighthouse, 
   - The declared state root is compared against the root recomputed after execution (Phase 4), and the receipts and transactions roots against the ones derived from the block's own body (Phase 5)
   - All three are reported as `{verified, Root} | {unverified, Reason}` verdicts in the `Verification` map. None of them is reported as a bare root: a recomputed value under a key named after a header field is indistinguishable from a confirmed one, and that is how a wrong receipts root passed unchecked until Phase 5
   - A block whose parent's state this node does not hold locally still gets its transactions root checked, since that root covers only the block's own transaction list. Its receipts root is reported `{unverified, not_executed}`
-- [x] **Transition configuration** — echoes `TERMINAL_TOTAL_DIFFICULTY` and `TERMINAL_BLOCK_HASH` back to the consensus client. The values are passed through, not interpreted: nothing in execution evaluates a total difficulty against the TTD to decide that the merge has happened (see EIP-3675 in Phase 5).
+- [x] **Transition configuration** — echoes `TERMINAL_TOTAL_DIFFICULTY` and `TERMINAL_BLOCK_HASH` back to the consensus client. `TERMINAL_TOTAL_DIFFICULTY` is now also *interpreted*: fork selection takes a block's total difficulty and activates Paris at the TTD (see EIP-3675 in Phase 5). `TERMINAL_BLOCK_HASH` is still only passed through.
 - [x] **Engine API authentication** — JWT secret via `JWT_SECRET` env var, HMAC-SHA256 verification
 - [x] **Engine API server startup** — `eth_rpc_server` starts separate cowboy listener on port 8551
 
@@ -298,9 +298,16 @@ EIP-1559, EIP-4788, EIP-4895 and EIP-2935 are implemented, and the two system-co
   - Process withdrawals in execution payload ✅ (through the state overlay, so the credits are inside the state root)
 - [ ] **EIP-3675 (PoS merge)** — full PoS execution engine (partial)
   - PoW difficulty = 0 after merge ✅
-  - `TERMINAL_TOTAL_DIFFICULTY` handling — carried through config but never evaluated against a total difficulty
+  - `TERMINAL_TOTAL_DIFFICULTY` handling ✅ — a `{ttd, N, Fork}` activation kind
+    alongside the block- and timestamp-activated ones; `current_fork/4` takes a
+    block's total difficulty, `#block{}` carries it, and mainnet's (58750000000000000000000)
+    and Sepolia's (0) are written down in the schedule
   - `TERMINAL_BLOCK_HASH` handling — not implemented
-  - Nothing decides that a chain has crossed the merge; Paris is the floor unconditionally, so a pre-merge block would run under post-merge rules
+  - The merge *was* mis-detected, silently. Paris was in no schedule and the
+    `paris` floor was unreachable once any listed fork was reached, so all 823461
+    mainnet blocks between the Merge and Shanghai executed as `gray_glacier`
+  - An unknown total difficulty reports the pre-merge fork rather than Paris, on
+    purpose: not knowing must not be read as "merged"
 - [ ] **Geth-compatible devp2p** — full protocol compliance
   - `eth/68` with all sub-protocols (status, new block, tx announcements)
   - `eth/69` (history) if needed
@@ -430,7 +437,7 @@ Where the work actually stands:
 | EIP-161 empty accounts, EIP-170 code size | done |
 | KZG commitment verification (EIP-4844) | **not done** |
 | Snap sync and proof-verified state reconstruction | **not done** |
-| Merge detection via TTD | **not done** — Paris is the floor unconditionally |
+| Merge detection via TTD | done — a `{ttd, N, Fork}` activation kind, gated on the block's own total difficulty, with mainnet's and Sepolia's TTDs in the schedule. `TERMINAL_BLOCK_HASH` is still not handled |
 
 Because the gas schedule is approximate, etherlang can execute blocks and report a state root, but that root is not expected to equal the one the network computed. The exact per-fork gas table and KZG commitment verification are listed above and are not done. Note that the fork-parameterized gas table that *looks* finished is not reachable from execution, so the gap is wider than its tests suggest. It is not established that the gas schedule is the *only* remaining divergence, because that cannot be checked without real prestate.
 

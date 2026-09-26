@@ -58,6 +58,7 @@ new(ParentHash, Number) ->
         timestamp = erlang:system_time(second),
         miner = <<0:160>>,
         difficulty = 0,
+        total_difficulty = undefined,
         gas_limit = ?MAX_GAS,
         gas_used = 0,
         transactions = [],
@@ -115,6 +116,7 @@ from_json(Map) when is_map(Map) ->
         timestamp = uint(maps:get(<<"timestamp">>, Map, 0)),
         miner = to_address(maps:get(<<"miner">>, Map, <<0:160>>)),
         difficulty = uint(maps:get(<<"difficulty">>, Map, 0)),
+        total_difficulty = uint_or_undefined(maps:get(<<"totalDifficulty">>, Map, undefined)),
         gas_limit = uint(maps:get(<<"gasLimit">>, Map, ?MAX_GAS)),
         extra_data = to_bytes(maps:get(<<"extraData">>, Map, <<>>)),
         nonce = to_bytes(maps:get(<<"nonce">>, Map, <<0:192>>)),
@@ -350,9 +352,9 @@ finalize_against(Block, ParentRoot, Txs, GasLimit, BaseFee) ->
 %% client's. Nothing caught it, because the tests for those calls invoke
 %% eth_fork_schedule directly with an explicit fork argument and so never go
 %% through this.
-fork_of(#block{number = Number, timestamp = Ts}) ->
+fork_of(#block{number = Number, timestamp = Ts, total_difficulty = TD}) ->
     try eth_fork_schedule:current_fork(
-          eth_fork_schedule:configured_network(), Number, Ts) of
+          eth_fork_schedule:configured_network(), Number, Ts, TD) of
         {ok, Fork} when is_atom(Fork) -> Fork;
         Fork when is_atom(Fork) -> Fork;
         _ -> paris

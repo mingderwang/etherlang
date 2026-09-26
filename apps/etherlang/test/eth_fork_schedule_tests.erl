@@ -114,6 +114,92 @@ fork_selection_sepolia_test() ->
     ?assertEqual(osaka, fork(sepolia, 11779968, 1760427360)),
     ?assertEqual(amsterdam, fork(sepolia, 11779968, 1791294816)).
 
+%% ---------------------------------------------------------------------------
+%% EIP-3675: the Merge is gated on total difficulty
+%% ---------------------------------------------------------------------------
+
+%% Mainnet's TERMINAL_TOTAL_DIFFICULTY. The Merge is a total-difficulty
+%% activation, so unlike every other fork it has no block number and no
+%% timestamp: it is the value total difficulty reaches at block 15537394. It is
+%% a constant of the network, written down here as data rather than as a guess
+%% about a block number.
+-define(MAINNET_TTD, 58750000000000000000000).
+
+%% The bug this gates. A post-Merge mainnet block before Shanghai used to come
+%% back gray_glacier, because the schedule jumped from gray_glacier straight to
+%% the Shanghai timestamp and nothing recognised the transition. It would then
+%% have been executed under a difficulty bomb that had already been halted, at a
+%% difficulty that should have been zero -- and nothing would have said so.
+%%
+%% The blocks are past Gray Glacier (15050000) and the timestamp 1670000000 sits
+%% between the Merge and Shanghai (1681338455), which is exactly the range that
+%% was wrong. Every one of the 823461 blocks in that window was mis-executed.
+merge_is_gated_on_total_difficulty_test() ->
+    ?assertEqual(paris, fork_td(mainnet, 16000000, 1670000000, ?MAINNET_TTD + 1000)),
+    ?assertEqual(gray_glacier, fork_td(mainnet, 16000000, 1670000000,
+                                      ?MAINNET_TTD - 1)).
+
+%% The transition block is itself post-Merge. Greater-or-equal, not greater:
+%% treating block 15537394 as the last PoW block would put it under both rule
+%% sets, and geth's MergeFORK treats the block that reaches the TTD as the
+%% first block of the PoS chain.
+merge_block_itself_is_post_merge_test() ->
+    ?assertEqual(paris, fork_td(mainnet, 15537394, 1660000000, ?MAINNET_TTD)),
+    ?assertEqual(gray_glacier, fork_td(mainnet, 15537393, 1660000000, ?MAINNET_TTD - 1)).
+
+%% Not knowing the total difficulty is not the same as knowing the chain has not
+%% merged. The selector fails toward pre-Merge, because a caller that guessed
+%% "merged" would apply PoS rules -- difficulty zero, no uncle processing, no
+%% difficulty bomb -- to a block that might not be post-Merge, and would not
+%% know it had. current_fork/3 is the no-total-difficulty entry point, and it
+%% has to agree with this rather than quietly returning paris.
+unknown_total_difficulty_is_not_read_as_merged_test() ->
+    ?assertEqual(gray_glacier, fork(mainnet, 15537394, 1660000000)),
+    ?assertEqual(gray_glacier, fork(mainnet, 16000000, 1670000000)),
+    %% And the pre-Merge answer is not vacuous: it differs from the post-Merge
+    %% one for the very same block.
+    ?assertEqual(paris, fork_td(mainnet, 16000000, 1670000000, ?MAINNET_TTD + 1000)).
+
+%% Sepolia merged at genesis, so its TERMINAL_TOTAL_DIFFICULTY is 0. That makes
+%% 0 a load-bearing value: if undefined and 0 were conflated, Sepolia would
+%% report a post-Merge chain as pre-Merge forever. current_fork/3 leaves it
+%% alone -- there is no way to know -- but a caller that passes the 0 it was
+%% given must get Paris.
+sepolia_merged_at_genesis_test() ->
+    ?assertEqual(paris, fork_td(sepolia, 1, 1633267481, 0)),
+    %% With no total difficulty there is no way to know, and London -- the
+    %% highest *block*-activated fork -- is what falls out. Sepolia has no Arrow
+    %% or Gray Glacier entry, because both predate it.
+    ?assertEqual(london, fork_td(sepolia, 1, 1633267481, undefined)),
+    ?assertEqual(london, fork_td(sepolia, 1, 1633267481, -1)).
+
+%% Paris must sit between Gray Glacier and Shanghai in the ranking, or the gate
+%% above would pick the wrong side of two of the three boundaries.
+paris_ranks_between_gray_glacier_and_shanghai_test() ->
+    Post = ?MAINNET_TTD + 1000,
+    ?assertEqual(paris, fork_td(mainnet, 16000000, 1670000000, Post)),
+    %% Once Shanghai's timestamp passes, Shanghai wins over Paris.
+    ?assertEqual(shanghai, fork_td(mainnet, 16000000, 1690000000, Post)).
+
+%% Shanghai, Cancun and Prague are activated by *timestamp* and are not gated on
+%% the total difficulty at all, because the network did not need them to be. So
+%% a block whose total difficulty is below the TTD but whose timestamp is past
+%% Shanghai's is reported as Shanghai -- Paris is correctly withheld, and a
+%% post-Merge fork is reported anyway.
+%%
+%% This combination does not occur on mainnet, since the Merge (September 2022)
+%% precedes Shanghai (April 2023) by seven months, so it is a property of the
+%% schedule rather than a divergence from it. It is pinned here because the day
+%% a network's fork order is not "Merge first" this becomes a real bug, and
+%% nothing else would notice.
+timestamp_fork_is_not_gated_on_the_merge_test() ->
+    ?assertEqual(shanghai, fork_td(mainnet, 19000000, 1690000000, ?MAINNET_TTD - 1)),
+    ?assertEqual(paris, fork_td(mainnet, 19000000, 1670000000, ?MAINNET_TTD + 1)).
+
+fork_td(Network, Number, Timestamp, TD) ->
+    {ok, F} = eth_fork_schedule:current_fork(Network, Number, Timestamp, TD),
+    F.
+
 %% A network with no schedule falls back to the ETH_FORK rules pin instead of
 %% guessing from its name.
 fork_selection_unknown_network_test() ->

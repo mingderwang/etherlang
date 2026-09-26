@@ -15,7 +15,7 @@
   - Fee recipient (coinbase) set ✅
   - State root matches after execution (deferred to Phase 4)
   - Receipts root matches after execution (deferred to Phase 4)
-- [x] **Transition configuration** — handle `TERMINAL_TOTAL_DIFFICULTY` and `TERMINAL_BLOCK_HASH` correctly for PoW→PoS transition
+- [x] **Transition configuration** — `TERMINAL_TOTAL_DIFFICULTY` is handled: it is the Merge's activation input, and fork selection evaluates a block's total difficulty against it (see EIP-3675 in Phase 5). `TERMINAL_BLOCK_HASH` is carried in the config and echoed back to the CL, but nothing checks a post-Merge block's difficulty against it or validates that the last PoW block is the one it names — that part is **not** done and is listed under EIP-3675 below
 - [ ] **Safe/finalized forkchoice** — handle CL's safe and finalized forkchoice updates, update `eth_sync:track_finalized/1` to respect CL finality
 - [x] **Engine API authentication** — JWT secret via `JWT_SECRET` env var, HMAC-SHA256 verification
 - [x] **Execution engine status** — engine status tracked in `eth_engine` gen_server
@@ -85,7 +85,7 @@
 
 ## Phase 5: Protocol Compliance (12 tasks)
 - [ ] **Per-fork exact gas schedule** — replace approximate gas with exact per-fork schedule
-  - Fork *selection* is done and driven by real network activation points (`current_fork/3`; Paris is the modelled floor, the Merge being a TTD activation rather than a block number). What is not done is the per-fork *gas table*: `eth_evm` still carries one approximate schedule, so opcode costs are wrong on every fork and are not bit-exact against any of them.
+  - Fork *selection* is done and driven by real network activation points, including the Merge's total-difficulty activation (`current_fork/4`; see EIP-3675 below). What is not done is the per-fork *gas table*: `eth_evm` still carries one approximate schedule, so opcode costs are wrong on every fork and are not bit-exact against any of them.
   - **There is a fork-parameterized table and it is dead code.** `eth_fork_schedule:gas_cost/3,4` (over `base_gas_cost/3` and `dynamic_gas_cost/3`) takes a fork atom, is exported, and has its own unit tests — and nothing in the execution path calls it. The EVM charges `eth_evm:base_cost/1`, which takes no fork. Only the tests exercise the fork-aware table, so it passing proves nothing about execution.
   - This matters for two reasons. It means the task is further from done than "one approximate schedule" suggests: wiring it up is not the remaining work, it is the *start* of it. And it means the two tables have been free to disagree, because nothing ever compared them. They do — see the entries fixed below, and `eth_evm` lacks EIP-150's pre-Berlin access costs and EIP-3860's init-code word cost entirely.
   - Istanbul, Berlin, London, Arrow Glacier, Gray Glacier, Merge, Bellatrix, Paris, Shanghai, Cancun, Deneb
@@ -118,7 +118,11 @@
   - Verified against two real Sepolia blocks (2 and 16 withdrawals)
 - [ ] **EIP-3675 (PoS merge)** — full PoS execution engine (partial)
   - Post-merge blocks are modelled: difficulty is 0 and the header is built in the PoS shape.
-  - **Not** done: `TERMINAL_TOTAL_DIFFICULTY` is threaded through the engine config and the block builder but is never *evaluated* against a block's total difficulty, and `TERMINAL_BLOCK_HASH` is not handled at all. Nothing here decides that a chain has crossed the merge; fork selection treats Paris as the floor unconditionally. A pre-merge block would be executed under post-merge rules.
+  - The merge is now **detected**, by total difficulty. `{ttd, N, Fork}` is a third activation kind alongside `{block, N, Fork}` and `{time, T, Fork}`, and `current_fork/4` takes a block's total difficulty. Mainnet's `TERMINAL_TOTAL_DIFFICULTY` (58750000000000000000000) and Sepolia's (0) are written down in the schedule as data, which is what the network uses and not a guess about a block number.
+  - `#block{}` carries `total_difficulty` and `from_json/1` reads it. `undefined` is distinct from `0`, because Sepolia's TTD *is* 0: conflating them would report a post-Merge chain as pre-Merge forever.
+  - This was a silent mis-execution, not a missing feature. Paris was absent from both schedules and `highest_ranked([]) -> paris` could never fire once any listed fork was reached, so every mainnet block from the Merge (15537394) to the Shanghai timestamp — 823461 blocks — was executed as `gray_glacier`: with a difficulty bomb that had already been halted, at a difficulty that should have been zero.
+  - An **unknown** total difficulty reports the *pre*-Merge fork, not Paris. The selector fails toward "not merged" on purpose: a caller that guessed "merged" would apply PoS rules to a block it has not established is post-Merge, and would not know it had. `current_fork/3` therefore does not answer the merge question at all, and `eth_block:fork/1` only answers it when the block actually carries the field.
+  - **Still not done**: `TERMINAL_BLOCK_HASH` is not handled at all — nothing checks a post-Merge block's difficulty against it, and nothing validates that the last PoW block is the one named. The timestamp-activated forks (Shanghai, Cancun, Prague) are not gated on the merge either, which is right for mainnet and Sepolia because both merged before Shanghai, and would be a bug on a network whose fork order differed. That is pinned by a test rather than left implicit.
 - [ ] **Geth-compatible devp2p** — full protocol compliance
   - `eth/68` with all sub-protocols, `eth/69` (history) if needed
   - Snap protocol (`snap/1`) full compliance

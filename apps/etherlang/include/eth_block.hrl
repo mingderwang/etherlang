@@ -18,6 +18,13 @@
     timestamp :: integer(),
     miner :: binary(),
     difficulty :: integer(),
+    %% Total difficulty *including this block*, or undefined when the source did
+    %% not supply it. It is the Merge's activation input (EIP-3675), so a block
+    %% that carries it can say which side of the transition it is on. undefined
+    %% is not the same as 0: 0 is a real total difficulty -- Sepolia's, for one,
+    %% which merged at genesis -- and reading it as "unknown" would report a
+    %% post-Merge chain as pre-Merge forever.
+    total_difficulty :: integer() | undefined,
     gas_limit :: integer(),
     gas_used :: integer(),
     transactions :: [map()],
