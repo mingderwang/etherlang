@@ -246,8 +246,14 @@ interop() ->
         {ok, Bodies2} = eth_eth:decode_bodies_bin(eth_rlp:encode(Bodies)),
         Roots2 = [begin {ok, R} = eth_eth:bodies_tx_root(B), R end || B <- Bodies2],
         ?assertEqual(Roots1, Roots2),
-        gen_server:stop(PidA),
-        gen_server:stop(PidB),
+        %% Both stops are guarded, as the `after' clause below already guards
+        %% its own. Stopping PidB unguarded made this test fail with `exit:noproc'
+        %% whenever that server had already gone -- which it does under load, and
+        %% which says nothing about the code under test. A test that fails for a
+        %% reason unrelated to what it asserts is worse than no test: it trains
+        %% the reader to re-run failures instead of reading them.
+        (try gen_server:stop(PidA) catch _:_ -> ok end),
+        (try gen_server:stop(PidB) catch _:_ -> ok end),
         gen_tcp:close(LS)
     after
         (try gen_server:stop(chain_eth_ab) catch _:_ -> ok end)

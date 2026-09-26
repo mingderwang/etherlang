@@ -18,7 +18,6 @@
 
 -define(DEFAULT_MAX, 1024).
 -define(DEFAULT_PER_SENDER, 16).
--define(INTRINSIC_BASE, 21000).
 -define(MAX_GAS, 30000000).
 
 -record(st, {txs = #{},
@@ -127,10 +126,37 @@ tx_hash(Bin) -> bin0x(eth_keccak:hash(Bin)).
 norm(H) when is_binary(H) -> string:lowercase(H);
 norm(_) -> error.
 
-%% Static + dynamic validation. Entry carries price for ordering.
+%% Admission runs the same validity rules block execution does.
+%%
+%% The pool used to run three checks of its own -- sender recovery, a chain id read
+%% straight off the `chainId' field, and a gas sanity bound -- and nothing else.
+%% Every other rule eth_tx:validate/2 enforces went unchecked at admission, so a
+%% blob transaction carrying no versioned hashes, or no maxFeePerBlobGas, was
+%% accepted here, handed a hash back to the caller and broadcast to its peers. It
+%% was rejected later, when a block tried to execute it.
+%%
+%% Those rules were not missing, and they were not untested either. They were
+%% tested through eth_block_builder:validate_transaction/2, which nothing in the
+%% application calls -- the builder is neither started nor referenced outside one
+%% test file. So the tests were green and the live path stayed open, which is the
+%% failure mode where passing tests are the problem rather than the reassurance.
 validate(S, Tx) ->
-    case {eth_tx:sender(Tx), tx_chain_ok(Tx), tx_gas_ok(Tx)} of
-        {{ok, Sender}, true, true} ->
+    case eth_tx:validate(Tx, pool_ctx()) of
+        ok -> admit(S, Tx);
+        {error, _} = E -> E
+    end.
+
+%% The pool's own share, and only that: what eth_tx:validate/2 is not asked to
+%% decide because the answer belongs to the pool rather than to the transaction.
+%%
+%% Balance and nonce are read from the pool's state view and are what separate
+%% `pending' from `queued'. eth_tx knows only whether the nonce matches, which
+%% would collapse a gapped transaction into a rejection, so that distinction is
+%% kept here. `base_nonce => unknown' records that the account could not be read
+%% at all, so a later attempt can retry rather than mistake the gap for real.
+admit(S, Tx) ->
+    case eth_tx:sender(Tx) of
+        {ok, Sender} ->
             State = S#st.state,
             Nonce = q(maps:get(<<"nonce">>, Tx, 0)),
             Price = price(Tx),
@@ -155,50 +181,41 @@ validate(S, Tx) ->
                             {error, no_state}
                     end
             end;
-        {{error, _} = E, _, _} ->
-            E;
-        _ ->
-            {error, invalid_tx}
+        {error, _} = E ->
+            E
     end.
 
 entry(Tx, Sender, Nonce, Price, Cost, Base) ->
     #{tx => Tx, sender => bin0x(Sender), nonce => Nonce,
       price => Price, cost => Cost, base_nonce => Base}.
 
-%% The chain id comes from configuration, not from a literal.
+%% The context admission is validated against. Deliberately short.
 %%
-%% This used to hardcode 11155111, which is Sepolia's. That is a chain id
-%% *assumption* dressed as a rule: on mainnet, or on any testnet but Sepolia, it
-%% rejects every transaction and the pool is a black hole. Worse, it silently
-%% disagrees with eth_block, which asks eth_fork_schedule:chain_id/0 -- so a node
-%% configured for one chain would accept into its pool what it then refused to
-%% finalize, or the reverse. One source, read the same way by every caller.
-tx_chain_ok(Tx) ->
-    case maps:get(<<"chainId">>, Tx, undefined) of
-        undefined ->
-            %% Legacy without EIP-155: only accepted with explicit v (still
-            %% replayable -- reject).
-            false;
-        C ->
-            to_int(C) =:= eth_fork_schedule:chain_id()
-    end.
-
-%% Gas sanity: known bounds, intrinsic floor, non-zero limit.
+%% chain_id and gas_limit are facts about this node, so they are supplied and their
+%% rules are enforced here as well as at execution. The chain id is the same
+%% eth_fork_schedule:chain_id/0 the block path reads, and the pool's own version
+%% used to hardcode 11155111 -- Sepolia's. That read as a chain id *assumption*
+%% dressed as a rule: on any other network it rejects every transaction and the
+%% pool is a black hole, and it disagreed with eth_block about which chain this
+%% node is on, so a node could accept into its pool what it then refused to
+%% finalize. Delegating also makes the pool's rule stronger where it was weaker:
+%% eth_tx derives a legacy transaction's chain id from `v', so a transaction whose
+%% `chainId' field contradicts its own signature is now caught, and a legitimate
+%% EIP-155 transaction that carries only `v' is no longer rejected for lacking
+%% the field. gas_limit likewise replaces a hardcoded ceiling with the one the
+%% block path enforces, so the two cannot drift apart.
 %%
-%% The intrinsic floor itself comes from eth_tx, which is the same function the
-%% block builder and block finalization use. This used to carry its own copy, and
-%% the copies disagreed in two ways: a contract-creation transaction was charged
-%% the 21000 transfer price instead of 53000, and EIP-3860 init-code word cost was
-%% missing entirely. Both are "charges less than consensus says" bugs, so a
-%% transaction the pool accepted could be one the validator rejected.
-tx_gas_ok(Tx) ->
-    Gas = to_int(maps:get(<<"gas">>, Tx, 0)),
-    Gas > 0 andalso Gas =< ?MAX_GAS andalso Gas >= intrinsic(Tx).
-
-intrinsic(Tx) ->
-    try eth_tx:intrinsic_gas(Tx)
-    catch _:_ -> ?INTRINSIC_BASE
-    end.
+%% base_fee and blob_base_fee are *not* supplied. Both depend on the block being
+%% built -- the first on the parent's gas use, the second on the parent's excess
+%% blob gas -- so neither is knowable when a transaction is submitted, and
+%% supplying a guess would reject transactions a later block would have accepted.
+%% eth_tx treats an absent key as the rule being unchecked rather than passed, so
+%% omitting them defers both floors to block execution, where the real values
+%% exist. For the same reason no balance_of/nonce_of fun is passed: those checks
+%% belong to admit/2 above.
+pool_ctx() ->
+    #{chain_id => eth_fork_schedule:chain_id(),
+      gas_limit => ?MAX_GAS}.
 
 price(Tx) ->
     case maps:get(<<"maxFeePerGas">>, Tx, undefined) of

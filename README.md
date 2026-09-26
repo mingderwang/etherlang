@@ -207,13 +207,24 @@ The current `eth_state` uses a bounded DETS-backed snap leaf store. A complete e
 
 ### Phase 3: Block Production (partial)
 
-Blocks are built and executed, but the node does not author them: it never receives proposer duties, so a locally built block is a construct for testing rather than something the network would accept. Execution is real — receipts, logs, bloom, state root — but the gas schedule has no per-fork branching, so the state roots it produces do not match the network's.
+Blocks arriving from a peer are executed for real, but the node does not author them, and the code that would is unreachable — see the builder below. It never receives proposer duties, so even a working builder would produce a construct for testing rather than something the network would accept. Execution is real — receipts, logs, bloom, state root — but the gas schedule has no per-fork branching, so the state roots it produces do not match the network's.
 
-- [x] **Block builder** — construct execution payloads from the transaction pool
-  - Select transactions from pending pool (by gas price / priority fee) ✅
-  - Respect block gas limit ✅
-  - Handle blob transactions (EIP-4844) (partial — point evaluation runs locally; no KZG commitment verification)
-  - Compute gas used, receipts, logs, bloom filter ✅
+- [ ] **Block builder** — construct execution payloads from the transaction pool
+  - The functions exist in `eth_block_builder` and were ticked done. They are
+    not reachable. The module is a `gen_server` that nothing starts — absent
+    from `etherlang.app.src`'s `registered` list and from the supervisor's
+    children — and nothing calls it, so `build_block/0,1` would raise `noproc`
+    if anything did. Its one surviving use is `validate_transaction/2`, from a
+    test file
+  - Select transactions from pending pool (by gas price / priority fee) — written, unreachable, untested
+  - Respect block gas limit — written, unreachable, untested
+  - Handle blob transactions (EIP-4844) — the fee-floor and commitment-hash checks exist in that wrapper; blob sidecar data is not propagated
+  - Compute gas used, receipts, logs, bloom filter — this is real and tested, but it happens in `eth_block` during execution and finalization, not in the builder
+  - Incomplete even if it were started: `build_block/1` reads `parent_hash` and
+    `number` from its options and discards both, `do_build/1` re-derives the
+    parent from `eth_chain:head/1` instead, so no block can be built on anything
+    but the current head; and the payload is never appended, there being no
+    `eth_submitBlock` and no `engine_getPayload` to hand one to
 - [ ] **Block header** — construct full block header:
   - Parent hash, uncle hash, fee recipient, state root, receipts root
   - Logs bloom, difficulty (0 in PoS), number, gas limit, gas used
@@ -324,8 +335,28 @@ EIP-1559, EIP-4788, EIP-4895 and EIP-2935 are implemented, and the two system-co
 - [ ] **Receipt verification** — verify transaction receipts on the peer path
   - Receipts are built during execution, but one arriving from a peer is never recomputed and compared
 - [x] **Full transaction validation** — every transaction in every block ✅
-  - `eth_tx:validate/1,2` is the single implementation; the pool, the block
-    builder and block finalization all delegate to it
+  - `eth_tx:validate/1,2` is the single implementation, and block finalization
+    and the block builder's wrapper both delegate to it. **The transaction pool
+    did not**, and this file used to say it did. The pool ran three checks of
+    its own — sender recovery, a chain id read straight off the `chainId` field,
+    a gas bound — and stopped, so every other rule went unchecked at admission:
+    a blob transaction with no versioned hashes, or with no
+    `maxFeePerBlobGas`, was given a hash and broadcast to peers, and was only
+    refused later when a block tried to execute it. The rules that would have
+    refused it were not untested either; they were tested through
+    `eth_block_builder:validate_transaction/2`, which nothing in the
+    application calls. The suite was green and the live path was open
+  - Admission now runs `eth_tx:validate/2`, and the pool's two weaker
+    duplicates are gone. The authoritative chain-id rule is both stronger — it
+    derives a legacy transaction's id from `v`, so a `chainId` field that
+    contradicts the signature is caught — and more correct, since a valid
+    EIP-155 transaction carrying only `v` is no longer rejected for lacking the
+    field. The hardcoded gas ceiling is now the block path's `gas_limit`
+  - `base_fee` and `blob_base_fee` are deliberately **not** passed to it. Both
+    depend on the block being built, and supplying a guess would refuse
+    transactions a later block would have accepted. An absent context key means
+    the rule is unchecked rather than passed, so both floors stay with block
+    execution, where the real values exist
   - `eth_block:finalize/1` validates before executing and returns
     `{error, {invalid_transaction, Index, Reason}}` without committing — an
     invalid transaction in a block changes nothing

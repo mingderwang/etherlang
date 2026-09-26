@@ -316,3 +316,127 @@ hex_to_bin(<<"0x", R/binary>>) -> binary:decode_hex(R).
 
 pair(Blocks) ->
     [{eth_hex:decode(maps:get(<<"number">>, B)), B, true} || B <- Blocks].
+
+%% ---------------------------------------------------------------------------
+%% Admission runs the same validity rules block execution does
+%% ---------------------------------------------------------------------------
+%%
+%% eth_tx:validate/2 enforced all of this already, and had tests for it, but the
+%% tests called eth_block_builder:validate_transaction/2 -- a wrapper that
+%% nothing in the application invokes, because the builder is neither started nor
+%% referenced outside a test file. eth_sendRawTransaction goes through eth_txpool,
+%% and admission there ran three checks of its own and stopped. So a blob
+%% transaction with no versioned hashes was given a hash and broadcast to peers,
+%% and the rules that would have refused it were green in the suite.
+%%
+%% Each case below goes through eth_txpool:add_map/3, which is the path the RPC
+%% handler takes.
+
+blob_tx_without_hashes_is_refused_at_admission_test() ->
+    ?assertEqual({error, bad_blob_hashes}, admit(blob_tx(#{<<"blobVersionedHashes">> => []}))).
+
+%% The commitments are well formed here, so the only thing wrong is the missing
+%% fee. eth_tx checks the hashes first, so leaving them out as well would report
+%% bad_blob_hashes and this case would pass for the wrong reason.
+blob_tx_without_blob_fee_is_refused_at_admission_test() ->
+    ?assertEqual({error, invalid_blob_fee},
+                 admit(blob_tx(#{<<"maxFeePerBlobGas">> => absent,
+                                 <<"blobVersionedHashes">> => [bin0x(versioned_hash(1))]}))).
+
+%% A commitment that is present but malformed is refused as well. A versioned
+%% hash is a 32-byte KZG commitment hash with the 0x01 version byte on top, so a
+%% leading 0x02 is not one.
+blob_tx_with_a_malformed_commitment_is_refused_test() ->
+    ?assertEqual({error, bad_blob_hashes},
+                 admit(blob_tx(#{<<"blobVersionedHashes">> => [bin0x(<<2, 0:248>>)]}))).
+
+%% A well-formed one is admitted, so the rules above are discriminating rather
+%% than a blanket refusal of blob transactions.
+blob_tx_with_a_well_formed_commitment_is_admitted_test() ->
+    ?assertMatch({ok, _},
+                 admit(blob_tx(#{<<"blobVersionedHashes">> => [bin0x(versioned_hash(1))]}))).
+
+%% eth_tx:validate/2 checks the blob shape before the signature, which is why an
+%% unsigned transaction reaches a blob verdict at all. Pinned because it is
+%% load-bearing for the cases above: reorder those two checks and they would
+%% start reporting bad_signature, which would look like the rules had been
+%% dropped rather than like an ordering change.
+blob_shape_is_checked_before_the_signature_test() ->
+    ?assertNotEqual({error, bad_signature},
+                    admit(blob_tx(#{<<"blobVersionedHashes">> => []}))).
+
+%% The pool's own nonce rule is unchanged by any of this: a transaction ahead of
+%% the account nonce is queued, not rejected, because eth_tx:validate/2 only
+%% knows whether the nonce matches and would call a gap bad_nonce.
+gapped_nonce_is_still_queued_not_refused_test() ->
+    Priv = eth_secp256k1:generate_key(),
+    Tx = sign_legacy(Priv, (base_tx())#{<<"nonce">> => <<"0x7">>}),
+    Addr = bin0x(addr_bin(eth_ecies:pubkey(Priv))),
+    State = funded_state(Addr, 1000000000000000000, 0),
+    Name = fresh_pool(),
+    {ok, _} = eth_txpool:start_link(#{name => Name}),
+    try
+        {ok, _} = eth_txpool:add_map(Name, Tx, State),
+        ?assertEqual(1, length(eth_txpool:queued(Name)))
+    after
+        (try gen_server:stop(Name) catch _:_ -> ok end)
+    end.
+
+%% --- helpers ---------------------------------------------------------------
+
+fresh_pool() ->
+    list_to_atom("pool_admit_" ++ integer_to_list(erlang:unique_integer([positive]))).
+
+%% Build a signed EIP-4844 transaction, run it past admission, and return the
+%% verdict. The account is funded and at nonce 0 so the balance and nonce checks
+%% are not what is under test.
+admit(Tx0) ->
+    Priv = eth_secp256k1:generate_key(),
+    Tx = Tx0#{<<"v">> => <<"0x0">>, <<"r">> => <<"0x0">>, <<"s">> => <<"0x0">>},
+    Signed = sign_blob(drop_absent(Tx), Priv),
+    Addr = bin0x(addr_bin(eth_ecies:pubkey(Priv))),
+    State = funded_state(Addr, 1000000000000000000, 0),
+    Name = fresh_pool(),
+    {ok, _} = eth_txpool:start_link(#{name => Name}),
+    try
+        eth_txpool:add_map(Name, Signed, State)
+    after
+        (try gen_server:stop(Name) catch _:_ -> ok end)
+    end.
+
+blob_tx(Extra) ->
+    maps:merge(#{<<"type">> => <<"0x3">>,
+                 <<"chainId">> => <<"0xaa36a7">>,
+                 <<"nonce">> => <<"0x0">>,
+                 <<"maxPriorityFeePerGas">> => <<"0x3">>,
+                 <<"maxFeePerGas">> => <<"0x77359400">>,
+                 <<"gas">> => <<"0x186a0">>,
+                 <<"to">> => <<"0x1000000000000000000000000000000000000001">>,
+                 <<"value">> => <<"0x0">>,
+                 <<"input">> => <<"0x">>,
+                 <<"maxFeePerBlobGas">> => <<"0x3b9aca00">>}, Extra).
+
+%% `absent' is a request to remove the key, so a missing field is genuinely
+%% missing rather than present-and-atom-valued.
+drop_absent(Tx) ->
+    maps:filter(fun(_, V) -> V =/= absent end, Tx).
+
+sign_blob(Tx, Priv) ->
+    Digest = eth_keccak:hash(<<16#03, (eth_rlp:encode(preimage_fields(Tx)))/binary>>),
+    {R, S, V} = eth_secp256k1:sign(Digest, Priv),
+    Tx#{<<"v">> => eth_hex:encode_int(V),
+        <<"r">> => eth_hex:encode_int(R),
+        <<"s">> => eth_hex:encode_int(S)}.
+
+preimage_fields(Tx) ->
+    [q(<<"chainId">>, Tx), q(<<"nonce">>, Tx),
+     q(<<"maxPriorityFeePerGas">>, Tx), q(<<"maxFeePerGas">>, Tx),
+     q(<<"gas">>, Tx), to_bin(maps:get(<<"to">>, Tx)), q(<<"value">>, Tx),
+     to_bin(maps:get(<<"input">>, Tx)),
+     [], q(<<"maxFeePerBlobGas">>, Tx), eth_tx:blob_versioned_hashes(Tx)].
+
+to_bin(<<"0x", R/binary>>) -> binary:decode_hex(R);
+to_bin(B) when is_binary(B), byte_size(B) =:= 20 -> B;
+to_bin(_) -> <<>>.
+
+versioned_hash(Tag) -> <<1, (binary:copy(<<Tag>>, 31))/binary>>.

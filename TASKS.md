@@ -37,10 +37,19 @@
 
 ## Phase 3: Block Production (7 tasks)
 - [ ] **Block builder** — construct execution payloads from the transaction pool:
-  - Select transactions from pending pool (by gas price / priority fee)
-  - Respect block gas limit
-  - Handle blob transactions (EIP-4844)
-  - Compute gas used, receipts, logs, bloom filter
+  - The sub-tasks are listed as work to do, but the code for most of them is
+    already written in `eth_block_builder` and is unreachable. The module is a
+    `gen_server` that nothing starts — it is in neither `etherlang.app.src`'s
+    `registered` list nor the supervisor's children — and nothing calls it, so
+    `build_block/0,1` would raise `noproc`. Its only surviving use is
+    `validate_transaction/2`, from one test file. It is also incomplete on its
+    own terms: `build_block/1` reads `parent_hash` and `number` from its options
+    and discards both, `do_build/1` re-derives the parent from `eth_chain:head/1`
+    instead, and the built payload is never appended
+  - Select transactions from pending pool (by gas price / priority fee) — written, unreachable, untested
+  - Respect block gas limit — written, unreachable, untested
+  - Handle blob transactions (EIP-4844) — the wrapper's fee and commitment-hash checks are real; blob sidecar data is not propagated
+  - Compute gas used, receipts, logs, bloom filter — done in `eth_block` during execution and finalization, not here
 - [ ] **Block header** — construct full block header:
   - Parent hash, uncle hash, fee recipient, state root, receipts root
   - Logs bloom, difficulty (0 in PoS), number, gas limit, gas used
@@ -145,6 +154,8 @@
   - The transactions root depends on nothing but the block's own transaction list, so it is checked even when the parent's state is not held locally and the body cannot be executed. The receipts root genuinely needs execution, and is reported `{unverified, not_executed}` on that path rather than guessed.
 - [x] **Full transaction validation** — validate every transaction in every block ✅
   - `eth_tx:validate/1,2` is the single implementation. `eth_block:finalize/1` calls it per transaction before executing, and a block containing an invalid one returns `{error, {invalid_transaction, Index, Reason}}` without committing state — executing it anyway would produce a wrong state root and accept an invalid block
+  - The transaction pool delegates to it too, which it did not until recently and which documentation here claimed it did. Admission ran three checks of its own and stopped, so the EIP-4844 rules went unchecked on the `eth_sendRawTransaction` path: a blob transaction with no versioned hashes or no `maxFeePerBlobGas` was given a hash and broadcast, and refused only when a block tried to execute it. Those rules had tests — through `eth_block_builder:validate_transaction/2`, which nothing in the application calls. The pool's two weaker duplicates were removed rather than kept in step, since the authoritative chain-id rule is both stronger (it derives a legacy id from `v`, catching a `chainId` field that contradicts the signature) and more correct (a valid EIP-155 transaction carrying only `v` was being rejected for lacking the field)
+  - `base_fee` and `blob_base_fee` are deliberately not passed to admission. Both depend on the block being built, so neither is knowable at submission, and a guess would refuse transactions a later block would have accepted. An absent context key means the rule is unchecked rather than passed, so the two floors stay with block execution
   - The sender is recovered from the signature; there is no `from` fallback, and `validate/2` deliberately ignores the payload's `from` because that field is a JSON-RPC annotation, not part of the signed payload
   - Checked, in rule order: type supported → field shapes and ranges → `to`/data/access list → fee fields consistent with the type → fee ceiling against the base fee → EIP-4844 blob rules → the intrinsic gas floor → signature (recoverable, `r` in range, `s` not malleable) → chain id → block gas limit → nonce and balance against the *executing* pre-state
   - **Not** done: the checks read configuration and pre-state the node holds. A transaction is not replayed against a historical root, and no signature is verified against a cached authority set
