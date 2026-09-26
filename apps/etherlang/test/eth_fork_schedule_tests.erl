@@ -380,3 +380,258 @@ gas_cost_call_test() ->
     %% DELEGATECALL and STATICCALL share the access cost.
     ?assertEqual(2600, eth_fork_schedule:gas_cost(16#F4, cancun, 0, #{})),
     ?assertEqual(2600, eth_fork_schedule:gas_cost(16#FA, cancun, 0, #{})).
+
+%% ---------------------------------------------------------------------------
+%% Gas schedule completeness
+%% ---------------------------------------------------------------------------
+%%
+%% Everything above samples the table. That is how it came to be wrong for
+%% eighteen opcodes with its own tests green: gas_cost_basics_test/0 checks ADD,
+%% MUL, SUB, DIV, MOD, ADDM, EXP, KECCAK256 and CREATE -- nine opcodes the table
+%% already had right -- and not one it had wrong. The tests below assert the
+%% whole table instead.
+%%
+%% Note that gas_cost/3,4 returns base *plus* dynamic, so every expectation here
+%% is a total for the given length argument. A base of 3 for a copy opcode is
+%% 6 at one word, and reading these numbers as bases is itself a trap.
+
+%% The complete Cancun base schedule. Costs are those of EIP-2929 (Berlin,
+%% warm/cold) as amended by EIP-3529 (London), EIP-3541/EIP-3651 (Shanghai) and
+%% EIP-4844 (Cancun), quoted at dynamic length 0 for a *cold* access. Memory
+%% expansion is charged by the interpreter and is not in this table.
+cancun_schedule() ->
+    [{16#00, "STOP",             0},
+     {16#01, "ADD",              3},
+     {16#02, "MUL",              5},
+     {16#03, "SUB",              3},
+     {16#04, "DIV",              5},
+     {16#05, "SDIV",             5},
+     {16#06, "MOD",              5},
+     {16#07, "SMOD",             5},
+     {16#08, "ADDM",             8},
+     {16#09, "MULMOD",           8},
+     {16#0A, "EXP",             10},
+     {16#0B, "SIGNEXTEND",       5}]
+    ++ named(16#10, ["LT", "GT", "SLT", "SGT", "EQ", "ISZERO", "AND", "OR",
+                     "XOR", "NOT", "BYTE", "SHL", "SHR", "SAR"], 3)
+    ++ [{16#20, "KECCAK256",     30},
+        {16#30, "ADDRESS",       2},
+        {16#31, "BALANCE",    2600},
+        {16#32, "ORIGIN",        2},
+        {16#33, "CALLER",        2},
+        {16#34, "CALLVALUE",     2},
+        {16#35, "CALLDATALOAD",  3},
+        {16#36, "CALLDATASIZE",  2},
+        {16#37, "CALLDATACOPY",  3},
+        {16#38, "CODESIZE",      2},
+        {16#39, "CODECOPY",      3},
+        {16#3A, "GASPRICE",      2},
+        {16#3B, "EXTCODESIZE", 2600},
+        {16#3C, "EXTCODECOPY", 2600},
+        {16#3D, "RETURNDATASIZE", 2},
+        {16#3E, "RETURNDATACOPY", 3},
+        {16#3F, "EXTCODEHASH", 2600},
+        {16#40, "BLOCKHASH",    20}]
+    ++ named(16#41, ["COINBASE", "TIMESTAMP", "NUMBER", "PREVRANDAO",
+                     "GASLIMIT", "CHAINID"], 2)
+    ++ [{16#47, "SELFBALANCE",   5},
+        {16#48, "BASEFEE",      20},
+        {16#49, "BLOBHASH",     20},
+        {16#4A, "BLOBBASEFEE",  20},
+        {16#50, "POP",           2},
+        {16#51, "MLOAD",         3},
+        {16#52, "MSTORE",        3},
+        {16#53, "MSTORE8",       3},
+        {16#54, "SLOAD",      2100},
+        {16#56, "JUMP",          8},
+        {16#57, "JUMPI",        10},
+        {16#58, "PC",            2},
+        {16#59, "MSIZE",         2},
+        {16#5A, "GAS",           2},
+        {16#5B, "JUMPDEST",      1},
+        {16#5C, "TLOAD",       100},
+        {16#5D, "TSTORE",      100},
+        {16#5E, "MCOPY",         3},
+        {16#5F, "PUSH0",         2}]
+    ++ numbered("PUSH", 16#60, 16#7F, 3)
+    ++ numbered("DUP", 16#80, 16#8F, 3)
+    ++ numbered("SWAP", 16#90, 16#9F, 3)
+    ++ [{16#A0, "LOG0",        375},
+        {16#A1, "LOG1",        750},
+        {16#A2, "LOG2",       1125},
+        {16#A3, "LOG3",       1500},
+        {16#A4, "LOG4",       1875},
+        {16#F0, "CREATE",     32000},
+        {16#F1, "CALL",        2600},
+        {16#F2, "CALLCODE",   2600},
+        {16#F4, "DELEGATECALL", 2600},
+        {16#F5, "CREATE2",    32000},
+        {16#FA, "STATICCALL",  2600},
+        {16#FF, "SELFDESTRUCT", 5000}].
+
+%% Expand a contiguous family that shares one price. PUSH1 through PUSH32 and
+%% its DUP and SWAP relatives, named per opcode so a failure says which.
+numbered(Name, First, Last, Cost) ->
+    [{Op, Name ++ integer_to_list(Op - First + 1), Cost}
+     || Op <- lists:seq(First, Last)].
+
+%% Expand a contiguous family that shares one price and has fixed names.
+named(First, Names, Cost) ->
+    [{First + N - 1, Name, Cost}
+     || {N, Name} <- lists:zip(lists:seq(1, length(Names)), Names)].
+
+%% Every price the table reports, for a cold access and no dynamic term.
+priced(Fork, Args) ->
+    [{Op, eth_fork_schedule:gas_cost(Op, Fork, 0, Args)}
+     || Op <- lists:seq(0, 255),
+        eth_fork_schedule:gas_cost(Op, Fork, 0, Args) =/= 0].
+
+%% The priced set is asserted *exactly*, not merely member by member, so an
+%% opcode that loses its clause and falls through to the catch-all is reported
+%% as a missing entry. That is the mechanism behind the four free opcodes below:
+%% the catch-all prices an unassigned opcode at 0, which is the opposite of the
+%% safe default, because an opcode nobody has costed is the one case that ought
+%% to be conspicuous.
+no_opcode_is_silently_unpriced_test() ->
+    Expected = lists:usort([Op || {Op, Name, _} <- cancun_schedule(),
+                                  Name =/= "STOP"]),
+    Priced = lists:usort([Op || {Op, _} <- priced(cancun, #{})]),
+    ?assertEqual({unexpected_prices, Priced -- Expected}, {unexpected_prices, []}),
+    ?assertEqual({unpriced_opcodes, Expected -- Priced}, {unpriced_opcodes, []}).
+
+%% ...and the values, one assertion per opcode, so a failure names the opcode
+%% rather than diffing two ninety-element lists.
+cancun_base_schedule_values_test() ->
+    [?assertEqual({Name, Cost},
+                  {Name, eth_fork_schedule:gas_cost(Op, cancun, 0, #{})})
+     || {Op, Name, Cost} <- cancun_schedule()],
+    ok.
+
+%% The opcodes that are genuinely free must be free by decision. They share
+%% their 0 with the undefined opcodes, so a lost clause here is invisible to
+%% no_opcode_is_silently_unpriced_test/0, and this is what keeps that from
+%% happening unnoticed.
+free_opcodes_are_free_by_decision_test() ->
+    ?assertEqual({16#00, "STOP", 0},
+                 {16#00, "STOP", eth_fork_schedule:gas_cost(16#00, cancun, 0, #{})}),
+    ?assertEqual({16#F3, "RETURN", 0},
+                 {16#F3, "RETURN", eth_fork_schedule:gas_cost(16#F3, cancun, 0, #{})}),
+    ?assertEqual({16#FD, "REVERT", 0},
+                 {16#FD, "REVERT", eth_fork_schedule:gas_cost(16#FD, cancun, 0, #{})}),
+    %% INVALID is free because what it costs is not a number but an exceptional
+    %% halt consuming the frame's whole allowance -- see eth_evm:run/5, whose
+    %% error form deliberately carries no gas figure. It was 5000 here, which is
+    %% neither its price nor a halt.
+    ?assertEqual({16#FE, "INVALID", 0},
+                 {16#FE, "INVALID", eth_fork_schedule:gas_cost(16#FE, cancun, 0, #{})}),
+    %% SSTORE's base is 0 because its entire cost is the EIP-2200/EIP-3529
+    %% dynamic term. It was 2, swept into a range with POP and JUMPDEST.
+    ?assertEqual({16#55, "SSTORE", 0},
+                 {16#55, "SSTORE", eth_fork_schedule:gas_cost(16#55, cancun, 0, #{})}).
+
+%% The opcodes the table had wrong before this commit, and the mistake each was.
+%% Kept separate so the record stays legible rather than living only in a diff.
+wrongly_priced_opcodes_are_now_right_test() ->
+    %% SELFBALANCE shared a clause with CREATE and CREATE2 -- they are the three
+    %% opcodes that read the *caller's* account -- and inherited 32000. A
+    %% contract could not afford to check its own balance. RETURNDATASIZE was
+    %% routed through access_cost/3 and cost 2600, a thousand times its price.
+    ?assertEqual({16#47, "SELFBALANCE", 5},
+                 {16#47, "SELFBALANCE", eth_fork_schedule:gas_cost(16#47, cancun, 0, #{})}),
+    ?assertEqual({16#3D, "RETURNDATASIZE", 2},
+                 {16#3D, "RETURNDATASIZE", eth_fork_schedule:gas_cost(16#3D, cancun, 0, #{})}),
+    %% TLOAD, TSTORE, MCOPY and PUSH0 had no clause at all and fell to the
+    %% catch-all, so all four were free. Cancun code uses all four.
+    ?assertEqual({16#5C, "TLOAD", 100},
+                 {16#5C, "TLOAD", eth_fork_schedule:gas_cost(16#5C, cancun, 0, #{})}),
+    ?assertEqual({16#5D, "TSTORE", 100},
+                 {16#5D, "TSTORE", eth_fork_schedule:gas_cost(16#5D, cancun, 0, #{})}),
+    ?assertEqual({16#5F, "PUSH0", 2},
+                 {16#5F, "PUSH0", eth_fork_schedule:gas_cost(16#5F, cancun, 0, #{})}),
+    %% Three blocks of the opcode table were priced by range where only some of
+    %% the members share a cost. 0x50-0x5B at 2 caught MLOAD, MSTORE, MSTORE8
+    %% and JUMPDEST; 0x35-0x3A at 3 caught CALLDATASIZE, CODESIZE and GASPRICE;
+    %% 0x55-0x5A at 2 caught JUMP and JUMPI. A range is the wrong tool across a
+    %% block where the members do not agree.
+    ?assertEqual({16#51, "MLOAD", 3},
+                 {16#51, "MLOAD", eth_fork_schedule:gas_cost(16#51, cancun, 0, #{})}),
+    ?assertEqual({16#52, "MSTORE", 3},
+                 {16#52, "MSTORE", eth_fork_schedule:gas_cost(16#52, cancun, 0, #{})}),
+    ?assertEqual({16#53, "MSTORE8", 3},
+                 {16#53, "MSTORE8", eth_fork_schedule:gas_cost(16#53, cancun, 0, #{})}),
+    ?assertEqual({16#5B, "JUMPDEST", 1},
+                 {16#5B, "JUMPDEST", eth_fork_schedule:gas_cost(16#5B, cancun, 0, #{})}),
+    ?assertEqual({16#36, "CALLDATASIZE", 2},
+                 {16#36, "CALLDATASIZE", eth_fork_schedule:gas_cost(16#36, cancun, 0, #{})}),
+    ?assertEqual({16#38, "CODESIZE", 2},
+                 {16#38, "CODESIZE", eth_fork_schedule:gas_cost(16#38, cancun, 0, #{})}),
+    ?assertEqual({16#3A, "GASPRICE", 2},
+                 {16#3A, "GASPRICE", eth_fork_schedule:gas_cost(16#3A, cancun, 0, #{})}),
+    ?assertEqual({16#56, "JUMP", 8},
+                 {16#56, "JUMP", eth_fork_schedule:gas_cost(16#56, cancun, 0, #{})}),
+    ?assertEqual({16#57, "JUMPI", 10},
+                 {16#57, "JUMPI", eth_fork_schedule:gas_cost(16#57, cancun, 0, #{})}),
+    ok.
+
+%% SLOAD is EIP-2929 warm/cold like every other access, but its cold cost is
+%% 2100 rather than the 2600 an account access costs: SLOAD is not an account
+%% access, and had it shared that helper it would have been 25% wrong in the
+%% expensive direction. It was 2, inside the 0x50-0x5B range.
+sload_is_warm_cold_with_its_own_cold_cost_test() ->
+    ?assertEqual(2100, eth_fork_schedule:gas_cost(16#54, cancun, 0, #{})),
+    ?assertEqual(100,  eth_fork_schedule:gas_cost(16#54, cancun, 0, #{warm => true})),
+    %% Before Berlin it was a flat 200, raised by EIP-150, with no warm/cold
+    %% distinction to honour.
+    ?assertEqual(200,  eth_fork_schedule:gas_cost(16#54, istanbul, 0, #{})),
+    ?assertEqual(200,  eth_fork_schedule:gas_cost(16#54, istanbul, 0, #{warm => true})).
+
+%% MCOPY copies whole words, so it charges 3 base plus 3 per word -- the same
+%% shape as the other copy opcodes. It had no clause, so copying memory, which
+%% Cancun introduced precisely to stop contracts rolling their own loop, was
+%% free.
+mcopy_costs_three_plus_three_per_word_test() ->
+    ?assertEqual(3, eth_fork_schedule:gas_cost(16#5E, cancun, 0)),
+    ?assertEqual(6, eth_fork_schedule:gas_cost(16#5E, cancun, 1)),
+    ?assertEqual(6, eth_fork_schedule:gas_cost(16#5E, cancun, 32)),
+    %% One byte past a word boundary costs a whole extra word.
+    ?assertEqual(9, eth_fork_schedule:gas_cost(16#5E, cancun, 33)),
+    ?assertEqual(9, eth_fork_schedule:gas_cost(16#5E, cancun, 64)),
+    %% Same shape as CALLDATACOPY and CODECOPY, for comparison.
+    ?assertEqual(3, eth_fork_schedule:gas_cost(16#37, cancun, 0)),
+    ?assertEqual(6, eth_fork_schedule:gas_cost(16#37, cancun, 32)).
+
+%% EIP-3860 charges both creators 2 gas per 32-byte word of init code, and
+%% CREATE2 additionally hashes the init code at KECCAK256's 6 per word, so
+%% CREATE2 pays 8 per word and CREATE pays 2. Neither term was in the table: a
+%% contract deploying a large contract paid nothing for the code it was about to
+%% run. eth_tx:initcode_gas/2 charges the same 2 per word in a transaction's
+%% intrinsic gas, so the two agree rather than the opcode double-counting.
+eip_3860_initcode_and_create2_hashing_test() ->
+    ?assertEqual(32000,   eth_fork_schedule:gas_cost(16#F0, cancun, 0)),
+    ?assertEqual(32002,   eth_fork_schedule:gas_cost(16#F0, cancun, 1)),
+    ?assertEqual(32002,   eth_fork_schedule:gas_cost(16#F0, cancun, 32)),
+    ?assertEqual(32004,   eth_fork_schedule:gas_cost(16#F0, cancun, 33)),
+    ?assertEqual(32000,   eth_fork_schedule:gas_cost(16#F5, cancun, 0)),
+    ?assertEqual(32008,   eth_fork_schedule:gas_cost(16#F5, cancun, 1)),
+    ?assertEqual(32008,   eth_fork_schedule:gas_cost(16#F5, cancun, 32)),
+    ?assertEqual(32016,   eth_fork_schedule:gas_cost(16#F5, cancun, 33)),
+    %% DELEGATECALL and STATICCALL are calls, not creators, so they pay neither
+    %% term: the address is not 20 new bytes of init code.
+    ?assertEqual(2600,    eth_fork_schedule:gas_cost(16#F4, cancun, 0)),
+    ?assertEqual(2600,    eth_fork_schedule:gas_cost(16#F4, cancun, 32)).
+
+%% RETURNDATASIZE and RETURNDATACOPY had their per-word costs the wrong way
+%% round: 0x3D, which takes no length at all, carried the 3-per-word term and
+%% 0x3E, which does, carried none. So reading the size of a return buffer was
+%% charged per byte of it and copying it was not charged at all.
+returndata_copy_costs_three_per_word_and_size_costs_nothing_test() ->
+    ?assertEqual(2, eth_fork_schedule:gas_cost(16#3D, cancun, 0)),
+    %% The size is independent of the buffer, and the table's length argument
+    %% is ignored for it rather than applied.
+    ?assertEqual(2, eth_fork_schedule:gas_cost(16#3D, cancun, 1024)),
+    ?assertEqual(3, eth_fork_schedule:gas_cost(16#3E, cancun, 0)),
+    ?assertEqual(6, eth_fork_schedule:gas_cost(16#3E, cancun, 32)),
+    ?assertEqual(9, eth_fork_schedule:gas_cost(16#3E, cancun, 33)),
+    %% EXTCODECOPY keeps its 3-per-word term; the swap above did not disturb it.
+    ?assertEqual(2600, eth_fork_schedule:gas_cost(16#3C, cancun, 0)),
+    ?assertEqual(2603, eth_fork_schedule:gas_cost(16#3C, cancun, 32)).

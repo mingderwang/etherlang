@@ -905,50 +905,119 @@ gas_cost(Opcode, Fork, Gas, Args) when is_map(Args) ->
 gas_cost(Opcode, Fork, Gas, _Args) ->
     gas_cost(Opcode, Fork, Gas).
 
-base_gas_cost(16#00, _, _) -> 0;
-base_gas_cost(16#01, _, _) -> 3;
-base_gas_cost(16#02, _, _) -> 5;
-base_gas_cost(16#03, _, _) -> 3;
-base_gas_cost(16#04, _, _) -> 5;
-base_gas_cost(16#05, _, _) -> 5;
-base_gas_cost(16#06, _, _) -> 5;
-base_gas_cost(16#07, _, _) -> 5;
-base_gas_cost(16#08, _, _) -> 8;
-base_gas_cost(16#09, _, _) -> 8;
-base_gas_cost(16#0A, _, _) -> 10;
-base_gas_cost(16#0B, _, _) -> 5;
+%% Base (constant) gas per opcode, for Cancun-era rules unless a clause says
+%% otherwise. This table was wrong for eighteen opcodes before 2026-09; the
+%% specific failures are named beside the clauses that now carry the right
+%% values, because each was a plausible-looking mistake rather than a typo.
+base_gas_cost(16#00, _, _) -> 0;                                   % STOP
+base_gas_cost(16#01, _, _) -> 3;                                   % ADD
+base_gas_cost(16#02, _, _) -> 5;                                   % MUL
+base_gas_cost(16#03, _, _) -> 3;                                   % SUB
+base_gas_cost(16#04, _, _) -> 5;                                   % DIV
+base_gas_cost(16#05, _, _) -> 5;                                   % SDIV
+base_gas_cost(16#06, _, _) -> 5;                                   % MOD
+base_gas_cost(16#07, _, _) -> 5;                                   % SMOD
+base_gas_cost(16#08, _, _) -> 8;                                   % ADDM
+base_gas_cost(16#09, _, _) -> 8;                                   % MULMOD
+base_gas_cost(16#0A, _, _) -> 10;                                  % EXP
+base_gas_cost(16#0B, _, _) -> 5;                                   % SIGNEXTEND
 base_gas_cost(Op, _, _) when Op >= 16#10, Op =< 16#1D -> 3;
-base_gas_cost(16#20, _, _) -> 30;
-base_gas_cost(16#30, _, _) -> 2;
-base_gas_cost(16#31, Fork, Args) -> access_cost(Fork, 400, Args);
-base_gas_cost(16#32, _, _) -> 2;
-base_gas_cost(16#33, _, _) -> 2;
-base_gas_cost(16#34, _, _) -> 2;
-base_gas_cost(Op, _, _) when Op >= 16#35, Op =< 16#3A -> 3;
-base_gas_cost(16#3B, Fork, Args) -> access_cost(Fork, 700, Args);
-base_gas_cost(16#3C, Fork, Args) -> access_cost(Fork, 700, Args);
-base_gas_cost(16#3D, Fork, Args) -> access_cost(Fork, 700, Args);
-base_gas_cost(16#3E, _, _) -> 2;
-base_gas_cost(16#3F, Fork, Args) -> access_cost(Fork, 400, Args);
-base_gas_cost(16#40, _, _) -> 20;
+base_gas_cost(16#20, _, _) -> 30;                                  % KECCAK256
+base_gas_cost(16#30, _, _) -> 2;                                   % ADDRESS
+base_gas_cost(16#31, Fork, Args) -> access_cost(Fork, 400, Args);  % BALANCE
+base_gas_cost(16#32, _, _) -> 2;                                   % ORIGIN
+base_gas_cost(16#33, _, _) -> 2;                                   % CALLER
+base_gas_cost(16#34, _, _) -> 2;                                   % CALLVALUE
+base_gas_cost(16#35, _, _) -> 3;                                   % CALLDATALOAD
+%% CALLDATASIZE, CODESIZE and GASPRICE are 2. These three sat in a 0x35-0x3A
+%% range priced at 3, which is the price of the *operations* in the same block
+%% of the opcode table; a range is the wrong tool across a block where only
+%% some of the members share a cost.
+base_gas_cost(16#36, _, _) -> 2;
+base_gas_cost(16#37, _, _) -> 3;                                   % CALLDATACOPY
+base_gas_cost(16#38, _, _) -> 2;                                   % CODESIZE
+base_gas_cost(16#39, _, _) -> 3;                                   % CODECOPY
+base_gas_cost(16#3A, _, _) -> 2;                                   % GASPRICE
+base_gas_cost(16#3B, Fork, Args) -> access_cost(Fork, 700, Args);  % EXTCODESIZE
+base_gas_cost(16#3C, Fork, Args) -> access_cost(Fork, 700, Args);  % EXTCODECOPY
+%% RETURNDATASIZE is 2. It was routed through access_cost/3, so a Cancun read
+%% cost 2600 -- a thousand times the real price, and enough to out-of-gas a loop
+%% that loops over return data. RETURNDATACOPY is the one with a per-word cost,
+%% and it is 3.
+base_gas_cost(16#3D, _, _) -> 2;
+base_gas_cost(16#3E, _, _) -> 3;
+base_gas_cost(16#3F, Fork, Args) -> access_cost(Fork, 400, Args);  % EXTCODEHASH
+base_gas_cost(16#40, _, _) -> 20;                                  % BLOCKHASH
 base_gas_cost(Op, _, _) when Op >= 16#41, Op =< 16#46 -> 2;
-base_gas_cost(16#47, Fork, _) -> account_creation_cost(Fork);
-base_gas_cost(16#48, _, _) -> 20;
-base_gas_cost(16#49, _, _) -> 20;
-base_gas_cost(16#4A, _, _) -> 20;
-base_gas_cost(Op, _, _) when Op >= 16#50, Op =< 16#5B -> 2;
-base_gas_cost(Op, _, _) when Op >= 16#60, Op =< 16#9F -> 3;
+%% SELFBALANCE is 5. It shared a clause with CREATE and CREATE2 -- the three
+%% opcodes that read the *caller's* account -- and inherited 32000. A contract
+%% checking its own balance could not afford to do so.
+base_gas_cost(16#47, _, _) -> 5;
+base_gas_cost(16#48, _, _) -> 20;                                  % BASEFEE
+base_gas_cost(16#49, _, _) -> 20;                                  % BLOBHASH
+base_gas_cost(16#4A, _, _) -> 20;                                  % BLOBBASEFEE
+base_gas_cost(16#50, _, _) -> 2;                                   % POP
+base_gas_cost(16#51, _, _) -> 3;                                   % MLOAD
+base_gas_cost(16#52, _, _) -> 3;                                   % MSTORE
+base_gas_cost(16#53, _, _) -> 3;                                   % MSTORE8
+%% SLOAD is EIP-2929 warm/cold, and its cold cost is 2100 rather than the 2600
+%% an account access costs. It was inside a 0x50-0x5B range priced at 2, so a
+%% storage read was 1050x too cheap.
+base_gas_cost(16#54, Fork, Args) -> sload_cost(Fork, Args);
+base_gas_cost(16#55, _, _) -> 0;                                   % SSTORE, all dynamic
+%% JUMP and JUMPI are 8 and 10. Like the CALLDATASIZE group above they were
+%% swept into a range that priced them at 2.
+base_gas_cost(16#56, _, _) -> 8;
+base_gas_cost(16#57, _, _) -> 10;
+base_gas_cost(16#58, _, _) -> 2;                                   % PC
+base_gas_cost(16#59, _, _) -> 2;                                   % MSIZE
+base_gas_cost(16#5A, _, _) -> 2;                                   % GAS
+base_gas_cost(16#5B, _, _) -> 1;                                   % JUMPDEST
+%% TLOAD, TSTORE, MCOPY and PUSH0 (Cancun) had no clause at all and fell to
+%% the catch-all below, which prices an unassigned opcode at 0. So the first
+%% two were free and MCOPY and PUSH0 were free. A catch-all of 0 is the
+%% opposite of the safe default: an opcode nobody has costed is the one case
+%% that should be conspicuous, and this is the reason gas_cost/3 was not
+%% trustworthy despite its own tests passing.
+base_gas_cost(16#5C, _, _) -> 100;                                 % TLOAD
+base_gas_cost(16#5D, _, _) -> 100;                                 % TSTORE
+base_gas_cost(16#5E, _, _) -> 3;                                   % MCOPY
+base_gas_cost(16#5F, _, _) -> 2;                                   % PUSH0
+base_gas_cost(Op, _, _) when Op >= 16#60, Op =< 16#7F -> 3;        % PUSH1..PUSH32
+base_gas_cost(Op, _, _) when Op >= 16#80, Op =< 16#8F -> 3;        % DUP1..DUP16
+base_gas_cost(Op, _, _) when Op >= 16#90, Op =< 16#9F -> 3;        % SWAP1..SWAP16
 base_gas_cost(Op, _, _) when Op >= 16#A0, Op =< 16#A4 -> 375 * (Op - 16#A0 + 1);
-base_gas_cost(16#F0, Fork, _) -> account_creation_cost(Fork);
-base_gas_cost(16#F1, Fork, Args) -> call_cost(Fork, Args);
-base_gas_cost(16#F2, Fork, Args) -> call_cost(Fork, Args);
-base_gas_cost(16#F3, _, _) -> 0;
-base_gas_cost(16#F4, Fork, Args) -> call_cost(Fork, Args);
-base_gas_cost(16#F5, Fork, _) -> account_creation_cost(Fork);
-base_gas_cost(16#FA, Fork, Args) -> call_cost(Fork, Args);
-base_gas_cost(16#FF, Fork, _) -> selfdestruct_cost(Fork);
-base_gas_cost(16#FE, _, _) -> 5000;
+base_gas_cost(16#F0, Fork, _) -> account_creation_cost(Fork);       % CREATE
+base_gas_cost(16#F1, Fork, Args) -> call_cost(Fork, Args);         % CALL
+base_gas_cost(16#F2, Fork, Args) -> call_cost(Fork, Args);         % CALLCODE
+base_gas_cost(16#F3, _, _) -> 0;                                   % RETURN
+base_gas_cost(16#F4, Fork, Args) -> call_cost(Fork, Args);         % DELEGATECALL
+base_gas_cost(16#F5, Fork, _) -> account_creation_cost(Fork);       % CREATE2
+base_gas_cost(16#FA, Fork, Args) -> call_cost(Fork, Args);         % STATICCALL
+base_gas_cost(16#FD, _, _) -> 0;                                   % REVERT
+%% INVALID is priced 0, like RETURN and REVERT, because what it costs is not a
+%% number: it is an exceptional halt that consumes the frame's whole allowance.
+%% See eth_evm:run/5, whose error form deliberately carries no gas figure. It
+%% was 5000 here, which is neither its price nor a halt.
+base_gas_cost(16#FE, _, _) -> 0;
+base_gas_cost(16#FF, Fork, _) -> selfdestruct_cost(Fork);           % SELFDESTRUCT
+%% An opcode with no assigned cost. 0 is the right answer only for the ones
+%% that are genuinely free and for the undefined opcodes, which cannot appear
+%% in deployed code; it is a guess everywhere else, and gas_cost/3's own tests
+%% did not notice for TLOAD, TSTORE, MCOPY and PUSH0 for exactly that reason.
 base_gas_cost(_, _, _) -> 0.
+
+%% SLOAD (EIP-2929). A cold slot costs 2100 and a warm one 100, from Berlin.
+%% Pre-Berlin it was a flat 200, raised by E-150.
+sload_cost(Fork, Args) ->
+    case at_least(Fork, berlin) of
+        false -> 200;
+        true ->
+            case maps:get(warm, Args, false) of
+                true -> 100;
+                false -> 2100
+            end
+    end.
 
 %% EIP-2929 (Berlin): a cold account access costs 2600 and a warm one costs
 %% 100. Before Berlin the flat legacy cost applies. EIP-150 raised the
@@ -989,9 +1058,18 @@ dynamic_gas_cost(16#20, _Fork, Length, _Args) -> 6 * ((Length + 31) div 32);
 dynamic_gas_cost(16#37, _Fork, Length, _Args) -> 3 * ((Length + 31) div 32);
 dynamic_gas_cost(16#39, _Fork, Length, _Args) -> 3 * ((Length + 31) div 32);
 dynamic_gas_cost(16#3C, _Fork, Length, _Args) -> 3 * ((Length + 31) div 32);
-dynamic_gas_cost(16#3D, _Fork, Length, _Args) -> 3 * ((Length + 31) div 32);
+dynamic_gas_cost(16#3E, _Fork, Length, _Args) -> 3 * ((Length + 31) div 32);
+%% MCOPY (Cancun) copies words, not bytes, and the word size is 32 either way.
+dynamic_gas_cost(16#5E, _Fork, Length, _Args) -> 3 * ((Length + 31) div 32);
 dynamic_gas_cost(Op, _Fork, Length, _Args) when Op >= 16#A0, Op =< 16#A4 ->
     8 * Length;
+%% EIP-3860 (Shanghai): both creators are charged 2 gas per 32-byte word of
+%% init code. eth_tx:initcode_gas/2 charges the same cost in a transaction's
+%% intrinsic gas, so the two agree rather than the opcode double-counting.
+dynamic_gas_cost(16#F0, _Fork, Length, _Args) -> 2 * ((Length + 31) div 32);
+%% CREATE2 additionally hashes the init code, at KECCAK256's per-word price.
+dynamic_gas_cost(16#F5, _Fork, Length, _Args) ->
+    6 * ((Length + 31) div 32) + 2 * ((Length + 31) div 32);
 dynamic_gas_cost(_Op, _Fork, _Length, _Args) -> 0.
 
 %% ---------------------------------------------------------------------------

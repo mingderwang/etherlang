@@ -151,8 +151,13 @@ call_state(CallerBal, CalleeCode) ->
 
 %% CALL stack: retlen, retoff, argslen, argsoff, value, to, gas.
 call_seq(ToByte, Value, Op) ->
+    <<(call_args(ToByte, Value))/binary, Op>>.
+
+%% The same seven arguments with the opcode left off, so the cost of the pushes
+%% can be measured and subtracted rather than written down as a constant.
+call_args(ToByte, Value) ->
     <<16#60,0, 16#60,0, 16#60,0, 16#60,0, 16#60,Value,
-      16#60,ToByte, 16#61,16#FF,16#FF, Op>>.
+      16#60,ToByte, 16#61,16#FF,16#FF>>.
 
 call_value_revert_rolls_back_test() ->
     %% Callee immediately reverts; the 40 wei sent must come back.
@@ -257,6 +262,97 @@ balance_cold_then_warm_test() ->
     Code = <<16#60,16#0E, 16#31, 16#50, 16#60,16#0E, 16#31, 16#50, 16#00>>,
     {ok, _, GasLeft, _, _} = eth_evm:run(Code, ?MSG0, State, ?ENV, ?GAS),
     ?assertEqual(?GAS - 2710, GasLeft).
+
+%% ---------------------------------------------------------------------------
+%% The CALL family has no base cost of its own
+%% ---------------------------------------------------------------------------
+
+%% EIP-2929 prices a call as its access cost and nothing else: 2600 cold, 100
+%% warm, plus 9000 for a value transfer and 25000 when the destination account
+%% does not yet exist, plus memory expansion of the argument and return regions.
+%% do_call/3 charges all of that, so base_cost/1 has nothing left to add and must
+%% be 0 for all four opcodes.
+%%
+%% DELEGATECALL was the only one that said so. CALL, CALLCODE and STATICCALL said
+%% nothing at all and fell to the catch-all, which charges 3. So every CALL,
+%% CALLCODE and STATICCALL in every block was charged 3 gas more than the
+%% specification says, while DELEGATECALL was correct.
+%%
+%% Three gas changes no execution outcome, which is why nothing caught it: no
+%% test fails, no contract behaves differently, the node still tracks the head.
+%% But gasUsed is a field in a receipt, the receipts root is in the block header,
+%% and the header is hashed -- so this is exactly the class of difference that
+%% makes an otherwise-correct execution compute the wrong block hash.
+call_family_has_no_base_cost_of_its_own_test() ->
+    [?assertEqual({call_name(Op), 2600},
+                  {call_name(Op), call_gas(Op, cold, funded)})
+     || Op <- [16#F1, 16#F2, 16#F4, 16#FA]],
+    ok.
+
+%% ...and the same four once the target is warm. This is what separates "the
+%% access cost is right" from "the total happens to come out right": the three
+%% gas in question are independent of warm/cold, so a table wrong in both places
+%% could pass the cold case alone.
+call_family_warm_target_costs_one_hundred_test() ->
+    [?assertEqual({call_name(Op), 100},
+                  {call_name(Op), call_gas(Op, warm, funded)})
+     || Op <- [16#F1, 16#F2, 16#F4, 16#FA]],
+    ok.
+
+%% The two optional terms, and the condition on the second: the 25000 new-account
+%% charge only applies to a call that transfers value, because a call that
+%% transfers nothing cannot create an account. Charging it on a zero-value call
+%% would make every read-only call cost 25000 more than it should.
+call_optional_terms_follow_the_specification_test() ->
+    NoValue = call_gas(16#F1, cold, funded),
+    WithValue = call_gas(16#F1, cold, funded_with_value),
+    NewAccount = call_gas(16#F1, cold, absent_account),
+    ?assertEqual(NoValue + 9000, WithValue),
+    ?assertEqual(WithValue + 25000, NewAccount).
+
+%% Gas one call opcode costs, measured by running the argument pushes, the call
+%% and a STOP. The pushes and the warm-up are measured and subtracted rather than
+%% written down, so what is asserted is a statement about the call rather than
+%% about the code wrapped around it.
+call_gas(Op, Warm, Account) ->
+    Warmup = case Warm of
+                 cold -> <<>>;
+                 warm -> <<16#60,16#0D, 16#31, 16#50>>
+             end,
+    {State, Value} = case Account of
+                         funded -> {call_state(1000000, <<16#00>>), 0};
+                         funded_with_value -> {call_state(1000000, <<16#00>>), 40};
+                         absent_account ->
+                             {eth_state:new(0, #{{balance, ?CALLER} => 1000000,
+                                                 {nonce, ?CALLER} => 0}), 40}
+                     end,
+    Code = <<Warmup/binary, (call_seq(16#0D, Value, Op))/binary, 16#00>>,
+    {ok, _, Left, _, _} = eth_evm:run(Code, ?MSG0, State, ?ENV, ?GAS),
+    ?GAS - Left - prologue_gas() - warmup_cost(Warm).
+
+warmup_cost(cold) -> 0;
+warmup_cost(warm) -> warmup_gas().
+
+%% Gas the seven pushed arguments cost, measured by running them and stopping.
+prologue_gas() ->
+    Code = <<(call_args(16#0D, 0))/binary, 16#00>>,
+    {ok, _, Left, _, _} = eth_evm:run(Code, ?MSG0, call_state(1000000, <<16#00>>),
+                                      ?ENV, ?GAS),
+    ?GAS - Left.
+
+%% Gas the BALANCE that warms the target costs: its PUSH1, the cold access, and
+%% the POP. Also measured, so a change to BALANCE's price cannot quietly make
+%% this test's warm figure wrong in the same direction twice.
+warmup_gas() ->
+    Code = <<16#60,16#0D, 16#31, 16#50, 16#00>>,
+    {ok, _, Left, _, _} = eth_evm:run(Code, ?MSG0, call_state(1000000, <<16#00>>),
+                                      ?ENV, ?GAS),
+    ?GAS - Left.
+
+call_name(16#F1) -> "CALL";
+call_name(16#F2) -> "CALLCODE";
+call_name(16#F4) -> "DELEGATECALL";
+call_name(16#FA) -> "STATICCALL".
 
 %% ---------------------------------------------------------------------------
 %% Environment-reading opcodes cost 20, not 2

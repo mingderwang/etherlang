@@ -227,6 +227,10 @@ base_cost(16#5F) -> 2;
 base_cost(Op) when Op >= 16#60, Op =< 16#7F -> 3;
 base_cost(Op) when Op >= 16#80, Op =< 16#8F -> 3;
 base_cost(Op) when Op >= 16#90, Op =< 16#9F -> 3;
+%% LOG is a flat 375 here; do_log/3 adds 375 per topic and 8 per byte of data,
+%% so the total is 375*(topics+1) + 8*len as the specification has it. The
+%% per-opcode figures are deliberately NOT spelled out in this table: doing so
+%% would charge the topic term twice.
 base_cost(Op) when Op >= 16#A0, Op =< 16#A4 -> 375;
 base_cost(16#F0) -> 32000;
 base_cost(16#F5) -> 32000;
@@ -238,9 +242,30 @@ base_cost(16#FF) -> 5000;
 %% catch-all below is the last resort for an opcode this schedule has not been
 %% given a cost for, which is exactly why these four are named explicitly.
 base_cost(16#F3) -> 0;
-base_cost(16#F4) -> 0;
 base_cost(16#FD) -> 0;
 base_cost(16#FE) -> 0;
+%% The whole CALL family is priced by do_call/3, which charges EIP-2929's access
+%% cost plus the 9000 value transfer and the 25000 new-account term, and memory
+%% expansion for the arguments and the return region. There is no base term to
+%% add on top, so it is 0 for all four.
+%%
+%% DELEGATECALL said 0 here and the other three said nothing, so they fell to the
+%% catch-all below and were charged 3 each. Every CALL, CALLCODE and STATICCALL
+%% in every block was therefore charged 3 gas more than the specification says,
+%% while DELEGATECALL was right -- and the discrepancy is invisible in execution
+%% (3 gas does not change any outcome) while being exactly the kind of
+%% difference that moves a gasUsed field and so a receipts root.
+base_cost(16#F1) -> 0;
+base_cost(16#F2) -> 0;
+base_cost(16#F4) -> 0;
+base_cost(16#FA) -> 0;
+%% The last resort for an opcode this schedule has not been given a cost for.
+%% It is 3 because 3 is the price of most arithmetic, which is the least-bad
+%% guess available -- but a guess is exactly the problem, and this catch-all is
+%% what hid three missing CALL entries for as long as it was here. An opcode
+%% with no cost should be conspicuous, not plausible: do_op/3 has no catch-all
+%% either, so an opcode that reaches here with no price crashes into
+%% run_t/6's handler and becomes an evm_crash rather than quietly costing 3.
 base_cost(_) -> 3.
 
 %% ---------------------------------------------------------------------------
