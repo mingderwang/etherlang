@@ -53,6 +53,8 @@
   - Which of those apply is decided by the block's own scheduled fork, read from the fork schedule rather than hardcoded
   - An EVM crash is an exceptional halt that consumes the whole gas limit and discards the frame, which is recorded as an error and not as a revert
   - The state root is recomputed from the committed trie afterwards
+  - Transaction-level effects are applied, not just the EVM: the nonce bump, the value transfer, gas purchase and settlement, and contract creation. EIP-161's empty-account rule and EIP-170's code-size limit are enforced. See "Transaction state effects" under Phase 5
+  - A transaction is validated before it is executed; a block containing an invalid one is refused and nothing is committed
   - **Not** a full state transition: the gas schedule is approximate rather than per-fork exact, so the roots this produces do not match the network's
 - [x] **Withdrawals** — process beacon block withdrawals (EIP-4895) ✅
   - Applied through the state overlay so the credits are inside the block's state root; `withdrawalsRoot` is the MPT root keyed by `rlp(position)`
@@ -91,6 +93,7 @@
   - Per-block base fee from the parent's, using the gas-target and adjustment rules; the burned portion is not credited to the fee recipient
   - Priority fee handling: the effective price a transaction pays is `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`, so a transaction never bids below the base fee by overpaying the recipient
   - The EIP-1559 chain id is part of every signing preimage, and it is read from configuration rather than from `eth_chainId` over RPC — an id that moved with the upstream endpoint's mood would change which transactions are valid
+  - The per-transaction side is implemented too: the sender is charged the ceiling for the whole gas limit and refunded the effective price for the unused part, the recipient gets `gasUsed * (effectivePrice - baseFee)`, and everything else is burned. Unused gas is therefore also charged its base fee, and a sender whose cap exceeds `baseFee + maxPriorityFeePerGas` forfeits the difference outright. Confirmed by test against the sum of balances, not by inspecting one of them.
 - [ ] **EIP-4844 (blobs)** — blob transactions support (partial)
   - Done: blob transaction type (0x03), blob gas accounting and `blobGasPrice`, excess blob gas carried across blocks
   - **Not** done: KZG commitment verification. Transactions are accepted and priced without their commitments being checked against the blob, so a block carrying an invalid commitment is not rejected. Blob data propagation is also absent. The item stays open until the commitment check exists.
@@ -127,11 +130,22 @@
   - Receipts are *built* during execution (per-transaction index, cumulative gas, own bloom, logs), and the block's declared `receiptsRoot` is recomputed from them and compared. The transactions root is checked the same way.
   - Both are reported as `{verified, Root} | {unverified, Reason}`, not as a bare root. Reporting only the recomputed value — which is what this did — is not verification: a peer could declare any receipts root and the report would show a self-consistent number under a key that read as though it had been confirmed.
   - The transactions root depends on nothing but the block's own transaction list, so it is checked even when the parent's state is not held locally and the body cannot be executed. The receipts root genuinely needs execution, and is reported `{unverified, not_executed}` on that path rather than guessed.
-- [ ] **Full transaction validation** — validate every transaction in every block
-  - A transaction's sender is recovered from its signature rather than read from the payload, and a sender that cannot be recovered makes finalization fail rather than falling back to a declared address
-  - **Not** done: nonce, balance, chain ID and gas limit are not checked against the pre-state, and an invalid signature does not cause the transaction to be rejected — a block whose transaction does not check out is executed anyway
+- [x] **Full transaction validation** — validate every transaction in every block ✅
+  - `eth_tx:validate/1,2` is the single implementation. `eth_block:finalize/1` calls it per transaction before executing, and a block containing an invalid one returns `{error, {invalid_transaction, Index, Reason}}` without committing state — executing it anyway would produce a wrong state root and accept an invalid block
+  - The sender is recovered from the signature; there is no `from` fallback, and `validate/2` deliberately ignores the payload's `from` because that field is a JSON-RPC annotation, not part of the signed payload
+  - Checked, in rule order: type supported → field shapes and ranges → `to`/data/access list → fee fields consistent with the type → fee ceiling against the base fee → EIP-4844 blob rules → the intrinsic gas floor → signature (recoverable, `r` in range, `s` not malleable) → chain id → block gas limit → nonce and balance against the *executing* pre-state
+  - **Not** done: the checks read configuration and pre-state the node holds. A transaction is not replayed against a historical root, and no signature is verified against a cached authority set
+  - An absent context key means the rule is **unchecked**, not passed. `finalize/1` supplies base fee, gas limit, gas used, chain id, and the balance/nonce lookups, so a caller that omits one is reading a weaker check than it asked for
+  - EIP-1559 chain id is read from `eth_fork_schedule:chain_id/0` in the pool and the block executor alike; it used to be hardcoded to Sepolia's `11155111` in the pool, which would reject every transaction on any other chain
+- [x] **Transaction state effects** — nonce, value, gas purchase, coinbase tip, base-fee burn ✅
+  - Applied in the geth/yellow-paper order: buy gas at the ceiling → bump the nonce → transfer value → run the EVM with `gasLimit - intrinsicGas` → refund the sender at the effective price → pay the coinbase `gasUsed * (effectivePrice - baseFee)`, the base-fee portion being burned
+  - Effective price is `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`; the sender is charged the ceiling for the whole gas limit and refunded the effective price for the unused part, so the base fee on unused gas is burned too
+  - EIP-161 is implemented via `eth_state:drop_if_empty/2`: an account touched but left empty must not enter the trie, which is what stops a zero-value transfer to a non-existent address from being committed
+  - Contract creation at the transaction level: address `keccak256(rlp([sender, nonce]))[12:]`, init code taken from the calldata, code installed only on success, new account nonce 1, EIP-170's 24576-byte limit
+  - **Not** done: none of this is checked against real prestate, so the state root it contributes to is not known to match the network's (see the gas schedule gap below)
 - [ ] **EVM opcode fidelity** — bit-exact EVM for all opcodes
-  - The gas schedule is approximate and shared across all forks, so opcode costs are wrong everywhere
+  - The gas schedule is approximate and shared across all forks, so opcode costs are wrong everywhere. **Unverified** as the sole cause of root divergence: the per-fork exact schedule has not been ruled out as the only remaining difference, because that cannot be checked end-to-end without real prestate
+  - The catch-all `base_cost(_) -> 3` remains a fallback for any opcode with no assigned cost. It silently mispriced the four halting opcodes `RETURN`/`REVERT`/`INVALID`/`SELFDESTRUCT` at 3 gas each until they were given 0; an unassigned opcode is still a guess rather than an error
   - Run Foundry/vmtests to verify opcode correctness
   - Run generalStateTests to verify state transitions
   - Fix any divergences found

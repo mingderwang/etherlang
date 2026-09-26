@@ -288,40 +288,50 @@ finalize_against(Block, ParentRoot, Txs, GasLimit, BaseFee) ->
                                   Block#block.timestamp,
                                   Block#block.parent_beacon_block_root,
                                   StateH, Fork),
-                {Executed0, StateT} = execute_transactions(Block, Txs, State0,
-                                                            BaseFee, GasLimit),
-                {ok, State1, _Applied} =
-                    eth_fork_schedule:apply_withdrawals_to_state(
-                      Executed0#block.withdrawals, StateT),
-                Executed = Executed0,
-                case eth_state:commit(State1) of
-                    ok ->
-                        Root = eth_mpt:state_root(),
-                        Verification = #{state_root =>
-                                             check_state_root(Executed#block.state_root,
-                                                              Root),
-                                         transactions_root =>
-                                             check_transactions_root(
-                                               Executed#block.transactions_root,
-                                               tx_root(Executed#block.transactions)),
-                                         receipts_root =>
-                                             check_receipts_root(
-                                               Executed#block.receipts_root,
-                                               receipts_root(Executed#block.receipts)),
-                                         gas_used => Executed#block.gas_used},
-                        {ok, commitments(Executed, Root), Verification};
-                    {error, Reason} ->
-                        {ok, commitments(Executed),
-                         #{state_root => {unverified, {commit_failed, Reason}},
-                           transactions_root =>
-                               check_transactions_root(
-                                 Executed#block.transactions_root,
-                                 tx_root(Executed#block.transactions)),
-                           receipts_root =>
-                               check_receipts_root(
-                                 Executed#block.receipts_root,
-                                 receipts_root(Executed#block.receipts)),
-                           gas_used => Executed#block.gas_used}}
+                case execute_transactions(Block, Txs, State0,
+                                           BaseFee, GasLimit) of
+                    {error, _} = Invalid ->
+                        %% A block whose body contains a transaction that is not
+                        %% valid is not a block, so there is nothing to report a
+                        %% Verification for. The state is deliberately not
+                        %% committed either: the system calls above did run, but
+                        %% committing a half-executed block's state would leave
+                        %% the trie holding a root that corresponds to no block
+                        %% anyone will ever ask for.
+                        Invalid;
+                    {ok, Executed, StateT} ->
+                        {ok, State1, _Applied} =
+                            eth_fork_schedule:apply_withdrawals_to_state(
+                              Executed#block.withdrawals, StateT),
+                        case eth_state:commit(State1) of
+                            ok ->
+                                Root = eth_mpt:state_root(),
+                                Verification = #{state_root =>
+                                                     check_state_root(Executed#block.state_root,
+                                                                      Root),
+                                                 transactions_root =>
+                                                     check_transactions_root(
+                                                       Executed#block.transactions_root,
+                                                       tx_root(Executed#block.transactions)),
+                                                 receipts_root =>
+                                                     check_receipts_root(
+                                                       Executed#block.receipts_root,
+                                                       receipts_root(Executed#block.receipts)),
+                                                 gas_used => Executed#block.gas_used},
+                                {ok, commitments(Executed, Root), Verification};
+                            {error, Reason} ->
+                                {ok, commitments(Executed),
+                                 #{state_root => {unverified, {commit_failed, Reason}},
+                                   transactions_root =>
+                                       check_transactions_root(
+                                         Executed#block.transactions_root,
+                                         tx_root(Executed#block.transactions)),
+                                   receipts_root =>
+                                       check_receipts_root(
+                                         Executed#block.receipts_root,
+                                         receipts_root(Executed#block.receipts)),
+                                   gas_used => Executed#block.gas_used}}
+                        end
                 end
             after
                 _ = eth_state:set_base_source(Previous)
@@ -421,13 +431,59 @@ commitments(#block{} = Block, Root) ->
 %% Transaction execution
 %% ---------------------------------------------------------------------------
 
-%% Returns the block and the post-execution state. The state is threaded rather
-%% than discarded: without it every transaction in a block sees the pre-block
-%% state, so the transactions in a block cannot build on each other at all.
+%% Returns the block and the post-execution state, or {error, ...} if the block
+%% is not a valid block. The state is threaded rather than discarded: without it
+%% every transaction in a block sees the pre-block state, so the transactions in
+%% a block cannot build on each other at all.
+%%
+%% Every transaction is checked for validity *before* it runs, against the state
+%% as it stands at that point in the block. This is not an optimisation. A block
+%% whose body contains a transaction with a bad nonce, an unfunded sender, a
+%% foreign chain id, a gas limit below its own intrinsic cost, or a signature
+%% that does not recover is not a block at all, and executing it anyway produces
+%% a state root that no other client can reproduce -- and worse, a plausible one
+%% that gets stored and served as if it were real. Validating first turns that
+%% into a refusal, which is recoverable.
+%%
+%% The checks are in eth_tx:validate/2, the same function the block builder and
+%% the transaction pool use, so there is one answer to "is this transaction
+%% valid" rather than three that can disagree about intrinsic gas.
 execute_transactions(Block, [], State, _BF, _GL) ->
-    {Block, State};
+    {ok, Block, State};
 execute_transactions(#block{base_fee_per_gas = BaseFee, gas_limit = GL} = Block,
                  [Tx | Rest], State, _BF, GL) ->
+    Index = length(Block#block.receipts),
+    case eth_tx:validate(Tx, validation_ctx(Block, State, BaseFee, GL)) of
+        {error, Reason} ->
+            {error, {invalid_transaction, Index, Reason}};
+        ok ->
+            case run_transaction(Block, Tx, State, BaseFee, GL) of
+                {error, _} = Err -> Err;
+                {Block1, State1} ->
+                    execute_transactions(Block1, Rest, State1, BaseFee, GL)
+            end
+    end.
+
+%% What validity needs that the transaction does not carry. The base fee and gas
+%% limit come from the block header, the chain id from this node's configuration
+%% (never from eth_state:chain_id/0, which asks the upstream peer -- a peer's
+%% answer is not a rule), and balance and nonce from the state being executed
+%% against, which is the state as of *this* point in the block rather than its
+%% start, so a block whose second transaction spends the first one's balance
+%% sees the reduced balance.
+validation_ctx(Block, State, BaseFee, GasLimit) ->
+    #{base_fee => BaseFee,
+      gas_limit => GasLimit,
+      gas_used => Block#block.gas_used,
+      chain_id => eth_fork_schedule:chain_id(),
+      balance_of => fun(Address) ->
+          {ok, maps:get(balance, eth_state:account(State, Address), 0)}
+      end,
+      nonce_of => fun(Address) ->
+          {ok, maps:get(nonce, eth_state:account(State, Address), 0)}
+      end}.
+
+run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     GasLimitTx = uint(maps:get(<<"gas">>, Tx, GL)),
     Value = uint(maps:get(<<"value">>, Tx, 0)),
     To = to_address(maps:get(<<"to">>, Tx, <<>>)),
@@ -444,6 +500,25 @@ execute_transactions(#block{base_fee_per_gas = BaseFee, gas_limit = GL} = Block,
         {ok, A} -> A;
         _ -> error({cannot_finalize, unrecoverable_sender})
     end,
+    %% A transaction with no destination creates a contract. The address is
+    %% keccak(rlp([sender, nonce]))[12:], which is why the nonce is read here
+    %% rather than after the bump below: the pre-transaction nonce is the input.
+    IsCreate = (To =:= <<>>),
+    Nonce = eth_state:nonce(State, Sender),
+    ContractAddress = create_address(Sender, Nonce),
+    Target = case IsCreate of true -> ContractAddress; false -> To end,
+    Intrinsic = eth_tx:intrinsic_gas(Tx),
+    %% Everything a transaction does to state outside the EVM's own frame. The
+    %% EVM only executes code; the nonce bump, the value transfer, the gas
+    %% purchase and the coinbase payment are the *transaction*'s effects, and
+    %% omitting them leaves a post-state that no other client can reproduce even
+    %% when the code ran perfectly. Without the nonce bump a second transaction
+    %% from the same sender cannot validate, because the account nonce never
+    %% moves; without the gas purchase the coinbase is never credited.
+    State0 = begin_transaction(State, Tx, Sender, Target, Value,
+                                GasLimitTx, IsCreate),
+    %% The EVM runs with what the intrinsic cost left, never the full limit.
+    EvmGas = max(0, GasLimitTx - Intrinsic),
     %% The EVM reads its message and environment through atom keys (s_msg/3,
     %% s_env/3 in eth_evm). Passing the JSON-RPC spelling instead meant every
     %% lookup missed and fell back to its default: the contract saw no
@@ -453,7 +528,7 @@ execute_transactions(#block{base_fee_per_gas = BaseFee, gas_limit = GL} = Block,
     Msg = #{
         caller => Sender,
         origin => Sender,
-        address => To,
+        address => Target,
         value => Value,
         data => Data,
         gas_price => EffectiveGasPrice,
@@ -463,19 +538,27 @@ execute_transactions(#block{base_fee_per_gas = BaseFee, gas_limit = GL} = Block,
     %% Code is read through the same state view the EVM executes against.
     %% Fetching it from a separate store would let a call run against code that
     %% the state it runs in says does not exist.
-    Code = eth_state:code(State, To),
-    Env = block_env(Block, State),
-    {Result, GasLeft, State1, Logs} =
-        try eth_evm:run(Code, Msg, State, Env, GasLimitTx) of
-            {ok, _Output, GL0, St0, L0} -> {ok, GL0, St0, L0};
-            {revert, _Output, GL1, St1, L1} -> {revert, GL1, St1, L1};
-            {error, _Reason, St2, L2} -> {error, 0, St2, L2}
+    %%
+    %% A creation is the one case where the code to run is *not* the account's:
+    %% the calldata is the init code, and it runs at the address the create
+    %% derives. Its return value is the deployed code, which is installed below
+    %% only if the frame succeeded.
+    Code = case IsCreate of
+               true -> Data;
+               false -> eth_state:code(State0, Target)
+           end,
+    Env = block_env(Block, State0),
+    {Result, Output, GasLeft, StateRun, Logs} =
+        try eth_evm:run(Code, Msg, State0, Env, EvmGas) of
+            {ok, Out0, GL0, St0, L0} -> {ok, Out0, GL0, St0, L0};
+            {revert, Out1, GL1, St1, L1} -> {revert, Out1, GL1, St1, L1};
+            {error, _Reason, St2, _L2} -> {error, <<>>, 0, St2, []}
         catch
             %% An EVM crash is an exceptional halt, which consumes the whole
             %% gas limit and discards the frame. It is not the same as a revert,
             %% which is a deliberate failure the caller can observe in the
             %% return data, and must not be recorded as one.
-            _:_ -> {error, 0, State, []}
+            _:_ -> {error, <<>>, 0, State0, []}
         end,
     %% Gas charged is what the transaction was given minus what it returned. An
     %% exceptional halt returns nothing, so it is charged its whole limit.
@@ -483,6 +566,9 @@ execute_transactions(#block{base_fee_per_gas = BaseFee, gas_limit = GL} = Block,
                      error -> GasLimitTx;
                      _ -> GasLimitTx - GasLeft
                  end,
+    State1 = settle_gas(deploy(StateRun, Result, Output, Target, IsCreate),
+                        Block, Sender, GasLeft, GasCharged, EffectiveGasPrice,
+                        base_fee_of(BaseFee)),
     Cumulative = Block#block.gas_used + GasCharged,
     Index = length(Block#block.receipts),
     Block1 = Block#block{
@@ -491,7 +577,99 @@ execute_transactions(#block{base_fee_per_gas = BaseFee, gas_limit = GL} = Block,
         logs = Block#block.logs ++ Logs,
         gas_used = Cumulative
     },
-    execute_transactions(Block1, Rest, State1, BaseFee, GL).
+    {Block1, State1}.
+
+%% The effects a transaction has on state that are not the EVM's own execution.
+%%
+%% The order is the one the yellow paper and geth both use, and it is not
+%% arbitrary: the gas is bought *before* execution so that a transaction which
+%% cannot pay for its own limit is rejected rather than run and left owing, and
+%% the nonce is incremented *before* execution so a contract cannot re-enter the
+%% sender with the same nonce.
+%%
+%% The upfront cost is charged at the sender's ceiling (maxFeePerGas, or
+%% gasPrice for a legacy transaction) while the refund below is at the effective
+%% price, so the difference is the miner/validator's tip plus the portion of the
+%% cap that was never needed. That is why an over-paying 1559 sender is not
+%% refunded the cap.
+begin_transaction(State, Tx, Sender, Target, Value, GasLimit, IsCreate) ->
+    S1 = buy_gas(State, Tx, Sender, GasLimit),
+    S2 = eth_state:set_nonce(S1, Sender, eth_state:nonce(S1, Sender) + 1),
+    case IsCreate of
+        true -> S2;
+        false -> transfer(S2, Sender, Target, Value)
+    end.
+
+%% Install the code a creation returned. Only a successful frame deploys: a
+%% reverted or failed init code leaves nothing behind at the new address, which
+%% is why the account is not pre-created above -- there is then nothing to undo.
+%%
+%% EIP-161: the new account's nonce is 1, never 0. That is what distinguishes a
+%% contract account from an address that has merely been touched, and it is
+%% checked by the state trie, so getting it wrong changes the root.
+deploy(State, ok, Output, Address, true) when byte_size(Output) =< 24576 ->
+    S1 = eth_state:set_code(State, Address, Output),
+    S2 = eth_state:set_nonce(S1, Address, 1),
+    eth_state:mark_created(S2, Address);
+deploy(State, ok, Output, Address, true) ->
+    %% EIP-170: the deployed code is over the size limit. The frame still
+    %% succeeded, so the gas is spent, but nothing is deployed and the account
+    %% does not survive.
+    _ = Output,
+    eth_state:drop_if_empty(State, Address);
+deploy(State, _Result, _Output, _Address, _IsCreate) ->
+    State.
+
+%% Charged at the sender's ceiling, not the effective price: the client is
+%% committing to the cap and only the difference comes back.
+buy_gas(State, Tx, Sender, GasLimit) ->
+    Ceiling = gas_ceiling(Tx),
+    Debit = GasLimit * Ceiling,
+    eth_state:set_balance(State, Sender, eth_state:balance(State, Sender) - Debit).
+
+gas_ceiling(Tx) ->
+    case eth_tx:tx_type(Tx) of
+        eip1559 -> uint(maps:get(<<"maxFeePerGas">>, Tx, 0));
+        eip4844 -> uint(maps:get(<<"maxFeePerGas">>, Tx, 0));
+        _ -> uint(maps:get(<<"gasPrice">>, Tx, 0))
+    end.
+
+transfer(State, From, To, Value) ->
+    S1 = eth_state:set_balance(State, From, eth_state:balance(State, From) - Value),
+    S2 = eth_state:set_balance(S1, To, eth_state:balance(S1, To) + Value),
+    %% EIP-161: a recipient touched by a zero-value transfer is a no-op. A plain
+    %% self-send is also a no-op, because the two balance writes cancel and the
+    %% account would otherwise be re-created.
+    case {Value, From =:= To} of
+        {0, _} -> eth_state:drop_if_empty(S2, To);
+        {_, true} -> State;
+        _ -> S2
+    end.
+
+%% Return the unused gas to the sender at the effective price and pay the tip to
+%% the coinbase. The two are different amounts on purpose: the sender gets
+%% effective price, the coinbase gets effective price minus base fee, and the
+%% base fee portion is burned.
+settle_gas(State, Block, Sender, GasLeft, GasCharged, EffectivePrice, BaseFee) ->
+    Miner = Block#block.miner,
+    Tip = max(0, EffectivePrice - BaseFee),
+    S1 = eth_state:set_balance(State, Sender,
+                               eth_state:balance(State, Sender) + GasLeft * EffectivePrice),
+    S2 = eth_state:set_balance(S1, Miner,
+                               eth_state:balance(S1, Miner) + GasCharged * Tip),
+    %% The coinbase is "touched" by receiving a payment even if the payment is
+    %% zero, and an account touched but left empty must not survive (EIP-161).
+    case GasCharged * Tip of
+        0 -> eth_state:drop_if_empty(S2, Miner);
+        _ -> S2
+    end.
+
+%% CREATE's address: keccak256(rlp([sender, nonce]))[12:]. Deterministic, so
+%% nobody has to be trusted to publish it and nobody can be front-run into
+%% another account's address.
+create_address(Sender, Nonce) ->
+    Encoded = eth_rlp:encode([Sender, Nonce]),
+    binary:part(eth_keccak:hash(Encoded), 12, 20).
 
 %% The execution environment, in the shape eth_evm reads it: flat atom keys.
 %% BLOCKHASH needs a state view to resolve the requested block, so the state is

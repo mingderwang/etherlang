@@ -165,55 +165,40 @@ entry(Tx, Sender, Nonce, Price, Cost, Base) ->
     #{tx => Tx, sender => bin0x(Sender), nonce => Nonce,
       price => Price, cost => Cost, base_nonce => Base}.
 
-%% Chain ID must be Sepolia; unprotected legacy (no chain) is rejected.
+%% The chain id comes from configuration, not from a literal.
+%%
+%% This used to hardcode 11155111, which is Sepolia's. That is a chain id
+%% *assumption* dressed as a rule: on mainnet, or on any testnet but Sepolia, it
+%% rejects every transaction and the pool is a black hole. Worse, it silently
+%% disagrees with eth_block, which asks eth_fork_schedule:chain_id/0 -- so a node
+%% configured for one chain would accept into its pool what it then refused to
+%% finalize, or the reverse. One source, read the same way by every caller.
 tx_chain_ok(Tx) ->
     case maps:get(<<"chainId">>, Tx, undefined) of
         undefined ->
             %% Legacy without EIP-155: only accepted with explicit v (still
-            %% replayable — reject).
+            %% replayable -- reject).
             false;
         C ->
-            to_int(C) =:= 11155111
+            to_int(C) =:= eth_fork_schedule:chain_id()
     end.
 
 %% Gas sanity: known bounds, intrinsic floor, non-zero limit.
+%%
+%% The intrinsic floor itself comes from eth_tx, which is the same function the
+%% block builder and block finalization use. This used to carry its own copy, and
+%% the copies disagreed in two ways: a contract-creation transaction was charged
+%% the 21000 transfer price instead of 53000, and EIP-3860 init-code word cost was
+%% missing entirely. Both are "charges less than consensus says" bugs, so a
+%% transaction the pool accepted could be one the validator rejected.
 tx_gas_ok(Tx) ->
     Gas = to_int(maps:get(<<"gas">>, Tx, 0)),
     Gas > 0 andalso Gas =< ?MAX_GAS andalso Gas >= intrinsic(Tx).
 
 intrinsic(Tx) ->
-    Data = tx_data(Tx),
-    AL = maps:get(<<"accessList">>, Tx, []),
-    ?INTRINSIC_BASE + data_cost(Data) + al_cost(AL).
-
-tx_data(Tx) ->
-    Raw = maps:get(<<"input">>, Tx, maps:get(<<"data">>, Tx, <<>>)),
-    case Raw of
-        <<"0x", Rest/binary>> ->
-            try binary:decode_hex(Rest) catch _:_ -> <<>> end;
-        B when is_binary(B) ->
-            try binary:decode_hex(B) catch _:_ -> <<>> end;
-        _ ->
-            <<>>
+    try eth_tx:intrinsic_gas(Tx)
+    catch _:_ -> ?INTRINSIC_BASE
     end.
-
-data_cost(Data) when is_binary(Data) ->
-    lists:foldl(fun(B, Acc) ->
-        case B of
-            0 -> Acc + 4;
-            _ -> Acc + 16
-        end
-    end, 0, binary_to_list(Data));
-data_cost(_) ->
-    0.
-
-al_cost(AL) when is_list(AL) ->
-    lists:foldl(fun(E, Acc) ->
-        Keys = maps:get(<<"storageKeys">>, E, []),
-        Acc + 2400 + 1900 * length(Keys)
-    end, 0, AL);
-al_cost(_) ->
-    0.
 
 price(Tx) ->
     case maps:get(<<"maxFeePerGas">>, Tx, undefined) of

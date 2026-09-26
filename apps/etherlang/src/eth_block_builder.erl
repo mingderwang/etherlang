@@ -194,10 +194,22 @@ select_transactions([Entry | Rest], BaseFee, UsedGas, Selected) ->
         _ -> select_transactions(Rest, BaseFee, UsedGas, Selected)
     end.
 
-%% Validate a transaction before including it in a block. Field types, ranges,
-%% intrinsic gas, fee ceiling, and signature recovery are all checked here;
-%% balance and nonce are checked by the pool/state layer because they depend on
-%% the current account state rather than the transaction alone.
+%% Validate a transaction before including it in a block.
+%%
+%% The rules themselves live in eth_tx:validate/2, which is also what the
+%% transaction pool and block finalization use. Three copies of "is this
+%% transaction valid" is three copies that can drift: an intrinsic-gas schedule
+%% that differs by one constant between the proposer and the validator charges
+%% different fees for the same transaction and computes a different state root.
+%%
+%% What stays here is the one check that is *not* a consensus rule. A `from` field
+%% is a JSON-RPC annotation, not part of the signed transaction, and no consensus
+%% rule mentions it, so eth_tx:validate/2 deliberately ignores it -- a peer's
+%% block is not invalid because an RPC field disagrees. When this node is
+%% assembling its own block out of transactions it did not author, a declared
+%% `from` that disagrees with the recovered signer is a strong signal that the
+%% transaction is being relayed with a corrupted or spoofed body, and refusing to
+%% propose it is worth the cost.
 validate_transaction(Tx) when is_map(Tx) ->
     validate_transaction(Tx, #{}).
 
@@ -207,393 +219,55 @@ validate_transaction(Tx) when is_map(Tx) ->
 %%   nonce_of      -> fun((Address) -> {ok, Nonce})
 %%   chain_id      -> integer()
 validate_transaction(Tx, Ctx) when is_map(Tx), is_map(Ctx) ->
-    try
-        Gas = int_field(Tx, <<"gas">>),
-        Value = int_field(Tx, <<"value">>),
-        Nonce = int_field(Tx, <<"nonce">>, 0),
-        GasPrice = int_field(Tx, <<"gasPrice">>, 0),
-        MaxFee = int_field(Tx, <<"maxFeePerGas">>, undefined),
-        MaxPriority = int_field(Tx, <<"maxPriorityFeePerGas">>, undefined),
-        ok = ensure(Gas > 0, {error, gas_limit_zero}),
-        ok = ensure(Value >= 0, {error, negative_value}),
-        ok = ensure(Nonce >= 0, {error, negative_nonce}),
-        ok = ensure_tx_type_supported(Tx),
-        {To, IsCreate} = to_field(Tx),
-        ok = ensure(validate_to(To), {error, invalid_to}),
-        Data = data_field(Tx),
-        AccessList = access_list_field(Tx),
-        ok = ensure(valid_access_list(AccessList), {error, invalid_access_list}),
-        BaseFee = maps:get(base_fee, Ctx, undefined),
-        ok = ensure(valid_fee_fields(Tx, GasPrice, MaxFee, MaxPriority), {error, invalid_fee}),
-        ok = ensure(fee_ceiling_ok(Tx, MaxFee, MaxPriority, GasPrice, BaseFee),
-                    {error, fee_too_low}),
-        ok = check_blobs(Tx, Ctx),
-        Intrinsic = intrinsic_gas(Data, IsCreate, AccessList),
-        ok = ensure(Gas >= Intrinsic, {error, intrinsic_gas}),
-        ok = ensure(valid_signature(Tx), {error, bad_signature}),
-        ok = check_chain_id(Tx, Ctx),
-        ok = check_state(Tx, Nonce, Gas, Value, MaxFee, GasPrice, Ctx),
-        {ok, true}
-    catch
-        throw:{error, _} = Err -> Err;
-        throw:Reason -> {error, Reason};
-        Class:Reason -> {error, {invalid_transaction, Class, Reason}}
+    case eth_tx:validate(Tx, Ctx) of
+        ok ->
+            case check_from_field(Tx) of
+                ok -> {ok, true};
+                {error, _} = Err -> Err
+            end;
+        {error, _} = Err ->
+            Err
     end;
 validate_transaction(_Tx, _Ctx) ->
     {error, invalid_transaction}.
 
-ensure(true, _Ok) -> ok;
-ensure(false, Err) -> throw(Err).
-
-int_field(Tx, Key) -> int_field(Tx, Key, undefined).
-
-int_field(Tx, Key, Default) ->
-    case maps:get(Key, Tx, Default) of
-        undefined -> undefined;
-        I when is_integer(I), I >= 0 -> I;
-        B when is_binary(B) -> decode_uint(B);
-        _ -> throw({error, {bad_field, Key}})
+check_from_field(Tx) ->
+    case eth_tx:sender(Tx) of
+        {ok, Payer} ->
+            case maps:get(<<"from">>, Tx, undefined) of
+                undefined ->
+                    ok;
+                Declared when is_binary(Declared) ->
+                    case declared_address(Declared) of
+                        Payer -> ok;
+                        _ -> {error, sender_mismatch}
+                    end;
+                _ ->
+                    ok
+            end;
+        _ ->
+            ok
     end.
 
-%% JSON-RPC encodes quantities with no leading zeros, so "0x0", "0x1" and
-%% "0x7b" all have an odd number of hex digits. binary:decode_hex/1 rejects
-%% those, so an odd-length string is left-padded with a zero nibble first.
-decode_uint(<<"0x">>) -> 0;
-decode_uint(<<"0x", S/binary>>) ->
-    case decode_hex_bytes(S) of
-        {ok, Bin} -> binary:decode_unsigned(Bin);
-        error -> throw({error, bad_hex})
-    end;
-decode_uint(<<"0X", S/binary>>) -> decode_uint(<<"0x", S/binary>>);
-decode_uint(B) when is_binary(B) -> binary:decode_unsigned(B);
-decode_uint(_) -> throw({error, bad_uint}).
+%% A `from` that is not even shaped like an address is treated as "no claim
+%% made" rather than as a mismatch: it cannot be evidence of tampering if it is
+%% not an address in the first place, and failing to parse an annotation should
+%% not fail validation. The "0x" prefix has to come off before decode_hex/1 --
+%% that function rejects the letter x outright.
+declared_address(<<"0x", S/binary>>) -> decode_address_hex(S);
+declared_address(<<"0X", S/binary>>) -> decode_address_hex(S);
+declared_address(B) when is_binary(B) -> decode_address_hex(B);
+declared_address(Other) -> Other.
 
-%% binary:decode_hex/1 yields the bytes directly and raises badarg on
-%% non-hex input, so wrap it and left-pad odd-length digit strings. The result
-%% is normalized to {ok, Bytes} so a failure is distinguishable from the empty
-%% byte string (which is itself a legal decoding).
-decode_hex_bytes(S) ->
+decode_address_hex(S) ->
     Padded = case byte_size(S) rem 2 of
         0 -> S;
         1 -> <<"0", S/binary>>
     end,
-    try {ok, binary:decode_hex(Padded)}
-    catch _:_ -> error
+    try binary:decode_hex(Padded)
+    catch _:_ -> undefined
     end.
 
-%% The destination is decoded *before* it is classified, because a JSON-RPC
-%% "0x" is a two-byte binary that would otherwise look like a (malformed)
-%% address rather than the empty destination that means contract creation.
-to_field(Tx) ->
-    case maps:get(<<"to">>, Tx, undefined) of
-        undefined -> {<<>>, true};
-        null -> {<<>>, true};
-        B when is_binary(B) ->
-            case hex_bytes_20(B) of
-                <<>> -> {<<>>, true};
-                Addr -> {Addr, false}
-            end;
-        _ -> throw({error, invalid_to})
-    end.
-
-hex_bytes_20(<<"0x", S/binary>>) ->
-    case decode_hex_bytes(S) of
-        {ok, Bin} -> Bin;
-        error -> throw({error, invalid_to})
-    end;
-hex_bytes_20(<<"0X", S/binary>>) -> hex_bytes_20(<<"0x", S/binary>>);
-hex_bytes_20(B) when is_binary(B) -> B.
-
-validate_to(<<>>) -> true;
-validate_to(B) when is_binary(B), byte_size(B) =:= 20 -> true;
-validate_to(_) -> false.
-
-data_field(Tx) ->
-    case maps:get(<<"input">>, Tx, maps:get(<<"data">>, Tx, <<>>)) of
-        B when is_binary(B) -> hexdata_20(B);
-        _ -> throw({error, bad_data})
-    end.
-
-hexdata_20(<<"0x", S/binary>>) ->
-    case decode_hex_bytes(S) of
-        {ok, Bin} -> Bin;
-        error -> throw({error, bad_data})
-    end;
-hexdata_20(<<"0X", S/binary>>) -> hexdata_20(<<"0x", S/binary>>);
-hexdata_20(B) when is_binary(B) -> B;
-hexdata_20(_) -> throw({error, bad_data}).
-
-%% An access list arrives over JSON-RPC as a list of objects
-%%   #{<<"address">> => 0x..., <<"storageKeys">> => [0x..., ...]}
-%% but the wire form is a list of [Address, [Slot...]] pairs. Both shapes are
-%% normalized to {AddressBin, [SlotBin]} so validation has one representation.
-access_list_field(Tx) ->
-    case maps:get(<<"accessList">>, Tx, []) of
-        L when is_list(L) -> [normalize_access_entry(E) || E <- L];
-        _ -> throw({error, invalid_access_list})
-    end.
-
-normalize_access_entry({Addr, Slots}) when is_list(Slots) ->
-    {access_address(Addr), [access_slot(S) || S <- Slots]};
-normalize_access_entry(#{<<"address">> := Addr,
-                         <<"storageKeys">> := Slots}) when is_list(Slots) ->
-    {access_address(Addr), [access_slot(S) || S <- Slots]};
-normalize_access_entry(#{address := Addr, storageKeys := Slots}) when is_list(Slots) ->
-    {access_address(Addr), [access_slot(S) || S <- Slots]};
-normalize_access_entry(_) ->
-    throw({error, invalid_access_list}).
-
-access_address(A) when is_binary(A) -> hex_bytes_20(A);
-access_address(_) -> throw({error, invalid_access_list}).
-
-access_slot(S) when is_binary(S) ->
-    case hexdata_20(S) of
-        Bin when byte_size(Bin) =:= 32 -> Bin;
-        _ -> throw({error, invalid_access_list})
-    end;
-access_slot(I) when is_integer(I) ->
-    <<I:256>>;
-access_slot(_) -> throw({error, invalid_access_list}).
-
-valid_access_list([]) -> true;
-valid_access_list(L) ->
-    lists:all(fun({Addr, Slots}) ->
-        is_binary(Addr) andalso byte_size(Addr) =:= 20 andalso
-        is_list(Slots) andalso lists:all(fun(S) ->
-            is_binary(S) andalso byte_size(S) =:= 32
-        end, Slots)
-    end, L).
-
-%% EIP-2718/1559: typed transactions must carry both fee fields; legacy
-%% transactions must not. A transaction with maxFeePerGas but no
-%% maxPriorityFeePerGas (or vice versa) is malformed.
-valid_fee_fields(Tx, GasPrice, MaxFee, MaxPriority) ->
-    case tx_type(Tx) of
-        eip1559 -> valid_1559_fees(MaxFee, MaxPriority);
-        eip4844 -> valid_1559_fees(MaxFee, MaxPriority);
-        _ -> is_integer(GasPrice) andalso GasPrice >= 0
-    end.
-
-valid_1559_fees(MaxFee, MaxPriority) ->
-    is_integer(MaxFee) andalso is_integer(MaxPriority) andalso
-    MaxPriority =< MaxFee.
-
-tx_type(Tx) ->
-    case maps:get(<<"type">>, Tx, <<"0x0">>) of
-        <<"0x0">> -> legacy;
-        <<"0x1">> -> eip2930;
-        <<"0x2">> -> eip1559;
-        <<"0x3">> -> eip4844;
-        0 -> legacy;
-        1 -> eip2930;
-        2 -> eip1559;
-        3 -> eip4844;
-        _ -> throw({error, unsupported_type})
-    end.
-
-ensure_tx_type_supported(Tx) ->
-    case tx_type(Tx) of
-        T when T =:= legacy; T =:= eip2930; T =:= eip1559; T =:= eip4844 -> ok;
-        _ -> throw({error, unsupported_type})
-    end.
-
-%% Under EIP-1559 a transaction can only be included when the price it offers
-%% covers the base fee. A 1559 transaction offers maxFeePerGas; legacy and
-%% EIP-2930 transactions offer gasPrice directly. Either way, a transaction
-%% whose ceiling is below the base fee can never be mined. Pre-London there is
-%% no base fee, so no floor applies.
-fee_ceiling_ok(Tx, MaxFee, _MaxPriority, GasPrice, BaseFee) when is_integer(BaseFee) ->
-    Ceiling = case tx_type(Tx) of
-        eip1559 -> MaxFee;
-        eip4844 -> MaxFee;
-        _ -> GasPrice
-    end,
-    is_integer(Ceiling) andalso Ceiling >= BaseFee;
-fee_ceiling_ok(_Tx, _MaxFee, _MaxPriority, _GasPrice, _BaseFee) ->
-    true.
-
-%% EIP-4844 blob validity. Three independent rules, and they fail differently
-%% so a caller can tell *why* a blob transaction was rejected:
-%%
-%%   * the transaction must reference at least one blob, and every versioned
-%%     hash must be a well-formed KZG commitment hash;
-%%   * maxFeePerBlobGas is mandatory;
-%%   * maxFeePerBlobGas must cover the block's blob gas price, which is what
-%%     actually makes the blob purchasable. The price comes from Ctx because it
-%%     depends on the parent block's excess blob gas; when the caller cannot
-%%     supply it the floor is not checked rather than guessed.
-check_blobs(Tx, _Ctx) ->
-    case tx_type(Tx) of
-        eip4844 ->
-            ok = ensure(eth_tx:valid_versioned_hashes(Tx), {error, bad_blob_hashes}),
-            MaxFeePerBlobGas = int_field(Tx, <<"maxFeePerBlobGas">>),
-            ok = ensure(is_integer(MaxFeePerBlobGas), {error, invalid_blob_fee}),
-            case maps:get(blob_base_fee, _Ctx, undefined) of
-                undefined -> ok;
-                BlobBaseFee when is_integer(BlobBaseFee) ->
-                    ensure(MaxFeePerBlobGas >= BlobBaseFee, {error, blob_fee_too_low})
-            end;
-        _ ->
-            ok
-    end.
-
-%% Intrinsic gas: 21000 base, 32000 for contract creation, 4 per zero byte and
-%% 16 per non-zero byte of calldata, plus EIP-2930 access list costs
-%% (2400 per address, 1900 per storage key).
-%%
-%% Note that binary_to_list/1 yields *integers*, so the zero-byte case must
-%% match the integer 0. Matching a <<0>> binary pattern here would silently
-%% charge every byte at the non-zero rate.
-intrinsic_gas(Data, IsCreate, AccessList) ->
-    Base = case IsCreate of
-        true -> 53000;
-        false -> 21000
-    end,
-    DataGas = lists:foldl(fun(0, A) -> A + 4;
-                             (_, A) -> A + 16
-                          end, 0, binary_to_list(Data)),
-    AccessGas = lists:foldl(fun({_Addr, Slots}, A) ->
-        A + 2400 + 1900 * length(Slots)
-    end, 0, AccessList),
-    Base + DataGas + AccessGas + initcode_gas(Data, IsCreate).
-
-%% EIP-3860 (Shanghai): init code is metered at 2 gas per 32-byte word.
-initcode_gas(_Data, false) -> 0;
-initcode_gas(Data, true) -> 2 * ((byte_size(Data) + 31) div 32).
-
-%% Signature validity has two independent parts, and only the second is
-%% usually noticed:
-%%
-%%   1. EIP-2 malleability bound. r must lie in [1, N-1] and s in [1, N/2].
-%%      The upper half of the s range is malleable -- replacing s with N-s
-%%      yields a second valid signature over the same message -- so those are
-%%      rejected outright. This is what makes a transaction hash a stable
-%%      identifier rather than one of many.
-%%
-%%   2. Sender agreement. Public-key recovery *succeeds* for almost any
-%%      (r, s, v) triple; it simply yields a different address. So "recovery
-%%      succeeded" proves nothing on its own. What actually binds the signature
-%%      to the transaction is agreement with the declared sender, which
-%%      check_from_field/2 verifies.
-valid_signature(Tx) ->
-    R = int_field(Tx, <<"r">>),
-    S = int_field(Tx, <<"s">>),
-    V = int_field(Tx, <<"v">>),
-    case {in_group_range(R), low_half_s(S), valid_recovery_id(Tx, V)} of
-        {true, true, true} ->
-            case eth_tx:sender(Tx) of
-                {ok, _} -> true;
-                _ -> false
-            end;
-        _ ->
-            false
-    end.
-
-in_group_range(I) when is_integer(I) ->
-    I >= 1 andalso I < ?SECP256K1_N;
-in_group_range(_) ->
-    false.
-
-low_half_s(S) when is_integer(S) ->
-    S >= 1 andalso S =< ?SECP256K1_N div 2;
-low_half_s(_) ->
-    false.
-
-%% Legacy `v` is either the unprotected 27/28 or the EIP-155 form
-%% chainId*2+35+recid; typed transactions carry a bare recovery id 0/1.
-valid_recovery_id(Tx, V) when is_integer(V) ->
-    case tx_type(Tx) of
-        legacy -> V =:= 27 orelse V =:= 28 orelse V >= 35;
-        _ -> V =:= 0 orelse V =:= 1
-    end;
-valid_recovery_id(_Tx, _V) ->
-    false.
-
-%% EIP-155 replay protection: legacy transactions carry the chain id inside
-%% `v' as (chainId * 2 + 35 + recid); typed transactions carry it explicitly.
-%% An unprotected legacy transaction (v = 27/28) is only valid when the node
-%% itself is configured without a chain id.
-check_chain_id(Tx, Ctx) ->
-    case maps:get(chain_id, Ctx, undefined) of
-        undefined -> ok;
-        Expected -> ensure(tx_chain_id(Tx) =:= Expected, {error, wrong_chain_id})
-    end.
-
-tx_chain_id(Tx) ->
-    case tx_type(Tx) of
-        legacy ->
-            V = int_field(Tx, <<"v">>),
-            case V >= 35 of
-                true -> (V - 35) div 2;
-                false -> undefined
-            end;
-        _ ->
-            int_field(Tx, <<"chainId">>)
-    end.
-
-%% The payer is the address recovered from the signature, not a caller-supplied
-%% `from' field. When the transaction *does* carry `from' (as an RPC-decoded map
-%% usually does), it must agree with the recovered address, otherwise the tx is
-%% being replayed under a forged sender.
-check_state(Tx, Nonce, Gas, Value, MaxFee, GasPrice, Ctx) ->
-    case recover_sender(Tx) of
-        {ok, Payer} ->
-            ok = check_from_field(Tx, Payer),
-            Price = effective_price_for_validation(MaxFee, GasPrice,
-                                                   maps:get(base_fee, Ctx, undefined)),
-            Total = Gas * Price + Value,
-            ok = check_balance(Payer, Total, Ctx),
-            ok = check_nonce(Payer, Nonce, Ctx);
-        error ->
-            ok
-    end.
-
-recover_sender(Tx) ->
-    case eth_tx:sender(Tx) of
-        {ok, Sender} -> {ok, Sender};
-        _ -> error
-    end.
-
-check_from_field(Tx, Payer) ->
-    case maps:get(<<"from">>, Tx, undefined) of
-        undefined -> ok;
-        Declared when is_binary(Declared) ->
-            ensure(hex_bytes_20(Declared) =:= Payer, {error, sender_mismatch});
-        _ -> ok
-    end.
-
-check_balance(Payer, Total, Ctx) ->
-    case maps:get(balance_of, Ctx, undefined) of
-        undefined -> ok;
-        Fun when is_function(Fun, 1) ->
-            case Fun(Payer) of
-                {ok, Balance} when is_integer(Balance) ->
-                    ensure(Balance >= Total, {error, insufficient_balance});
-                _ -> ok
-            end
-    end.
-
-%% The sender's account nonce must equal the transaction nonce; a gap stalls
-%% the account and a lower nonce is a replay.
-check_nonce(Payer, Nonce, Ctx) ->
-    case maps:get(nonce_of, Ctx, undefined) of
-        undefined -> ok;
-        Fun when is_function(Fun, 1) ->
-            case Fun(Payer) of
-                {ok, AccountNonce} when is_integer(AccountNonce) ->
-                    ensure(AccountNonce =:= Nonce, {error, bad_nonce});
-                _ -> ok
-            end
-    end.
-
-%% A sender must be able to cover gas * maxFeePerGas (the worst case, since the
-%% miner may take the full priority fee), plus the transferred value. Legacy
-%% transactions are bounded by gasPrice.
-effective_price_for_validation(MaxFee, _GasPrice, _BaseFee) when is_integer(MaxFee) ->
-    MaxFee;
-effective_price_for_validation(_MaxFee, GasPrice, _BaseFee) when is_integer(GasPrice) ->
-    GasPrice;
-effective_price_for_validation(_, _, _) -> 0.
 
 price(#{price := Price}) -> Price;
 price(#{tx := Tx}) -> maps:get(<<"gasPrice">>, Tx, 0).

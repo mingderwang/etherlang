@@ -213,6 +213,16 @@ base_cost(Op) when Op >= 16#A0, Op =< 16#A4 -> 375;
 base_cost(16#F0) -> 32000;
 base_cost(16#F5) -> 32000;
 base_cost(16#FF) -> 5000;
+%% Halting opcodes cost nothing beyond the work they actually do (memory
+%% expansion, or the refund). RETURN and REVERT in particular are *not* 3 gas
+%% each: they neither read nor write state, so pricing them charges every
+%% function that returns -- which is every function -- for its own return. The
+%% catch-all below is the last resort for an opcode this schedule has not been
+%% given a cost for, which is exactly why these four are named explicitly.
+base_cost(16#F3) -> 0;
+base_cost(16#F4) -> 0;
+base_cost(16#FD) -> 0;
+base_cost(16#FE) -> 0;
 base_cost(_) -> 3.
 
 %% ---------------------------------------------------------------------------

@@ -224,6 +224,9 @@ Blocks are built and executed, but the node does not author them: it never recei
   - Update state trie after each transaction ✅
   - Collect receipts and logs ✅
   - Track gas used and refunds ✅
+  - Transaction-level effects applied in the protocol order: buy gas at the ceiling, bump the nonce, transfer value, run the EVM, refund the sender at the effective price, pay the recipient the tip
+  - EIP-161 (a touched-but-empty account must not enter the trie) and EIP-170 (24576-byte code limit) enforced
+  - A transaction is validated before it is executed; a block containing an invalid one is refused and nothing is committed
   - Gas costs are approximate, not per-fork exact
 - [x] **Withdrawals** — process beacon block withdrawals (EIP-4895) ✅
 - [ ] **Beacon requests** — handle `engine_notifyHeaders` and beacon root requests
@@ -256,17 +259,20 @@ State is stored in a trie, persisted, prunable, and its root recomputed and chec
 
 ### Phase 5: Protocol Compliance (partial)
 
-EIP-1559, EIP-4788, EIP-4895 and EIP-2935 are implemented, and the two system-contract EIPs are verified against the real bytecode Sepolia has deployed and against real block state. The per-fork gas schedule is not, which is the reason the state roots this node computes do not match the network's.
+EIP-1559, EIP-4788, EIP-4895 and EIP-2935 are implemented, and the two system-contract EIPs are verified against the real bytecode Sepolia has deployed and against real block state. The per-fork gas schedule is not, so the state roots this node computes are not expected to match the network's. It has not been established that the gas schedule is the *only* remaining divergence — that cannot be checked end-to-end without real prestate.
 
 - [ ] **Per-fork exact gas schedule** — replace approximate gas with exact per-fork schedule
+  - Fork *selection* is driven by real activation points (`current_fork/3`); the per-fork *gas table* is what is missing
   - Istanbul, Berlin, London, Arrow Glacier, Gray Glacier, Merge, Bellatrix, Paris, Shanghai, Cancun, Deneb
   - Each fork's exact gas costs for all opcodes
+  - The catch-all `base_cost(_) -> 3` is still a fallback for an unassigned opcode. It silently priced `RETURN`/`REVERT`/`INVALID`/`SELFDESTRUCT` at 3 gas each until they were given 0 — an unassigned opcode is still a guess rather than an error
   - Dynamic base fee calculation (EIP-1559)
   - Blob gas accounting (EIP-4844)
 - [x] **EIP-1559** — base fee calculation and burning ✅
   - Compute base fee per block ✅
-  - Burn base fee (update state trie) ✅
+  - Burn base fee ✅ — the sender pays `gasLimit * maxFeePerGas` and is refunded `gasLeft * effectivePrice`, so the base fee on unused gas is burned as well as on used gas; the fee recipient gets `gasUsed * (effectivePrice - baseFee)` and nothing else
   - Priority fee handling ✅
+  - Verified by asserting on the *sum* of balances, not on one account: what the sender loses and what the recipient gains must account for the rest
 - [ ] **EIP-4844 (blobs)** — blob transactions support (partial)
   - Blob transaction type (0x03) ✅
   - Blob gas pricing ✅
@@ -303,12 +309,18 @@ EIP-1559, EIP-4788, EIP-4895 and EIP-2935 are implemented, and the two system-co
   - Historical blocks are not re-executed, so agreement with previously accepted roots is not re-established
 - [ ] **Receipt verification** — verify transaction receipts on the peer path
   - Receipts are built during execution, but one arriving from a peer is never recomputed and compared
-- [ ] **Full transaction validation** — validate every transaction in every block
-  - Signature verification (secp256k1) — the sender is recovered and an unrecoverable one fails finalization, but an invalid signature does not reject the transaction
-  - Nonce checking — not implemented
-  - Balance checking — not implemented
-  - Chain ID checking — not implemented
-  - Gas limit checking — not implemented
+- [x] **Full transaction validation** — every transaction in every block ✅
+  - `eth_tx:validate/1,2` is the single implementation; the pool, the block
+    builder and block finalization all delegate to it
+  - `eth_block:finalize/1` validates before executing and returns
+    `{error, {invalid_transaction, Index, Reason}}` without committing — an
+    invalid transaction in a block changes nothing
+  - Covers field shapes and ranges, `to`/data/access list, per-type fee
+    consistency, the fee ceiling, EIP-4844 blob rules, the intrinsic gas
+    floor, signature recoverability and malleability, chain id, the block gas
+    limit, and nonce/balance against the executing pre-state
+  - No `from` fallback: the sender is always recovered from the signature
+  - An absent context key means the rule is unchecked, not passed
 
 ### Phase 6: JSON-RPC API Completion
 
@@ -407,15 +419,17 @@ Where the work actually stands:
 | Engine API server for CL communication | done (transition config values are passed through, not interpreted) |
 | Block execution: receipts, logs, bloom, state root, EIP-4788, EIP-4895, EIP-2935 | done, and the two system-contract EIPs verified against live Sepolia data |
 | Block authoring (proposer duties) | **not done** — the node builds and executes blocks but is never selected to author one |
-| Per-fork exact gas schedule | **not done** — one approximate schedule for all forks. This is the single reason the state roots this node computes do not match the network's |
+| Per-fork exact gas schedule | **not done** — one approximate schedule for all forks. Whether this is the *only* reason the state roots this node computes do not match the network's is unverified: it cannot be checked end-to-end without real prestate |
 | Honest stateRoot verification | done for the current block; historical blocks are not re-executed |
 | Receipt verification on the peer path | done — a peer's `receiptsRoot` is recomputed from the executed body and compared, and reported as `{verified, Root} \| {unverified, Reason}` |
-| Transaction validation (nonce, balance, chain ID, gas limit) | **not done** |
+| Transaction validation (nonce, balance, chain ID, gas limit, intrinsic gas, signature) | done — one validator, called on the peer path before execution, with the offending transaction's index reported |
+| Transaction state effects (nonce, value, gas purchase, coinbase tip, base-fee burn) | done — the sender is charged the ceiling and refunded the effective price, the recipient gets the tip only, the base fee is burned. Not checked against real prestate |
+| EIP-161 empty accounts, EIP-170 code size | done |
 | KZG commitment verification (EIP-4844) | **not done** |
 | Snap sync and proof-verified state reconstruction | **not done** |
 | Merge detection via TTD | **not done** — Paris is the floor unconditionally |
 
-Because the gas schedule is approximate, etherlang can execute blocks and report a state root, but that root will not equal the one the network computed. Everything needed to *close* that gap — exact per-fork gas, full transaction validation, receipt verification — is listed above and none of it is done.
+Because the gas schedule is approximate, etherlang can execute blocks and report a state root, but that root is not expected to equal the one the network computed. The exact per-fork gas table and KZG commitment verification are listed above and are not done. It is not established that the gas schedule is the *only* remaining divergence, because that cannot be checked without real prestate.
 
 **Dependencies:** None — this is pure Erlang/OTP, no external consensus libraries needed.
 

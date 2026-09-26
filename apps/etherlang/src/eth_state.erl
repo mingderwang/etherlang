@@ -16,7 +16,7 @@
 -export([new/2, overrides_from_json/1,
          account/2, balance/2, nonce/2, code/2, storage/3, exists/2,
          set_balance/3, set_nonce/3, set_code/3, set_storage/4,
-         mark_created/2, is_created/2, set_destroyed/2,
+         mark_created/2, is_created/2, set_destroyed/2, drop_if_empty/2, empty/2,
          commit/1, base_source/0, set_base_source/1,
          chain_id/0, address/1, address_hex/1, hex_to_bin/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -118,6 +118,31 @@ set_destroyed(State, Addr) ->
     overlay_put(overlay_put(State, {destroyed, address(Addr)}, true),
                 {code, address(Addr)}, <<>>).
 is_destroyed(#{overlay := O}, Addr) -> maps:get({destroyed, Addr}, O, false).
+
+%% EIP-161/158: an account that a transaction *touched* but left empty -- nonce 0,
+%% balance 0, no code -- must not appear in the trie at all.
+%%
+%% This matters most for the case nobody thinks about: a zero-value transfer to
+%% an address that does not exist yet. The transfer moves nothing, so if the
+%% account is committed it is committed as an empty account, and the post-state
+%% root then disagrees with every other client's by exactly that account. The
+%% "touched" marking is what makes the rule expressible: without it there is no
+%% way to tell "a transaction wrote zero here" from "a transaction created an
+%% empty account here", and the first is legal while the second is not.
+drop_if_empty(State, Addr) ->
+    case empty(State, Addr) of
+        true -> set_destroyed(State, Addr);
+        false -> State
+    end.
+
+%% Is this account empty *as the state now stands*? Destroyed counts as empty:
+%% a self-destructed account is exactly the empty-account case by definition.
+empty(State, Addr) ->
+    A = address(Addr),
+    is_destroyed(State, A) orelse
+        (balance(State, A) =:= 0 andalso
+         nonce(State, A) =:= 0 andalso
+         code(State, A) =:= <<>>).
 
 %% ---------------------------------------------------------------------------
 %% State overrides (eth_call 3rd parameter)

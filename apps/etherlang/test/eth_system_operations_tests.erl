@@ -904,7 +904,7 @@ mpt_word(Addr, Slot) ->
 
 %% Finalize a block carrying N identical calls to the installed contract.
 run_block(N, Parent, Number, Timestamp, Calldata) ->
-    Txs = [signed_call(Calldata) || _ <- lists:seq(1, N)],
+    Txs = [signed_call(Calldata, Nonce) || Nonce <- lists:seq(0, N - 1)],
     Block = (eth_block:new(Parent, Number))#block{
         transactions = Txs, timestamp = Timestamp},
     {ok, Finalized, _V} = eth_block:finalize(Block),
@@ -928,15 +928,23 @@ install_probe(Code) ->
 %% from eth_tx, because sighash/1 is private -- and a test that reached for it
 %% would be checking eth_tx against itself, whereas the point of these cases is
 %% that eth_block's recovered sender is the one the signature actually names.
-signed_call(Calldata) ->
+%%
+%% This was originally an *unprotected* legacy transaction (v = 27 + recid), which
+%% is what eth_tx:validate/2 correctly refuses on a chain that has a chain id:
+%% EIP-155 replay protection exists precisely to stop an unprotected transaction
+%% being replayed onto another chain, so "no chain id" is not a pass. The fixture
+%% was never a transaction a real network would accept; signing for the
+%% configured chain is what makes it one.
+signed_call(Calldata, Nonce) ->
     {PrivKey, _Sender} = get(?MODULE),
-    Nonce = 0,
     GasPrice = 0,
     Gas = 1000000,
     Value = 0,
     To = ?PROBE,
+    ChainId = eth_fork_schedule:chain_id(),
     Digest = eth_keccak:hash(
-               eth_rlp:encode([Nonce, GasPrice, Gas, To, Value, Calldata])),
+               eth_rlp:encode([Nonce, GasPrice, Gas, To, Value, Calldata,
+                               ChainId, 0, 0])),
     {R, S, V} = eth_secp256k1:sign(Digest, PrivKey),
     #{<<"type">> => <<"0x0">>,
       <<"nonce">> => eth_hex:encode_int(Nonce),
@@ -945,7 +953,8 @@ signed_call(Calldata) ->
       <<"to">> => hex(To),
       <<"value">> => eth_hex:encode_int(Value),
       <<"input">> => hex(Calldata),
-      <<"v">> => eth_hex:encode_int(27 + V),
+      %% EIP-155: v = chainId * 2 + 35 + recid.
+      <<"v">> => eth_hex:encode_int(ChainId * 2 + 35 + V),
       <<"r">> => hex(int_to_32(R)),
       <<"s">> => hex(int_to_32(S)),
       %% Deliberately wrong: nothing may read this.
