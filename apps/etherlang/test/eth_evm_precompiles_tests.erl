@@ -2,17 +2,24 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+%% The newest fork, named rather than defaulted. Every test here used to call
+%% `precompile/2', which took no fork, and so asserted against a schedule belonging
+%% to no fork at all -- and several were half right in a way worth recording:
+%% `precompile(8, Data)' for a pairing check paired a Byzantium *address* with an
+%% Istanbul *price'. A default here would let the next such mixture go unnoticed.
+-define(FORK, cancun).
+
 %% EIP-198/2565 MODEXP vectors.
 
 modexp_small_test() ->
     %% 3^2 mod 5 = 4; Max=1 -> complexity 1, adjusted(2)=1 -> floor 200.
     Data = <<1:256, 1:256, 1:256, 3:8, 2:8, 5:8>>,
-    ?assertEqual({ok, <<4>>, 200}, eth_evm_precompiles:precompile(5, Data)).
+    ?assertEqual({ok, <<4>>, 200}, eth_evm_precompiles:precompile(5, Data, ?FORK)).
 
 modexp_zero_exponent_test() ->
     %% 3^0 mod 5 = 1; adjusted(0) is defined as 0, not -1.
     Data = <<1:256, 1:256, 1:256, 3:8, 0:8, 5:8>>,
-    ?assertEqual({ok, <<1>>, 200}, eth_evm_precompiles:precompile(5, Data)).
+    ?assertEqual({ok, <<1>>, 200}, eth_evm_precompiles:precompile(5, Data, ?FORK)).
 
 modexp_gas_counts_exponent_bits_test() ->
     %% 32-byte sizes, exponent 2^255: adjusted = 255, complexity = 1024,
@@ -21,14 +28,14 @@ modexp_gas_counts_exponent_bits_test() ->
     E = <<16#80, 0:248>>,
     M = binary:copy(<<16#FF>>, 32),
     Data = <<32:256, 32:256, 32:256, 2:256, E/binary, M/binary>>,
-    {ok, Out, Gas} = eth_evm_precompiles:precompile(5, Data),
+    {ok, Out, Gas} = eth_evm_precompiles:precompile(5, Data, byzantium),
     ?assertEqual(32, byte_size(Out)),
     ?assertEqual(13056, Gas).
 
 modexp_zero_modulus_test() ->
     %% M = 0 -> empty output (gas still charged per EIP-198).
     Data = <<1:256, 1:256, 1:256, 3:8, 2:8, 0:8>>,
-    {ok, Out, Gas} = eth_evm_precompiles:precompile(5, Data),
+    {ok, Out, Gas} = eth_evm_precompiles:precompile(5, Data, ?FORK),
     ?assertEqual(<<>>, Out),
     ?assertEqual(200, Gas).
 
@@ -38,13 +45,13 @@ modexp_long_exponent_head_bits_test() ->
     %% Max = 1 -> complexity 1 -> gas floor 200 either way; asserts output.
     E = <<16#80, 0:256>>,
     Data = <<1:256, 33:256, 1:256, 3:8, E/binary, 5:8>>,
-    ?assertEqual({ok, <<1>>, 200}, eth_evm_precompiles:precompile(5, Data)).
+    ?assertEqual({ok, <<1>>, 200}, eth_evm_precompiles:precompile(5, Data, ?FORK)).
 
 identity_test() ->
-    ?assertEqual({ok, <<"abc">>, 15 + 3}, eth_evm_precompiles:precompile(4, <<"abc">>)).
+    ?assertEqual({ok, <<"abc">>, 15 + 3}, eth_evm_precompiles:precompile(4, <<"abc">>, ?FORK)).
 
 ecrecover_recognized_test() ->
-    ?assertEqual(true, eth_evm_precompiles:is_precompile(1)).
+    ?assertEqual(true, eth_evm_precompiles:is_precompile(1, ?FORK)).
 
 %% ECRECOVER vectors recorded live from Sepolia upstream. Failure returns
 %% empty output (geth parity), never an error.
@@ -53,7 +60,7 @@ ecrecover_valid_test() ->
                               "000000000000000000000000000000000000000000000000000000000000001b"
                               "a30aeebf19b0dc75fb8e4457cd9069b30051021bd3f6c7bd5603512bc4231842"
                               "99c02cd178b7772ce623c6224c7177c52dfcd733244455d1453c90e0f81a5eb1">>),
-    {ok, Out, Gas} = eth_evm_precompiles:precompile(1, In),
+    {ok, Out, Gas} = eth_evm_precompiles:precompile(1, In, ?FORK),
     ?assertEqual(binary:decode_hex(<<"00000000000000000000000094d553c07966b312c542034bf66c71bdb929202d">>),
                  Out),
     ?assertEqual(3000, Gas).
@@ -63,7 +70,7 @@ ecrecover_valid_v28_test() ->
                               "000000000000000000000000000000000000000000000000000000000000001c"
                               "cc13d8fe87dcd5a9d291dcf94781a2a9a9350e85ad0fc33666072b27c2a249d"
                               "af7421999a698278f99413b1d9f76b858831c000bd753d1a13183df600c1a469f">>),
-    {ok, Out, Gas} = eth_evm_precompiles:precompile(1, In),
+    {ok, Out, Gas} = eth_evm_precompiles:precompile(1, In, ?FORK),
     ?assertEqual(binary:decode_hex(<<"000000000000000000000000665903e06d6382f5ea7ddaa0a6dfd99bcfc860f4">>),
                  Out),
     ?assertEqual(3000, Gas).
@@ -75,17 +82,17 @@ ecrecover_bad_v_test() ->
                                "99c02cd178b7772ce623c6224c7177c52dfcd733244455d1453c90e0f81a5eb1">>),
     <<H:32/binary, _:32/binary, RS:64/binary>> = Base,
     {ok, Out, Gas} = eth_evm_precompiles:precompile(
-                       1, <<H/binary, 0:256, RS/binary>>),
+                       1, <<H/binary, 0:256, RS/binary>>, ?FORK),
     ?assertEqual(<<>>, Out),
     ?assertEqual(3000, Gas).
 
 ecrecover_zero_r_test() ->
-    {ok, Out, _} = eth_evm_precompiles:precompile(1, binary:copy(<<0>>, 128)),
+    {ok, Out, _} = eth_evm_precompiles:precompile(1, binary:copy(<<0>>, 128), ?FORK),
     ?assertEqual(<<>>, Out).
 
 ecrecover_short_input_test() ->
     %% Short input zero-pads (v field becomes 0 -> invalid -> empty).
-    {ok, Out, _} = eth_evm_precompiles:precompile(1, <<1:256>>),
+    {ok, Out, _} = eth_evm_precompiles:precompile(1, <<1:256>>, ?FORK),
     ?assertEqual(<<>>, Out).
 
 %% The precompile set is 0x01..0x0A and nothing else. 0x0A used to be missing
@@ -93,10 +100,10 @@ ecrecover_short_input_test() ->
 %% mainnet exec-specs fixtures -- was unreachable from execution.
 precompile_set_is_one_through_ten_test() ->
     ?assertEqual([true, true, true, true, true, true, true, true, true, true],
-                 [eth_evm_precompiles:is_precompile(N) || N <- lists:seq(1, 10)]),
-    ?assertNot(eth_evm_precompiles:is_precompile(0)),
-    ?assertNot(eth_evm_precompiles:is_precompile(11)),
-    ?assertEqual(unsupported, eth_evm_precompiles:precompile(11, <<>>)).
+                 [eth_evm_precompiles:is_precompile(N, ?FORK) || N <- lists:seq(1, 10)]),
+    ?assertNot(eth_evm_precompiles:is_precompile(0, ?FORK)),
+    ?assertNot(eth_evm_precompiles:is_precompile(11, ?FORK)),
+    ?assertEqual(unsupported, eth_evm_precompiles:precompile(11, <<>>, ?FORK)).
 
 %% A precompile that is not implemented returns `unsupported', which eth_call
 %% turns into an upstream fallback. A precompile that ran and rejected its input
@@ -105,8 +112,8 @@ precompile_set_is_one_through_ten_test() ->
 %% pinned here rather than left to the reader of two case clauses.
 kzg_failure_is_not_a_fallback_test() ->
     ?assertEqual({error, {kzg, point_evaluation_failed}},
-                 eth_evm_precompiles:precompile(10, <<>>)),
-    ?assertNotEqual(unsupported, eth_evm_precompiles:precompile(10, <<>>)).
+                 eth_evm_precompiles:precompile(10, <<>>, ?FORK)),
+    ?assertNotEqual(unsupported, eth_evm_precompiles:precompile(10, <<>>, ?FORK)).
 
 %% ---------------------------------------------------------------------------
 %% EIP-152 BLAKE2b-F vectors (inputs built from parts, outputs verbatim).
@@ -120,47 +127,49 @@ blake2f_input(Rounds, F) ->
     <<Rounds:32, H/binary, M/binary, T/binary, F:8>>.
 
 blake2f_vector4_rounds_zero_test() ->
-    {ok, Out, Gas} = eth_evm_precompiles:precompile(9, blake2f_input(0, 1)),
+    {ok, Out, Gas} = eth_evm_precompiles:precompile(9, blake2f_input(0, 1), istanbul),
     ?assertEqual(binary:decode_hex(<<"08c9bcf367e6096a3ba7ca8485ae67bb2bf894fe72f36e3cf1361d5f3af54fa5"
                                       "d282e6ad7f520e511f6c3e2b8c68059b9442be0454267ce079217e1319cde05b">>),
                  Out),
     ?assertEqual(0, Gas).
 
 blake2f_vector5_twelve_rounds_test() ->
-    {ok, Out, Gas} = eth_evm_precompiles:precompile(9, blake2f_input(12, 1)),
+    {ok, Out, Gas} = eth_evm_precompiles:precompile(9, blake2f_input(12, 1), istanbul),
     ?assertEqual(binary:decode_hex(<<"ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d1"
                                       "7d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923">>),
                  Out),
     ?assertEqual(12, Gas).
 
 blake2f_vector6_unset_final_flag_test() ->
-    {ok, Out, Gas} = eth_evm_precompiles:precompile(9, blake2f_input(12, 0)),
+    {ok, Out, Gas} = eth_evm_precompiles:precompile(9, blake2f_input(12, 0), istanbul),
     ?assertEqual(binary:decode_hex(<<"75ab69d3190a562c51aef8d88f1c2775876944407270c42c9844252c26d2875298"
                                       "743e7f6d5ea2f2d3e8d226039cd31b4e426ac4f2d3d666a610c2116fde4735">>),
                  Out),
     ?assertEqual(12, Gas).
 
 blake2f_vector7_single_round_test() ->
-    {ok, Out, Gas} = eth_evm_precompiles:precompile(9, blake2f_input(1, 1)),
+    {ok, Out, Gas} = eth_evm_precompiles:precompile(9, blake2f_input(1, 1), istanbul),
     ?assertEqual(binary:decode_hex(<<"b63a380cb2897d521994a85234ee2c181b5f844d2c624c002677e9703449d2fba55"
                                       "1b3a8333bcdf5f2f7e08993d53923de3d64fcc68c034e717b9293fed7a421">>),
                  Out),
     ?assertEqual(1, Gas).
 
 blake2f_bad_length_test() ->
-    ?assertEqual(unsupported, eth_evm_precompiles:precompile(9, <<>>)),
+    ?assertEqual(unsupported, eth_evm_precompiles:precompile(9, <<>>, istanbul)),
     ?assertEqual(unsupported,
-                 eth_evm_precompiles:precompile(9, binary:part(blake2f_input(12, 1), 0, 212))),
+                 eth_evm_precompiles:precompile(9, binary:part(blake2f_input(12, 1), 0, 212), istanbul)),
     ?assertEqual(unsupported,
-                 eth_evm_precompiles:precompile(9, <<(blake2f_input(12, 1))/binary, 0>>)).
+                 eth_evm_precompiles:precompile(9, <<(blake2f_input(12, 1))/binary, 0>>,
+                                                istanbul)).
 
 blake2f_bad_flag_test() ->
     Good = blake2f_input(12, 1),
     Bad = binary:part(Good, 0, 212),
-    ?assertEqual(unsupported, eth_evm_precompiles:precompile(9, <<Bad/binary, 2>>)).
+    ?assertEqual(unsupported,
+                 eth_evm_precompiles:precompile(9, <<Bad/binary, 2>>, istanbul)).
 
 blake2f_recognized_test() ->
-    ?assertEqual(true, eth_evm_precompiles:is_precompile(9)).
+    ?assertEqual(true, eth_evm_precompiles:is_precompile(9, ?FORK)).
 
 %% ---------------------------------------------------------------------------
 %% EIP-196 alt_bn128 vectors (outputs recorded from Sepolia upstream;
@@ -178,22 +187,22 @@ ecadd_g1_double_test() ->
     In = <<(bn128_u(1))/binary, (bn128_u(2))/binary,
            (bn128_u(1))/binary, (bn128_u(2))/binary>>,
     ?assertEqual({ok, ?BN128_DOUBLE_G1, 150},
-                 eth_evm_precompiles:precompile(6, In)).
+                 eth_evm_precompiles:precompile(6, In, ?FORK)).
 
 ecmul_g1_times_two_test() ->
     In = <<(bn128_u(1))/binary, (bn128_u(2))/binary, (bn128_u(2))/binary>>,
     ?assertEqual({ok, ?BN128_DOUBLE_G1, 6000},
-                 eth_evm_precompiles:precompile(7, In)).
+                 eth_evm_precompiles:precompile(7, In, ?FORK)).
 
 ecadd_infinity_identity_test() ->
     Zeros = binary:copy(<<0>>, 128),
-    {ok, Out, Gas} = eth_evm_precompiles:precompile(6, Zeros),
+    {ok, Out, Gas} = eth_evm_precompiles:precompile(6, Zeros, ?FORK),
     ?assertEqual(binary:copy(<<0>>, 64), Out),
     ?assertEqual(150, Gas).
 
 ecmul_zero_scalar_test() ->
     In = <<(bn128_u(1))/binary, (bn128_u(2))/binary, (bn128_u(0))/binary>>,
-    {ok, Out, Gas} = eth_evm_precompiles:precompile(7, In),
+    {ok, Out, Gas} = eth_evm_precompiles:precompile(7, In, ?FORK),
     ?assertEqual(binary:copy(<<0>>, 64), Out),
     ?assertEqual(6000, Gas).
 
@@ -201,23 +210,23 @@ ecadd_coordinate_at_field_test() ->
     P = 21888242871839275222246405745257275088696311157297823662689037894645226208583,
     In = <<(bn128_u(P))/binary, (bn128_u(0))/binary,
            (bn128_u(0))/binary, (bn128_u(0))/binary>>,
-    ?assertEqual(unsupported, eth_evm_precompiles:precompile(6, In)).
+    ?assertEqual(unsupported, eth_evm_precompiles:precompile(6, In, ?FORK)).
 
 ecadd_off_curve_test() ->
     %% (2,2): 4 =/= 11 mod p.
     In = <<(bn128_u(2))/binary, (bn128_u(2))/binary,
            (bn128_u(0))/binary, (bn128_u(0))/binary>>,
-    ?assertEqual(unsupported, eth_evm_precompiles:precompile(6, In)).
+    ?assertEqual(unsupported, eth_evm_precompiles:precompile(6, In, ?FORK)).
 
 ecmul_short_input_padded_test() ->
     %% 64 bytes (no scalar): zero-padded scalar 0 -> infinity.
     In = <<(bn128_u(1))/binary, (bn128_u(2))/binary>>,
-    {ok, Out, _} = eth_evm_precompiles:precompile(7, In),
+    {ok, Out, _} = eth_evm_precompiles:precompile(7, In, ?FORK),
     ?assertEqual(binary:copy(<<0>>, 64), Out).
 
 ecadd_recognized_test() ->
-    ?assertEqual(true, eth_evm_precompiles:is_precompile(6)),
-    ?assertEqual(true, eth_evm_precompiles:is_precompile(7)).
+    ?assertEqual(true, eth_evm_precompiles:is_precompile(6, ?FORK)),
+    ?assertEqual(true, eth_evm_precompiles:is_precompile(7, ?FORK)).
 
 %% ---------------------------------------------------------------------------
 %% EIP-197 pairing check (0x08). G2 generator wire bytes from the EIP
@@ -233,18 +242,18 @@ pairing_g2() ->
 
 pairing_empty_test() ->
     ?assertEqual({ok, <<1:256>>, 45000},
-                 eth_evm_precompiles:precompile(8, <<>>)).
+                 eth_evm_precompiles:precompile(8, <<>>, istanbul)).
 
 pairing_bad_length_test() ->
     ?assertEqual(unsupported,
-                 eth_evm_precompiles:precompile(8, binary:copy(<<0>>, 191))),
+                 eth_evm_precompiles:precompile(8, binary:copy(<<0>>, 191), istanbul)),
     ?assertEqual(unsupported,
-                 eth_evm_precompiles:precompile(8, binary:copy(<<0>>, 193))).
+                 eth_evm_precompiles:precompile(8, binary:copy(<<0>>, 193), istanbul)).
 
 pairing_single_nondegenerate_test() ->
     %% e(G1,G2) =/= 1 (non-degeneracy): check returns 0.
     {ok, Out, Gas} = eth_evm_precompiles:precompile(
-                       8, <<(pairing_g1())/binary, (pairing_g2())/binary>>),
+                       8, <<(pairing_g1())/binary, (pairing_g2())/binary>>, istanbul),
     ?assertEqual(<<0:256>>, Out),
     ?assertEqual(79000, Gas).
 
@@ -257,7 +266,7 @@ pairing_cancel_test() ->
     NG2 = <<Xa:256, Xb:256, NYa:256, NYb:256>>,
     In = <<(pairing_g1())/binary, (pairing_g2())/binary,
            (pairing_g1())/binary, NG2/binary>>,
-    {ok, Out, Gas} = eth_evm_precompiles:precompile(8, In),
+    {ok, Out, Gas} = eth_evm_precompiles:precompile(8, In, istanbul),
     ?assertEqual(<<1:256>>, Out),
     ?assertEqual(113000, Gas).
 
@@ -265,13 +274,13 @@ pairing_bad_g1_test() ->
     %% x = p is not a valid encoding.
     P = 21888242871839275222246405745257275088696311157297823662689037894645226208583,
     Bad = <<P:256, 0:256, (pairing_g2())/binary>>,
-    ?assertEqual(unsupported, eth_evm_precompiles:precompile(8, Bad)).
+    ?assertEqual(unsupported, eth_evm_precompiles:precompile(8, Bad, istanbul)).
 
 pairing_off_curve_g2_test() ->
     %% Flip a Y bit of the generator: on-wire valid, off the twisted curve.
     <<Xa:256, Xb:256, Ya:256, Yb:256>> = pairing_g2(),
     Bad = <<(pairing_g1())/binary, Xa:256, Xb:256, (Ya + 1):256, Yb:256>>,
-    ?assertEqual(unsupported, eth_evm_precompiles:precompile(8, Bad)).
+    ?assertEqual(unsupported, eth_evm_precompiles:precompile(8, Bad, istanbul)).
 
 pairing_recognized_test() ->
-    ?assertEqual(true, eth_evm_precompiles:is_precompile(8)).
+    ?assertEqual(true, eth_evm_precompiles:is_precompile(8, ?FORK)).

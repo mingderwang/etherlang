@@ -6,44 +6,73 @@
 %% 0x0A is EIP-4844's point evaluation, which eth_kzg implements against
 %% BLS12-381 and the real trusted setup.
 
--export([precompile/2, is_precompile/1]).
+-export([precompile/3, is_precompile/2]).
 
-is_precompile(1) -> true;
-is_precompile(2) -> true;
-is_precompile(3) -> true;
-is_precompile(4) -> true;
-is_precompile(5) -> true;
-is_precompile(6) -> true;
-is_precompile(7) -> true;
-is_precompile(8) -> true;
-is_precompile(9) -> true;
-is_precompile(10) -> true;
-is_precompile(_) -> false.
+%% ---------------------------------------------------------------------------
+%% A precompile is a fork question, twice over
+%% ---------------------------------------------------------------------------
+%% This module took no fork, and both questions it should have been asking were
+%% therefore answered with one fork's answer:
+%%
+%%   - **Which contract is at an address.** 0x08 is the alt_bn128 pairing check from
+%%     Byzantium (EIP-197) onward; 0x09 is blake2f from Istanbul (EIP-152) and is
+%%     *nothing* before it; 0x0A is EIP-4844's point evaluation from Cancun. So
+%%     pre-Istanbul, 0x09 is an ordinary account with no code, and this module ran
+%%     blake2f there. The difference is not a gas difference: a CALL to an account
+%%     with no code succeeds, returns nothing and executes empty code, and a node
+%%     that answers it with a BLAKE2b round does not agree with the chain about what
+%%     that address is.
+%%   - **What it costs.** EIP-1108's table is the Istanbul column; EIP-196's and
+%%     EIP-197's are what apply before it. ECADD at 150 rather than 500 is a
+%%     three-fold error on every mainnet block from genesis to 9,069,000.
+%%
+%% `eth_fork_schedule:precompile_at/2' and `bn128_cost/2' hold both answers, so the
+%% fork knowledge stays in one place -- which is the whole reason this is a fork
+%% argument rather than a `case` here. The word count of the input is the one thing
+%% the table cannot know, so the per-word part is added here, from the figure the
+%% table gave for the base.
+%%
+%% `is_precompile/2' is the question the interpreter asks before it decides a CALL
+%% is a precompile rather than a frame, and it must agree with `precompile/3' in
+%% *both* directions: an address that holds no contract must not reach the
+%% precompile path at all, or the frame machinery would run empty code with a
+%% precompile's rules.
+is_precompile(Addr, Fork) ->
+    eth_fork_schedule:precompile_at(Fork, Addr) =/= undefined.
 
 %% -> {ok, Output, GasCost} | unsupported
-precompile(1, Data) ->
+precompile(Addr, Data, Fork) ->
+    case eth_fork_schedule:precompile_at(Fork, Addr) of
+        undefined ->
+            unsupported;
+        Which ->
+            run(Which, Data, Fork)
+    end.
+
+run(ecrecover, Data, _Fork) ->
     ecrecover(Data);
-precompile(2, Data) ->
+run(sha256, Data, _Fork) ->
     {ok, crypto:hash(sha256, Data), 60 + 12 * words(Data)};
-precompile(3, Data) ->
+run(ripemd160, Data, _Fork) ->
     Hash = crypto:hash(ripemd160, Data),
     {ok, <<0:96, Hash/binary>>, 600 + 120 * words(Data)};
-precompile(4, Data) ->
+run(identity, Data, _Fork) ->
     {ok, Data, 15 + 3 * words(Data)};
-precompile(5, Data) ->
-    modexp(Data);
-precompile(6, Data) ->
-    bn128_add(Data);
-precompile(7, Data) ->
-    bn128_mul(Data);
-precompile(8, Data) ->
-    eth_pairing_bn128:check_pairing(Data);
-precompile(9, Data) ->
+run(modexp, Data, Fork) ->
+    modexp(Data, Fork);
+run(ecadd, Data, Fork) ->
+    bn128_add(Data, Fork);
+run(ecmul, Data, Fork) ->
+    bn128_mul(Data, Fork);
+run(ecpairing, Data, Fork) ->
+    case eth_pairing_bn128:check_pairing(Data) of
+        {ok, Out} -> {ok, Out, bn128_cost(ecpairing, Fork, pairings(Data))};
+        Error -> Error
+    end;
+run(blake2f, Data, _Fork) ->
     blake2f(Data);
-precompile(10, Data) ->
-    point_evaluation(Data);
-precompile(_, _) ->
-    unsupported.
+run(point_evaluation, Data, _Fork) ->
+    point_evaluation(Data).
 
 %% EIP-4844: 50000 gas, and the success output is FIELD_ELEMENTS_PER_BLOB
 %% followed by BLS_MODULUS, each a 32-byte big-endian integer.
@@ -73,7 +102,7 @@ words(Bin) -> (byte_size(Bin) + 31) div 32.
 
 %% EIP-198: [lenB | lenE | lenM | B | E | M], result is B^E mod M zero-padded
 %% to lenM bytes.
-modexp(Data) ->
+modexp(Data, Fork) ->
     case split_header(Data) of
         {ok, LenB, LenE, LenM, Rest} ->
             Total = LenB + LenE + LenM,
@@ -86,9 +115,9 @@ modexp(Data) ->
                               0 -> <<>>;
                               _ -> eth_word:to_bytes(eth_word:powmod(B, E, M), LenM)
                           end,
-                    {ok, Out, modexp_gas(LenB, LenE, LenM, E)};
+                    {ok, Out, modexp_gas(LenB, LenE, LenM, E, Fork)};
                 false ->
-                    {ok, <<>>, modexp_gas(LenB, LenE, LenM, 0)}
+                    {ok, <<>>, modexp_gas(LenB, LenE, LenM, 0, Fork)}
             end;
         error ->
             {ok, <<>>, 0}
@@ -106,15 +135,14 @@ slice(Bin, Off, Len) ->
         false -> binary:part(Bin, Off, max(0, byte_size(Bin) - Off))
     end.
 
-modexp_gas(LenB, LenE, LenM, E) ->
-    Max = max(LenB, LenM),
-    Complexity = mult_complexity(Max),
+%% EIP-198's formula, or EIP-2565's, with the divisor, the minimum and the
+%% multiplication complexity all read from the fork table because all three changed at
+%% Berlin and the two schedules are not substitutes for one another.
+modexp_gas(LenB, LenE, LenM, E, Fork) ->
+    {Divisor, Minimum} = eth_fork_schedule:modexp_cost(Fork),
+    Complexity = eth_fork_schedule:modexp_complexity(Fork, max(LenB, LenM)),
     Adjusted = adjusted_exp_len(LenE, E),
-    max(200, Complexity * max(Adjusted, 1) div 20).
-
-mult_complexity(X) when X =< 64 -> X * X;
-mult_complexity(X) when X =< 1024 -> X * X div 4 + 96 * X - 3072;
-mult_complexity(X) -> X * X div 16 + 480 * X - 199680.
+    max(Minimum, Complexity * max(Adjusted, 1) div Divisor).
 
 adjusted_exp_len(LenE, E) when LenE =< 32 ->
     %% EIP-198: index of the highest bit (1->0, 2->1, 255->7, 256->8),
@@ -361,20 +389,35 @@ secp_egcd(A, B, X, Y, M) ->
     secp_egcd(B rem A, A, Y - Q * X, X, M).
 -define(BN128_P, 21888242871839275222246405745257275088696311157297823662689037894645226208583).
 
-bn128_add(Data) ->
+bn128_add(Data, Fork) ->
     <<X1:256, Y1:256, X2:256, Y2:256, _/binary>> = bn128_pad(Data, 128),
     case {bn128_point(X1, Y1), bn128_point(X2, Y2)} of
         {error, _} -> unsupported;
         {_, error} -> unsupported;
-        {P1, P2} -> {ok, bn128_encode(bn128_add_points(P1, P2)), 150}
+        {P1, P2} -> {ok, bn128_encode(bn128_add_points(P1, P2)),
+                     bn128_cost(ecadd, Fork, 0)}
     end.
 
-bn128_mul(Data) ->
+bn128_mul(Data, Fork) ->
     <<X:256, Y:256, S:256, _/binary>> = bn128_pad(Data, 96),
     case bn128_point(X, Y) of
         error -> unsupported;
-        P -> {ok, bn128_encode(bn128_mul_point(P, S)), 6000}
+        P -> {ok, bn128_encode(bn128_mul_point(P, S)),
+              bn128_cost(ecmul, Fork, 0)}
     end.
+
+%% The alt_bn128 price for a fixed number of units, from the fork table's `{Base,
+%% PerUnit}' for that contract.
+bn128_cost(Which, Fork, Units) ->
+    {Base, PerUnit} = eth_fork_schedule:bn128_cost(Fork, Which),
+    Base + PerUnit * Units.
+
+%% How many pairs a pairing check was asked about. The input is a list of 192-byte
+%% pairs, and EIP-197 charges per pair; a length that is not a whole number of pairs
+%% is not a valid pairing check, and the caller's own length check decides that, so
+%% this is only ever asked about well-formed input.
+pairings(Data) ->
+    byte_size(Data) div 192.
 
 %% Right-pad short input with zeros (CALLDATALOAD-compatible semantics).
 bn128_pad(Data, N) when byte_size(Data) >= N -> Data;

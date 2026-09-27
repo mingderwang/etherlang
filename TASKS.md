@@ -224,11 +224,38 @@ behavioural change per commit, and each step says what it now does.
    - **`+56668` and `+56665`, 12 fixtures each.** The largest systematic bucket and
      the one most likely to be a single cause. **Unresolved.**
    - **`-1208` gas, 1 fixture, `homestead/coverage` at Homestead.** **Unresolved.**
-   Separately: `eth_evm_precompiles:precompile/2` takes **no fork**, so the EIP-1108
-   repricing cannot be applied at all — ECADD is charged 150 at every fork where
-   Byzantium's EIP-196 figure is 500 and Istanbul's is 15000, so it is wrong
-   everywhere and cannot be made right without a fork parameter. That is a known
-   structural gap, not a finding from the corpus.
+   - **Precompile pricing took no fork at all. Fixed** (`v1.27`). This was a
+     structural gap rather than a corpus finding, and it was a large one:
+     - **The alt_bn128 prices were Istanbul's at every fork.** EIP-1108's table has
+       two columns and the node used the "Updated" one everywhere, so ECADD cost 150
+       where Byzantium says 500, ECMUL 6,000 where it says 40,000, and the pairing
+       check 45,000 + 34,000k where it says 100,000 + 80,000k. On mainnet that is
+       every block from genesis to 9,069,000.
+     - **The layout was Istanbul's at every fork too.** 0x08 is the pairing check
+       from Byzantium (EIP-197) and stays there; 0x09 is blake2f from Istanbul
+       (EIP-152) and is *nothing* before it; 0x06/0x07 arrived with EIP-196. So a
+       Byzantium block's CALL to 0x09 ran a BLAKE2b round, where the specification has
+       no contract at all and a CALL should succeed on empty code.
+     - **ModExp was a mixture matching no fork**: EIP-198's complexity and divisor
+       with EIP-2565's floor of 200, and no Berlin switch — so Berlin's divisor of 3
+       and its `words**2` complexity were missing. EIP-198 has no minimum, so small
+       calls at Byzantium were overcharged, and large ones at Berlin by up to 6.7x.
+     `precompile/2` and `is_precompile/1` became `precompile/3` and `is_precompile/2`,
+     and the fork now comes from the frame's own `#ctx.fork` in `eth_evm` and from the
+     block being simulated in `eth_call` — not from the operator's `ETH_FORK` pin,
+     which is what `eth_estimateGas` on a historical block was using.
+
+     **One thing I got wrong while fixing this, and the committed corpus is what
+     caught it.** I first wrote the layout as "Istanbul swapped 0x08 and 0x09, so
+     blake2f took 0x08 and the pairing check moved to 0x09" — from recollection, and
+     wrong. The corpus says otherwise directly: `byzantium/eip197_ec_pairing` contains
+     a contract whose code is `PUSH1 8 ... CALL`, and `istanbul/eip152_blake2` contains
+     `PUSH1 9, PUSH1 1, DELEGATECALL`. There is no swap. Had the recollection stood,
+     the change would have replaced a correct layout with a wrong one while its commit
+     message claimed to repair it. The rule this follows is the one §4.2 already
+     states — derive the value, then pin it — and the two committed fixtures are a
+     derivation from a third party's expected results, whereas my memory of which
+     address moved was not.
 8. **Block-level conformance**  *(next after that)*. The corpus above is state transitions.
    EEST's `blockchain_tests` and the Ethereum Foundation's own `ethereum/tests`
    exercise what a state test cannot: state roots, receipts roots, logs blooms and

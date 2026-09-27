@@ -64,6 +64,10 @@
           tx_type_available/2,
           introduced_tx_type/1,
           set_code_auth_cost/1,
+          modexp_cost/1,
+          modexp_complexity/2,
+          precompile_at/2,
+          bn128_cost/2,
           timestamp_in_frame/3,
           timestamp_frame/2,
           activated_at/2 ]).
@@ -77,6 +81,11 @@
 %% metered during the state transition and is not implemented; see the note beside
 %% `set_code_auth_cost/1'.
 -define(PER_EMPTY_ACCOUNT_COST, 25000).
+%% EIP-2565 sets GQUADDIVISOR to 3 and adds a 200 gas minimum; EIP-198 set it to 20
+%% and had no minimum. See `modexp_cost/1'.
+-define(MOD_EXP_GQUADDIVISOR_BERLIN, 3).
+-define(MOD_EXP_MIN_BERLIN, 200).
+-define(MOD_EXP_GQUADDIVISOR_BYZANTIUM, 20).
 -define(BASE_FEE_INITIAL, 1000000000).
 -define(MIN_BASE_FEE, 7).
 -define(MAX_WITHDRAWALS_PER_PAYLOAD, 16).
@@ -1504,6 +1513,141 @@ sstore_supported(_Fork) -> false.
 %% would be two copies of one fact, and this module's own history is that two copies
 %% drift: `eth_evm:base_cost/1' was a fork-free duplicate of the gas table, and the
 %% two had come to disagree about how they grouped four sets of constants.
+%% ---------------------------------------------------------------------------
+%% ModExp (0x05): EIP-198's price, then EIP-2565's
+%% ---------------------------------------------------------------------------
+%% ModExp is the one precompile whose price is a formula rather than a figure, and
+%% the formula changed once. This node implemented a mixture that matched no fork at
+%% all: EIP-198's multiplication complexity and its divisor of 20, with EIP-2565's
+%% floor of 200 -- and no Berlin switch, so Berlin's divisor of 3 and its `words**2'
+%% complexity were missing entirely.
+%%
+%% The 200 floor is EIP-2565's, and EIP-198's text has no minimum at all: "Consumes
+%% floor(mult_complexity(...) * max(ADJUSTED_EXPONENT_LENGTH, 1) / GQUADDIVISOR) gas"
+%% with GQUADDIVISOR = 20. So a small ModExp call at Byzantium was overcharged, and
+%% every ModExp call at Berlin was overcharged by up to a factor of six.
+-spec modexp_cost(atom()) -> {non_neg_integer(), non_neg_integer()}.
+modexp_cost(Fork) ->
+    case at_least(Fork, berlin) of
+        true -> {?MOD_EXP_GQUADDIVISOR_BERLIN, ?MOD_EXP_MIN_BERLIN};
+        false -> {?MOD_EXP_GQUADDIVISOR_BYZANTIUM, 0}
+    end.
+
+%% The multiplication complexity, which is a different function on each side of
+%% Berlin and not a simplification of one another.
+%%
+%% EIP-198's own text:
+%%
+%%   def mult_complexity(x):
+%%       if x <= 64: return x ** 2
+%%       elif x <= 1024: return x ** 2 // 4 + 96 * x - 3072
+%%       else: return x ** 2 // 16 + 480 * x - 199680
+%%
+%% EIP-2565 replaced all three branches with `words**2', where
+%% `words = math.ceil(max_length / 8)`. Berlin did not tune the piecewise formula, it
+%% discarded it, and carrying the piecewise one across Berlin is not a conservative
+%% choice -- it is a different number.
+-spec modexp_complexity(atom(), non_neg_integer()) -> non_neg_integer().
+modexp_complexity(Fork, Max) ->
+    case at_least(Fork, berlin) of
+        true ->
+            Words = (Max + 7) div 8,
+            Words * Words;
+        false when Max =< 64 ->
+            Max * Max;
+        false when Max =< 1024 ->
+            Max * Max div 4 + 96 * Max - 3072;
+        false ->
+            Max * Max div 16 + 480 * Max - 199680
+    end.
+
+%% ---------------------------------------------------------------------------
+%% Precompiles: which contract is where, and what it costs
+%% ---------------------------------------------------------------------------
+%% A precompile's *address* is fork-dependent, and so is its price, and this module
+%% held neither. Two consequences, both on forks this node's schedule covers:
+%%
+%%   - The **layout** was Istanbul's at every fork. 0x08 is the pairing check from
+%%     Byzantium and stays there; 0x09 is blake2f from Istanbul (EIP-152) and is
+%%     *nothing* before it; 0x0A is EIP-4844's point evaluation from Cancun. So on a
+%%     Byzantium block the node ran blake2f at 0x09, where the specification has no
+%%     contract at all. That is not a gas difference: a CALL to an address with no
+%%     code succeeds, returns nothing and runs empty code, and one that runs blake2f
+%%     does not.
+%%   - The **prices** were Istanbul's at every fork. EIP-1108's table is the
+%%     Istanbul column; the pre-Istanbul figures are EIP-196's and EIP-197's.
+%%     ECADD at 150 rather than 500 is not a rounding difference, and on mainnet it
+%%     applies to every block from genesis to 9,069,000.
+%%
+%% `precompile_at/2' and `bn128_cost/2' are separate questions and stay separate
+%% functions. A single "what does address N cost" function cannot answer either one
+%% correctly on its own: the cost depends on the word count of the input, which the
+%% precompile knows and this table does not, and it depends on the layout, which is
+%% the other question.
+-spec precompile_at(atom(), integer()) -> atom() | undefined.
+precompile_at(_Fork, 1) -> ecrecover;
+precompile_at(_Fork, 2) -> sha256;
+precompile_at(_Fork, 3) -> ripemd160;
+precompile_at(_Fork, 4) -> identity;
+precompile_at(_Fork, 5) -> modexp;
+%% EIP-196 (Byzantium) added the alt_bn128 arithmetic. Before Byzantium 0x06 and
+%% 0x07 are ordinary accounts, exactly as 0x09 is before Istanbul.
+precompile_at(Fork, 6) -> introduced_at(Fork, byzantium, ecadd);
+precompile_at(Fork, 7) -> introduced_at(Fork, byzantium, ecmul);
+%% 0x08 is the alt_bn128 pairing check from Byzantium onward and **stays** there
+%% across Istanbul. I wrote this the other way round first -- on the recollection
+%% that Istanbul swapped 0x08 and 0x09, giving blake2f 0x08 and the pairing check
+%% 0x09 -- and that was wrong. The committed corpus says so directly:
+%%
+%%   - `byzantium/eip197_ec_pairing/test_gas_costs.json` contains a contract whose
+%%     code is `PUSH1 8 ... CALL`, so the pairing check is at 0x08 at Byzantium.
+%%   - `istanbul/eip152_blake2/test_blake2_precompile_delegatecall.json` contains
+%%     `PUSH1 9, PUSH1 1, DELEGATECALL`, so blake2f is at 0x09 at Istanbul.
+%%
+%% Two fixtures, one at each fork, and no swap between them. Had the recollection
+%% stood, the fix would have swapped a correct layout for a wrong one while the commit
+%% message claimed to repair it -- which is why the answer came from the corpus and
+%% not from an EIP page, and why the two addresses' history is recorded here at all.
+%% Gated like every other arrival rather than written as a constant. An unrecognised
+%% fork ranks as ancient everywhere else in this module, so a bare `8 -> ecpairing'
+%% would make 0x08 the one address an unknown fork *can* reach -- and that is the same
+%% mistake `opcode_exists/2' exists to avoid, in a different table.
+precompile_at(Fork, 8) -> introduced_at(Fork, byzantium, ecpairing);
+precompile_at(Fork, 9) -> introduced_at(Fork, istanbul, blake2f);
+precompile_at(Fork, 10) -> introduced_at(Fork, cancun, point_evaluation);
+precompile_at(_Fork, _) -> undefined.
+
+%% EIP-4844 (Cancun) added the point evaluation at 0x0A. Before Cancun there is
+%% nothing there.
+introduced_at(Fork, At, What) ->
+    case at_least(Fork, At) of
+        true -> What;
+        false -> undefined
+    end.
+
+%% The alt_bn128 arithmetic costs, as `{Base, PerUnit}'.
+%%
+%% The post-Istanbul figures are EIP-1108's own table:
+%%
+%%   Contract       Address   Current Gas Cost        Updated Gas Cost
+%%   ECADD          0x06      500                      150
+%%   ECMUL          0x07      40 000                   6 000
+%%   Pairing check  0x08      80 000 * k + 100 000     34 000 * k + 45 000
+%%
+%% and the "Current" column is EIP-196's and EIP-197's, which is what applies before
+%% Istanbul. `PerUnit' is per pair for the pairing check and zero elsewhere.
+-spec bn128_cost(atom(), ecadd | ecmul | ecpairing) -> {integer(), integer()}.
+bn128_cost(Fork, ecadd) -> istanbul_from(Fork, {500, 0}, {150, 0});
+bn128_cost(Fork, ecmul) -> istanbul_from(Fork, {40000, 0}, {6000, 0});
+bn128_cost(Fork, ecpairing) ->
+    istanbul_from(Fork, {100000, 80000}, {45000, 34000}).
+
+istanbul_from(Fork, Before, From) ->
+    case at_least(Fork, istanbul) of
+        true -> From;
+        false -> Before
+    end.
+
 %% ---------------------------------------------------------------------------
 %% EIP-7702: the authorization list
 %% ---------------------------------------------------------------------------

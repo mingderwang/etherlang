@@ -1402,3 +1402,138 @@ no_fork_before_prague_charges_for_the_authorization_list_test() ->
      || F <- [frontier, homestead, byzantium, istanbul, berlin, london, cancun]],
     ?assertEqual(0, eth_fork_schedule:set_code_auth_cost(not_a_fork)),
     ?assertEqual(0, eth_fork_schedule:set_code_auth_cost(<<"prague">>)).
+
+%% ---------------------------------------------------------------------------
+%% Precompiles: the layout and the alt_bn128 prices
+%% ---------------------------------------------------------------------------
+%% `eth_evm_precompiles:precompile/2' took no fork, so both questions it should have
+%% been asking were answered with one fork's answer. 0x08 is the pairing check from
+%% Byzantium (EIP-197) and stays there; 0x09 is blake2f from Istanbul (EIP-152) and is
+%% *nothing* before it; 0x0A is EIP-4844's point evaluation from Cancun.
+%%
+%% The layout is pinned from the committed corpus rather than from the EIPs, because I
+%% got it wrong from recollection first -- on the belief that Istanbul swapped 0x08 and
+%% 0x09. Two committed fixtures say otherwise and they are the authority here:
+%% `byzantium/eip197_ec_pairing/test_gas_costs.json` contains `PUSH1 8 ... CALL`, and
+%% `istanbul/eip152_blake2/test_blake2_precompile_delegatecall.json` contains
+%% `PUSH1 9, PUSH1 1, DELEGATECALL`. Had the recollection stood, this commit would have
+%% swapped a correct layout for a wrong one while claiming to repair it.
+
+the_pairing_check_is_at_0x08_from_byzantium_and_never_moves_test() ->
+    [?assertEqual(ecpairing, eth_fork_schedule:precompile_at(F, 8))
+     || F <- [byzantium, istanbul, london, cancun, prague]],
+    [?assertEqual(What, eth_fork_schedule:precompile_at(cancun, N))
+     || {N, What} <- [{1, ecrecover}, {2, sha256}, {3, ripemd160}, {4, identity},
+                      {5, modexp}, {6, ecadd}, {7, ecmul}]],
+    %% And 0x01..0x05 really are genesis-era, so they are the ones a constant clause
+    %% is right for. 0x06 and 0x07 arrived with EIP-196 at Byzantium.
+    [?assertEqual(undefined, eth_fork_schedule:precompile_at(F, N))
+     || F <- [frontier, homestead], N <- [6, 7, 8, 9, 10]],
+    [?assertEqual(ecadd, eth_fork_schedule:precompile_at(byzantium, 6)),
+     ?assertEqual(ecmul, eth_fork_schedule:precompile_at(byzantium, 7))].
+
+blake2f_appears_at_0x09_at_istanbul_and_is_nothing_before_it_test() ->
+    [?assertEqual(blake2f, eth_fork_schedule:precompile_at(F, 9))
+     || F <- [istanbul, london, cancun, prague]],
+    %% Before Istanbul, 0x09 is an ordinary account with no code. That is the
+    %% difference the defect turned into a wrong answer: a CALL to an address with no
+    %% code succeeds and runs empty code, and this node ran a BLAKE2b round there.
+    [?assertEqual(undefined, eth_fork_schedule:precompile_at(F, 9))
+     || F <- [frontier, homestead, byzantium, spurious_dragon, tangerine_whistle,
+              constantinople, petersburg]].
+
+point_evaluation_appears_at_0x0a_at_cancun_test() ->
+    [?assertEqual(point_evaluation, eth_fork_schedule:precompile_at(F, 10))
+     || F <- [cancun, prague]],
+    [?assertEqual(undefined, eth_fork_schedule:precompile_at(F, 10))
+     || F <- [frontier, byzantium, istanbul, berlin, london, shanghai]].
+
+nothing_else_is_a_precompile_test() ->
+    [?assertEqual(undefined, eth_fork_schedule:precompile_at(cancun, N))
+     || N <- [0, 11, 12, 255, 1000, -1]],
+    %% A fork this table has never heard of ranks as ancient everywhere else, so it
+    %% must not be able to reach a precompile that arrived after genesis. If 0x08 were
+    %% a constant clause it would be the one address an unknown fork *could* reach.
+    [?assertEqual(undefined, eth_fork_schedule:precompile_at(not_a_fork, N))
+     || N <- [6, 8, 9, 10]],
+    ?assertEqual(ecrecover, eth_fork_schedule:precompile_at(not_a_fork, 1)).
+
+%% EIP-1108's own table, whose "Current Gas Cost" column is EIP-196's and EIP-197's:
+%%
+%%   Contract       Address   Current Gas Cost        Updated Gas Cost
+%%   ECADD          0x06      500                      150
+%%   ECMUL          0x07      40 000                   6 000
+%%   Pairing check  0x08      80 000 * k + 100 000     34 000 * k + 45 000
+%%
+%% The node charged the "Updated" column at *every* fork, so ECADD on mainnet from
+%% genesis to 9,069,000 cost 150 where the chain says 500.
+alt_bn128_cost_before_and_after_istanbul_test() ->
+    [?assertEqual({500, 0}, eth_fork_schedule:bn128_cost(F, ecadd))
+     || F <- [byzantium, spurious_dragon, constantinople, petersburg]],
+    [?assertEqual({150, 0}, eth_fork_schedule:bn128_cost(F, ecadd))
+     || F <- [istanbul, london, berlin, cancun, prague]],
+    [?assertEqual({40000, 0}, eth_fork_schedule:bn128_cost(F, ecmul))
+     || F <- [byzantium, petersburg]],
+    [?assertEqual({6000, 0}, eth_fork_schedule:bn128_cost(F, ecmul))
+     || F <- [istanbul, prague]],
+    [?assertEqual({100000, 80000}, eth_fork_schedule:bn128_cost(F, ecpairing))
+     || F <- [byzantium, petersburg]],
+    [?assertEqual({45000, 34000}, eth_fork_schedule:bn128_cost(F, ecpairing))
+     || F <- [istanbul, prague]].
+
+%% ---------------------------------------------------------------------------
+%% ModExp: EIP-198's price, then EIP-2565's
+%% ---------------------------------------------------------------------------
+%% The node implemented a mixture that matched no fork at all: EIP-198's multiplication
+%% complexity and its divisor of 20, with EIP-2565's floor of 200 -- and no Berlin
+%% switch, so Berlin's divisor of 3 and its `words**2' complexity were missing. EIP-198's
+%% text has no minimum ("Consumes floor(mult_complexity(...) * max(ADJUSTED_EXPONENT_
+%% LENGTH, 1) / GQUADDIVISOR) gas" with GQUADDIVISOR = 20), so a small call at
+%% Byzantium was overcharged, and a large one at Berlin was overcharged by up to 6.7x.
+
+modexp_has_eip198s_divisor_and_no_minimum_before_berlin_test() ->
+    [?assertEqual({20, 0}, eth_fork_schedule:modexp_cost(F))
+     || F <- [frontier, byzantium, spurious_dragon, tangerine_whistle,
+              constantinople, petersburg]].
+
+modexp_has_eip2565s_divisor_and_minimum_from_berlin_test() ->
+    %% EIP-2565's GQUADDIVISOR is 3 and its minimum is 200.
+    [?assertEqual({3, 200}, eth_fork_schedule:modexp_cost(F))
+     || F <- [berlin, london, merge, shanghai, cancun, prague]].
+
+modexp_complexity_is_eip198s_piecewise_form_before_berlin_test() ->
+    %% EIP-198's own text:
+    %%   if x <= 64: x ** 2
+    %%   elif x <= 1024: x ** 2 // 4 + 96 * x - 3072
+    %%   else: x ** 2 // 16 + 480 * x - 199680
+    [?assertEqual(0, eth_fork_schedule:modexp_complexity(byzantium, 0)),
+     ?assertEqual(64 * 64, eth_fork_schedule:modexp_complexity(byzantium, 64)),
+     ?assertEqual(65 * 65 div 4 + 96 * 65 - 3072,
+                  eth_fork_schedule:modexp_complexity(byzantium, 65)),
+     ?assertEqual(1024 * 1024 div 4 + 96 * 1024 - 3072,
+                  eth_fork_schedule:modexp_complexity(byzantium, 1024)),
+     ?assertEqual(1025 * 1025 div 16 + 480 * 1025 - 199680,
+                  eth_fork_schedule:modexp_complexity(byzantium, 1025)),
+     %% And it is the piecewise form rather than `words**2', which would be 16 at
+     %% 1024 bytes -- so this distinguishes them rather than merely pinning one.
+     ?assertNotEqual(16 * 16, eth_fork_schedule:modexp_complexity(byzantium, 1024))].
+
+modexp_complexity_is_words_squared_from_berlin_test() ->
+    %% EIP-2565 *replaced* the piecewise formula with `words**2' where
+    %% words = ceil(max_length / 8). Berlin did not tune EIP-198's formula, it
+    %% discarded it, so carrying the piecewise one across Berlin is not a conservative
+    %% choice -- it is a different number, and at 32 bytes the two differ by 64x.
+    [?assertEqual(1, eth_fork_schedule:modexp_complexity(F, 1))
+     || F <- [berlin, cancun]],
+    [?assertEqual(16, eth_fork_schedule:modexp_complexity(F, 32))
+     || F <- [berlin, cancun]],
+    %% 2048 bytes is 256 *words*, so 256 squared. I wrote 256 first, having mistaken
+    %% the byte length for the word count; the ceiling is on words, not bytes.
+    [?assertEqual(65536, eth_fork_schedule:modexp_complexity(F, 2048))
+     || F <- [berlin, cancun]],
+    %% Ceiling, not truncation, checked across a whole word boundary rather than at
+    %% one value that happens to divide: 33 through 40 bytes are 5 words, 41 is 6.
+    [?assertEqual(25, eth_fork_schedule:modexp_complexity(cancun, X))
+     || X <- [33, 34, 39, 40]],
+    ?assertEqual(36, eth_fork_schedule:modexp_complexity(cancun, 41)),
+    ?assertEqual(4096, eth_fork_schedule:modexp_complexity(cancun, 512)).

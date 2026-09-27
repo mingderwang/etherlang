@@ -832,7 +832,11 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
     case Depth >= 1024 of
         true -> finish_call(E, Ctx, Ctx#ctx.state, <<>>, RetOff, RetLen, 0);
         false ->
-            case eth_evm_precompiles:is_precompile(ToW) of
+            %% A precompile's identity and price are both fork questions, and the
+            %% frame carries the fork in its own record for exactly this. The record
+            %% field rather than the Env, because `#ctx.fork' is what the opcode gate
+            %% consulted, so the two cannot disagree.
+            case eth_evm_precompiles:is_precompile(ToW, Ctx#ctx.fork) of
                 true ->
                     %% A precompile's cost is paid out of the gas the CALL
                     %% forwarded, and whatever is left of that forwarded allowance
@@ -868,7 +872,8 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
                             %% still spent: the CALL opcode has already paid for it.
                             finish_call(E, Ctx, Ctx#ctx.state, <<>>, RetOff, RetLen, 0);
                         {ok, St0} ->
-                            case eth_evm_precompiles:precompile(ToW, Args) of
+                            case eth_evm_precompiles:precompile(ToW, Args,
+                                                              Ctx#ctx.fork) of
                                 {ok, Out, Cost} when CallGas >= Cost ->
                                     finish_call(add_gas(E, CallGas - Cost), Ctx, St0,
                                                 Out, RetOff, RetLen, 1);

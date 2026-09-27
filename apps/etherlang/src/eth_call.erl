@@ -48,8 +48,8 @@ do_call(Tx, BlockParam, Overrides) ->
                        <<"data">> => hex(Out)}}};
         {error, _Reason} ->
             {error, fallback};
-        {precompile, AddrInt, Data} ->
-            run_precompile(AddrInt, Data);
+        {precompile, AddrInt, Data, Fork} ->
+            run_precompile(AddrInt, Data, Fork);
         {no_block, _reason} ->
             {error, fallback};
         {no_env, _reason} ->
@@ -77,8 +77,8 @@ attempt(Tx, BlockParam, Overrides) ->
                               G when is_integer(G) -> eth_hex:decode(G);
                               _ -> ?DEFAULT_GAS
                           end,
-                    case top_precompile(Tx) of
-                        {precompile, AddrInt, Data} -> {precompile, AddrInt, Data};
+                    case top_precompile(Tx, maps:get(fork, Env)) of
+                        {precompile, AddrInt, Data, F} -> {precompile, AddrInt, Data, F};
                         not_precompile ->
                             Msg = msg_from_tx(Tx, maps:get(<<"number">>, Block)),
                             State = eth_state:new(maps:get(<<"number">>, Block),
@@ -235,7 +235,8 @@ attempt_gas(Tx, BlockParam, Overrides, Gas) ->
         %% A precompile is not an EVM execution -- it is charged for what it does
         %% and has no gas counter -- so it is classified here rather than by
         %% classify/1, which answers questions about an EVM run.
-        {precompile, AddrInt, Data} -> precompile_attempt(AddrInt, Data, Gas);
+        {precompile, AddrInt, Data, Fork} ->
+            precompile_attempt(AddrInt, Data, Gas, Fork);
         Outcome -> classify(Outcome)
     end.
 
@@ -268,8 +269,8 @@ classify(Other) ->
 %% A precompile is charged for what it does, so "did it run out of gas" is a
 %% question about its cost, not about the EVM's gas counter. It fails for one
 %% reason only -- an input it rejects -- and that reason is the answer.
-precompile_attempt(AddrInt, Data, _Gas) ->
-    case eth_evm_precompiles:precompile(AddrInt, Data) of
+precompile_attempt(AddrInt, Data, _Gas, Fork) ->
+    case eth_evm_precompiles:precompile(AddrInt, Data, Fork) of
         {ok, _Out, _Cost} -> ok;
         unsupported -> {error, unsupported_precompile};
         {error, Reason} -> {error, Reason}
@@ -315,8 +316,8 @@ quantity_of(V) when is_binary(V) ->
     try eth_hex:decode(V) catch _:_ -> undefined end;
 quantity_of(_) -> undefined.
 
-run_precompile(AddrInt, Data) ->
-    case eth_evm_precompiles:precompile(AddrInt, Data) of
+run_precompile(AddrInt, Data, Fork) ->
+    case eth_evm_precompiles:precompile(AddrInt, Data, Fork) of
         {ok, Out, _Cost} -> {ok, hex(Out)};
         unsupported -> {error, fallback};
         %% The precompile ran and rejected the input. That is this node's
@@ -328,14 +329,20 @@ run_precompile(AddrInt, Data) ->
 
 %% eth_call straight to a precompile address (0x01..0x09) executes the
 %% precompile directly; returns not_precompile otherwise.
-top_precompile(Tx) ->
+top_precompile(Tx, Fork) ->
     case maps:get(<<"to">>, Tx, undefined) of
         undefined ->
             not_precompile;
         ToHex when is_binary(ToHex) ->
             W = eth_word:from_bytes(eth_state:address(ToHex)),
-            case eth_evm_precompiles:is_precompile(W) of
-                true -> {precompile, W, tx_data(Tx)};
+            %% Under the fork being simulated, which is not the operator's pin and is
+            %% not "the newest fork". 0x09 answers this differently before and after
+            %% Istanbul -- a pairing check at one, blake2f at the other, and an
+            %% ordinary empty account at neither for a while -- so asking without a
+            %% fork made `eth_estimateGas' on a historical block price a precompile
+            %% the block has no contract at.
+            case eth_evm_precompiles:is_precompile(W, Fork) of
+                true -> {precompile, W, tx_data(Tx), Fork};
                 false -> not_precompile
             end
     end.
