@@ -1537,3 +1537,55 @@ modexp_complexity_is_words_squared_from_berlin_test() ->
      || X <- [33, 34, 39, 40]],
     ?assertEqual(36, eth_fork_schedule:modexp_complexity(cancun, 41)),
     ?assertEqual(4096, eth_fork_schedule:modexp_complexity(cancun, 512)).
+
+%% ---------------------------------------------------------------------------
+%% EIP-150: the call gas cap and the stipend
+%% ---------------------------------------------------------------------------
+%% EIP-150 did two things to the gas a child frame receives, and the node applied both
+%% at every fork including the four before Tangerine Whistle. The EIP's own text gives
+%% the rule it replaced, which is what makes the earlier behaviour derivable rather
+%% than a guess:
+%%
+%%     Define "all but one 64th" of N as N - floor(N / 64).
+%%     ...
+%%     That is, substitute:
+%%     extra_gas = (not ext.account_exists(to)) * opcodes.GCALLNEWACCOUNT +
+%%                 (value > 0) * opcodes.GCALLVALUETRANSFER
+%%     if compustate.gas < gas + extra_gas:
+%%         return vm_exception('OUT OF GAS', needed=gas+extra_gas)
+%%     submsg_gas = gas + opcodes.GSTIPEND * (value > 0)
+%%
+%% The `substitute' block has no cap in it: before the EIP a call got whatever the
+%% parent had left and asking for more was an out-of-gas error.
+
+the_call_gas_cap_arrives_with_tangerine_whistle_test() ->
+    %% `tangerine' **is** Tangerine Whistle, so the rule applies *at* it and the
+    %% "before" set is the three forks ahead of it. I listed `tangerine' on the wrong
+    %% side first and the test said so, which is the boundary that matters: EIP-150's
+    %% activation is the fork itself, not the one after it.
+    [?assertNot(eth_fork_schedule:all_but_one_64th(F))
+     || F <- [frontier, homestead, dao]],
+    [?assert(eth_fork_schedule:all_but_one_64th(F))
+     || F <- [tangerine, spurious_dragon, byzantium, istanbul, berlin, cancun, prague]],
+    ?assertNot(eth_fork_schedule:all_but_one_64th(not_a_fork)).
+
+the_call_stipend_arrives_with_tangerine_whistle_too_test() ->
+    [?assertEqual(0, eth_fork_schedule:call_stipend(F))
+     || F <- [frontier, homestead, dao]],
+    [?assertEqual(2300, eth_fork_schedule:call_stipend(F))
+     || F <- [spurious_dragon, byzantium, istanbul, berlin, cancun, prague]],
+    ?assertEqual(0, eth_fork_schedule:call_stipend(not_a_fork)).
+
+%% `submsg_gas = gas + opcodes.GSTIPEND * (value > 0)' -- the stipend is for calls
+%% that move value, not for calls that do not. I read this as backwards when I first
+%% looked at the interpreter, on the reasoning that a stipend exists to let a callee
+%% do the cheap thing a value transfer can already afford, and the interpreter turned
+%% out to be right. The comment in `eth_evm' called the figure EIP-2929's; it is
+%% EIP-150's, and EIP-2929 is what it pays for.
+the_stipend_is_eip150s_and_it_is_for_value_moves_test() ->
+    %% The macro is private to `eth_fork_schedule', so this is the same figure read
+    %% back through the only accessor there is -- which is also why the interpreter's
+    %% own comment had to be corrected by hand: it named EIP-2929 for a figure EIP-150
+    %% introduced, and nothing checked it.
+    ?assertEqual(2300, eth_fork_schedule:call_stipend(tangerine)),
+    ?assertEqual(0, eth_fork_schedule:call_stipend(dao)).

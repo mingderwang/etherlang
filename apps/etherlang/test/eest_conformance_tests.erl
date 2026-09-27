@@ -80,8 +80,14 @@
 %% applied** -- no delegation indicator is written and no authority's code is loaded --
 %% so "the state differs" is the correct verdict for them and "could not represent the
 %% transaction" was the less informative one.
--define(EXPECTED, #{match => 11,
-                    state_mismatch => 252,
+%%
+%% 11 -> 12, and the entry it gained is a **pre-Tangerine Whistle** fixture. The 63/64
+%% cap and the 2300 stipend are EIP-150's, and the interpreter applied both at every
+%% fork including the four before it; EIP-150's own `substitute' block gives the code it
+%% replaced, which has no cap in it at all. `state_mismatch` 252 -> 251, one fixture,
+%% for one rule applied to the right span.
+-define(EXPECTED, #{match => 12,
+                    state_mismatch => 251,
                     tx_decode_failed => 0,
                     tx_roundtrip_mismatch => 0,
                     sender_mismatch => 0,

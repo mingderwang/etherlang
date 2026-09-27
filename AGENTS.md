@@ -435,7 +435,7 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
 | `TERMINAL_BLOCK_HASH` (EIP-3675) | Chain-config data, not in the EIP. Carried and echoed, never checked against a post-Merge block's difficulty. |
 | Per-fork gas *price* wiring | Done. One owner of every price; the interpreter's duplicate table is deleted. SSTORE included (EIP-2200, Berlin and later). |
 | `eth_tx:intrinsic_gas/1` fork-awareness | Takes no fork and falls back to the operator's `ETH_FORK` pin. Correct for pool admission, where no block exists; wrong for `eth_call`/`eth_estimateGas` and block execution, which pass the block's own fork through `intrinsic_gas/2`. Do not use the one-argument form where a block is in hand. |
-| EIP-150's 63/64 rule and 2300 stipend | Applied at every fork. The EIP states the rule it introduced, not the one it replaced, and no consulted client still supports a pre-Whistle block — so the earlier behaviour would have to be invented. |
+| EIP-150's 63/64 rule and 2300 stipend | **Both are now fork-gated** (Tangerine Whistle and later; zero before), and the pre-Whistle rule is derived rather than invented because EIP-150's own `substitute` block is the code it replaced. That gained a corpus fixture: 11 -> 12 matches. What is **still open** is where the stipend sits relative to the cap — the EIP's pseudocode adds it after the clamp, this module adds it before, and the reading that follows the EIP makes a child's allowance exceed the caller's remaining. Not changed on a reading; see TASKS.md. |
 | Pre-Berlin SSTORE | Refused, not priced. Three schedules exist before Berlin (the flat rule, EIP-1283 at Constantinople, Petersburg's revert of it) and only EIP-2200's text is implemented. `eth_call` falls back upstream; block execution is unreachable on a post-Merge chain. See §3 "Fork awareness". |
 
 ## 11. Known dead code
@@ -480,8 +480,13 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
   against real data — and the point is that the pin already existed and I read past
   it. `requestsHash` was never "inert because upstream JSONs do not carry it": upstream
   JSONs **do** carry it, from Prague on.
-- `eth_rpc_server:start_engine_api/2` still swallows a listener failure
-  (`{error, Reason} -> logger:error(...), ok`).
+- `eth_rpc_server:start_engine_api/2` **no longer** swallows a listener failure. It
+  logged the error, returned `ok`, and `init/1` ignored the answer anyway, so a node
+  whose Engine API port was taken came up reporting success with the Engine API
+  silently absent. It is now `{stop, {engine_api, Reason}}`, like every other listener
+  failure in that `case`. The no-JWT-secret case is unchanged and still starts the
+  node: that is a 503 from the *handler*, and refusing to boot would be a much worse
+  answer to a scheme whose point is refusing to serve.
 - `eth_block:run_transaction/5` is exported for the conformance runner. It is not
   test-only -- `finalize_against/5` is its production caller -- but note that
   `finalize/1` **cannot** serve a caller holding its own pre-state, because it

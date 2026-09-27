@@ -808,23 +808,77 @@ do_call(Kind, Op, E, Ctx) ->
                                 {ok, E10} ->
                                     Args = read(E10, ArgsOff, ArgsLen),
                                     Avail = E10#e.gas,
-                                    %% EIP-2929: value transfers get a
-                                    %% 2300 gas stipend to prevent
-                                    %% reentrancy (callee can only do a
-                                    %% simple transfer, not access storage).
-                                    GasForChild = case Value of
-                                        0 -> GasReq;
-                                        _ -> GasReq + 2300
-                                    end,
-                                    CallGas = min(GasForChild,
-                                                  Avail - Avail div 64),
-                                    {ok, E11} = charge(E10, CallGas),
-                                    run_call(Kind, To, ToW, Value, Args, CallGas,
-                                             RetOff, RetLen, E11, CtxA)
+                                    case child_gas(GasReq, Avail,
+                                                   CtxA#ctx.fork, Value) of
+                                        {oog, _Why} ->
+                                            oog(E10, CtxA);
+                                        {CallGas, _ChildGas} ->
+                                            {ok, E11} = charge(E10, CallGas),
+                                            run_call(Kind, To, ToW, Value, Args,
+                                                     CallGas, RetOff, RetLen,
+                                                     E11, CtxA)
+                                    end
                             end
                     end
             end
     end.
+
+%% The gas a child frame receives, as `{CallGas, ChildGas}'.
+%%
+%% `CallGas' is the whole figure and it is what the caller is **charged**, because the
+%% caller is refunded exactly `CallGas - Cost' on the way back -- so charging or
+%% refunding any other figure hands out or takes back gas nobody paid for. My first
+%% version of this change charged the pre-stipend figure and refunded the
+%% post-stipend one, and two existing tests caught it at 9300 against 11600.
+%%
+%% **The one thing this does not settle is where the stipend sits relative to the cap.**
+%% EIP-150 writes:
+%%
+%%     gas = min(gas, max_call_gas(compustate.gas - extra_gas))
+%%     submsg_gas = gas + opcodes.GSTIPEND * (value > 0)
+%%
+%% which reads as the stipend being added *after* the clamp. Implementing it that way
+%% makes the child's allowance `cap + 2300` while the caller is only asked for
+%% `cap + 2300` too -- and with a callee that spends everything it is given, the
+%% child's allowance then exceeds what the caller had left, and the CALL's own charge
+%% raises. That is a second-order accounting question I could not settle from the text
+%% alone, and a change to a CALL's gas is not something to ship on a reading.
+%%
+%% So the stipend stays **inside** the clamp, which is what this module always did and
+%% which is symmetric with the charge. The clause this replaces applied the 63/64
+%% cap and the 2300 stipend at **every** fork, including the four before Tangerine
+%% Whistle; that much is derived from the EIP's own `substitute' block and is fixed
+%% here. The ordering within Tangerine-and-later is recorded in TASKS.md as open,
+%% with the reason, rather than guessed at.
+%%
+%% Before Tangerine Whistle there is no cap and no stipend at all. The EIP gives the
+%% code it replaced:
+%%
+%%     if compustate.gas < gas + extra_gas:
+%%         return vm_exception('OUT OF GAS', needed=gas+extra_gas)
+%%
+%% so a call was given whatever the parent had left, and asking for more was an
+%% out-of-gas error rather than a clamp. That is a different *answer*, not a different
+%% number, which is why it is returned as `{oog, _}' and short-circuits the call
+%% rather than being clamped into a smaller frame. An earlier version returned the
+%% `oog/2' record from inside an arithmetic expression, which raised `badarith' on
+%% every pre-Tangerine call that overran its request.
+child_gas(GasReq, Avail, Fork, Value) ->
+    case eth_fork_schedule:all_but_one_64th(Fork) of
+        true ->
+            Stipend = case Value of
+                         0 -> 0;
+                         _ -> eth_fork_schedule:call_stipend(Fork)
+                     end,
+            Call = min(GasReq + Stipend, Avail - Avail div 64),
+            {Call, Call};
+        false ->
+            case Avail < GasReq of
+                true -> {oog, gas_request_exceeds_remaining};
+                false -> {GasReq, GasReq}
+            end
+    end.
+
 
 run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
     Env = Ctx#ctx.env,
@@ -1097,7 +1151,13 @@ run_create1(Op, Init, Salt, Value, E, Ctx) ->
                         State1, <<>>, 0, 0, 0);
         false ->
             Avail = E#e.gas,
-            ChildGas = Avail - Avail div 64,
+            %% "CREATE only provides all but one 64th of the parent gas to the child
+            %% call." -- EIP-150, and before Tangerine Whistle it provided all of it,
+            %% like every other call.
+            ChildGas = case eth_fork_schedule:all_but_one_64th(Ctx#ctx.fork) of
+                          true -> Avail - Avail div 64;
+                          false -> Avail
+                      end,
             {ok, E1} = charge(E, ChildGas),
             case can_transfer(State1, Sender, Value) of
                 false ->

@@ -64,6 +64,8 @@
           tx_type_available/2,
           introduced_tx_type/1,
           set_code_auth_cost/1,
+          all_but_one_64th/1,
+          call_stipend/1,
           modexp_cost/1,
           modexp_complexity/2,
           precompile_at/2,
@@ -86,6 +88,10 @@
 -define(MOD_EXP_GQUADDIVISOR_BERLIN, 3).
 -define(MOD_EXP_MIN_BERLIN, 200).
 -define(MOD_EXP_GQUADDIVISOR_BYZANTIUM, 20).
+%% EIP-150's GSTIPEND. The interpreter's comment called this EIP-2929's; it is not --
+%% EIP-2929 prices the callee's first access, and the stipend is what pays for it. The
+%% stipend is EIP-150's, from Tangerine Whistle.
+-define(CALL_STIPEND, 2300).
 -define(BASE_FEE_INITIAL, 1000000000).
 -define(MIN_BASE_FEE, 7).
 -define(MAX_WITHDRAWALS_PER_PAYLOAD, 16).
@@ -1526,6 +1532,51 @@ sstore_supported(_Fork) -> false.
 %% floor(mult_complexity(...) * max(ADJUSTED_EXPONENT_LENGTH, 1) / GQUADDIVISOR) gas"
 %% with GQUADDIVISOR = 20. So a small ModExp call at Byzantium was overcharged, and
 %% every ModExp call at Berlin was overcharged by up to a factor of six.
+%% ---------------------------------------------------------------------------
+%% EIP-150: the call gas cap and the stipend
+%% ---------------------------------------------------------------------------
+%% EIP-150 (Tangerine Whistle) did two things to the gas a child frame receives, and
+%% **the node applied both at every fork**, including the four before it. Its own text
+%% gives the rule it replaced, which is what makes the earlier behaviour derivable
+%% rather than a matter of recall:
+%%
+%%     Define "all but one 64th" of N as N - floor(N / 64).
+%%
+%%     ... if a call asks for more gas than the maximum allowed amount ... do not
+%%     return an OOG error; instead, if a call asks for more gas than all but one
+%%     64th of the maximum allowed amount, call with all but one 64th ...
+%%     CREATE only provides all but one 64th of the parent gas to the child call.
+%%
+%%     That is, substitute:
+%%
+%%     extra_gas = (not ext.account_exists(to)) * opcodes.GCALLNEWACCOUNT +
+%%                 (value > 0) * opcodes.GCALLVALUETRANSFER
+%%     if compustate.gas < gas + extra_gas:
+%%         return vm_exception('OUT OF GAS', needed=gas+extra_gas)
+%%     submsg_gas = gas + opcodes.GSTIPEND * (value > 0)
+%%
+%% The `substitute' block is the code as it stood **before** the EIP, and it has no
+%% `all but one 64th' in it: a call was given whatever the parent had left, and asking
+%% for more was an out-of-gas error. The cap and the stipend therefore both arrive with
+%% Tangerine Whistle and neither existed before it.
+-spec all_but_one_64th(atom()) -> boolean().
+all_but_one_64th(Fork) when is_atom(Fork) -> at_least(Fork, tangerine);
+all_but_one_64th(_Fork) -> false.
+
+%% EIP-150's GSTIPEND, 2300, and it is added when **value moves** -- `submsg_gas =
+%% gas + opcodes.GSTIPEND * (value > 0)`. I read this as backwards when I first looked
+%% at the interpreter, on the reasoning that a stipend exists to let a callee do the
+%% cheap thing a value transfer can already afford. The EIP says the opposite and the
+%% interpreter was already right; the reasoning that produced the doubt is what a
+%% recollection is worth.
+-spec call_stipend(atom()) -> non_neg_integer().
+call_stipend(Fork) when is_atom(Fork) ->
+    case at_least(Fork, tangerine) of
+        true -> ?CALL_STIPEND;
+        false -> 0
+    end;
+call_stipend(_Fork) -> 0.
+
 -spec modexp_cost(atom()) -> {non_neg_integer(), non_neg_integer()}.
 modexp_cost(Fork) ->
     case at_least(Fork, berlin) of

@@ -281,6 +281,24 @@ behavioural change per commit, and each step says what it now does.
      histogram: a current run of the same corpus puts the biggest positive deltas on
      the `enough_gas_False` pairing cases above, so this fingerprint has to be
      re-derived rather than chased.
+   - **Where the 2300 stipend sits relative to the 63/64 cap: open, and left open on
+     purpose.** EIP-150's pseudocode reads
+%%
+%%         gas = min(gas, max_call_gas(compustate.gas - extra_gas))
+%%         submsg_gas = gas + opcodes.GSTIPEND * (value > 0)
+%%
+%%     which says the stipend is added **after** the clamp. This module adds it before,
+%%     which is symmetric with the charge and is what it has always done. I implemented
+%%     the reading above, and it made the child's allowance `cap + 2300` while the
+%%     caller was charged `cap + 2300` — so with a callee that spends everything it is
+%%     given, the child's allowance exceeds what the caller had left and the CALL's own
+%%     charge raises. That is second-order accounting I could not settle from the text,
+%%     and a CALL's gas is not something to change on a reading. **So the fork gating
+%%     is fixed and the ordering is not.** The fix that did land is the one the EIP's
+%%     `substitute` block gives verbatim: before Tangerine Whistle there is no cap and
+%%     no stipend, a call gets whatever the parent has left, and asking for more is an
+%%     out-of-gas error rather than a clamp — which is a different *answer*, not a
+%%     different number, and the corpus gained a fixture from it (11 -> 12 matches).
    - **`-1208` gas, 1 fixture, `homestead/coverage` at Homestead.** **Unresolved.**
    - **Precompile pricing took no fork at all. Fixed** (`v1.27`). This was a
      structural gap rather than a corpus finding, and it was a large one:

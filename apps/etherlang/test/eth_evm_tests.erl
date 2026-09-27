@@ -1587,3 +1587,73 @@ the_allowance_boundary_is_the_precompiles_cost_exactly_test() ->
     {_, FlagExact} = run_pc(precompile_call_sstoring_flag(150), 100000),
     ?assertEqual(0, eth_state:storage(FlagShort, ?MSG0_ADDRESS, 0)),
     ?assertEqual(1, eth_state:storage(FlagExact, ?MSG0_ADDRESS, 0)).
+
+%% ---------------------------------------------------------------------------
+%% EIP-150: the 63/64 cap and the stipend, as behaviour
+%% ---------------------------------------------------------------------------
+%% The table test pins the two figures. These pin the two *behaviours*, and they are
+%% different questions: a fork table can be right while the interpreter reads it in the
+%% wrong order, which is exactly what happened to the stipend.
+%%
+%% The call below requests 0xFFFF = 65,535 gas and the frame is given a little under
+%% 65,600, so all but one 64th of what is left is *less* than the request and the cap
+%% binds. At Tangerine Whistle and later the call is clamped and the frame survives; at
+%% DAO and earlier there was no cap, so asking for more than the parent had left was an
+%% out-of-gas error and the whole frame halts. The difference is the difference between
+%% a clamped call and a dead transaction, so it is worth a test at each end.
+
+huge_call_is_clamped_at_tangerine_whistle_and_halts_before_it_test() ->
+    Requested = 16#FFFF,
+    %% Between all-but-one-64th-of-the-frame and the frame itself, so the request is
+    %% more than the cap allows and more than the parent has left. 65,000 works because
+    %% 65,000 - 1,015 = 64,985 < 65,535 < 65,000. My first choice was 65,600, which is
+    %% *more* than the request, so nothing overran and the two forks agreed for the
+    %% wrong reason -- a test that cannot fail on the change it exists to pin.
+    Frame = 65000,
+    Code = <<(call_args(16#0D, 0))/binary, 16#F1, 16#00>>,
+    Run = fun(Fork) ->
+        eth_evm:run(Code, ?MSG0, call_state(1000000, <<16#00>>),
+                    #{fork => Fork}, Frame)
+    end,
+    %% Tangerine Whistle and later: the request is clamped to all but one 64th and the
+    %% frame continues to its STOP.
+    [begin
+         {ok, _, Left, _, _} = Run(F),
+         ?assert(Left < Frame)
+     end || F <- [tangerine, spurious_dragon, byzantium, istanbul, berlin, cancun]],
+    %% Before it: no cap, so the request exceeds what the parent had left and the frame
+    %% runs out of gas. The whole allowance is consumed, which is what makes the two
+    %% answers visibly different rather than a difference of a few hundred gas.
+    [?assertMatch({error, out_of_gas, _State, []}, Run(F))
+     || F <- [frontier, homestead, dao]],
+    %% And the boundary is stated rather than implied: the frame has less than the
+    %% request, so the cap and the old rule disagree about it, and `tangerine' is on
+    %% the capped side.
+    ?assert(Requested > Frame - Frame div 64),
+    ?assert(Requested > Frame),
+    ?assert(eth_fork_schedule:all_but_one_64th(tangerine)),
+    ?assertNot(eth_fork_schedule:all_but_one_64th(dao)).
+
+the_stipend_goes_to_the_child_and_is_refunded_if_unused_test() ->
+    %% A value-bearing call to an account with no code: the child runs nothing, so the
+    %% stipend comes straight back and the caller pays only the CALL's own price. This
+    %% is the shape that caught the first version of this change, which charged the
+    %% caller the pre-stipend figure and refunded the post-stipend one and so handed
+    %% the caller 2300 gas it had never paid for.
+    Code = <<(call_args(16#0D, 40))/binary, 16#F1, 16#00>>,
+    {ok, _, Left, _, _} = eth_evm:run(Code, ?MSG0, call_state(1000000, <<16#00>>),
+                                      #{fork => istanbul}, ?GAS),
+    NoValue = fun() ->
+        C0 = <<(call_args(16#0D, 0))/binary, 16#F1, 16#00>>,
+        {ok, _, L0, _, _} = eth_evm:run(C0, ?MSG0, call_state(1000000, <<16#00>>),
+                                        #{fork => istanbul}, ?GAS),
+        ?GAS - L0
+    end,
+    WithValue = ?GAS - Left,
+    %% EIP-161's 9000 for the value transfer, and **not** 9000 + 2300: the stipend is
+    %% handed to the child and the child hands it back, so it is not part of what the
+    %% caller pays. Before Tangerine Whistle there is no 9000 either and no stipend.
+    ?assertEqual(NoValue() + 9000, WithValue),
+    {ok, _, L1, _, _} = eth_evm:run(Code, ?MSG0, call_state(1000000, <<16#00>>),
+                                    #{fork => homestead}, ?GAS),
+    ?assertEqual(NoValue() + 0, ?GAS - L1).
