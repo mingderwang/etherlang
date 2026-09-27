@@ -198,6 +198,55 @@ dispatch(<<"eth_blockNumber">>, _Params, State) ->
         undefined -> {error, chain_empty}
     end;
 
+%% EIP-695 made the chain id mandatory, and every client checks it at startup to
+%% confirm it is talking to the chain it thinks it is.
+%%
+%% It was answered by the catch-all, so the number came from `UPSTREAM_RPC_URL' --
+%% it described the operator's configuration, not the chain this node executes, and
+%% it would change if that variable did. The number is not hard to know:
+%% `eth_fork_schedule:chain_id/0' is the same source the EVM's `CHAINID' opcode
+%% reads, so this and the opcode cannot disagree.
+dispatch(<<"eth_chainId">>, _Params, _State) ->
+    {ok, eth_hex:encode_int(eth_fork_schedule:chain_id())};
+
+%% EIP-3675: the Merge took uncles out of the block header. A post-Merge block has
+%% none, so the count is `0` and the uncle is `null` -- and on this chain, which
+%% merged at genesis, that is true at *every* height it has. Both are therefore
+%% constants here, answered without a lookup and without asking anyone.
+%%
+%% By number it is unconditional, and that is not a shortcut: resolving the tag
+%% would tell us nothing, because the answer is the same whatever height is asked
+%% for. The tag is still validated, so a malformed one is still a bad-params error
+%% rather than a `0` for a block that does not exist.
+%%
+%% By *hash* it is not unconditional. A hash this node does not hold may name a
+%% pre-Merge block on some other chain, which really did carry uncles, and `0`
+%% would then be a claim about a block this node has never seen. Those refuse,
+%% naming the reason, rather than answering.
+dispatch(<<"eth_getUncleCountByBlockNumber">>, [Tag], State) ->
+    case uncle_number_tag(State, Tag) of
+        ok -> {ok, <<"0x0">>};
+        {error, Why} -> {error, Why}
+    end;
+
+dispatch(<<"eth_getUncleByBlockNumberAndIndex">>, [Tag, _Index], State) ->
+    case uncle_number_tag(State, Tag) of
+        ok -> {ok, null};
+        {error, Why} -> {error, Why}
+    end;
+
+dispatch(<<"eth_getUncleCountByBlockHash">>, [Hash], State) ->
+    case uncle_hash_known(State, Hash) of
+        ok -> {ok, <<"0x0">>};
+        {error, Why} -> {error, Why}
+    end;
+
+dispatch(<<"eth_getUncleByBlockHashAndIndex">>, [Hash, _Index], State) ->
+    case uncle_hash_known(State, Hash) of
+        ok -> {ok, null};
+        {error, Why} -> {error, Why}
+    end;
+
 dispatch(<<"eth_syncing">>, _Params, State) ->
     Sync = maps:get(sync, State, eth_sync),
     case try eth_sync:status(Sync) catch _:_ -> error end of
@@ -471,8 +520,37 @@ dispatch(<<"eth_estimateGas">>, Params, _State) ->
             end
     end;
 
-dispatch(_Method, Params, _State) ->
-    proxy(_Method, Params).
+%% A method with no clause here is **refused**, not forwarded.
+%%
+%% It used to be forwarded, and that is the single most misleading thing this
+%% handler could do: the set of questions this node can answer is not the set of
+%% questions it answers. A client asking `eth_getUncleCountByBlockNumber' of this
+%% node was told the answer by a *different* node, and nothing in the response said
+%% so. The same held for `eth_chainId', where the answer came from whatever
+%% `UPSTREAM_RPC_URL' happened to point at -- so it tracked the operator's
+%% configuration rather than the chain this node executes.
+%%
+%% `-32601' is the JSON-RPC 2.0 code for "method not found", and it is the honest
+%% answer: this node does not implement the method. The message names the method so
+%% the refusal is debuggable from a client's log rather than merely absent.
+%%
+%% The *deliberate* fallbacks are unaffected and are not in this clause: several
+%% methods above proxy on purpose, and only after a documented local attempt has
+%% come up empty -- `eth_getBalance' when the account is not in the local overlay,
+%% `eth_estimateGas' when the EVM is disabled. A fallback with a reason is
+%% different in kind from answering everything.
+dispatch(Method, _Params, _State) ->
+    {error, {code, -32601, method_not_supported(Method)}}.
+
+method_not_supported(Method) when is_binary(Method) ->
+    iolist_to_binary(
+      io_lib:format("method not supported by this node: ~s. It implements the "
+                    "methods in its own dispatch/3; a catch-all used to forward "
+                    "unknown methods upstream, which meant the answer came from a "
+                    "different node and nothing in the response said so.",
+                    [Method]));
+method_not_supported(Method) ->
+    iolist_to_binary(io_lib:format("method not supported by this node: ~p", [Method])).
 
 %% `BlockNumberOrTagOrHash' -- the parameter of eth_getBlockReceipts -- is the tag
 %% vocabulary *or* a 32-byte hash. A hash is not a height, so it cannot go through
@@ -841,6 +919,42 @@ hex_to_bin(B) when is_binary(B) -> binary:decode_hex(B).
 %% upstream when a local lookup misses, so the peer resolves the tag the client
 %% wrote rather than one this node re-spelled.
 num_or_tag(Hex, _Num) -> Hex.
+
+%% A block tag or number this node recognises, for the uncle methods.
+uncle_number_tag(State, Tag) ->
+    Chain = maps:get(chain, State, eth_chain),
+    try eth_rpc_projection:resolve_block_number(Chain, Tag) of
+        N when is_integer(N) -> ok
+    catch
+        _:_ -> {error, {code, -32602, <<"invalid block number or tag">>}}
+    end.
+
+%% Whether this node holds the block a hash names. It does not have to be
+%% post-Merge for the answer to be `0` -- the node's chain is -- but it does have to
+%% be a block this node can speak about at all.
+%% The hash arrives as the 0x-hex string the specification puts on the wire and
+%% the chain store is keyed by, and is passed through unchanged -- the same
+%% convention `eth_getBlockByHash/3' already uses. The first version of this also
+%% accepted 32 *raw* bytes, which cannot arrive: a JSON string is text, and
+%% `thoas:encode/1' rejects a byte above 0x7f outright, so the branch was
+%% unreachable from the only caller there is.
+uncle_hash_known(State, Hash) when is_binary(Hash) ->
+    Chain = maps:get(chain, State, eth_chain),
+    case eth_hex:is_hex(Hash) of
+        false ->
+            {error, {code, -32602, <<"invalid block hash">>}};
+        true ->
+            case eth_chain:get_by_hash(Chain, Hash) of
+                {ok, _Map, _Full} ->
+                    ok;
+                _ ->
+                    {error, {code, -32001,
+                             <<"block not held locally: this node answers uncle "
+                               "counts only for blocks it has, because a hash it "
+                               "does not hold may name a pre-Merge block that "
+                               "really did have uncles">>}}
+            end
+    end.
 
 %% Serve-time totalDifficulty compat (see defines at top of file). Only
 %% fills the field when absent AND the block is provably post-merge on a
