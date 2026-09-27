@@ -262,21 +262,45 @@ behavioural change per commit, and each step says what it now does.
      should have read the table was dead. **Pinning a table is not pinning a caller.**
      The new tests are at the precompile, and one of them pins the *arity* of the
      reply, because the arity is the thing that fell through the match.
-   - **The largest remaining positive bucket, and it is not the pairing price.**
-     Two fixtures in `byzantium/eip197_ec_pairing/test_gas_costs` — the
-     `enough_gas_False` cases — where the node spends its whole **1,000,000** gas
-     limit and the chain spends 56,723 (Istanbul) or 56,712 (Byzantium). The node's
-     receipt says `status = 1`, so the transaction **succeeds** where the chain's
-     expectation implies it stops early; it is not an out-of-gas and not a revert.
-     The callee is nineteen bytes: `PUSH1 0` five times, `PUSH1 8`, `PUSH2 0xafc7`,
-     `CALL`, `PUSH1 0`, `SSTORE` — so it forwards **0xafc7 = 44,999** gas to the
-     pairing check at 0x08 with **empty input**, and Istanbul's empty pairing check
-     costs 45,000. The call must therefore fail by **one gas**, `SSTORE` stores the
-     failure, and the transaction ends. Fixing Byzantium's price does not move it: the
-     Istanbul figure was already 45,000. **Unresolved.** The next step is a gas trace
-     of the callee to find where the node spends 979,000 that the chain does not, and
-     the specific suspicion is the failed-CALL path in `eth_evm:run_call/10` returning
-     the forwarded allowance rather than consuming it.
+   - ~~**The largest remaining positive bucket.** Two fixtures in
+     `byzantium/eip197_ec_pairing/test_gas_costs`, the `enough_gas_False` cases, where
+     the node spent its whole **1,000,000** gas limit against the chain's 56,723.
+     **Cause found**, by running the nineteen-byte callee directly instead of reasoning
+     about the fixture: `PUSH1 0` five times, `PUSH1 8`, `PUSH2 0xafc7`, `CALL`,
+     `PUSH1 0`, `SSTORE` — it forwards 44,999 gas to the pairing check with **empty
+     input**, which at Istanbul costs 45,000, so the call fails by one gas and the
+     `SSTORE` stores the failure. The call is fine. The `SSTORE` is the whole of it,
+     and it is a **`SSTORE` at Istanbul**, which this node **refuses** because it has no
+     pre-Berlin SSTORE schedule. The refusal was being recorded as an ordinary failed
+     transaction, which is charged its whole limit. Fixed — see below.~~
+   - **An unpriceable operation was executed into a wrong state root. Fixed**
+     (`v1.34`). `eth_block:run_transaction/5` now returns
+     `{error, {unpriced, What}}` when the interpreter halts with `unsupported`, and
+     `execute_transactions/5` propagates it — the path it already had for a transaction
+     it cannot execute, with the state deliberately not committed either.
+     **55 of the 266 committed fixtures were affected**: 48 pre-Berlin `sstore`
+     (byzantium 14, istanbul 16, petersburg 16, homestead 2) and 7 `precompile 9`, the
+     alt_bn128 pairing check. The tally's `state_mismatch` fell 251 → 196 and a new
+     outcome, `unpriced`, took those 55. **The tally did not get better; it got
+     honest** — a wrong state root committed to the trie is the failure mode this
+     project exists to avoid, and a refusal is the correct answer while the schedule is
+     missing.
+   - **Two named gaps remain behind those 55.**
+     - **Pre-Berlin SSTORE is still unpriced.** Refusing is now safe; pricing it is the
+       real fix. Three schedules exist before Berlin — the flat rule, EIP-1283's net
+       metering at Constantinople, and Petersburg's revert of it — and the constants
+       changed twice besides (EIP-150's `SLOAD_GAS`, EIP-1884's). That needs three
+       EIPs' texts read and each constant pinned per fork, and it is **not** something
+       to do on recollection: a wrong `SSTORE` price is a wrong state root on every
+       pre-Berlin block, which is exactly what the refusal above just stopped
+       happening.
+     - **The 7 `precompile 9` entries are a different problem and are not yet
+       separated.** `eth_pairing_bn128:check_pairing/1` returns the same `unsupported`
+       atom for "this node cannot run this" and for "the input is invalid", and an
+       invalid pairing input is a *call failure* under EIP-197/EIP-212, not an absence.
+       So on those 7 the node is declining for a reason that is not a reason to decline,
+       and until the two are distinguished it cannot be said whether the node lacks the
+       implementation or rejects input the chain accepts.
    - **`+56668` and `+56665`.** **Unresolved**, and no longer the largest thing in the
      histogram: a current run of the same corpus puts the biggest positive deltas on
      the `enough_gas_False` pairing cases above, so this fingerprint has to be

@@ -86,8 +86,24 @@
 %% fork including the four before it; EIP-150's own `substitute' block gives the code it
 %% replaced, which has no cap in it at all. `state_mismatch` 252 -> 251, one fixture,
 %% for one rule applied to the right span.
+%%
+%% `state_mismatch` 251 -> 196, and a new outcome of 55. **The tally did not get
+%% better; it got honest.** 55 fixtures were being executed into a state root the chain
+%% would never produce, because the interpreter refuses operations whose schedule it
+%% does not have -- and the refusal was being recorded as an ordinary failed
+%% transaction, which is charged its *whole* gas limit. `eth_block:run_transaction/5'
+%% now refuses the block instead, so those 55 are named `unpriced` rather than counted
+%% as an arithmetic disagreement. They are:
+%%
+%%   - 48 pre-Berlin `sstore` -- byzantium 14, istanbul 16, petersburg 16, homestead 2
+%%   - 7 `precompile 9`, the alt_bn128 pairing check at its Istanbul-and-later address
+%%
+%% Both are real gaps and both are now loud, which is the point: a wrong state root
+%% committed to the trie is the failure mode this project exists to avoid, and a
+%% refusal is the correct answer while the schedule is missing.
 -define(EXPECTED, #{match => 12,
-                    state_mismatch => 251,
+                    state_mismatch => 196,
+                    unpriced => 55,
                     tx_decode_failed => 0,
                     tx_roundtrip_mismatch => 0,
                     sender_mismatch => 0,
@@ -224,8 +240,17 @@ committed_subset_is_a_real_subset_test() ->
 %% to be the distinct reasons it is, and none may duplicate.
 the_outcome_vocabulary_distinguishes_failure_kinds_test() ->
     Outcomes = eest_state_tests:outcomes(),
-    ?assertEqual(11, length(Outcomes)),
-    ?assertEqual(11, length(lists:usort(Outcomes))).
+    ?assertEqual(12, length(Outcomes)),
+    ?assertEqual(12, length(lists:usort(Outcomes))),
+    %% `unpriced' is in the vocabulary because `eth_block:run_transaction/5' started
+    %% refusing a block whose execution it cannot price, rather than executing it into a
+    %% state root the chain would not produce. Without an outcome of its own those
+    %% entries would have been counted as `crash' -- blaming the harness -- or as
+    %% `state_mismatch' -- blaming the arithmetic -- and either would have hidden the
+    %% thing the number exists to say.
+    ?assert(lists:member(unpriced, Outcomes)),
+    %% And it must stay distinct from the two it could plausibly be folded into.
+    ?assertNot(lists:member(unpriced, [state_mismatch, crash])).
 
 %% The fixtures are the third party's expected results, so they are committed and
 %% never fetched, and this asserts the corpus is really on disk where the runner

@@ -585,6 +585,25 @@ validation_ctx(Block, State, BaseFee, GasLimit) ->
           {ok, maps:get(nonce, eth_state:account(State, Address), 0)}
       end}.
 
+%% The frame's own outcome, with "this node cannot price this" kept separate.
+%%
+%% An EVM crash is an exceptional halt, which consumes the whole gas limit and discards
+%% the frame. It is not the same as a revert, which is a deliberate failure the caller
+%% can observe in the return data, and must not be recorded as one.
+run_frame(Code, Msg, State, Env, EvmGas) ->
+    try eth_evm:run(Code, Msg, State, Env, EvmGas) of
+        {ok, Out, GL, St, L} ->
+            {ok, Out, GL, St, L};
+        {revert, Out1, GL1, St1, L1} ->
+            {revert, Out1, GL1, St1, L1};
+        {error, {unsupported, What}, _St2, _L3} ->
+            {error, {unpriced, What}};
+        {error, _Reason, St2, _L2} ->
+            {error, <<>>, 0, St2, []}
+    catch
+        _:_ -> {error, <<>>, 0, State, []}
+    end.
+
 run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     GasLimitTx = uint(maps:get(<<"gas">>, Tx, GL)),
     Value = uint(maps:get(<<"value">>, Tx, 0)),
@@ -654,56 +673,74 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
                false -> eth_state:code(State0, Target)
            end,
     Env = block_env(Block, State0),
-    {Result, Output, GasLeft, StateRun, Logs} =
-        try eth_evm:run(Code, Msg, State0, Env, EvmGas) of
-            {ok, Out0, GL0, St0, L0} -> {ok, Out0, GL0, St0, L0};
-            {revert, Out1, GL1, St1, L1} -> {revert, Out1, GL1, St1, L1};
-            {error, _Reason, St2, _L2} -> {error, <<>>, 0, St2, []}
-        catch
-            %% An EVM crash is an exceptional halt, which consumes the whole
-            %% gas limit and discards the frame. It is not the same as a revert,
-            %% which is a deliberate failure the caller can observe in the
-            %% return data, and must not be recorded as one.
-            _:_ -> {error, <<>>, 0, State0, []}
-        end,
-    %% Gas charged is what the transaction was given minus what it returned. An
-    %% exceptional halt returns nothing, so it is charged its whole limit.
-    GasCharged0 = case Result of
-                      error -> GasLimitTx;
-                      _ -> GasLimitTx - GasLeft
-                  end,
-    %% EIP-7623: the total is floored at `21000 + 10 * tokens_in_calldata', where a
-    %% token is a zero calldata byte or a quarter of a non-zero one. Everything else
-    %% in the EIP's `max' is what `GasCharged0' already is -- the intrinsic plus the
-    %% execution, with the refund already netted off, because `GasLeft' carries it --
-    %% so the whole rule is this one `max'.
+    %% **A halt that means "this node cannot price this" is not a transaction
+    %% failure, and committing it as one is the worst thing available here.**
     %%
-    %% It is Prague, and before Prague the floor is 0 and this is a no-op. The
-    %% `max' is also why the `error' arm needs no special case: a frame that consumed
-    %% its whole allowance is charged its whole allowance, which is already at or
-    %% above the floor because validation refuses a limit below it.
-    GasCharged = max(GasCharged0, eth_fork_schedule:calldata_floor(fork(Block), Data)),
-    %% The floor is a **charge**, not an accounting entry, and this is the half that is
-    %% easy to miss. `settle_gas/7' settles the sender by refunding the unused
-    %% allowance against the price `buy_gas/4' charged, so the sender's net is
-    %% `GasCharged0 * price' whatever `GasCharged' is set to afterwards. The first
-    %% version of this fix therefore reported a `gasUsed' of 21,010 -- the floor --
-    %% while the sender was still billed 21,009 and the coinbase was paid a tip on
-    %% 21,010. `gasUsed' is a receipt field, so the block would have carried a number
-    %% the sender was not charged, and the base fee would have been burned on gas
-    %% nobody paid for.
-    State1 = settle_gas(deploy(StateRun, Result, Output, Target, IsCreate),
-                        Block, Sender, GasLeft, GasCharged, EffectiveGasPrice,
-                        base_fee_of(BaseFee), GasCharged - GasCharged0),
-    Cumulative = Block#block.gas_used + GasCharged,
-    Index = length(Block#block.receipts),
-    Block1 = Block#block{
-        receipts = Block#block.receipts ++ [make_receipt(Tx, Result, GasCharged,
-                                                          Cumulative, Logs, Index)],
-        logs = Block#block.logs ++ Logs,
-        gas_used = Cumulative
-    },
-    {Block1, State1}.
+    %% `unsupported' is raised when the interpreter meets an operation whose schedule it
+    %% does not have -- pre-Berlin SSTORE is the live case, refused because there are
+    %% three pre-Berlin SSTORE schedules and only EIP-2200's text is implemented. The
+    %% refusal was written for `eth_call', where it degrades to an upstream answer, and
+    %% there it is right. In block execution it did the opposite: the reason was
+    %% discarded, the halt was recorded as an ordinary error, the transaction was
+    %% charged its **whole** gas limit, and the block's state root was committed as
+    %% though the chain had reached that outcome.
+    %%
+    %% The corpus found it as the largest single divergence it had: two fixtures in
+    %% `byzantium/eip197_ec_pairing' whose nineteen-byte callee spends 979,000 of a
+    %% 979,000 allowance that the chain spends in 35,723, with
+    %% `{unsupported, {sstore, istanbul}}' underneath. Running that callee directly is
+    %% what named the cause: the call to the pairing check is fine, and the SSTORE that
+    %% stores its return value is the whole of it.
+    %%
+    %% `execute_transactions/5' already refuses to commit a block whose body contains a
+    %% transaction it cannot execute, and deliberately does not commit the state either.
+    %% This joins that path: a block this node cannot produce is *reported*, not
+    %% produced. Pricing the pre-Berlin SSTORE is the real fix and is still open
+    %% (TASKS.md) -- but until it is done, refusing is the honest answer and executing
+    %% wrongly is not.
+    case run_frame(Code, Msg, State0, Env, EvmGas) of
+        {error, {unpriced, What}} ->
+            {error, {unpriced, What}};
+        {Result, Output, GasLeft, StateRun, Logs} ->
+        %% Gas charged is what the transaction was given minus what it returned. An
+        %% exceptional halt returns nothing, so it is charged its whole limit.
+        GasCharged0 = case Result of
+                          error -> GasLimitTx;
+                          _ -> GasLimitTx - GasLeft
+                      end,
+        %% EIP-7623: the total is floored at `21000 + 10 * tokens_in_calldata', where a
+        %% token is a zero calldata byte or a quarter of a non-zero one. Everything else
+        %% in the EIP's `max' is what `GasCharged0' already is -- the intrinsic plus the
+        %% execution, with the refund already netted off, because `GasLeft' carries it --
+        %% so the whole rule is this one `max'.
+        %%
+        %% It is Prague, and before Prague the floor is 0 and this is a no-op. The
+        %% `max' is also why the `error' arm needs no special case: a frame that consumed
+        %% its whole allowance is charged its whole allowance, which is already at or
+        %% above the floor because validation refuses a limit below it.
+        GasCharged = max(GasCharged0, eth_fork_schedule:calldata_floor(fork(Block), Data)),
+        %% The floor is a **charge**, not an accounting entry, and this is the half that is
+        %% easy to miss. `settle_gas/7' settles the sender by refunding the unused
+        %% allowance against the price `buy_gas/4' charged, so the sender's net is
+        %% `GasCharged0 * price' whatever `GasCharged' is set to afterwards. The first
+        %% version of this fix therefore reported a `gasUsed' of 21,010 -- the floor --
+        %% while the sender was still billed 21,009 and the coinbase was paid a tip on
+        %% 21,010. `gasUsed' is a receipt field, so the block would have carried a number
+        %% the sender was not charged, and the base fee would have been burned on gas
+        %% nobody paid for.
+        State1 = settle_gas(deploy(StateRun, Result, Output, Target, IsCreate),
+                            Block, Sender, GasLeft, GasCharged, EffectiveGasPrice,
+                            base_fee_of(BaseFee), GasCharged - GasCharged0),
+        Cumulative = Block#block.gas_used + GasCharged,
+        Index = length(Block#block.receipts),
+        Block1 = Block#block{
+            receipts = Block#block.receipts ++ [make_receipt(Tx, Result, GasCharged,
+                                                              Cumulative, Logs, Index)],
+            logs = Block#block.logs ++ Logs,
+            gas_used = Cumulative
+        },
+        {Block1, State1}
+    end.
 
 %% The effects a transaction has on state that are not the EVM's own execution.
 %%

@@ -1233,3 +1233,107 @@ the_evm_allowance_follows_the_blocks_own_fork_test() ->
     %% declared gas, and a different receipts root because the frame it was given
     %% was sized under a different fork's floor.
     ?assertNotEqual(London, Shanghai).
+
+%% ---------------------------------------------------------------------------
+%% A block this node cannot price is refused, not executed wrongly
+%% ---------------------------------------------------------------------------
+%% The interpreter refuses operations whose schedule it does not have -- pre-Berlin
+%% SSTORE, because there are three pre-Berlin SSTORE schedules and only EIP-2200's text
+%% is implemented. That refusal is right for `eth_call', where it degrades to an
+%% upstream answer. In block execution it was recorded as an ordinary failed
+%% transaction, which is charged its **whole** gas limit, and the block's state root was
+%% committed as though the chain had reached that outcome.
+%%
+%% The corpus found it as the largest single divergence it had: **55 of 266 fixtures**,
+%% 48 of them pre-Berlin SSTORE and 7 of them the pairing check. Running the nineteen-byte
+%% callee from `byzantium/eip197_ec_pairing` by hand is what named the cause -- the call
+%% to the pairing check is fine, and the `SSTORE` that stores its return value is the
+%% whole of it. The node spent 979,000 of a 979,000 allowance the chain spends in 35,723.
+%%
+%% So `run_transaction/5` returns `{error, {unpriced, What}}` and
+%% `execute_transactions/5` propagates it, which is the path it already had for a
+%% transaction it cannot execute. The state is not committed either.
+
+a_pre_berlin_sstore_transaction_is_refused_rather_than_executed_test() ->
+    with_network("mainnet", fun() -> with_ctx(fun() ->
+        {Priv, Sender} = new_key(),
+        fund(Sender, 1000 * ?WEI, 0),
+        %% `0x60 0x00 0x60 0x01 0x55` is PUSH1 0, PUSH1 1, SSTORE.
+        %%
+        %% `to => <<>>` so that `input' is **init code** and this body is what actually
+        %% executes. My first version left `to' at the default probe account, which
+        %% made `input' *calldata* -- the frame called an account with no code, ran
+        %% nothing, and the transaction succeeded. The refusal never fired and the test
+        %% would have passed for the wrong reason had the assertion been weaker.
+        Code = <<16#60, 0, 16#60, 1, 16#55>>,
+        Tx = signed(Priv, #{to => <<>>, gas => 200000, gas_price => 1, input => Code}),
+        %% The **number** carries the fork, not the timestamp: mainnet reaches Byzantium
+        %% at block 4,370,000 and this node's `fork_at/1' helper resolves a *timestamp*
+        %% at block 1, which is a different question. A timestamp of 4,370,001 at block
+        %% 1 is 1970, and resolves to `paris'.
+        ?assertEqual(byzantium, fork_at_number(4370001)),
+        Byzantium = (eth_block:new(<<0:256>>, 4370001))#block{
+                       timestamp = 1, gas_limit = 1000000},
+        Result = eth_block:run_transaction(Byzantium, Tx, eth_state:new(0, #{}),
+                                           undefined, 1000000),
+        ?assertMatch({error, {unpriced, {sstore, byzantium}}}, Result),
+        %% And it is *refused*, not executed: the same transaction at Berlin, whose
+        %% schedule is implemented, produces a block with a receipt. Without this the
+        %% test would pass if `run_transaction/5` simply failed for every reason.
+        ?assertEqual(berlin, fork_at_number(12244001)),
+        Berlin = (eth_block:new(<<0:256>>, 12244001))#block{
+                     timestamp = 1, gas_limit = 1000000},
+        {BerlinBlock, _State} = eth_block:run_transaction(
+                                 Berlin, Tx, eth_state:new(0, #{}),
+                                 undefined, 1000000),
+        [Receipt] = BerlinBlock#block.receipts,
+        ?assertEqual(1, maps:get(<<"status">>, Receipt)),
+        %% A creation's own 53,000 intrinsic is charged whatever the body does, so the
+        %% assertion is that it is *not* the whole 200,000 limit -- which is what an
+        %% ordinary execution looks like and what the refused one no longer is.
+        ?assert(maps:get(<<"gasUsed">>, Receipt) < 200000)
+    end) end).
+
+a_refused_transaction_commits_no_state_test() ->
+    %% `finalize/1' already refused to commit a block whose body contained a
+    %% transaction it could not execute, and deliberately did not commit the state
+    %% either. This asserts it still does, for this reason.
+    with_network("mainnet", fun() -> with_ctx(fun() ->
+        {Priv, Sender} = new_key(),
+        fund(Sender, 1000 * ?WEI, 0),
+        Code = <<16#60, 0, 16#60, 1, 16#55>>,
+        Tx = signed(Priv, #{to => <<>>, gas => 200000, gas_price => 1, input => Code}),
+        Parent = store_parent(eth_mpt:state_root()),
+        Block = (child_block(Parent, 4370001, [Tx]))#block{timestamp = 1,
+                                                          gas_limit = 1000000},
+        %% Measured immediately before the call rather than against `Parent', because
+        %% `store_parent/1' itself writes to the trie and so the parent's root is not
+        %% what the trie holds at this point. The claim under test is that `finalize/1'
+        %% changed nothing, and that is a before-and-after.
+        Before = eth_mpt:state_root(),
+        ?assertMatch({error, {unpriced, {sstore, byzantium}}},
+                     eth_block:finalize(Block)),
+        ?assertEqual({unchanged, Before}, {unchanged, eth_mpt:state_root()})
+    end) end).
+
+%% The fork a mainnet block *number* lands on, which is a different question from
+%% `fork_at/1' above and the one a block's header actually asks.
+fork_at_number(Number) ->
+    {ok, F} = eth_fork_schedule:current_fork(mainnet, Number, 1),
+    F.
+
+%% mainnet, because **Sepolia's schedule in this node begins at London**, so on the
+%% configured network a pre-Berlin fork is unreachable -- `current_fork(sepolia, N, _)'
+%% answers London or later for every N. The conformance runner sets the same variable
+%% for the same reason. Without it these two tests cannot name a pre-Berlin fork at all,
+%% and a test that cannot reach the state it is about is not a test.
+with_network(Network, Fun) ->
+    Previous = os:getenv("ETH_NETWORK"),
+    true = os:putenv("ETH_NETWORK", Network),
+    try Fun()
+    after
+        case Previous of
+            false -> os:unsetenv("ETH_NETWORK");
+            _ -> os:putenv("ETH_NETWORK", Previous)
+        end
+    end.

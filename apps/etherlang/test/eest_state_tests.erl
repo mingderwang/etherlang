@@ -277,13 +277,21 @@ fork_of_key(Key) ->
 -define(REJECT_MISMATCH, rejection_mismatch).
 -define(FORK_UNREACHABLE, fork_unreachable).
 -define(CRASH, crash).
+%% "This node cannot price something in this transaction." Not a state difference and
+%% not a validity disagreement: the node declines rather than answering wrongly. Added
+%% when `eth_block:run_transaction/5' started refusing an unpriceable operation instead
+%% of executing it into a state root the chain would not produce -- which was 55 of the
+%% 266 committed fixtures. Folding those into `crash' would blame the harness and into
+%% `state_mismatch' would blame the arithmetic; either would hide the thing the number
+%% exists to say.
+-define(UNPRICED, unpriced).
 -define(NO_POST, no_post_for_fork).
 -define(BAD_FIXTURE, unreadable_fixture).
 
 outcomes() ->
     [?MATCH, ?STATE_MISMATCH, ?TX_DECODE, ?TX_ROUNDTRIP, ?SENDER,
      ?REJECT_NOT_RAISED, ?REJECT_MISMATCH, ?FORK_UNREACHABLE, ?CRASH,
-     ?NO_POST, ?BAD_FIXTURE].
+     ?NO_POST, ?BAD_FIXTURE, ?UNPRICED].
 
 %% Every outcome, always, including the ones that did not occur.
 %%
@@ -441,6 +449,16 @@ post_for_fork(Entry, Fork) ->
     end.
 
 run_post(Fork, Entry, Post) ->
+    %% The `unpriced' refusal is a throw from `execute/4', caught here so one
+    %% unpriceable entry does not abort the whole survey. Classifying it is the point:
+    %% see the note on the outcome.
+    try run_post_inner(Fork, Entry, Post) of
+        Result -> Result
+    catch
+        throw:{?UNPRICED, What} -> {?UNPRICED, {unpriced, What}}
+    end.
+
+run_post_inner(Fork, Entry, Post) ->
     %% `txbytes' and `hash' are hex DATA in the fixture; `eth_tx:from_rlp/1' and
     %% the `hash' it puts in the decoded map are raw bytes. Handing one to the
     %% other fails to decode, which is indistinguishable from a codec that
@@ -824,9 +842,15 @@ execute(Fork, Tx, Entry, Post) ->
     %% with -- the derived one, and the tip came out at the full gas price. Two
     %% sources of truth for one header field, which is the mistake this module's
     %% comments keep warning about.
-    {Block1, State1} = eth_block:run_transaction(Block, Tx, PreState,
-                                                  Block#block.base_fee_per_gas,
-                                                  Block#block.gas_limit),
+    {Block1, State1} =
+        case eth_block:run_transaction(Block, Tx, PreState,
+                                       Block#block.base_fee_per_gas,
+                                       Block#block.gas_limit) of
+            {error, {unpriced, What}} ->
+                throw({?UNPRICED, What});
+            {Block1x, State1x} ->
+                {Block1x, State1x}
+        end,
     Receipt = last_receipt(Block1),
     %% Both states, because the gas figure is an *arithmetic* recovery from the
     %% sender's balance and needs the balance it started from. Reading the
