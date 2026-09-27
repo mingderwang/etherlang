@@ -31,6 +31,7 @@
           from_payload/1,
           payload_block_hash/1,
           to_json/1,
+          to_payload/1,
           tx_root/1,
           receipts_root/1,
           logs_bloom/1,
@@ -1425,6 +1426,149 @@ to_json(#block{withdrawals = Ws, parent_beacon_block_root = PBR} = Block) ->
             _ -> to_hex(PBR)
         end
       }).
+
+%% to_payload/1 is the inverse of from_payload/1, and it did not exist. The
+%% decoder was the only half of the payload codec, so `engine_getPayload' had
+%% nothing to hand back even once a builder existed: to_json/1 produces *block*
+%% JSON, which is a different structure -- it carries `miner', `nonce',
+%% `difficulty', `sha3Uncles' and `transactionsRoot', and omits `feeRecipient',
+%% `prevRandao', `blockNumber' and `blockHash'. A client destructuring the result
+%% of getPayloadV1 for the specification's field names would find none of them.
+%%
+%% The block hash is computed by payload_block_hash/1 rather than hash/1, and that
+%% is deliberate: payload_block_hash/1 is the fork-aware encoder -- it emits 16,
+%% 17 or 20 header fields depending on which the payload carries -- and it is the
+%% one pinned by the real Sepolia block hashes in eth_block_payload_tests. hash/1
+%% goes through to_rlp/1, which includes the Cancun trailing fields
+%% unconditionally and so is only correct for Cancun-or-later headers (AGENTS.md
+%% section 10, "deliberately not done").
+%%
+%% `transactions' is emitted as the EIP-2718 wire bytes, because that is what the
+%% decoder reads and therefore what the transactions root is computed over. The
+%% encoder cannot reconstruct the original bytes from a decoded transaction --
+%% a type-3 transaction's `blobVersionedHashes' is not an RPC field at all -- so
+%% a transaction this module cannot re-encode is an error here rather than a
+%% silently wrong root. {unencodable_transaction, Index} names which one.
+to_payload(#block{} = Block) ->
+    case encode_transactions(Block) of
+        {ok, Txs} ->
+            Base = #{<<"parentHash">> => to_hex(Block#block.parent_hash),
+                     <<"feeRecipient">> => to_hex(Block#block.miner),
+                     <<"stateRoot">> => to_hex(Block#block.state_root),
+                     <<"receiptsRoot">> => to_hex(Block#block.receipts_root),
+                     <<"logsBloom">> => to_hex(Block#block.logs_bloom),
+                     <<"prevRandao">> => to_hex(Block#block.mix_hash),
+                     <<"blockNumber">> => eth_hex:encode_int(Block#block.number),
+                     <<"gasLimit">> => eth_hex:encode_int(Block#block.gas_limit),
+                     <<"gasUsed">> => eth_hex:encode_int(Block#block.gas_used),
+                     <<"timestamp">> => eth_hex:encode_int(Block#block.timestamp),
+                     <<"extraData">> => to_hex(Block#block.extra_data),
+                     <<"transactions">> => Txs,
+                     %% Only the post-Paris additions, and only when the block
+                     %% carries them. A Paris payload must not grow a `withdrawals'
+                     %% key, because the structure check in eth_engine compares the
+                     %% exact key set and would answer -32602 to this node's own
+                     %% payload -- so the key is added by drop_absent/1 below
+                     %% rather than given a placeholder value. A placeholder would
+                     %% be present-and-wrong, which is the same failure as the
+                     %% defaulted payload field from_payload/1 refuses to invent.
+                     <<"__withdrawals__">> => payload_withdrawals(Block)},
+            case base_fee_quantity(Block) of
+                {ok, FeeHex} ->
+                    Base0 = drop_absent(Base#{<<"baseFeePerGas">> => FeeHex}),
+                    Base1 = payload_blob_fields(Block, Base0),
+                    Base2 = payload_beacon_root(Block, Base1),
+                    %% payload_block_hash/1 answers {ok, Hash} | {error, Reason},
+                    %% not a bare binary. Wrapping the tagged tuple in data_hex/1
+                    %% was the first version's bug, and it is worth writing down
+                    %% because the failure is a function_clause on a 66-byte
+                    %% binary -- nothing that names the function which got the
+                    %% shape wrong.
+                    case payload_block_hash(Base2) of
+                        {ok, Hash} ->
+                            {ok, Base2#{<<"blockHash">> => to_hex(Hash)}};
+                        {error, Reason} ->
+                            {error, Reason}
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% `baseFeePerGas' is a required field of ExecutionPayloadV1 and there is no
+%% honest value for a pre-London block: emitting `null' would make the payload
+%% fail the decoder's own required-field check and fail the structure check in
+%% eth_engine (which reads `null' as not provided), and emitting 0 would state a
+%% base fee the network never had. So a block without one is an error here, not a
+%% number. The Engine API is post-Merge, so this cannot arise on any payload a
+%% consensus client would receive -- and if it ever did, refusing is the answer
+%% that does not invent a value.
+%% Remove the two placeholder keys. A pre-Paris block must not carry a
+%% `withdrawals' key at all, and the internal key is renamed rather than deleted
+%% so a map that *should* have had one is visibly distinguishable from a map whose
+%% withdrawals were dropped.
+drop_absent(Map) ->
+    Base0 = case maps:get(<<"__withdrawals__">>, Map, absent) of
+                {present, Ws} -> Map#{<<"withdrawals">> => Ws};
+                absent -> maps:remove(<<"__withdrawals__">>, Map)
+            end,
+    maps:remove(<<"__withdrawals__">>, Base0).
+
+base_fee_quantity(#block{base_fee_per_gas = undefined}) ->
+    {error, {no_base_fee, pre_london}};
+base_fee_quantity(#block{base_fee_per_gas = BaseFee})
+  when is_integer(BaseFee), BaseFee >= 0 ->
+    {ok, eth_hex:encode_int(BaseFee)}.
+
+%% Named for the encoder to keep it distinct from payload_transactions/1 above,
+%% which is the *decoder's* reader of a payload map's `transactions' key. Both
+%% take one argument and both are about transactions, which is exactly the pair
+%% that gets confused for the same function.
+encode_transactions(#block{transactions = Txs}) ->
+    encode_transactions(Txs, 0, []).
+
+encode_transactions([], _Index, Acc) ->
+    {ok, lists:reverse(Acc)};
+encode_transactions([Tx | Rest], Index, Acc) ->
+    case eth_tx:to_rlp(Tx) of
+        {ok, Bytes} ->
+            encode_transactions(Rest, Index + 1, [to_hex(Bytes) | Acc]);
+        _ ->
+            {error, {unencodable_transaction, Index}}
+    end.
+
+%% `withdrawals' is present exactly when the block has the list at all. The
+%% record's default is `[]', which cannot distinguish "no withdrawals" from "no
+%% such field", so the fork decides -- a pre-Shanghai block has no withdrawals
+%% field and must not emit one.
+%% eth_fork_schedule:at_least/2 is (Fork, Feature) -- "is this fork at least that
+%% feature" -- and reading it as (Feature, Fork) compiles, runs, and answers
+%% false for every Cancun block, because Shanghai is not at least Cancun. Both
+%% arguments are atoms of the same shape, so nothing catches it: the withdrawals
+%% key is simply left off, and the block hash that follows is computed over a
+%% header missing a field rather than raising.
+payload_withdrawals(#block{withdrawals = Ws} = Block) ->
+    case eth_fork_schedule:at_least(fork(Block), shanghai) of
+        true -> {present, [withdrawal_to_json(W) || W <- Ws]};
+        false -> absent
+    end.
+
+payload_blob_fields(#block{blob_gas_used = BGU, excess_blob_gas = EBG} = Block,
+                     Base) ->
+    case eth_fork_schedule:at_least(fork(Block), cancun) of
+        true ->
+            Base#{<<"blobGasUsed">> => eth_hex:encode_int(BGU),
+                  <<"excessBlobGas">> => eth_hex:encode_int(EBG)};
+        false ->
+            Base
+    end.
+
+payload_beacon_root(#block{parent_beacon_block_root = undefined}, Base) ->
+    Base;
+payload_beacon_root(#block{parent_beacon_block_root = Root}, Base) ->
+    Base#{<<"parentBeaconBlockRoot">> => to_hex(Root)}.
 
 %% Hex is emitted lowercase. The chain store indexes blocks by the canonical
 %% lowercase hash eth_header produces, and a lookup built from uppercase hex

@@ -9,7 +9,7 @@
 > run, so nothing here should be read as a conformance claim. The unwired per-fork
 > gas table (Phase 5) is a precondition for any such result.
 
-**86 tasks across 9 phases** — Phase 1-5 partially complete (**39 done, 47 remaining**).
+**86 tasks across 9 phases** — Phase 1-5 partially complete (**40 done, 46 remaining**).
 
 > The header used to read "81 tasks … 44/81 done, 37 remaining". Counted against the
 > file at `d623f6a` it was 82 boxes, 33 of them ticked — so it overstated completion
@@ -17,6 +17,54 @@
 > wrong in six phases for the same reason. The numbers above and the per-phase
 > labels are counted, not asserted; re-derive them with
 > `grep -cE '^- \[[ x]\]' TASKS.md` before quoting them.
+
+## What to do next, in order
+
+This list exists so that work is not chosen by whichever item is nearest to hand.
+It is ordered by what unblocks the most, and the ordering is deliberate. One
+behavioural change per commit, and each step says what it now does.
+
+1. ~~**Start `eth_block_builder` and make `forkchoiceUpdated` issue a `payloadId`.**~~
+   **Done.** The builder is a supervised child and in the `registered` list, and it
+   was *rewritten* rather than switched on — see the Phase 1 item for the four header
+   defects the dead version would have shipped the moment it was started.
+   `eth_block:to_payload/1` was added as the inverse of `from_payload/1` and
+   round-trips all three real Sepolia payloads hash-identically. The honest limit
+   stands: a block this node builds has a state root that will not match the
+   network's while the gas table is unwired, so the node can serve a CL's requests
+   but is not yet safe to propose from.
+2. **Add the missing JSON-RPC methods**  *(next)* (Phase 6): `eth_estimateGas`,
+   `eth_feeHistory`, `eth_getTransactionByHash`, `eth_maxPriorityFeePerGas`,
+   `eth_createAccessList`, `eth_getBlockReceipts`, `eth_getProof`, `eth_accounts`.
+   Independent of everything above, and the cheapest remaining work.
+3. **Wire the per-fork gas table into the EVM** (Phase 5). This is a refactor, not a
+   substitution, and it is a precondition for every state-root claim this project
+   could make.
+4. **EEST conformance work**: run the execution-specs fixtures and record what fails.
+   Nothing in this repository has been checked against them (see the note at the top).
+
+### Deliberately later: the rest of the Engine API
+
+These are real gaps, not low-priority decoration, but they are not on the critical
+path to a node a consensus layer can drive — items 1 and 2 above are. Left here so
+they are not forgotten rather than worked on prematurely.
+
+- **`engine_getPayloadBodiesByHashV1` / `ByRangeV1`** (Phase 1). Blocked on **data,
+  not code**: the EIP-2718 wire bytes are not retained, and `eth_chain` stores the
+  `eth_getBlockByNumber` response whose `transactions` are decoded RPC objects. The
+  prerequisite is a storage change — fetch `eth_getRawTransactionByHash` per
+  transaction at sync time and keep the bytes — and that belongs with the other
+  chain-store work, not as a bolt-on to the engine.
+- **`engine_notifyHeaders`** (Phase 1, and the Beacon requests item in Phase 3). No
+  clause in any per-fork file of `execution-apis`; implementing it now would mean
+  inventing its shape. The EIP-4788 execution side is already done; only the
+  engine-API plumbing is missing.
+- **Engine API V4/V5** (Osaka, Amsterdam). Mainnet is not on these, so V3 is the
+  highest version a live consensus client calls.
+- **`engine_getBlobsV1`** (Phase 5). The point-evaluation check is already local;
+  this is the method that surfaces it, and `eth_kzg:blob_to_kzg_commitment/1` is
+  still deliberately unimplemented, so it would need that first.
+
 
 ## Phase 1: Engine API — Consensus Layer Interface (14 tasks)
 - [ ] **Engine API server** — `eth_engine` serves ten methods over real HTTP with the response shapes the specification defines and a JWT check on every request: `newPayload`, `forkchoiceUpdated` and `getPayload` at V1, V2 and V3, plus `engine_exchangeTransitionConfigurationV1`. The four V1 methods named here previously were all of them, and a post-Merge consensus client — which calls `forkchoiceUpdatedV3` and `getPayloadV3` every slot — got `-32601 method not found` for both. This item stays open on the missing methods listed at the end of this section. `newPayload` now decodes, checks the block hash, executes and maps the verdict. It still cannot hold the state an arbitrary payload needs, so it answers `SYNCING` in practice. This item stays open on the missing methods listed at the end of this section. What each method actually does:
@@ -133,7 +181,7 @@ Recorded because the documentation claimed otherwise, and because each of these 
   - Verified against two real Sepolia blocks (2 and 16 withdrawals)
 - [ ] **Beacon requests** — handle `engine_notifyHeaders` and beacon root requests
   - The execution side of EIP-4788 is done (see Phase 5): the parent beacon block root is carried on the block, read from the payload, and applied at finalization. What is missing is the engine-API plumbing — `engine_notifyHeaders` is not handled, and a new payload's `parentBeaconBlockRoot` is not populated from the consensus client's notification. As it stands, a locally built block has no beacon root, so the system call is correctly skipped and its ring buffer goes unadvanced.
-- [ ] **Execution payload building** — integrate with consensus client's `engine_getPayload` flow
+- [x] **Execution payload building** — integrated with the consensus client's `engine_getPayload` flow. `forkchoiceUpdated` returns a `payloadId` from a `payloadAttributes`, and `getPayloadV1`/`V2`/`V3` return the block it names. **Not production-usable as a proposer**: a built block's state root will not match the network's while the per-fork gas table is unwired (Phase 5), and a build is refused rather than guessed when the chain does not hold the head
 - [ ] **Proposer selection** — receive proposer duties from consensus client, produce blocks when selected
 
 ## Phase 4: State Management (8 tasks)

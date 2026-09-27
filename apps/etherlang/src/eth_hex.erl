@@ -2,7 +2,46 @@
 
 %% Helpers for Ethereum-style 0x-prefixed hex encoding/decoding.
 
--export([decode/1, encode/1, encode_int/1, is_hex/1]).
+-export([decode/1, decode_bytes/1, encode/1, encode_int/1, encode_bytes/1, is_hex/1]).
+
+%% decode/1 answers an *integer* -- it is a QUANTITY decoder, and a 32-byte hash
+%% can never come out of it. It is therefore not the function to reach for when
+%% reading a DATA value, and it has been reached for: three times in this codebase,
+%% each time producing a check that could never succeed (eth_engine's
+%% parentBeaconBlockRoot test, its expectedBlobVersionedHashes test, and this
+%% module's own absence).
+%%
+%% decode_bytes/1 is the DATA decoder: 0x-prefixed hex, or the bytes themselves, to
+%% the bytes. It answers {ok, Bytes} | error so a caller can tell "not DATA" from
+%% "the zero-length DATA value", which are different.
+decode_bytes(Value) when is_binary(Value) ->
+    case Value of
+        <<"0x">> -> {ok, <<>>};
+        <<"0x", Rest/binary>> -> from_hex(Rest);
+        <<"0X", Rest/binary>> -> from_hex(Rest);
+        %% A bare binary is taken as the bytes it already is, which is what an
+        %% in-process caller holds. eth_block:data/2 has the same tolerance, and
+        %% the width check belongs to the caller in both.
+        _ -> {ok, Value}
+    end;
+decode_bytes(Value) when is_list(Value) -> decode_bytes(iolist_to_binary(Value));
+decode_bytes(_Value) -> error.
+
+%% Lowercase, because that is what the rest of the codebase emits and what JSON
+%% peers compare hex as text against: bin0x/1 in eth_tx lowercases, and a payload
+%% whose blockHash is uppercase will not equal the blockHash the same node reports
+%% through a path that lowercases. binary:encode_hex/1 emits uppercase.
+encode_bytes(Bin) when is_binary(Bin) ->
+    <<"0x", (string:lowercase(binary:encode_hex(Bin)))/binary>>;
+encode_bytes(Int) when is_integer(Int) ->
+    encode_int(Int).
+
+from_hex(Hex) when byte_size(Hex) rem 2 =:= 0 ->
+    case is_hex(Hex) of
+        true -> {ok, binary:decode_hex(Hex)};
+        false -> error
+    end;
+from_hex(_Hex) -> error.
 
 %% Decode "0x..." (list or binary) into an integer. Bare integers pass through.
 decode(Value) when is_integer(Value) -> Value;

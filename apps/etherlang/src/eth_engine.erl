@@ -27,7 +27,7 @@
 
 -export([start_link/1, start_link/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
--export([new_payload/1, forkchoice_updated/1, get_payload/1,
+-export([new_payload/1, forkchoice_updated/1, forkchoice_updated/2, get_payload/1,
          exchange_transition_config/1, jwt_secret/0,
          %% Exported so the status mapping can be tested against the finalize
          %% results eth_finalize_tests produces, rather than only through a path
@@ -38,6 +38,7 @@
          %% only reach them over HTTP cannot distinguish "the gate refused it"
          %% from "the gate was never consulted".
          payload_admission/2, attributes_admission/2,
+         build_attributes/2,
          blob_hashes_admission/2, status_for_version/2,
          version_fork/1, structure_for_version/2,
          required_structure/1, required_attributes/1,
@@ -912,6 +913,42 @@ forkchoice_updated(ForkChoiceState) when is_map(ForkChoiceState) ->
 forkchoice_updated(_ForkChoiceState) ->
     {error, invalid_forkchoice_state}.
 
+%% forkchoice_updated/2 is the method a consensus client actually calls, because
+%% payloadAttributes is params[1] and this module's one-argument form had nowhere
+%% to put it. So the build that the specification describes -- "process
+%% payloadAttributes after successfully applying the forkchoiceState" -- could not
+%% be expressed at all, and `getPayload' reported every payloadId unknown because
+%% none was ever issued.
+%%
+%% The order is the specification's: apply the forkchoiceState first, and only
+%% then act on the attributes, and only if the head is VALID. This node never
+%% reports VALID -- it holds no prestate for an arbitrary head, so it answers
+%% SYNCING -- and a build is therefore issued unconditionally rather than gated on
+%% a validity claim it cannot make. That is a real deviation and it is recorded
+%% here rather than hidden: a client is asked for a block on top of a head this
+%% node has not validated. The alternative is to never build, which is where this
+%% node was.
+forkchoice_updated(ForkChoiceState, Attributes) when is_map(ForkChoiceState) ->
+    case apply_forkchoice(ForkChoiceState) of
+        {error, Reason} ->
+            {error, Reason};
+        Status ->
+            case Attributes of
+                null -> {Status, undefined};
+                undefined -> {Status, undefined};
+                _ ->
+                    case start_build(ForkChoiceState, Attributes) of
+                        {ok, PayloadId} -> {Status, PayloadId};
+                        {error, Reason} -> logger:warning(
+                            "etherlang: forkchoiceUpdated could not start a build: ~p",
+                            [Reason]),
+                                           {Status, undefined}
+                    end
+            end
+    end;
+forkchoice_updated(_ForkChoiceState, _Attributes) ->
+    {error, invalid_forkchoice_state}.
+
 %% The argument is the forkchoiceState itself. This took the whole JSON-RPC
 %% `params' envelope and dug out a "forkChoice" key from it, which the
 %% specification does not have: the state arrives as params[0]. The envelope and
@@ -1012,10 +1049,233 @@ forkchoice_status(_Head, _PayloadId) ->
 %% The builder that would issue payloadIds is `eth_block_builder', which is not
 %% started (see the Phase 3 notes in TASKS.md), so no payloadId this node could be
 %% asked about is one it issued.
+%% get_payload/1 answers a payload this node built, with the `blockValue' the
+%% fee recipient is promised.
+%%
+%% It answered `{error, unknown_payload}' for *every* id, unconditionally, because
+%% nothing ever issued one: `eth_block_builder' was not started and
+%% `forkchoiceUpdated' had no payloadAttributes handling, so there was no build to
+%% collect. The id is validated first -- the specification's parameter is DATA, 8
+%% bytes -- and an id of the wrong shape is `invalid_params' rather than
+%% `unknown_payload', because "you sent me nonsense" and "I never built that" are
+%% different answers and only the first is a client bug.
 get_payload(PayloadId) ->
     case data(PayloadId, 8) of
-        {ok, _Bytes} -> {error, unknown_payload};
-        {error, _Why} -> {error, invalid_params}
+        {ok, Bytes} ->
+            case whereis(eth_block_builder) of
+                undefined ->
+                    %% The builder is not running, so nothing can have been built.
+                    %% The old unconditional answer was right for the wrong reason:
+                    %% it said "unknown" because it never asked.
+                    {error, unknown_payload};
+                _Pid ->
+                    try eth_block_builder:get_payload(Bytes) of
+                        {ok, Payload, BlockValue} ->
+                            {ok, Payload, BlockValue};
+                        {error, Reason} ->
+                            {error, Reason}
+                    catch
+                        Class:Reason -> {error, {builder_failed, Class, Reason}}
+                    end
+            end;
+        {error, _Why} ->
+            {error, invalid_params}
+    end.
+
+%% Hand the decoded attributes to the builder and keep the payloadId it issues.
+%%
+%% The builder being unstarted was not a missing feature but a dead module: it was
+%% absent from `etherlang.app.src's registered list and from `etherlang_sup's
+%% children, so `whereis(eth_block_builder)' was undefined and every call raised
+%% noproc. This checks first and refuses the build with a reason, so a
+%% misconfigured node answers SYNCING with a null payloadId -- the same honest
+%% answer it gave before -- rather than raising inside the request.
+start_build(ForkChoiceState, Attributes) ->
+    case whereis(eth_block_builder) of
+        undefined ->
+            {error, builder_not_running};
+        _Pid ->
+            case build_attributes(ForkChoiceState, Attributes) of
+                {error, Reason} ->
+                    {error, Reason};
+                {ok, Decoded} ->
+                    try eth_block_builder:build(Decoded) of
+                        {ok, Payload, BlockValue} ->
+                            store_payload(Payload, BlockValue);
+                        {error, Reason} ->
+                            {error, Reason}
+                    catch
+                        Class:Reason ->
+                            {error, {build_crashed, Class, Reason}}
+                    end
+            end
+    end.
+
+%% The builder owns the payloadId store -- it is the thing that issues and serves
+%% them -- so this goes through its gen_server rather than keeping a second copy
+%% here. Two stores would answer getPayload from whichever the caller happened to
+%% reach, and the CL would get "unknown payload" for an id it was just given.
+store_payload(Payload, BlockValue) ->
+    case eth_block_builder:store_payload(Payload, BlockValue) of
+        {ok, PayloadId} ->
+            logger:info("etherlang: issued engine payloadId for a block this node "
+                        "built; its state root is not expected to match the "
+                        "network's while the per-fork gas table is unwired"),
+            {ok, PayloadId};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Turn the client's payloadAttributes into the decoded form
+%% eth_block_builder:build/1 takes: raw bytes and integers, not the JSON strings
+%% the Engine API carries. Decoding happens here rather than in the builder
+%% because this module already decodes the attributes for the admission checks, and
+%% a second decoder is a second place for a field to be read wrongly.
+%%
+%% Three of the values are not in payloadAttributes at all and are read from the
+%% parent block, which the chain store already holds:
+%%
+%%   number       the head's height. payloadAttributes carries no number, and the
+%%                fork that applies to the block being built is partly decided by
+%%                it. Guessing 0 would build a block for the genesis slot.
+%%   gasLimit     the parent's. EIP-1559's base-fee formula divides by it, so a
+%%                constant here would compute a base fee the network does not use.
+%%   baseFeePerGas  the parent's own base fee, which is the formula's other input.
+%%
+%% If the chain does not hold the head, there is no honest value for any of the
+%% three, so this is an error and the build is refused. A node that does not have
+%% the block a client wants built on top of cannot build on it, and returning a
+%% payloadId anyway would start a build whose base fee is a guess -- which is the
+%% first field of the header and the one every fee calculation then divides by.
+-spec build_attributes(map(), map()) -> {ok, map()} | {error, term()}.
+build_attributes(ForkChoiceState, Attributes) when is_map(Attributes) ->
+    case data(field(ForkChoiceState, "headBlockHash", undefined), 32) of
+        {ok, ParentHash} ->
+            case parent_fields(ParentHash) of
+                {error, Reason} ->
+                    {error, Reason};
+                {ok, Parent} ->
+                    with_attributes(Parent, Attributes)
+            end;
+        {error, Reason} ->
+            {error, {bad_head, Reason}}
+    end;
+build_attributes(_ForkChoiceState, _Attributes) ->
+    {error, attributes_not_an_object}.
+
+%% The parent block as the chain store holds it. That is the `eth_getBlockByNumber`
+%% response, i.e. a map with hex quantities -- not a #block{} record -- so these are
+%% read from the map with strict decoders and no defaults. A missing or unreadable
+%% value is an error, because every use of it would otherwise be a number this node
+%% made up.
+%% eth_chain is keyed by the `hash' field of the block map it stores, which is the
+%% 0x-prefixed hex string an eth_getBlockByNumber response carries -- not the 32 raw
+%% bytes every other hash in this codebase is held as. So the key has to be
+%% re-encoded, and getting this wrong does not raise: `get_by_hash' answers
+%% `not_found', the build is refused, and `forkchoiceUpdated' reports a null
+%% payloadId. That is the honest answer for a node that cannot find the block, so
+%% the failure is silent -- and it is why this was worth writing down rather than
+%% discovering through a null payloadId.
+%%
+%% eth_block:parent_state_root/1 bridges the same gap for the same reason, and
+%% eth_eth's three callers pass a variable they named `Hex'.
+parent_fields(ParentHash) ->
+    try eth_chain:get_by_hash(eth_hex:encode_bytes(ParentHash)) of
+        {ok, Block, _Full} when is_map(Block) ->
+            Num = strict_quantity(maps:get(<<"number">>, Block, undefined)),
+            GasLimit = strict_quantity(maps:get(<<"gasLimit">>, Block, undefined)),
+            BaseFee = strict_quantity(maps:get(<<"baseFeePerGas">>, Block,
+                                               undefined)),
+            %% EIP-4844's two inputs, for the same reason as the three above: the
+            %% header's excessBlobGas is the parent's excess plus the gas the
+            %% parent's blobs used, less the per-block target. Defaulting it to 0
+            %% would be a consensus value this node invented, and a Cancun header
+            %% carries it -- so a build on top of a parent that used blobs would
+            %% commit to an excess the network did not compute.
+            ParentExcess = strict_quantity(maps:get(<<"excessBlobGas">>, Block,
+                                                    undefined)),
+            ParentBlobGas = strict_quantity(maps:get(<<"blobGasUsed">>, Block,
+                                                     undefined)),
+            case {Num, GasLimit, BaseFee, ParentExcess, ParentBlobGas} of
+                {{ok, N}, {ok, GL}, {ok, BF}, {ok, PE}, {ok, PB}} ->
+                    %% The block being built is the *child*, so its number is one
+                    %% above the head's. Passing the head's own number through built a
+                    %% block at its parent's height -- visible only in the log line
+                    %% this module writes ("built block 0" for a block on top of
+                    %% block 0), because a block that duplicates its parent's height
+                    %% hashes without complaint and no assertion was reading it.
+                    {ok, #{parent_hash => ParentHash, number => N + 1,
+                           gas_limit => GL, base_fee => BF,
+                           parent_excess_blob_gas => PE,
+                           parent_blob_gas_used => PB}};
+                Other ->
+                    {error, {unreadable_parent, Other}}
+            end;
+        _ ->
+            {error, head_not_held}
+    catch
+        _:_ -> {error, chain_unavailable}
+    end.
+
+%% The client's attributes land on top of the parent's. Each is decoded strictly
+%% and a value that will not decode is an error rather than a default: a
+%% `prevRandao' read as zero is indistinguishable on the wire from a client that
+%% sent zero, and a `timestamp' read as 0 would build a block for the genesis slot.
+%%
+%% The attribute key set is the one PayloadAttributesV1/V2/V3 defines, and the
+%% version's *own* keys -- the admission check in eth_engine has already refused a
+%% set that does not match -- so there is nothing to select here: every key present
+%% is a key the version defines.
+with_attributes(Parent, Attributes) ->
+    Fields = [{timestamp, fun attr_quantity/1, 0},
+              {prev_randao, fun attr_data_32/1, <<0:256>>},
+              {fee_recipient, fun attr_data_20/1, <<0:160>>},
+              {withdrawals, fun attr_withdrawals/1, []},
+              {parent_beacon_block_root, fun attr_beacon_root/1, undefined}],
+    try
+        {ok, lists:foldl(
+               fun({Key, Read, Default}, Acc) ->
+                   case maps:find(Key, Attributes) of
+                       error -> maps:put(Key, Default, Acc);
+                       {ok, null} -> maps:put(Key, Default, Acc);
+                       {ok, Value} -> maps:put(Key, Read(Value), Acc)
+                   end
+               end, Parent, Fields)}
+    catch
+        throw:{bad_attribute, Key, Reason} -> {error, {bad_attribute, Key, Reason}}
+    end.
+
+attr_quantity(V) ->
+    case strict_quantity(V) of
+        {ok, N} -> N;
+        error -> throw({bad_attribute, <<"timestamp">>, bad_quantity})
+    end.
+
+attr_data_32(V) ->
+    case data(V, 32) of
+        {ok, Bytes} -> Bytes;
+        {error, _} -> throw({bad_attribute, <<"prevRandao">>, bad_data})
+    end.
+
+attr_data_20(V) ->
+    case data(V, 20) of
+        {ok, Bytes} -> Bytes;
+        {error, _} -> throw({bad_attribute, <<"suggestedFeeRecipient">>, bad_data})
+    end.
+
+attr_withdrawals(V) when is_list(V) -> V;
+attr_withdrawals(_V) ->
+    throw({bad_attribute, <<"withdrawals">>, not_a_list}).
+
+%% A V1 build has no beacon root and must not be given one: a Cancun header field
+%% on a Paris block is a field the encoder does not emit, so the value would be
+%% carried in a block whose hash never commits to it. The version's own attributes
+%% are the authority on whether the field exists -- the admission check refuses a V1
+%% attributes object that carries one -- so absence here is absence.
+attr_beacon_root(V) ->
+    case data(V, 32) of
+        {ok, Bytes} -> Bytes;
+        {error, _} -> throw({bad_attribute, <<"parentBeaconBlockRoot">>, bad_data})
     end.
 
 %% engine_exchangeTransitionConfigurationV1(Config) -> {ok, Config} | {error, Reason}

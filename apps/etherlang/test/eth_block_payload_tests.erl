@@ -321,3 +321,41 @@ with_key(Fx, Key, undefined) ->
                 maps:put(Key, undefined, payload(Fx)));
 with_key(Fx, Key, Value) ->
     maps:put(Key, Value, payload(Fx)).
+
+%% The encoder has to be the inverse of a decoder that is pinned against real
+%% block hashes, or it is not an inverse at all. These use the real Sepolia
+%% payloads, so a field name or width that disagrees with the network shows up as
+%% a block hash that is not the block's own.
+to_payload_round_trips_a_real_cancun_block_test() ->
+    P = maps:get(payload, eth_payload_fixture:cancun()),
+    {ok, Block} = eth_block:from_payload(P),
+    {ok, Encoded} = eth_block:to_payload(Block),
+    ?assertEqual(maps:get(<<"blockHash">>, P), maps:get(<<"blockHash">>, Encoded)),
+    [?assertEqual(maps:get(K, P), maps:get(K, Encoded))
+     || K <- [<<"parentHash">>, <<"feeRecipient">>, <<"stateRoot">>,
+             <<"receiptsRoot">>, <<"logsBloom">>, <<"prevRandao">>,
+             <<"blockNumber">>, <<"gasLimit">>, <<"gasUsed">>, <<"timestamp">>,
+             <<"extraData">>, <<"baseFeePerGas">>, <<"blobGasUsed">>,
+             <<"excessBlobGas">>, <<"parentBeaconBlockRoot">>]],
+    ?assertEqual(maps:get(<<"transactions">>, P), maps:get(<<"transactions">>, Encoded)),
+    ?assertEqual(maps:get(<<"withdrawals">>, P), maps:get(<<"withdrawals">>, Encoded)).
+
+to_payload_round_trips_a_real_shanghai_block_test() ->
+    P = maps:get(payload, eth_payload_fixture:shanghai()),
+    {ok, Block} = eth_block:from_payload(P),
+    {ok, Encoded} = eth_block:to_payload(Block),
+    ?assertEqual(maps:get(<<"blockHash">>, P), maps:get(<<"blockHash">>, Encoded)),
+    %% A Shanghai payload has no blob fields, and the encoder must not add any:
+    %% the structure check in eth_engine compares the exact key set.
+    ?assertNot(maps:is_key(<<"blobGasUsed">>, Encoded)),
+    ?assertNot(maps:is_key(<<"parentBeaconBlockRoot">>, Encoded)),
+    ?assert(maps:is_key(<<"withdrawals">>, Encoded)).
+
+to_payload_round_trips_a_real_paris_block_test() ->
+    P = maps:get(payload, eth_payload_fixture:paris()),
+    {ok, Block} = eth_block:from_payload(P),
+    {ok, Encoded} = eth_block:to_payload(Block),
+    ?assertEqual(maps:get(<<"blockHash">>, P), maps:get(<<"blockHash">>, Encoded)),
+    %% A Paris payload has no withdrawals field at all.
+    ?assertNot(maps:is_key(<<"withdrawals">>, Encoded)),
+    ?assertNot(maps:is_key(<<"blobGasUsed">>, Encoded)).

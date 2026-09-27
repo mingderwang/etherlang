@@ -46,6 +46,25 @@ init([]) ->
                type => worker,
                modules => [eth_engine]},
 
+    %% eth_block_builder was a gen_server nothing started: absent from the .app.src
+    %% `registered' list and from this child list, so `whereis(eth_block_builder)'
+    %% was undefined and every call raised noproc. It is the module that turns a
+    %% consensus client's payloadAttributes into a block, so while it was dead the
+    %% node could answer a client's proposals and could never produce one --
+    %% `engine_getPayload' reported every payloadId unknown because none was ever
+    %% issued.
+    %%
+    %% Started after eth_chain, because a build reads the head block out of the
+    %% chain store for its number, gas limit and base fee, and a build attempted
+    %% before the chain is up is refused rather than guessed.
+    Builder = #{id => eth_block_builder,
+                start => {eth_block_builder, start_link, [#{max_gas => 30000000,
+                                                            max_transactions => 2048}]},
+                restart => permanent,
+                shutdown => 5000,
+                type => worker,
+                modules => [eth_block_builder]},
+
     Rpc = #{id => eth_rpc_server,
             start => {eth_rpc_server, start_link, [#{port => eth_config:listen_port()}]},
             restart => permanent,
@@ -134,4 +153,5 @@ init([]) ->
                         []
                 end,
 
-    {ok, {SupFlags, [State, Chain, Engine, Rpc, Sync, Pool, Store] ++ Disc ++ Peer ++ StateSync}}.
+    {ok, {SupFlags, [State, Chain, Builder, Engine, Rpc, Sync, Pool, Store]
+             ++ Disc ++ Peer ++ StateSync}}.

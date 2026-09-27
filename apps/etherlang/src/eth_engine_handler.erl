@@ -307,24 +307,36 @@ handle_forkchoice_updated(Map, _State, Id, Version) ->
                 {admission_error, Code, Message, Id2} ->
                     error_rpc(Id2, Code, Message);
                 proceed ->
-                    forkchoice_reply(ForkChoice, Id)
+                    forkchoice_reply(ForkChoice, param(Map, 1), Id)
             end;
         _ ->
             invalid_params(Id)
     end.
 
-forkchoice_reply(ForkChoice, Id) ->
-    case eth_engine:forkchoice_updated(ForkChoice) of
-        Status when is_binary(Status) ->
+%% The result is {payloadStatus, payloadId}, and the payloadId used to be a
+%% hardcoded `null' in every branch -- which is the correct answer only when there
+%% are no payloadAttributes, and a lie when there are. `eth_engine:forkchoice_updated/2'
+%% acts on the attributes and issues a payloadId when it can build, so the field
+%% now carries what actually happened.
+forkchoice_reply(ForkChoice, Attributes, Id) ->
+    case eth_engine:forkchoice_updated(ForkChoice, Attributes) of
+        {Status, PayloadId} when is_binary(Status) ->
             ok(Id, #{
                 <<"payloadStatus">> => payload_status(Status, null, null),
-                <<"payloadId">> => null
+                <<"payloadId">> => payload_id_json(PayloadId)
             });
         {error, Reason} ->
             %% -38002 is the specification's code for a forkchoiceState that is
             %% invalid or inconsistent.
             error_rpc(Id, -38002, message(Reason))
     end.
+
+%% DATA, 8 bytes. `undefined' -- no attributes, so no build was started -- is
+%% `null' in the response, which is what the specification uses for "no payloadId"
+%% and is distinct from an 8-byte zero id, which would name a build.
+payload_id_json(undefined) -> null;
+payload_id_json(Id) when is_binary(Id) ->
+    eth_hex:encode_bytes(Id).
 
 %% The result of getPayload changes shape with the version:
 %%
@@ -344,7 +356,8 @@ handle_get_payload(Map, Id, Version) ->
     case param(Map, 0) of
         PayloadId when is_binary(PayloadId) ->
             case eth_engine:get_payload(PayloadId) of
-                {payload, Payload} -> ok(Id, get_payload_result(Payload, Version));
+                {ok, Payload, BlockValue} ->
+                    ok(Id, get_payload_result(Payload, Version, BlockValue));
                 {error, Reason} ->
                     %% -38001 is the specification's code for an unknown payload.
                     error_rpc(Id, -38001, message(Reason))
@@ -353,18 +366,25 @@ handle_get_payload(Map, Id, Version) ->
             invalid_params(Id)
     end.
 
-get_payload_result(Payload, 1) -> Payload;
-get_payload_result(Payload, 2) ->
+%% V1's result is the bare ExecutionPayloadV1, with no blockValue field at all --
+%% the field arrives with V2. Sending it on V1 would be a V2 response to a V1
+%% method, and a client destructuring the specification's V1 shape would find an
+%% extra key it has no use for.
+get_payload_result(Payload, 1, _BlockValue) -> Payload;
+get_payload_result(Payload, 2, BlockValue) ->
     #{<<"executionPayload">> => Payload,
       %% `blockValue' is "The expected value to be received by the feeRecipient in
-      %% wei". This node issues no payloadIds (eth_block_builder is not started),
-      %% so this branch is unreachable from a client and the value here is never a
-      %% commitment to anything. It is written as 0 rather than omitted so the
-      %% response has the shape the method's version requires, should the builder
-      %% ever be started.
-      <<"blockValue">> => <<"0x0">>};
-get_payload_result(Payload, 3) ->
-    (get_payload_result(Payload, 2))#{
+      %% wei" (src/engine/shanghai.md). It was hardcoded to 0 because the builder
+      %% was not started and no build existed; it is now the value the builder
+      %% computed from the receipts of the transactions it actually included, which
+      %% is a sum of tips -- the base fee is burned, not paid out.
+      %%
+      %% A `0x0' here on a V2 or V3 method is a claim that the block pays its
+      %% proposer nothing, which is false for any block with a transaction in it, so
+      %% the value is carried through rather than defaulted.
+      <<"blockValue">> => eth_hex:encode_int(BlockValue)};
+get_payload_result(Payload, 3, BlockValue) ->
+    (get_payload_result(Payload, 2, BlockValue))#{
       %% "The call MUST return blobsBundle with empty blobs, commitments and proofs
       %% if the payload doesn't contain any blob transactions." (cancun.md,
       %% engine_getPayloadV3 item 2.) An empty bundle is a true statement about a
