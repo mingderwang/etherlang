@@ -272,6 +272,22 @@ what it does now, and what the symptom was — concretely, with the values.
 
 ## 5. Testing
 
+- **Conformance.** `eest_state_tests.erl` runs the `execution-spec-tests`
+  `state_tests` corpus against the state transition, and classifies every entry
+  into a vocabulary that keeps "did not decode", "recovered the wrong sender",
+  "should have been rejected but was not" and "state differs" apart. Do not
+  collapse them: one `fail` bucket would sum four different bugs and hide all
+  four, and the totals would look identical. The committed subset lives in
+  `test/vectors/eest/` with a `PROVENANCE.md`; the full 503 MB run is a developer
+  step (`eest_report`).
+
+  **The tally is not asserted and must not be.** It drifts between runs of the same
+  code, because a storage read a fixture's code performs but does not declare falls
+  through `base_source` to the local MPT, which is process-wide and shared with the
+  rest of the suite. Seeding everything the fixture mentions removes most of it; the
+  rest needs an isolated state base, and until that exists a pinned number is a test
+  that flips.
+
 - **No network.** Every test runs against `eth_mock_node` (in-process JSON-RPC)
   or a loopback devp2p stack on real sockets. **A unit test must never perform a
   lazy upstream fetch.** If a test needs real chain data it belongs in
@@ -423,6 +439,11 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
   Inert, because upstream block JSONs do not carry it.
 - `eth_rpc_server:start_engine_api/2` still swallows a listener failure
   (`{error, Reason} -> logger:error(...), ok`).
+- `eth_block:run_transaction/5` is exported for the conformance runner. It is not
+  test-only -- `finalize_against/5` is its production caller -- but note that
+  `finalize/1` **cannot** serve a caller holding its own pre-state, because it
+  resolves the parent's state root through `eth_chain` and then requires the local
+  MPT to *hold* that root. A state test is the opposite case.
 
 ## 12. Next up, in order
 

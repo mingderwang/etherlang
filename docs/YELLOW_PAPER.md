@@ -1,6 +1,6 @@
 # etherlang — design and current state
 
-**Status**: v1.0 in progress. 628 eunit tests, green.
+**Status**: v1.0 in progress. 632 eunit tests, green.
 
 This document describes what the node *is* and what it is *becoming*: the system
 model, the trust assumptions, the data structures, and — at least as important —
@@ -284,6 +284,7 @@ Two halves of "per-fork exact" must not be confused:
 | | Status |
 |---|---|
 | **Availability** — may this fork run this instruction at all? | **Done.** An instruction the fork lacks is an exceptional halt consuming the frame's whole allowance. |
+| **Conformance** — does it agree with anybody else? | **Measured once, and it is about 2%.** The `execution-spec-tests` `state_tests` corpus runs against this node's state transition. Two real defects came out of it. The figure is not reproducible yet and is reported rather than asserted. §7.3 |
 | **Price** — what does it cost? | **Done, Berlin and later.** `eth_fork_schedule` owns every price; the interpreter's duplicate table is deleted. SSTORE included; pre-Berlin SSTORE is *refused* rather than priced (§7.2.3). |
 
 The availability half was the more dangerous of the two, because every clause in
@@ -387,6 +388,41 @@ exercising the flat rule at both neighbours would pass. So
 fallback: a pre-Berlin call degrades to another node's answer rather than to a
 plausible wrong one of this node's own. Block execution is unaffected — this node
 syncs Sepolia.
+
+### 7.3 Conformance: measured, and it is bad
+
+Everything above in this section is about the node agreeing with *itself* and with
+the EIPs. The question this section is about is whether it agrees with anybody
+else, and until `v1.18` the honest answer was that **nothing in this repository had
+ever been run against a third party's expected results**. The opcode table was
+cross-checked against go-ethereum's Frontier instruction set and execution-specs'
+per-fork `Ops` counts; the gas schedule was derived from the EIP texts and pinned by
+unit tests. Both of those are real checks, and neither can catch a schedule that is
+wrong in a way its own tests agree with.
+
+`apps/etherlang/test/eest_state_tests.erl` closes that. It runs EEST's `state_tests`
+corpus, and **about 2% of the committed subset matches**. Two findings, neither of
+which needed any new code to surface:
+
+- the node **accepts an EIP-1559 transaction at a pre-London fork**, which the
+  specification rejects — a validator admitting something invalid, which is the
+  worst category there is;
+- `eth_tx:from_rlp/1` **has no clause for an EIP-7702 (type 4) transaction**.
+
+The 2% is not a rounding of a good number. It says the EVM and the transaction
+wrapper are broadly not yet conformant, and that every state root this node has
+ever computed was computed by code that disagrees with the specification on the
+large majority of transactions it is given. That is a more useful sentence than the
+one this document used to carry.
+
+**The figure is not reproducible and is not asserted.** It drifts between runs of
+the same code, because a storage read a fixture's code performs but does not
+declare falls through to a process-wide MPT shared with the rest of the suite. A
+pinned conformance number whose expected value flips is worse than no number, so
+the tally is reported and the regression fence pins only what does not move.
+
+Not covered: EEST's `blockchain_tests` and the Ethereum Foundation's own
+`ethereum/tests`. This is a state-transition measurement, not a block-level one.
 
 ### 7.2.4 Still not implemented
 

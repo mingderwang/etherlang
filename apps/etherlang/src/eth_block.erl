@@ -21,6 +21,24 @@
           add_transaction/2,
           declare_state_root/2,
           finalize/1,
+          %% Exported for the execution-spec-tests conformance runner, which
+          %% needs to apply exactly one transaction to a state it built itself
+          %% and read the resulting state and receipt back.
+          %%
+          %% `finalize/1' cannot serve that: it resolves the parent's state root
+          %% through `eth_chain' and then requires the local MPT to *hold* that
+          %% root, so it can only run against a block this node synced. A state
+          %% test is the opposite case -- a pre-state the runner constructs from
+          %% a fixture -- and routing it through `finalize/1' would mean
+          %% importing every fixture's pre-state into the trie and resetting it
+          %% again per fixture.
+          %%
+          %% This is not a test-only function: `finalize_against/5' is its
+          %% production caller and the whole of block execution goes through it.
+          %% What is exported is one transaction's effects, which is the unit
+          %% `eth_fork_schedule:current_fork/3,4` and the gas table are already
+          %% reasoned about in.
+          run_transaction/5,
           %% Exported because the reason vocabulary of an `unverified' verdict is
           %% this module's private vocabulary, and eth_engine has to decide
           %% whether a verdict means "checked, and wrong" or "could not check".

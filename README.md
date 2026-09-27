@@ -66,8 +66,8 @@ beacon, validators, or block production).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**628 tests, green**).
-* **Status** — v0.7.0; eunit green (628 tests) and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**632 tests, green**).
+* **Status** — v0.7.0; eunit green (632 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -522,6 +522,7 @@ Where the work actually stands:
 | Block execution: receipts, logs, bloom, state root, EIP-4788, EIP-4895, EIP-2935 | done, and the two system-contract EIPs verified against live Sepolia data |
 | Block authoring (proposer duties) | **not done** — the node builds and executes blocks but is never selected to author one |
 | Per-fork exact gas schedule | **done, Berlin and later.** `eth_fork_schedule` owns every price the interpreter charges and `eth_evm:base_cost/1`, a second fork-free copy of the schedule, is deleted. SSTORE included: EIP-2200's net metering, with EIP-2929's figures and EIP-3529's refunds. **Pre-Berlin SSTORE is refused, not priced** — three schedules exist there (the flat rule, EIP-1283 at Constantinople, Petersburg's revert of it) and only EIP-2200's text is implemented, so a single pre-Berlin figure would be right for two spans and wrong for the third. Fork-selected now: every opcode's constant price, EIP-150's pre-Berlin access costs, EIP-2929's warm/cold split, EIP-161's 9000/25000, the refund cap, EIP-6780, EIP-3860, and `eth_tx`'s intrinsic floor. Getting there meant picking one owner of each price's composition — the two tables agreed on most totals and split four groups differently — and comparing them found two live bugs: `ADDRESS` cost 3 where it is 2, and EIP-161's terms gated on Berlin rather than Spurious Dragon. SSTORE net metering needed the transaction-start value of each slot, which this node did not track; it now does, in a map of its own, and the 2700-gas-per-no-op-write overcharge is gone. Whether the gas schedule is the *only* reason this node's state roots do not match the network's is unverified: it cannot be checked end-to-end without real prestate |
+| Conformance against a third party's expected results | **started, and the measurement is bad.** `eest_state_tests.erl` runs the `execution-spec-tests` `state_tests` corpus. **About 2% of the committed subset matches** (5–7 of 266, and the figure is not reproducible — see below). Two real defects it found with no new code written for it: the node **accepts an EIP-1559 transaction at a pre-London fork**, and it **cannot decode an EIP-7702 (type 4) transaction at all**. Nothing in this repository had been *run* against a third party's expected results before this; the opcode table was cross-checked against instruction counts and the gas schedule was derived from the EIPs, and a schedule can be wrong in both senses and still self-consistent |
 | Honest stateRoot verification | done for the current block; historical blocks are not re-executed |
 | Receipt verification on the peer path | done — a peer's `receiptsRoot` is recomputed from the executed body and compared, and reported as `{verified, Root} \| {unverified, Reason}` |
 | Transaction validation (nonce, balance, chain ID, gas limit, intrinsic gas, signature) | done — one validator, called on the peer path before execution, with the offending transaction's index reported |
@@ -540,6 +541,32 @@ Where the work actually stands:
   - Writing that first version against the existing `mark/2` helper was the bug worth recording. `mark/2` writes the **transient** set, because a transient write is a flag; an original value is a word. So the original went into the wrong map and every SSTORE was priced as a first write — the dirty write came out at 2900 again, and a non-`true` value sat in a map every other reader assumes holds only booleans. Caught by a test that asserts a second write to a dirty slot costs 100.
   - EIP-2200's arm (2.2.2) is guarded on `original == new`, and dropping that guard is silent: the frame still succeeds and still returns a plausible amount of gas, just 2800 short on the refund. It was dropped in the first draft of `reset_adjustment/2` — a clause that returned 0 for any non-zero `new` consumed every case the arm was written for — and the per-arm table tests caught it.
   - **Not implemented, and named: pre-Berlin SSTORE.** There are *three* pre-Berlin schedules, not one — the flat rule from Frontier to Byzantium, **EIP-1283's** net metering at Constantinople, and Petersburg reverting it back. EIP-1283 is a different schedule and not a restatement of the flat one (its title is "Net gas metering for SSTORE without dirty maps", and the absence of a dirty map is exactly what EIP-2200 later introduced). Only EIP-2200's text is implemented here, so a single pre-Berlin figure would be right for two of those three spans and wrong for the third — and wrong *only* at Constantinople is the kind of gap nobody notices. `eth_fork_schedule:sstore_supported/1` therefore refuses before Berlin, and the interpreter reports `{unsupported, {sstore, Fork}}`, which `eth_call` answers with an upstream fallback. A pre-Berlin call degrades to another node's answer rather than to a plausible wrong one of this node's own. Unreachable for block execution: this node syncs Sepolia, which is post-Merge.
+
+- **The first conformance measurement, and it is 2%.** `apps/etherlang/test/eest_state_tests.erl` runs the
+  `execution-spec-tests` `state_tests` suite — 25 of upstream's 2,681 files, committed under
+  `test/vectors/eest/` with a `PROVENANCE.md` recording the release, the rule the subset was chosen by, and
+  the command for the full run. Every entry is executed and classified, and the classifications are kept
+  distinct on purpose: a transaction that does not decode, a signature that recovers the wrong address, a
+  transaction the node admits that the specification rejects, and a state that comes out different are four
+  different bugs with four different owners, and one `fail` bucket would sum them and hide all four.
+  - **About 5 to 7 of 266 entries match.** The gas figure is recovered from the balances the way a state test
+    encodes it, so a divergence reads as a gas number rather than as a wei difference — the first fixture looked
+    at reported `45,247` gas, which is EIP-2929's cold account charge and about sixteen times that.
+  - Two findings, neither of which required writing any code to find: the node **accepts a type-2 (EIP-1559)
+    transaction at a pre-London fork**, which the specification rejects — the worst kind of divergence, because
+    it is a validator admitting something invalid — and `eth_tx:from_rlp/1` **has no clause for an EIP-7702
+    (type 4) transaction**, so it cannot decode one at all.
+  - **The figure is not reproducible, and that is stated rather than smoothed over.** It drifts between runs of
+    the same code — 5, 6, 7 and 2 were all observed — because a storage slot that a fixture's code reads but
+    never declares falls through to `eth_state`'s `base_source`, which the run points at the local MPT, and
+    the local MPT is process-wide and shared with the rest of the suite. So the tally is **reported, not
+    asserted**: a pinned conformance figure whose expected value flips between runs is a test that teaches its
+    readers to ignore it. Seeding every address and slot the fixture mentions removes most of it and is done
+    regardless; the rest needs an isolated state base, which is item 6 in TASKS.
+  - What is *not* covered: EEST's `blockchain_tests` (so no state root, no receipts root, no block header), the
+    Ethereum Foundation's own `ethereum/tests` suites, and the six EEST suites whose smallest fixture exceeds
+    150 KB. This is a state-transition corpus, not a block corpus, and the total must not be read as
+    block-level conformance.
 
 It is **not** established that the gas schedule is the *only* remaining divergence, because that cannot be checked without real prestate. That is still the reason not to treat the schedule as close, and it was the reason to distrust the two gas bugs above as well: a schedule that has been found wrong twice by reading it against the EIPs is not a schedule that should be assumed right in the places nobody has read. KZG commitment verification is listed above and is also not done.
 

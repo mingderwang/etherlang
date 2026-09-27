@@ -76,8 +76,43 @@ behavioural change per commit, and each step says what it now does.
      **refused** (`sstore_supported/1` -> `{unsupported, {sstore, Fork}}`, which
      `eth_call` answers with an upstream fallback) rather than priced with a
      figure that would be right for two spans and wrong for the third.
-5. **EEST conformance work**  *(next)*: run the execution-specs fixtures and record what fails.
-   Nothing in this repository has been checked against them (see the note in Phase 8).
+5. ~~**EEST conformance work.**~~  **Done as far as it can be, and the answer is
+   bad.** `apps/etherlang/test/eest_state_tests.erl` runs the `execution-spec-tests`
+   `state_tests` corpus against this node's state transition and classifies every
+   entry. **About 5 to 7 of 266 committed entries match — roughly 2%.** Nothing in
+   this repository had ever been measured against a third party's expected results
+   before; the opcode table was cross-checked against instruction *counts* and the
+   gas schedule was derived from the EIPs, and a schedule can be wrong in both of
+   those senses and still self-consistent.
+   - What the corpus found, immediately and without any new code being written for
+     it: the node **accepts a type-2 (EIP-1559) transaction at a pre-London fork**,
+     which the specification rejects — 5 entries, and the worst kind of divergence
+     because it is a validator that admits something invalid. And it **cannot
+     decode an EIP-7702 (type 4) transaction at all**, 4 entries, `eth_tx:from_rlp/1`
+     having no clause for it.
+   - `eth_block:run_transaction/5` is now exported for the runner. It was already
+     the function `finalize_against/5` calls, so this is not a test-only export; it
+     is one transaction's effects, and `finalize/1` cannot serve the runner because
+     it resolves the parent's state root through `eth_chain` and then requires the
+     local MPT to *hold* that root.
+   - **The figure is not reproducible, and that is the next task.** It drifts
+     between runs of the same code — 5, 6, 7 and 2 were all observed — because a
+     storage slot that the fixture's code reads but never declares falls through
+     to `base_source`, which the run points at the local MPT, which is
+     process-wide and shared with the rest of the suite. Seeding everything the
+     fixture mentions removes most of it and is done anyway; the remainder needs an
+     **isolated state base for the runner**, which is a change to how `eth_state`
+     resolves a missing key. Until that exists the tally is reported and not
+     asserted, and `eest_conformance_tests` pins only what does not move.
+   - 25 of upstream's 2,681 files are committed (1.2 MB, one per suite, the
+     smallest in each). `PROVENANCE.md` beside them records the release, the rule
+     the subset was chosen by, and the command for the full 503 MB run.
+6. **An isolated state base for the conformance runner**  *(next)*. See item 5: the
+   tally cannot be asserted while a storage read the fixture does not declare can
+   reach the process-wide MPT. Two thirds of the reported divergences are
+   `state_mismatch', so the runner is worth trusting; it is the *denominator* that
+   is unstable, and an unstable denominator is the one thing a conformance figure
+   must not have.
 
 ### Deliberately later: the rest of the Engine API
 
@@ -475,12 +510,18 @@ Recorded because the documentation claimed otherwise, and because each of these 
   - The tests produce the failure from a **real bind on a real occupied port**, not by raising a term that looks like one. An earlier version raised a literal `{badmatch, {error, eaddrinuse}}` and passed against the broken matcher, which proves the point: the shape the matcher is written against and the shape that arrives are the same shape right up until they are not
   - The remaining `free_port/0` callers (`eth_mock_node`, `eth_call_tests`, `eth_rpc_server_tests`, `eth_txpool_tests`, `eth_peer_tests`, `eth_statesync_tests`, `eth_receipt_tests`, `eth_engine_tests`) each make **one** bind and are not converted here. If one of them ever reports `eaddrinuse`, it is the same race
 - [ ] **Foundry tests** — `forge test` with `--rpc-url` pointing to etherlang; contract deployment, execution, opcode regression tests
-- [ ] **Geth test vectors** — run geth's test suite: block execution, state transition, transaction, VM tests
+- [ ] **Geth test vectors** — run geth's test suite: block execution, state transition, transaction, VM tests. Partly superseded by the EEST state tests above, which are *generated from* that corpus; its block-level suites are not covered by them
 - [ ] **Property-based tests** — property-based testing of EVM execution
 - [ ] **Fuzz testing** — fuzz the EVM interpreter for edge cases
 - [ ] **Differential testing** — run same block through etherlang and geth, compare outputs
 - [ ] **Performance benchmarks** — block processing speed, state access latency
-- [ ] **Conformance tests** — run Ethereum Foundation conformance tests
+- [x] **Conformance tests** — `eest_state_tests.erl` runs the `execution-spec-tests`
+  `state_tests` corpus. **Started, and the first measurement is about 2%**
+  (5-7 of 266 committed entries; see "What to do next" item 5 for the number, the
+  two real defects it found, and why the figure is not yet reproducible). The
+  Ethereum Foundation's own `ethereum/tests` block-level suites and EEST's
+  `blockchain_tests` are **not** run, and the fork table's provenance check against
+  instruction counts is a weaker claim than running the fixtures
 
 ## Phase 9: Infrastructure & Operations (10 tasks)
 - [ ] **Docker image** — multi-stage build, optimized production image
