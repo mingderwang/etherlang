@@ -221,8 +221,37 @@ behavioural change per commit, and each step says what it now does.
      so this is not what is wrong with the other 228 — but the remaining coinbase
      diffs are now unexplained rather than known-noise, and that is the next thing
      to run down.
-   - **`+56668` and `+56665`, 12 fixtures each.** The largest systematic bucket and
-     the one most likely to be a single cause. **Unresolved.**
+   - **The full-corpus figure is not measured, and the tool made that unmeasurable.**
+     The committed 266-entry subset is pinned and reproducible; the full 2,681-file
+     upstream run had been going for **four hours** at 100% CPU with an output file
+     still on its first line, because `eest_state_tests:survey/1` printed nothing
+     until it finished. Four hours with no output is indistinguishable from a hung
+     process — the only way to tell them apart was to go and read `ps` — so a long
+     measurement could not be left alone and had to be watched.
+     `survey/2` now takes a progress interval in files and writes
+     `~/25 files, ~p entries, ~p ms~n` to `standard_error`, so it cannot interleave
+     with the report on `standard_io'. Off by default, so a test run and a developer
+     run of the same function print the same thing. The run is restarted with it.
+     **The 2,681-file number is not claimed until that run finishes.**
+   - **Twelve-fixture buckets, one per file, three files.** `-22000` on
+     `shanghai/eip3651_warm_coinbase`, `-19500` on
+     `frontier/identity_precompile/test_identity_precompile_returndata`, `-4200` on
+     `shanghai/eip3855_push0`. Each is internally consistent across its sub-cases and
+     each is *negative* — the node refunds gas the chain charges — so the likely shape
+     is one cause reached three ways rather than three causes. Partly characterised:
+     the `identity_precompile` case is not an out-of-gas, and the node spends 23,771
+     where the fixture expects 43,271 out of a 200,000 limit. The callee forwards only
+     16 gas to the identity precompile, which costs `15 + 3*words` = 18, so the call
+     must fail and leave `RETURNDATASIZE` at 0 — and the SSTORE that stores it is the
+     dominant term in the expected figure. **Unresolved: the three are not yet
+     explained, and the arithmetic above is a hypothesis, not a finding.**
+   - **`+56668` and `+56665`.** The largest systematic bucket in the earlier
+     fingerprint pass. **Unresolved**, and the bins have since moved — a current run
+     of the same corpus shows the largest positive deltas at ~986,000 on
+     `berlin/eip2929_gas_cost_increases/test_call.py::test_call_insufficient_balance`
+     and `berlin/eip2930_access_list/test_acl.py::test_repeated_address_acl` — so the
+     +56668 pair is no longer the biggest thing in the histogram and the fingerprint
+     has to be re-derived rather than chased.
    - **`-1208` gas, 1 fixture, `homestead/coverage` at Homestead.** **Unresolved.**
    - **Precompile pricing took no fork at all. Fixed** (`v1.27`). This was a
      structural gap rather than a corpus finding, and it was a large one:

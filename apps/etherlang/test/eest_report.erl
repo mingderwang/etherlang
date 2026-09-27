@@ -28,7 +28,11 @@ main([Dir]) ->
     %% odd.
     os:putenv("ETH_NETWORK", "mainnet"),
     T0 = erlang:monotonic_time(millisecond),
-    S = eest_state_tests:survey(Dir),
+    %% A progress line every 25 files, to `standard_error'. 25 rather than 1 because
+    %% the committed subset is 25 files and this is a developer tool for a corpus of
+    %% thousands; at one line per file the short run is noise and the long run is
+    %% unreadable. See `eest_state_tests:survey/2' for why this exists at all.
+    S = eest_state_tests:survey(Dir, 25),
     Ms = erlang:monotonic_time(millisecond) - T0,
     print(Dir, S, Ms),
     halt(0);

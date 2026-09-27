@@ -89,7 +89,7 @@
 -include("eth_block.hrl").
 
 -export([corpus/0, committed/0, entries/0, entries/1, outcomes/0,
-         tally/1, report/0, report/1, survey/1, survey/0, files/1]).
+         tally/1, report/0, report/1, survey/1, survey/0, survey/2, files/1]).
 
 %% A streaming pass over a corpus: the tally, a per-fork breakdown, a histogram of
 %% the gas deltas, and a bounded sample of the divergences.
@@ -106,24 +106,54 @@
 %% only thing worth keeping verbatim is a sample of divergences, which is bounded by
 %% construction. Peak memory is one fixture's decoded JSON rather than the corpus's.
 -spec survey(file:filename_all()) -> map().
-survey(Root) ->
+survey(Root) -> survey(Root, 0).
+
+%% `Every' is a progress interval in files; 0 is silent.
+%%
+%% The interval exists because a run over the whole upstream corpus is measured in
+%% hours, and the first version of this printed **nothing at all** until it finished.
+%% Four hours at 100% CPU with an output file still at its first line is
+%% indistinguishable from a hung process, and the only way to tell the two apart was
+%% to go and look at `ps' -- so a long run could not be left alone and had to be
+%% babysat, which is the opposite of what a background measurement is for.
+%%
+%% Progress goes to `standard_error' so it cannot interleave with the report on
+%% `standard_io', and it is off for the committed subset so a test run and a
+%% developer run of the same function print the same thing.
+survey(Root, Every) ->
     with_mainnet(
       fun() ->
               eth_test_util:with_local_reads(
                 fun() ->
                         Files = files(Root),
-                        lists:foldl(fun file_survey/2, initial_survey(length(Files)),
-                                   Files)
+                        T0 = erlang:monotonic_time(millisecond),
+                        lists:foldl(fun(F, A) ->
+                                            Acc = file_survey(F, A),
+                                            report_progress(Acc, Every, T0),
+                                            Acc
+                                    end,
+                                    initial_survey(length(Files), Every), Files)
                 end)
       end).
 
-initial_survey(N) ->
-    #{files => N, total => 0, tally => maps:from_list([{O, 0} || O <- outcomes()]),
+report_progress(#{files_done := D, files := N, total := T, every := Every}, Every, T0)
+  when is_integer(Every), Every > 0, D rem Every =:= 0 ->
+    Ms = erlang:monotonic_time(millisecond) - T0,
+    io:format(standard_error,
+              "~p/~p files, ~p entries, ~p ms~n", [D, N, T, Ms]),
+    ok;
+report_progress(_Acc, _Every, _T0) ->
+    ok.
+
+initial_survey(N, Every) ->
+    #{files => N, files_done => 0, every => Every, total => 0,
+      tally => maps:from_list([{O, 0} || O <- outcomes()]),
       by_fork => #{}, gas => #{}, sample => [], sample_limit => 40}.
 
 %% Fold one file's results in. Reversed so the accumulated list stays cheap.
 file_survey(File, Acc) ->
-    lists:foldl(fun(R, A) -> survey_one(R, A) end, Acc, file_entries(File)).
+    Acc1 = lists:foldl(fun(R, A) -> survey_one(R, A) end, Acc, file_entries(File)),
+    maps:update_with(files_done, fun(N) -> N + 1 end, 1, Acc1).
 
 survey_one({Key, Outcome, Detail, _File} = R, Acc) ->
     #{total := T, tally := Tl, by_fork := Bf, gas := G, sample := S,
