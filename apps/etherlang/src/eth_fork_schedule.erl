@@ -56,6 +56,9 @@
           call_cost/3,
           refund_cap/2,
           selfdestruct_deletes/1,
+          sstore_cost/4,
+          sstore_sentry/1,
+          sstore_supported/1,
           initcode_word_cost/1,
           timestamp_in_frame/3,
           timestamp_frame/2,
@@ -1404,14 +1407,175 @@ account_creation_cost(_Fork) -> 32000.
 selfdestruct_cost(_Fork) -> 5000.
 
 %% ---------------------------------------------------------------------------
-%% Rules the fork selects, as opposed to prices it supplies
+%% SSTORE net metering (EIP-2200)
 %% ---------------------------------------------------------------------------
 %% ---------------------------------------------------------------------------
+%% This is the one price that cannot be derived from the frame alone. Every other
+%% opcode's cost is a function of the opcode, the fork, and what the frame has
+%% already touched. SSTORE's depends on a third thing the frame does not carry:
+%% the value the slot held **at the start of the transaction**, as opposed to the
+%% value it holds now. EIP-2200's whole point is that the difference between those
+%% two is what distinguishes a first write from a rewrite.
+%%
+%% The interpreter supplies all three values and this function supplies the
+%% arithmetic, because the arithmetic is where the fork lives.
+
+%% What a transaction must have left for SSTORE to proceed at all. EIP-2200
+%% clause (0): at or below the stipend, fail the frame. It exists so a frame
+%% cannot be left with enough gas to keep executing but not enough to pay for
+%% its own writes -- the reentrancy window EIP-1283 opened and EIP-2200 closed.
+%%
+%% Zero before Berlin, because the sentry is EIP-2200's and there is nothing to
+%% check against. The comparison is `gas =< Sentry', so a sentry of 0 would halt
+%% every SSTORE; callers must skip the check entirely rather than compare against
+%% it. See `sstore_supported/1`.
+-spec sstore_sentry(atom()) -> non_neg_integer().
+sstore_sentry(Fork) when is_atom(Fork) ->
+    case at_least(Fork, berlin) of
+        true -> 2300;
+        false -> 0
+    end;
+sstore_sentry(_Fork) -> 0.
+
+%% Is SSTORE's schedule implemented at this fork?
+%%
+%% Berlin and later only, and the boundary is not arbitrary. There are **three**
+%% pre-Berlin schedules, not one: the flat rule (20000 to create a slot, 5000 to
+%% reset one, 15000 back for clearing) from Frontier to Byzantium; EIP-1283's net
+%% metering at Constantinople, which is a *different* schedule and not a
+%% restatement of the flat one -- its title is "Net gas metering for SSTORE without
+%% dirty maps", and the absence of a dirty map is exactly what EIP-2200 later
+%% introduced; and then Petersburg, which reverted Constantinople and so restored
+%% the flat rule. A single pre-Berlin price would be right for two of those three
+%% spans and wrong for the third, and wrong *only* at Constantinople is the kind of
+%% gap that is never noticed, because nothing executes Constantinople blocks on
+%% this node and a test that exercised the flat rule at both neighbours would pass.
+%%
+%% So pre-Berlin is refused rather than priced, and the caller turns that into an
+%% `unsupported' error, which `eth_call' answers with an upstream fallback. A
+%% fabricated number would be worse than another node's answer: this one would be
+%% indistinguishable from a correct one.
+-spec sstore_supported(atom()) -> boolean().
+sstore_supported(Fork) when is_atom(Fork) -> at_least(Fork, berlin);
+sstore_supported(_Fork) -> false.
+
+%% EIP-3529 (London) replaces SSTORE_CLEARS_SCHEDULE -- 15000 as EIP-2200 defined
+%% it -- with `SSTORE_RESET_GAS + ACCESS_LIST_STORAGE_KEY_COST', which is
+%% (5000 - 2100) + 1900 = 4800. EIP-2929 is what put SSTORE_RESET_GAS at 2900 in
+%% the first place, so the sum is over the *Berlin* reset figure and not over 5000.
+-spec clears_schedule(atom()) -> integer().
+clears_schedule(Fork) when is_atom(Fork) ->
+    case at_least(Fork, london) of
+        true -> 4800;
+        false -> 15000
+    end;
+clears_schedule(_Fork) -> 15000.
+
+%% The price of one SSTORE and the refund it earns, as EIP-2200 (with EIP-2929's
+%% figures) and EIP-3529's refund define them.
+%%
+%% The decision tree, with the clause numbers from the EIP so each arm can be
+%% checked against it:
+%%
+%%   (1.)   current == new                                  -> SLOAD_GAS, no refund
+%%   (2.)   original == current
+%%     (2.1.1.)  original == 0                              -> SSTORE_SET_GAS
+%%     (2.1.2.)  otherwise                                  -> SSTORE_RESET_GAS,
+%%                                                            + clears if new == 0
+%%   (2.2.) original /== current (the slot is dirty)        -> SLOAD_GAS
+%%     (2.2.1.)  original /= 0
+%%       (2.2.1.1.)  current == 0                          -> -clears
+%%       (2.2.1.2.)  new == 0                              -> +clears
+%%     (2.2.2.)  original == new
+%%       (2.2.2.1.)  original == 0                          -> +(SET - SLOAD)
+%%       (2.2.2.2.)  otherwise                              -> +(RESET - SLOAD)
+%%
+%% `Original' is the value at the start of the transaction and `Current' the value
+%% now, so "dirty" is simply `Original =/= Current' -- EIP-2200 needs no dirty flag
+%% because the two values carry the same information. That is worth stating
+%% because the obvious implementation adds one, and a flag that can disagree with
+%% the values it summarises is a second source of truth.
+%%
+%% 2.2.1.1 and 2.2.1.2 are written as two separate contributions rather than an
+%% if/else. They cannot both fire -- in arm (2.2.) a zero `Current' implies a
+%% non-zero `New', since a zero-to-zero write was handled at (1.) -- so the two
+%% forms agree, and the separate form is the one that matches the EIP's text.
+-spec sstore_cost(atom(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
+          {non_neg_integer(), integer()}.
+sstore_cost(Fork, Original, Current, New)
+  when is_atom(Fork), is_integer(Original), is_integer(Current), is_integer(New) ->
+    case at_least(Fork, berlin) of
+        false ->
+            %% Not reachable: `sstore_supported/1' is checked by the caller, which
+            %% refuses rather than reaches here. Answering something anyway would be
+            %% inventing a price; the clause exists so a future caller that forgets
+            %% the check gets 0 rather than a plausible number.
+            {0, 0};
+        true ->
+            case Current =:= New of
+                true -> {100, 0};                                    % (1.)
+                false ->
+                    case Original =:= Current of
+                        true -> sstore_clean(Fork, Original, New);    % (2.1.)
+                        false -> sstore_dirty(Fork, Original, Current, New)  % (2.2.)
+                    end
+            end
+    end;
+sstore_cost(_Fork, _Original, _Current, _New) ->
+    {0, 0}.
+
+sstore_clean(_Fork, 0, _New) ->
+    {20000, 0};                                                    % (2.1.1.)
+sstore_clean(Fork, _Original, New) ->
+    {2900, case New =:= 0 of
+               true -> clears_schedule(Fork);                      % (2.1.2.)
+               false -> 0
+           end}.
+
+sstore_dirty(Fork, Original, Current, New) ->
+    Clears = clears_schedule(Fork),
+    Refund = clear_adjustment(Clears, Original, Current, New) +   % (2.2.1.)
+             reset_adjustment(Original, New),                      % (2.2.2.)
+    {100, Refund}.
+
+%% (2.2.1.) A dirty slot that was non-zero when the transaction began, being
+%% re-created or deleted again, moves the clear refund in the matching direction.
+clear_adjustment(_Clears, 0, _Current, _New) ->
+    0;
+clear_adjustment(Clears, _Original, 0, _New) ->
+    -Clears;                                                        % (2.2.1.1.)
+clear_adjustment(Clears, _Original, _Current, 0) ->
+    Clears;                                                         % (2.2.1.2.)
+clear_adjustment(_Clears, _Original, _Current, _New) ->
+    0.
+
+%% (2.2.2.) The slot is being put back to the value the transaction found, so the
+%% whole of the earlier write is undone: the difference between what that write
+%% cost and what this one costs comes back.
+reset_adjustment(Original, New) when New =/= Original ->
+    %% 2.2.2 is guarded on `original == new', and that guard is the whole of
+    %% the arm: without it a dirty write that merely changes the value to
+    %% something else would refund, which is not what the EIP says. It is also
+    %% the arm that misbehaves worst when dropped -- the cases that reach it are
+    %% exactly the ones where a write is being undone, and a wrong `0' there is
+    %% invisible because the frame still succeeds and still returns a plausible
+    %% amount of gas.
+    0;
+reset_adjustment(0, 0) ->
+    20000 - 100;                                                    % (2.2.2.1.)
+reset_adjustment(_Original, _New) ->
+    2900 - 100.                                                     % (2.2.2.2.)
+
+%% ---------------------------------------------------------------------------
+
 %% Not every fork-dependent rule is a number in a table. Some of them are a
 %% question with a boolean answer -- may this frame delete an account's storage,
 %% may this transaction's refunds exceed this -- and those are here, next to the
 %% prices, so that "what does this fork do" is answerable from one module.
 
+%% ---------------------------------------------------------------------------
+%% Rules the fork selects, as opposed to prices it supplies
+%% ---------------------------------------------------------------------------
 %% EIP-3529 (London) sets MAX_REFUND_QUOTIENT to 5 and caps the refund at
 %% `gas_used // 5'. Before it, EIP-2200 (Berlin) capped at `gas_used // 2', and
 %% the ratio is 1/2 in the EIP-3529 motivation section's own description of the

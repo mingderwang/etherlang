@@ -1105,3 +1105,143 @@ call_optional_terms_start_at_spurious_dragon_not_berlin_test() ->
     [?assertEqual(eth_fork_schedule:call_cost(16#F1, F, Full),
                   eth_fork_schedule:call_cost(Op, F, Full))
      || F <- AtOrAfter, Op <- [16#F2, 16#F4, 16#FA]].
+
+%% ---------------------------------------------------------------------------
+%% SSTORE net metering (EIP-2200)
+%% ---------------------------------------------------------------------------
+%%
+%% The decision tree, arm by arm, with the values the arms must return. `Original'
+%% is the value at the start of the transaction, `Current' the value now, `New' the
+%% value being written -- so `Original =/= Current' is what EIP-2200 calls a dirty
+%% slot, and no separate flag is involved.
+
+%% (1.) A no-op write. This is the case the interpreter got wrong by 2700 gas net:
+%% it charged 2900 with a 100 refund, and EIP-2200 says SLOAD_GAS and nothing
+%% else -- 100 from EIP-2929.
+sstore_noop_costs_a_warm_read_and_refunds_nothing_test() ->
+    [?assertEqual({100, 0}, eth_fork_schedule:sstore_cost(F, V, V, V))
+     || F <- [berlin, london, shanghai, cancun, prague],
+        V <- [0, 1, 42, 16#FFFFFFFF]].
+
+%% (2.1.1.) First write to a slot that was zero: SSTORE_SET_GAS, fork-invariant.
+sstore_creating_a_zero_slot_costs_twenty_thousand_test() ->
+    [?assertEqual({20000, 0}, eth_fork_schedule:sstore_cost(F, 0, 0, V))
+     || F <- [berlin, london, shanghai, cancun], V <- [1, 42]].
+
+%% (2.1.2.) First write to a slot that was non-zero: SSTORE_RESET_GAS, and the
+%% clear refund only when the write clears it.
+sstore_resetting_a_set_slot_costs_2900_and_clears_for_4800_test() ->
+    Post = [berlin, london, shanghai, cancun],
+    [?assertEqual({2900, 0}, eth_fork_schedule:sstore_cost(F, 7, 7, 9)) || F <- Post],
+    %% EIP-3529's 4800 from London; EIP-2200's own 15000 before it.
+    [?assertEqual({2900, 4800}, eth_fork_schedule:sstore_cost(F, 7, 7, 0))
+     || F <- [london, shanghai, cancun]],
+    ?assertEqual({2900, 15000}, eth_fork_schedule:sstore_cost(berlin, 7, 7, 0)).
+
+%% (2.2.) A dirty write costs SLOAD_GAS and is where the refund adjustments live.
+%% A write that puts the slot back to its original value refunds almost all of
+%% what the earlier write cost -- that is the whole mechanism EIP-2200 adds.
+sstore_dirty_writes_cost_a_warm_read_test() ->
+    [?assertEqual(100, element(1, eth_fork_schedule:sstore_cost(F, O, C, N)))
+     || F <- [berlin, london, cancun],
+        {O, C, N} <- [{0, 1, 2}, {7, 9, 11}, {7, 0, 3}, {7, 5, 8}]].
+
+%% (2.2.2.1.) Back to a slot that was originally zero: the full SET is refunded
+%% less the warm read this write costs.
+sstore_undoing_a_create_refunds_nineteen_thousand_nine_hundred_test() ->
+    [?assertEqual({100, 20000 - 100},
+                  eth_fork_schedule:sstore_cost(F, 0, 1, 0))
+     || F <- [berlin, london, shanghai, cancun]].
+
+%% (2.2.2.2.) Back to a slot that was originally non-zero: RESET less the warm
+%% read. 2900 - 100 = 2800.
+%%
+%% `Current' is 3, not 0, so that clause (2.2.1.1) -- which refunds negatively for
+%% a slot that was cleared earlier in the transaction -- stays out of the way and
+%% this pins (2.2.2.2) alone. The case that does put them together is pinned
+%% separately, because that is the one where dropping the arm is invisible.
+sstore_undoing_a_reset_refunds_2800_test() ->
+    [?assertEqual({100, 2800}, eth_fork_schedule:sstore_cost(F, 7, 3, 7))
+     || F <- [berlin, london, shanghai, cancun]].
+
+%% (2.2.1.1.) and (2.2.2.2.) together, which is what restoring a *cleared* slot
+%% does. The two are not alternatives: the EIP lists both under (2.2.), and a
+%% dirty write can satisfy each. The refund here is the net of them, negative,
+%% because the transaction already collected the clear refund for zeroing the
+%% slot and is now giving it back while also being repaid for the write.
+%%
+%% A missing (2.2.2.2.) shows up here and nowhere else -- and the symptom is not
+%% a wrong refund total, it is a *less negative* one that the refund cap then
+%% fails to clamp correctly, so it reaches the state root as a divergence rather
+%% than as a wrong answer.
+sstore_restoring_a_cleared_slot_sums_both_adjustments_test() ->
+    %% EIP-3529's 4800 from London, EIP-2200's 15000 at Berlin.
+    ?assertEqual({100, -15000 + 2800}, eth_fork_schedule:sstore_cost(berlin, 7, 0, 7)),
+    [?assertEqual({100, -4800 + 2800}, eth_fork_schedule:sstore_cost(F, 7, 0, 7))
+     || F <- [london, shanghai, cancun]].
+
+%% (2.2.1.) The clear refund moves in the matching direction when a dirty slot is
+%% re-created or deleted again. These are the two arms that make a refund
+%% *negative*, which is why the refund is accumulated rather than clamped: an
+%% earlier clear is un-refunded when the slot comes back.
+sstore_recreating_a_dirty_slot_removes_the_clear_refund_test() ->
+    [?assertEqual({100, -4800}, eth_fork_schedule:sstore_cost(F, 7, 0, 3))
+     || F <- [london, shanghai, cancun]],
+    ?assertEqual({100, -15000}, eth_fork_schedule:sstore_cost(berlin, 7, 0, 3)),
+    [?assertEqual({100, 4800}, eth_fork_schedule:sstore_cost(F, 7, 3, 0))
+     || F <- [london, shanghai, cancun]],
+    ?assertEqual({100, 15000}, eth_fork_schedule:sstore_cost(berlin, 7, 3, 0)).
+
+%% A dirty write that is none of the above earns no refund: it is not undoing the
+%% earlier write and it is not crossing zero in either direction.
+sstore_dirty_writes_that_change_nothing_else_refund_nothing_test() ->
+    [?assertEqual({100, 0}, eth_fork_schedule:sstore_cost(F, 7, 3, 9))
+     || F <- [berlin, london, cancun]],
+    [?assertEqual({100, 0}, eth_fork_schedule:sstore_cost(F, 0, 3, 9))
+     || F <- [berlin, london, cancun]],
+    %% Original non-zero, current non-zero, new non-zero, and new is not the
+    %% original: nothing fires.
+    [?assertEqual({100, 0}, eth_fork_schedule:sstore_cost(F, 5, 3, 9))
+     || F <- [berlin, london, cancun]].
+
+%% Refunds accumulate, so two writes in one transaction can together exceed the
+%% cap. The cap is `refund_cap/2''s job, not this function's, and the pair is
+%% pinned here because a clamping bug in *either* would show up as a frame that
+%% comes back with more gas than the rules allow.
+sstore_refunds_accumulate_rather_than_clamp_test() ->
+    %% A slot created then undone then deleted again: +19900, then the clear.
+    Total = fun(F) ->
+        {_, R1} = eth_fork_schedule:sstore_cost(F, 0, 0, 1),      %% create
+        {_, R2} = eth_fork_schedule:sstore_cost(F, 0, 1, 0),      %% undo
+        {_, R3} = eth_fork_schedule:sstore_cost(F, 0, 0, 0),      %% and clear
+        R1 + R2 + R3
+    end,
+    %% The third write is a no-op, so it refunds nothing: 19900 either way.
+    ?assertEqual(19900, Total(london)),
+    ?assertEqual(19900, Total(berlin)).
+
+%% The sentry. EIP-2200 clause (0): at or below the stipend the frame must fail,
+%% and the comparison is `=<', not `<'. 2300 from Berlin; nothing before it,
+%% because the sentry is EIP-2200's.
+sstore_sentry_is_2300_from_berlin_test() ->
+    [?assertEqual(2300, eth_fork_schedule:sstore_sentry(F))
+     || F <- [berlin, london, shanghai, cancun, prague, osaka]],
+    [?assertEqual(0, eth_fork_schedule:sstore_sentry(F))
+     || F <- [frontier, homestead, byzantium, constantinople, petersburg, istanbul]].
+
+%% Berlin and later only, and the boundary is not arbitrary: there are *three*
+%% pre-Berlin schedules -- the flat rule, EIP-1283's net metering at Constantinople
+%% (a different schedule, not a restatement of the flat one), and Petersburg's
+%% revert of it. So pre-Berlin is refused rather than priced, and a caller that
+%% forgot to check gets 0 rather than a plausible number.
+sstore_is_refused_before_berlin_test() ->
+    [?assertEqual(false, eth_fork_schedule:sstore_supported(F))
+     || F <- [frontier, homestead, dao, tangerine, spurious_dragon, byzantium,
+              constantinople, petersburg, istanbul, muir_glacier]],
+    [?assertEqual(true, eth_fork_schedule:sstore_supported(F))
+     || F <- [berlin, london, arrow_glacier, gray_glacier, merge, paris, shanghai,
+              cancun, prague, osaka, amsterdam]],
+    ?assertEqual(false, eth_fork_schedule:sstore_supported(no_such_fork)),
+    %% And the refusal is a refusal, not a price: the fallback answers 0.
+    ?assertEqual({0, 0}, eth_fork_schedule:sstore_cost(constantinople, 0, 0, 1)),
+    ?assertEqual({0, 0}, eth_fork_schedule:sstore_cost(frontier, 7, 7, 0)).

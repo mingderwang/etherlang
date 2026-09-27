@@ -148,16 +148,33 @@ constant is one too many, and they had drifted in how they decomposed four group
 rather than in their values, which is why neither could be substituted for the
 other. The rules now fork-selected are every opcode's constant price, EIP-150's
 pre-Berlin access costs, EIP-2929's warm/cold split, EIP-161's 9000/25000 (which
-are Spurious Dragon's, not Berlin's), the refund cap, EIP-6780, EIP-3860, and
-`eth_tx`'s intrinsic floor.
+are Spurious Dragon's, not Berlin's), the refund cap, EIP-6780, EIP-3860,
+`eth_tx`'s intrinsic floor, and SSTORE's net metering.
 
-**SSTORE net metering is not implemented, and a no-op write is mispriced.** A
-no-op is charged 2900 with a 100 refund where EIP-2200 clause (1) says
-`SLOAD_GAS` and nothing else — 800 at Berlin, 100 from EIP-2929. That is 2700 gas
-net overcharged on every no-op write, at London too. It needs the value each slot
-held at the *start of the transaction*, which the EVM does not track and the
-transient map cannot hold (it is discarded on a child revert, and the original
-value must survive one). Do not substitute the current value for the original.
+**SSTORE is EIP-2200's net metering, Berlin and later.** It is the one price
+that cannot be derived from the frame: the cost depends on the value the slot held
+at the *start of the transaction*, not the value it holds now. The interpreter
+keeps those in `#ctx.originals`, keyed on `(address, slot)`, recorded on the first
+write to that slot — the read that supplies it *is* the transaction-start value,
+but only because nothing has written the slot yet, which is why the record has to
+precede the write.
+
+Three things about that arrangement are easy to get wrong, and each was:
+
+- **It is not the transient map.** `mark/2` writes the transient set, because a
+  transient write is a flag; an original value is a word. Using `mark/2` put every
+  original in the wrong map, so every SSTORE was priced as a first write and a
+  non-`true` value sat in a map every other reader assumes holds booleans.
+- **A CALL frame cannot write a slot its parent goes on to write** — it writes its
+  own account's storage. `DELEGATECALL` can, and it is the only way to observe the
+  map crossing a frame boundary. A test built on CALL proves nothing.
+- **Pre-Berlin is refused, not priced** (`sstore_supported/1` →
+  `{unsupported, {sstore, Fork}}`, which `eth_call` answers with an upstream
+  fallback). There are *three* pre-Berlin schedules — the flat rule, EIP-1283's net
+  metering at Constantinople, and Petersburg reverting it — and EIP-1283 is not a
+  restatement of the flat one. Do not add a pre-Berlin price without reading
+  EIP-1283's text; a single figure would be right for two spans and wrong for the
+  third, and wrong *only* at Constantinople is never noticed.
 
 ---
 
@@ -386,11 +403,11 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
 | `eth_kzg:blob_to_kzg_commitment/1` | Needs the `g1_lin` derivation; no local blob fixture, and the EIP-4844 vector fetch 404'd. |
 | EIP-7685 `requestsHash` | Hashing rule sourced, but the EIP does not fix the header field position, and without EIP-7251 there are no requests. |
 | `TERMINAL_BLOCK_HASH` (EIP-3675) | Chain-config data, not in the EIP. Carried and echoed, never checked against a post-Merge block's difficulty. |
-| Per-fork gas *price* wiring | Done. One owner of every price; the interpreter's duplicate table is deleted. SSTORE is the exception — see below. |
+| Per-fork gas *price* wiring | Done. One owner of every price; the interpreter's duplicate table is deleted. SSTORE included (EIP-2200, Berlin and later). |
 | `eth_block:to_rlp/1` fork-awareness | It unconditionally includes the Cancun trailing fields, so it is only correct for Cancun-or-later headers. Pre-existing, documented, unfixed. |
 | `eth_tx:intrinsic_gas/1` fork-awareness | Takes no fork and falls back to the operator's `ETH_FORK` pin. Correct for pool admission, where no block exists; wrong for `eth_call`/`eth_estimateGas` and block execution, which pass the block's own fork through `intrinsic_gas/2`. Do not use the one-argument form where a block is in hand. |
 | EIP-150's 63/64 rule and 2300 stipend | Applied at every fork. The EIP states the rule it introduced, not the one it replaced, and no consulted client still supports a pre-Whistle block — so the earlier behaviour would have to be invented. |
-| SSTORE net metering | Not implemented, and a no-op write is mispriced by 2700 gas net. See §3 "Fork awareness". |
+| Pre-Berlin SSTORE | Refused, not priced. Three schedules exist before Berlin (the flat rule, EIP-1283 at Constantinople, Petersburg's revert of it) and only EIP-2200's text is implemented. `eth_call` falls back upstream; block execution is unreachable on a post-Merge chain. See §3 "Fork awareness". |
 
 ## 11. Known dead code
 
@@ -413,12 +430,18 @@ The authoritative version of this list is the "What to do next, in order" sectio
 the top of `TASKS.md`, which also records the Engine API work that is deliberately
 **later** and why. Kept here only as a pointer, because this file is read more often.
 
-1. Wire the per-fork gas **prices** into the EVM — a refactor, and a precondition
-   for any state-root claim, and for a block this node builds being proposable.
-   The *availability* half is already done; see §3 "Fork awareness".
-2. Run the EEST fixtures and record what fails.
+1. Run the EEST fixtures and record what fails. Nothing in this repository has
+   been checked against `execution-specs`, and that is the only remaining
+   precondition for trusting any state-root claim this node makes.
 
 Done, and no longer listed:
+
+- Per-fork gas *pricing*, including SSTORE. `eth_fork_schedule` is the execution
+  path's only source of prices, `eth_evm:base_cost/1` is deleted, and every rule
+  above is fork-selected. Getting there found live bugs rather than confirming
+  the schedule: a no-op `SSTORE` was overcharged by 2700 gas net, a dirty write
+  was priced as a clean one, `ADDRESS` cost 3, and EIP-161's terms were gated on
+  the wrong fork. See §3 "Fork awareness".
 
 - Per-fork opcode *availability*. `eth_fork_schedule:opcode_exists/2` answers
   whether a fork has an instruction, and `eth_evm` halts on one it does not. Every

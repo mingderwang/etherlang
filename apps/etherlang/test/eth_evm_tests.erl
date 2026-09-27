@@ -154,6 +154,13 @@ call_state(CallerBal, CalleeCode) ->
                        {nonce, ?CALLEE} => 0,
                        {code, ?CALLEE} => CalleeCode}).
 
+%% DELEGATECALL stack: retlen, retoff, argslen, argsoff, to, gas. Six pushes,
+%% not CALL's seven -- there is no value argument, which is the whole difference
+%% between the two opcodes at the call site and the easiest thing to get wrong.
+dcall_seq(ToByte, Op) ->
+    <<16#60,0, 16#60,0, 16#60,0, 16#60,0,
+      16#60,ToByte, 16#61,16#FF,16#FF, Op>>.
+
 %% CALL stack: retlen, retoff, argslen, argsoff, value, to, gas.
 call_seq(ToByte, Value, Op) ->
     <<(call_args(ToByte, Value))/binary, Op>>.
@@ -1232,3 +1239,193 @@ log_charges_eight_a_byte_plus_memory_test() ->
     %% And the term is fork-invariant: it is EIP-150's log data price and was never
     %% changed, so a pre-Berlin frame pays the same 8 a byte.
     ?assertEqual(750 + 8 * 32 + 3, At(32, istanbul)).
+
+%% ---------------------------------------------------------------------------
+%% SSTORE net metering (EIP-2200), measured through execution
+%% ---------------------------------------------------------------------------
+%%
+%% The table tests in eth_fork_schedule pin the arithmetic. These pin the two
+%% things only execution can show: that the interpreter hands the table the value
+%% the slot held when the *transaction* began rather than the value it holds now,
+%% and that it keeps doing so across a CALL boundary.
+
+%% The account the top-level frame writes to: ?MSG0's own address.
+-define(ACCT, <<0:160>>).
+
+%% `PUSH1 Val, PUSH1 Slot, SSTORE'. Slot is on top, so it is pushed last --
+%% SSTORE pops key first, then value.
+sstore_op(Val, Slot) -> <<16#60,Val, 16#60,Slot, 16#55>>.
+
+%% The same program with that one SSTORE turned into a JUMPDEST. Only the final
+%% byte differs, so the pushes are common to both and cancel in the
+%% difference. Building this by hand instead -- writing `<<16#5B>>' where the
+%% whole `sstore_op' was -- silently differences the two pushes away too, which
+%% showed up here as every price coming out exactly 6 too high.
+sstore_blunt(Val, Slot) -> <<16#60,Val, 16#60,Slot, 16#5B>>.
+
+%% JUMPDEST's cost, named once. It is not free -- a blunt program pays it, so the
+%% difference comes out one gas under the real price -- and it cannot be read out
+%% of `eth_fork_schedule:constant_cost/2', which answers 0 for JUMPDEST as well
+%% as for PUSH1. Written down here, in one place, so that a single change to it
+%% is a single edit.
+-define(JDEST, 1).
+
+%% The net price of a single SSTORE: what `Sharp' spends that `Blunt' does not.
+%%
+%% Two things are corrected for. The refund: what is measured is cost *net of
+%% refund*, which is the figure the frame pays and the one a state root depends
+%% on. And JUMPDEST, above.
+%%   * the refund. What is measured is cost *net of refund*, which is the figure
+%%     the frame pays and the one a state root depends on.
+%%
+%% No absolute figure is asserted anywhere below: the push price is a per-byte
+%% tier that `constant_cost/2' does not carry, so an absolute number would be
+%% asserting PUSH1's price as a side effect and would fail for a reason that has
+%% nothing to do with SSTORE.
+net_price(Sharp, Blunt, State, Fork) ->
+    spent(Sharp, State, Fork) - spent(Blunt, State, Fork) + ?JDEST.
+
+%% The price of something a *callee* did: the parent program is byte-identical
+%% in both runs, so it cancels and what is left is the callee's own opcode. The
+%% two runs differ only in the callee's code, so the JUMPDEST correction is the
+%% same one.
+callee_net(Parent, With, Without, Fork) ->
+    spent(Parent, With, Fork) - spent(Parent, Without, Fork) + ?JDEST.
+
+%% The price of the last SSTORE in a program made of consecutive `sstore_op's.
+sstore_net(Code, State, Fork) ->
+    Blunt = binary:part(Code, 0, byte_size(Code) - 1),
+    net_price(Code, <<Blunt/binary, 16#5B>>, State, Fork).
+
+%% (1.) A no-op write. The interpreter used to charge 2900 with a 100 refund
+%% here, netting 2800, where EIP-2200 clause (1) charges SLOAD_GAS and nothing
+%% else -- 100 from EIP-2929. That is 2700 gas net overcharged on every no-op
+%% write at every fork, including Cancun, and the module comment said so rather
+%% than anyone fixing it.
+sstore_writing_a_value_it_already_holds_costs_a_warm_read_test() ->
+    Code = <<(sstore_op(1, 1))/binary, (sstore_op(1, 1))/binary>>,
+    St = eth_state:set_storage(?STATE, ?ACCT, 1, 0),
+    ?assertEqual(100, sstore_net(Code, St, cancun)).
+
+%% (2.2.) The test that the `originals' map exists for. The slot is written twice
+%% in one transaction, so the second write sees current = 1 while the
+%% transaction started at 0. If the interpreter re-read the slot to recover the
+%% original it would see 1, conclude the slot was clean, and charge 2900 --
+%% pricing two different writes identically, which is the entire defect EIP-2200
+%% was written to close.
+sstore_a_second_write_to_a_dirty_slot_is_not_priced_as_a_clean_one_test() ->
+    Code = <<(sstore_op(1, 1))/binary, (sstore_op(2, 1))/binary>>,
+    St = eth_state:set_storage(?STATE, ?ACCT, 1, 0),
+    ?assertEqual(100, sstore_net(Code, St, cancun)).
+
+%% The original is per slot, not per frame. Slot 1 starts at 0 and slot 2 at 5;
+%% after writing slot 1 the frame writes slot 2, which is still an untouched
+%% reset. A single original carried across the frame would put slot 2's original
+%% at 0, make it look dirty, and price it as a warm read.
+sstore_tracks_an_original_for_each_slot_separately_test() ->
+    Code = <<(sstore_op(1, 1))/binary, (sstore_op(7, 2))/binary>>,
+    St0 = eth_state:set_storage(?STATE, ?ACCT, 1, 0),
+    St = eth_state:set_storage(St0, ?ACCT, 2, 5),
+    ?assertEqual(2900, sstore_net(Code, St, cancun)).
+
+%% The original is per (address, slot), and this is the only test that can tell
+%% the two apart. The caller writes its *own* slot 1, which starts at 0; the
+%% callee then writes the *callee's* slot 1, which starts at 5. Keyed on the slot
+%% alone, the callee's write would inherit the caller's original of 0, see
+%% 0 =/= 5, and price a clean reset as a dirty write at 100 instead of 2900.
+sstore_tracks_an_original_for_each_account_separately_test() ->
+    Callee = <<(sstore_op(7, 1))/binary, 16#00>>,
+    Parent = <<(sstore_op(1, 1))/binary, (call_seq(16#0D, 0, 16#F1))/binary, 16#00>>,
+    NoStore = <<(sstore_blunt(7, 1))/binary, 16#00>>,   %% the callee's SSTORE, neutered
+    With = both_slots(call_state(1000, Callee), 0, 5),
+    Without = both_slots(call_state(1000, NoStore), 0, 5),
+    ?assertEqual(2900, callee_net(Parent, With, Without, cancun)).
+
+%% Seed slot 1 of *both* accounts a CALL test touches.
+%%
+%% `call_state/2' seeds balances, nonces and code but not storage, and an
+%% unseeded slot does not read as zero: `eth_state:storage/3' falls through to
+%% the configured base source, which in the default `upstream' mode is an RPC
+%% call. A test that forgets one such slot does not fail, it *hangs* inside
+%% httpc, and EUnit reports that as a cancelled test rather than an error -- so
+%% the symptom is a suite that mysteriously loses a test. Seeding both, and
+%% `with_local_reads' as a floor under the group, makes the miss impossible.
+both_slots(St, CallerV, CalleeV) ->
+    eth_state:set_storage(eth_state:set_storage(St, ?CALLER, 1, CallerV),
+                          ?CALLEE, 1, CalleeV).
+
+%% Across a frame boundary. DELEGATECALL, not CALL: a CALL frame writes its own
+%% account's storage and can therefore never touch a slot the parent goes on to
+%% write, so a CALL has nothing to carry across and a test built on one asserts
+%% nothing. DELEGATECALL runs the child with the *parent's* address, so the
+%% child can write the parent's slot and the parent's next write has to know it.
+sstore_after_a_delegatecall_writes_the_slot_knows_it_was_dirty_test() ->
+    %% The child writes 9 into the parent's slot 1, which started at 0. The parent
+    %% then writes 3. Original 0, current 9, new 3: clause (2.2.), a warm read.
+    %% If the map did not cross the boundary the parent would recover the original
+    %% by re-reading, see 9, and charge 2900 for a reset it has already paid for.
+    Callee = <<(sstore_op(9, 1))/binary, 16#00>>,
+    St = both_slots(call_state(1000, Callee), 0, 0),
+    Sharp = <<(dcall_seq(16#0D, 16#F4))/binary, (sstore_op(3, 1))/binary>>,
+    Blunt = <<(dcall_seq(16#0D, 16#F4))/binary, (sstore_blunt(3, 1))/binary>>,
+    ?assertEqual(100, net_price(Sharp, Blunt, St, cancun)).
+
+%% A reverted frame leaves the slot as it was, so the parent's next write is a
+%% first write: 20000, not 2900.
+%%
+%% What this pins is the *state restoration*, not the map. Both ways of handling
+%% the child's `originals' -- keep them, or drop them for the parent's -- give
+%% 20000 here, because a reverted write left the slot at 0 and the parent
+%% re-reads 0, which is the original. That was checked by injection rather than
+%% argued: removing the child's originals from the revert path leaves every test
+%% in both modules green.
+%%
+%% Recorded plainly because the obvious reading of the test name is that the
+%% map's survival is what is under test, and it is not: what would break this is
+%% a revert that failed to put the slot back, and a green run says only that the
+%% revert is intact.
+sstore_after_a_reverted_delegatecall_is_priced_as_a_first_write_test() ->
+    Callee = <<(sstore_op(9, 1))/binary, 16#60,0, 16#FD>>,
+    St = both_slots(call_state(1000, Callee), 0, 0),
+    Sharp = <<(dcall_seq(16#0D, 16#F4))/binary, (sstore_op(3, 1))/binary>>,
+    Blunt = <<(dcall_seq(16#0D, 16#F4))/binary, (sstore_blunt(3, 1))/binary>>,
+    ?assertEqual(20000, net_price(Sharp, Blunt, St, cancun)).
+
+%% EIP-2200 clause (0), at the boundary. Gas at the SSTORE is 2301 in the first
+%% run and exactly 2300 in the second, and the comparison is `=<', so the first
+%% proceeds and the second fails the frame. The threshold is expressed against
+%% the table rather than written down, so a change to PUSH1's price moves it
+%% rather than silently moving the boundary being tested.
+sstore_at_or_below_the_stipend_fails_the_frame_test() ->
+    Code = sstore_op(7, 1),                       %% a no-op write, so 100
+    St = eth_state:set_storage(?STATE, ?ACCT, 1, 7),
+    Sstore = element(1, eth_fork_schedule:sstore_cost(cancun, 7, 7, 7)),
+    %% Calibrate on what the program actually spends, because the push price is
+    %% a per-byte tier `constant_cost/2' does not carry: it answers 0 for PUSH1
+    %% as well as for JUMPDEST, so a threshold computed from the table would sit
+    %% 6 gas above the one being tested and the boundary assertion below would
+    %% be about nothing. `Full' is the whole program's cost, so an allowance of
+    %% (2300 - Sstore + Full) leaves exactly 2300 at the SSTORE.
+    Full = spent(Code, St, cancun),
+    At = 2300 - Sstore + Full,
+    ?assertMatch({error, out_of_gas, _, _},
+                 eth_evm:run(Code, ?MSG0, St, ?ENV, At)),
+    ?assertMatch({ok, _, _, _, _},
+                 eth_evm:run(Code, ?MSG0, St, ?ENV, At + 1)).
+
+%% Pre-Berlin, SSTORE is refused and says so. There are three pre-Berlin
+%% schedules -- the flat rule, EIP-1283's net metering at Constantinople, and
+%% Petersburg reverting it -- and only EIP-2200's text is implemented here, so a
+%% single pre-Berlin price would be right for two spans and wrong for the third.
+%% `unsupported' is the reason `eth_call' answers with an upstream fallback, so
+%% this degrades to another node's answer rather than to a plausible wrong one of
+%% this node's own.
+sstore_before_berlin_is_refused_rather_than_priced_test() ->
+    Code = sstore_op(1, 1),
+    St = eth_state:set_storage(?STATE, ?ACCT, 1, 0),
+    [?assertMatch({error, {unsupported, {sstore, F}}, _, _},
+                  eth_evm:run(Code, ?MSG0, St, #{fork => F}, ?GAS))
+     || F <- [frontier, byzantium, constantinople, petersburg, istanbul]],
+    %% And Berlin is not refused, which is what makes the boundary the boundary.
+    ?assertMatch({ok, _, _, _, _},
+                 eth_evm:run(Code, ?MSG0, St, #{fork => berlin}, ?GAS)).

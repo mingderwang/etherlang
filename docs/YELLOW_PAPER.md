@@ -1,6 +1,6 @@
 # etherlang — design and current state
 
-**Status**: v1.0 in progress. 608 eunit tests, green.
+**Status**: v1.0 in progress. 628 eunit tests, green.
 
 This document describes what the node *is* and what it is *becoming*: the system
 model, the trust assumptions, the data structures, and — at least as important —
@@ -77,10 +77,20 @@ Two specific non-claims, because both are easy to overstate:
 
 ### 1.4 An unverified claim, flagged where it appears
 
-`README.md` and `TASKS.md` both say the unwired gas table is why a built block's
-state root will not match the network's. That is a *reasonable expectation*, not
-a measurement. The correct statement is narrower: the root is **not known** to
-match, and the gas table is one identified reason it might not. See §7.
+There was a period when `README.md` and `TASKS.md` both said the unwired gas table
+was why a built block's state root would not match the network's. The table is
+wired now, and the claim had to be retired rather than kept and softened, because
+it had quietly become a *different* claim: "the table is the reason" reads as a
+diagnosis, and by the time the table was complete it had been found wrong four
+times over by reading it against the EIPs — a no-op `SSTORE` overcharged by 2700
+gas net, a dirty write priced as a clean one, `ADDRESS` at 3, and EIP-161's terms
+gated on Berlin rather than Spurious Dragon. A schedule found wrong four times by
+inspection is not a schedule one should then nominate as *the* remaining reason.
+
+The correct statement is narrower and is what the documentation now says: the root
+is **not known** to match. Completing the schedule is necessary for it to match
+and is not evidence that it does. It cannot be checked end to end without real
+prestate, which this node does not hold for arbitrary blocks. See §7.
 
 ---
 
@@ -274,7 +284,7 @@ Two halves of "per-fork exact" must not be confused:
 | | Status |
 |---|---|
 | **Availability** — may this fork run this instruction at all? | **Done.** An instruction the fork lacks is an exceptional halt consuming the frame's whole allowance. |
-| **Price** — what does it cost? | **Done, except SSTORE.** `eth_fork_schedule` owns every price; the interpreter's duplicate table is deleted. |
+| **Price** — what does it cost? | **Done, Berlin and later.** `eth_fork_schedule` owns every price; the interpreter's duplicate table is deleted. SSTORE included; pre-Berlin SSTORE is *refused* rather than priced (§7.2.3). |
 
 The availability half was the more dangerous of the two, because every clause in
 `do_op/3` was unconditional: PUSH0 executed in a Paris block and TSTORE executed
@@ -324,25 +334,59 @@ rather than reading either, is what turned up the rest:
   being charged the access cost. The gate had never been exercised, because
   nothing called the function.
 
-### 7.2.3 A live SSTORE bug, named rather than fixed
+### 7.2.3 SSTORE: the one price that is not derivable from the frame
 
-The one thing still wrong is SSTORE, and it is wrong at every fork.
+SSTORE was the one thing still wrong, and it was wrong at every fork. It is now
+implemented, and the shape of the problem is worth keeping because it is the only
+place in the schedule where the answer is not a function of the opcode and the
+fork.
 
-A no-op write — storing a slot's existing value back to itself — is charged **2900
-with a 100 refund**, netting 2800. EIP-2200 clause (1) says a no-op costs
-`SLOAD_GAS` and nothing else: 800 at Berlin, 100 from EIP-2929. The interpreter
-therefore overcharges **2700 gas net on every no-op write, London included**.
+A no-op write — storing a slot's existing value back to itself — was charged
+**2900 with a 100 refund**, netting 2800, where EIP-2200 clause (1) says `SLOAD_GAS`
+and nothing else: 800 at Berlin, 100 from EIP-2929. **2700 gas net overcharged on
+every no-op write, London included.** The `20000` / `2900` / `4800` cases beside it
+were correct, which is why this sat undetected next to a schedule that had just
+been described as exact within Cancun-era rules.
 
-The `20000` / `2900` / `4800` cases beside it are correct, which is why this sat
-undetected next to a schedule that had just been described as exact within
-Cancun-era rules.
+The whole of the old implementation was a three-case expression over the slot's
+**current** value. EIP-2200's rule needs a third value the frame does not carry —
+what the slot held at the **start of the transaction** — and a three-case
+expression over one of the other two has nowhere to put the distinction between a
+first write and a rewrite. So there were two defects, not one: the no-op was
+overcharged, and a *dirty* write was priced as a clean one. The second is the more
+interesting of the two, because the dirty write is the case EIP-2200 exists to
+price, and the code did not merely get it slightly wrong — it had no term for it.
 
-It is not fixed here because the correct rule is EIP-2200's **net** metering,
-which needs the value each slot held *at the start of the transaction*. The EVM
-tracks no such thing, and the transient map cannot hold it: that map is
-transaction-scoped but is discarded on a child revert, whereas the original value
-must survive one. Substituting the current value for the original would be
-inventing a schedule no fork specifies.
+The original values live in a second map, `#ctx.originals`, keyed on
+`(address, slot)` and recorded on the first write to each. The read that supplies
+one *is* the transaction-start value, but only because nothing has written the
+slot yet, which is why the record has to precede the write. The transient map
+cannot hold them: that map is transaction-scoped but is discarded on a child
+revert, whereas an original value must survive one.
+
+Two things about that arrangement are traps rather than insights, and both were
+hit rather than foreseen. The first draft reused the existing `mark/2` helper,
+which writes the *transient* set — correct for a flag, wrong for a word — so every
+original landed in the wrong map and every SSTORE was priced as a first write.
+And a `CALL` frame writes its own account's storage, so a `CALL` can never touch a
+slot its parent goes on to write; only `DELEGATECALL` can, and a test built on
+`CALL` to check the map crosses a frame boundary asserts nothing at all.
+
+**Pre-Berlin SSTORE is refused, not priced.** There are *three* pre-Berlin
+schedules, not one: the flat rule from Frontier to Byzantium, EIP-1283's net
+metering at Constantinople, and Petersburg reverting it. EIP-1283 is a different
+schedule and not a restatement of the flat one — its title is "Net gas metering for
+SSTORE without dirty maps", and the absence of a dirty map is exactly what
+EIP-2200 later introduced. Only EIP-2200's text is implemented here, so a single
+pre-Berlin figure would be right for two of those three spans and wrong for the
+third. Wrong *only* at Constantinople is the kind of gap that is never noticed,
+because nothing on this node executes a Constantinople block and a test
+exercising the flat rule at both neighbours would pass. So
+`sstore_supported/1` refuses before Berlin and the interpreter reports
+`{unsupported, {sstore, Fork}}`, which `eth_call` answers with an upstream
+fallback: a pre-Berlin call degrades to another node's answer rather than to a
+plausible wrong one of this node's own. Block execution is unaffected — this node
+syncs Sepolia.
 
 ### 7.2.4 Still not implemented
 

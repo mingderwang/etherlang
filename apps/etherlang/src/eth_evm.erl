@@ -16,7 +16,20 @@
             retdata = <<>>, halt = undefined, logs = [], refund = 0,
             dests = undefined}).
 
--record(ctx, {state, env, msg, transient = #{}, fork}).
+%% `originals' holds, per (address, slot), the value that slot held when the
+%% *transaction* began -- EIP-2200's `original'. It is a different thing from
+%% `transient' in the one respect that matters: a child frame's transient writes
+%% must vanish when it reverts, because they belong to the frame. An original
+%% value belongs to the transaction and must *survive* a revert, because the slot
+%% is back to what it was and the next write still needs the same original.
+%%
+%% That is why it is a separate map rather than a reserved key in the transient
+%% one. The invariant that makes it safe to handle the two identically: a child's
+%% map starts as a copy of the parent's and only ever gains entries, and an entry
+%% is a transaction-start value, so the child can never disagree with the parent
+%% about one. The child's map is therefore the correct one on *both* the success
+%% and the revert path, and no merge rule is needed.
+-record(ctx, {state, env, msg, transient = #{}, originals = #{}, fork}).
 
 -export([run/5, valid_jumpdests/1]).
 
@@ -28,7 +41,8 @@
 %% | {revert, Output, GasLeft, State, Logs}
 %% | {error, Reason, State, Logs}
 run(Code, Msg, State, Env, Gas) when is_binary(Code) ->
-    {Res, _Transient} = run_t(Code, Msg, State, Env, Gas, #{}, fork_of(Env)),
+    {Res, _Transient, _Originals} =
+        run_t(Code, Msg, State, Env, Gas, #{}, #{}, fork_of(Env)),
     Res.
 
 %% The fork this frame executes under, taken from the Env.
@@ -47,9 +61,9 @@ fork_of(Env) -> maps:get(fork, Env).
 %% transaction-global: a child frame inherits a copy of the parent map and,
 %% on success, its writes merge back (child wins); on revert/error the
 %% parent map is kept unchanged.
-run_t(Code, Msg, State, Env, Gas, Transient, Fork) when is_binary(Code) ->
+run_t(Code, Msg, State, Env, Gas, Transient, Originals, Fork) when is_binary(Code) ->
     Ctx = #ctx{state = State, env = Env, msg = Msg, transient = Transient,
-               fork = Fork},
+               originals = Originals, fork = Fork},
     E0 = #e{code = Code, gas = max(Gas, 0), dests = valid_jumpdests(Code)},
     try exec(E0, Ctx) of
         {E1, Ctx1} ->
@@ -81,10 +95,11 @@ run_t(Code, Msg, State, Env, Gas, Transient, Fork) when is_binary(Code) ->
                       {error, R} -> {error, R, Ctx1#ctx.state, E1#e.logs};
                       undefined -> {ok, <<>>, FinalGas, Ctx1#ctx.state, E1#e.logs}
                   end,
-            {Res, Ctx1#ctx.transient}
+            {Res, Ctx1#ctx.transient, Ctx1#ctx.originals}
     catch
         Class:Reason:Stack ->
-            {{error, {evm_crash, Class, Reason, hd(Stack)}, State, []}, Transient}
+            {{error, {evm_crash, Class, Reason, hd(Stack)}, State, []}, Transient,
+             Originals}
     end.
 
 %% Jump destinations: positions holding JUMPDEST that are not inside PUSH data.
@@ -474,26 +489,17 @@ do_op(16#55, E, Ctx) ->
     case s_msg(static, Ctx, false) of
         true -> {E#e{halt = {error, write_protection}}, Ctx};
         false ->
-            {Slot, E1} = pop(E), {Val, E2} = pop(E1),
-            Addr = s_msg(address, Ctx, <<0:160>>),
-            Current = eth_state:storage(Ctx#ctx.state, Addr, Slot),
-            {Cost, Refund} = case Current =:= Val of
-                true -> {2900, 100};
+            case eth_fork_schedule:sstore_supported(Ctx#ctx.fork) of
                 false ->
-                    case Current =:= 0 andalso Val =/= 0 of
-                        true -> {20000, 0};
-                        false -> {2900, case Current =/= 0 andalso Val =:= 0 of
-                                            true -> 4800;
-                                            false -> 0
-                                        end}
-                    end
-            end,
-            case charge(E2, Cost) of
-                {ok, E3} ->
-                    State1 = eth_state:set_storage(Ctx#ctx.state, Addr, Slot, Val),
-                    next(E3#e{refund = E3#e.refund + Refund},
-                         Ctx#ctx{state = State1});
-                oog -> oog(E2, Ctx)
+                    %% Refused rather than priced. There are three pre-Berlin
+                    %% SSTORE schedules and only EIP-2200's text is implemented
+                    %% here, so a single pre-Berlin figure would be right for two
+                    %% spans and wrong for Constantinople -- and `unsupported' is
+                    %% what eth_call answers with an upstream fallback, so this
+                    %% degrades to another node's answer rather than to a
+                    %% plausible wrong one of this node's own.
+                    unsupported({sstore, Ctx#ctx.fork}, E, Ctx);
+                true -> sstore(E, Ctx)
             end
     end;
 do_op(16#56, E, Ctx) ->
@@ -581,6 +587,67 @@ do_op(16#FF, E, Ctx) ->
     end;
 
 do_op(Op, E, Ctx) -> unsupported({opcode, Op}, E, Ctx).
+
+%% EIP-2200 net metering, with EIP-2929's figures and EIP-3529's refunds.
+%%
+%% The whole of the previous implementation was a three-case expression over the
+%% slot's *current* value, and it was wrong at every fork:
+%%
+%%   * a no-op write was charged 2900 with a 100 refund, netting 2800, where
+%%     EIP-2200 clause (1) charges SLOAD_GAS and nothing else -- 100 from
+%%     EIP-2929 -- so 2700 gas net was overcharged on every one of them;
+%%   * a dirty write, the case EIP-2200 exists to price, was charged as a clean
+%%     one, because nothing distinguished them;
+%%   * and the clear refund was 4800 at every fork, EIP-3529's figure, where
+%%     before London it is 15000.
+sstore(E, Ctx) ->
+    {Slot, E1} = pop(E), {Val, E2} = pop(E1),
+    Addr = s_msg(address, Ctx, <<0:160>>),
+    Current = eth_state:storage(Ctx#ctx.state, Addr, Slot),
+    %% EIP-2200 clause (0): at or below the stipend, the frame fails. Checked
+    %% before the price, and on the gas as it stands rather than after charging,
+    %% which is the whole point -- it exists to stop a frame keeping just enough
+    %% gas to keep running but not enough to pay for its own writes.
+    case E2#e.gas =< eth_fork_schedule:sstore_sentry(Ctx#ctx.fork) of
+        true -> oog(E2, Ctx);
+        false ->
+            {Original, CtxA} = original_of(Ctx, Addr, Slot, Current),
+            {Cost, Refund} = eth_fork_schedule:sstore_cost(
+                                Ctx#ctx.fork, Original, Current, Val),
+            case charge(E2, Cost) of
+                {ok, E3} ->
+                    State1 = eth_state:set_storage(Ctx#ctx.state, Addr, Slot, Val),
+                    next(E3#e{refund = E3#e.refund + Refund},
+                         CtxA#ctx{state = State1});
+                oog -> oog(E2, CtxA)
+            end
+    end.
+
+%% EIP-2200's `original': the value the slot held when the transaction began.
+%%
+%% Recorded on the *first* write to the slot, and the read that supplies it is
+%% that value because nothing has written the slot yet in this transaction --
+%% which is the only reason this is correct and why the record has to happen
+%% before the write rather than being read back afterwards. From then on the
+%% recorded value is reused, so `Original =/= Current' is exactly EIP-2200's
+%% "dirty" test and no separate flag is needed.
+%%
+%% Note the map this writes to, and note that `mark/2' is the wrong helper here
+%% even though it looks like the right one. `mark/2' writes the *transient* set,
+%% because a transient write is a flag: an original value is a word, and putting
+%% a word into a set of `true' both loses it -- the next SSTORE looks in
+%% `originals' and finds nothing -- and leaves a non-`true' value in a map every
+%% other reader assumes holds only booleans. It was written against `mark/2'
+%% first and every SSTORE was then priced as a first write, so a dirty write cost
+%% 2900 where EIP-2200 says 100.
+original_of(Ctx, Addr, Slot, Current) ->
+    Key = {sstore_original, Addr, Slot},
+    case maps:get(Key, Ctx#ctx.originals, absent) of
+        absent ->
+            {Current, Ctx#ctx{originals = maps:put(Key, Current, Ctx#ctx.originals)}};
+        Original ->
+            {Original, Ctx}
+    end.
 
 %% ---------------------------------------------------------------------------
 %% Simple operation helpers
@@ -814,32 +881,60 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
                                          value => ChildValue, data => Args,
                                          gas_price => s_msg(gas_price, Ctx, 0),
                                          static => ChildStatic, depth => Depth + 1},
-                            {Result, ChildT} = run_t(ChildCode, ChildMsg, StateIn,
-                                                     Env, CallGas, Ctx#ctx.transient,
-                                                     Ctx#ctx.fork),
-                            handle_child(Result, E, Ctx, StateIn, RetOff, RetLen, ChildT)
+                            {Result, ChildT, ChildO} =
+                                run_t(ChildCode, ChildMsg, StateIn, Env, CallGas,
+                                      Ctx#ctx.transient, Ctx#ctx.originals,
+                                      Ctx#ctx.fork),
+                            handle_child(Result, E, Ctx, StateIn, RetOff, RetLen,
+                                         ChildT, ChildO)
                     end
             end
     end.
 
-handle_child({ok, Out, Left, St, Logs}, E, Ctx, _StateIn, RetOff, RetLen, ChildT) ->
+%% `ChildO' -- the child's SSTORE original values -- is taken on **all three**
+%% paths, including the two that discard the child's transient writes and state.
+%% That is not an oversight and it is not symmetric with `ChildT': an original
+%% value belongs to the transaction, not the frame. The child reverting does not
+%% un-write the fact that slot 7 held 42 when the transaction started; it only
+%% puts the slot back to 42. So the parent's next write to slot 7 must see the
+%% same original it would have seen had the child never run.
+%%
+%% Taking the child's map rather than the parent's is safe because it is always a
+%% superset with identical values (see the #ctx{} comment): the child cannot have
+%% recorded a *different* original for a key the parent already had.
+%%
+%% And it is worth being exact about how much this matters, because the paragraph
+%% above reads as though discarding the child's map would be a bug. It would not.
+%% Dropping it for the parent's on this path was injected and the whole suite
+%% stayed green, because a reverted write left the slot at the value the parent's
+%% map would have recorded anyway, so the parent's next write re-derives the same
+%% original. The child's map is taken because it is a superset and it keeps one
+%% rule for all three outcomes instead of three rules -- not because the parent's
+%% would be wrong. Stated here so the next reader does not go looking for the bug
+%% this is not.
+handle_child({ok, Out, Left, St, Logs}, E, Ctx, _StateIn, RetOff, RetLen, ChildT, ChildO) ->
     %% Success commits child state, child logs AND child transient writes
     %% (merged over the parent map: the child ran later).
     MergedT = maps:merge(Ctx#ctx.transient, ChildT),
     E1 = E#e{gas = E#e.gas + Left, retdata = Out, logs = E#e.logs ++ Logs},
-    finish_call(E1, Ctx#ctx{state = St, transient = MergedT}, St, Out, RetOff, RetLen, 1, Left);
-handle_child({revert, Out, Left, _St, _Logs}, E, Ctx, _StateIn, RetOff, RetLen, _ChildT) ->
+    finish_call(E1, Ctx#ctx{state = St, transient = MergedT, originals = ChildO},
+                St, Out, RetOff, RetLen, 1, Left);
+handle_child({revert, Out, Left, _St, _Logs}, E, Ctx, _StateIn, RetOff, RetLen,
+             _ChildT, ChildO) ->
     %% A revert discards the whole child frame INCLUDING the CALL value
     %% transfer: restore the pre-call state, not the post-transfer snapshot.
-    %% Child transient writes and logs are discarded with it.
+    %% Child transient writes and logs are discarded with it. Its SSTORE
+    %% originals are not, for the reason above.
     Pre = Ctx#ctx.state,
-    finish_call(E#e{gas = E#e.gas + Left, retdata = Out}, Ctx#ctx{state = Pre},
+    finish_call(E#e{gas = E#e.gas + Left, retdata = Out},
+                Ctx#ctx{state = Pre, originals = ChildO},
                 Pre, Out, RetOff, RetLen, 0, Left);
-handle_child({error, Reason, _St, _Logs}, E, Ctx, _StateIn, RetOff, RetLen, _ChildT) ->
+handle_child({error, Reason, _St, _Logs}, E, Ctx, _StateIn, RetOff, RetLen,
+             _ChildT, ChildO) ->
     case Reason of
         {unsupported, What} -> unsupported(What, E, Ctx);
         _ -> Pre = Ctx#ctx.state,
-             finish_call(E#e{retdata = <<>>}, Ctx#ctx{state = Pre},
+             finish_call(E#e{retdata = <<>>}, Ctx#ctx{state = Pre, originals = ChildO},
                          Pre, <<>>, RetOff, RetLen, 0, 0)
     end.
 
@@ -973,26 +1068,31 @@ create_with_value(_Op, Init, Value, Sender, NewAddr, State1, E1, Ctx, ChildGas) 
                  gas_price => s_msg(gas_price, Ctx, 0),
                  static => false, depth => s_msg(depth, Ctx, 0) + 1},
     Result = run_t(Init, ChildMsg, State2, Env, ChildGas, Ctx#ctx.transient,
-                   Ctx#ctx.fork),
+                   Ctx#ctx.originals, Ctx#ctx.fork),
     case Result of
-        {{ok, Code, Left, St, Logs}, ChildT} when byte_size(Code) =< 24576 ->
+        {{ok, Code, Left, St, Logs}, ChildT, ChildO} when byte_size(Code) =< 24576 ->
             St1 = eth_state:set_code(St, NewAddr, Code),
             %% Record the creation for EIP-6780 (same-tx self-destruct).
             St2 = eth_state:mark_created(St1, NewAddr),
             MergedT = maps:merge(Ctx#ctx.transient, ChildT),
             E2 = E1#e{gas = E1#e.gas + Left, logs = E1#e.logs ++ Logs},
             next(push(E2, eth_word:from_bytes(NewAddr)),
-                 Ctx#ctx{state = St2, transient = MergedT});
-        {{ok, _Code, _Left, _St, _}, _ChildT} ->
+                 Ctx#ctx{state = St2, transient = MergedT, originals = ChildO});
+        {{ok, _Code, _Left, _St, _}, _ChildT, ChildO} ->
             %% code too large: consume gas, fail with no deployment and no
-            %% value movement (nonce from State1 is kept)
-            next(push(E1#e{gas = E1#e.gas, retdata = <<>>}, 0), Ctx#ctx{state = State1});
-        {{revert, Out, Left, _St, _}, _ChildT} ->
+            %% value movement (nonce from State1 is kept). The init code's SSTORE
+            %% originals are kept: the code ran, so the facts it recorded are
+            %% transaction facts whatever became of the deployment.
+            next(push(E1#e{gas = E1#e.gas, retdata = <<>>}, 0),
+                 Ctx#ctx{state = State1, originals = ChildO});
+        {{revert, Out, Left, _St, _}, _ChildT, ChildO} ->
             %% Revert rolls back deployment AND the value transfer; the
-            %% sender nonce increment (State1) is kept.
+            %% sender nonce increment (State1) is kept. The init code's SSTORE
+            %% originals are kept with it, for the same reason a reverted CALL's
+            %% are: they are transaction facts, not frame ones.
             next(push(E1#e{gas = E1#e.gas + Left, retdata = Out}, 0),
-                 Ctx#ctx{state = State1});
-        {{error, Reason, _St, _}, _ChildT} ->
+                 Ctx#ctx{state = State1, originals = ChildO});
+        {{error, Reason, _St, _}, _ChildT, _ChildO} ->
             case Reason of
                 {unsupported, What} -> unsupported(What, E1, Ctx);
                 _ -> next(push(E1#e{retdata = <<>>}, 0), Ctx#ctx{state = State1})

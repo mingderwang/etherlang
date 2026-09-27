@@ -41,31 +41,42 @@ behavioural change per commit, and each step says what it now does.
    round-trips all three real Sepolia payloads hash-identically. The honest limit
    stands, though the reason has narrowed: a block this node builds has a state
    root that is **not known** to match the network's. The gas table is wired now,
-   and what remains is SSTORE net metering -- a known 2700-gas-per-no-op-write
-   overcharge -- plus the standing caveat that no state-root divergence has been
-   checked end to end. The node can serve a CL's requests but is not yet safe to
-   propose from.
+   SSTORE net metering included, and what remains is the standing caveat: no
+   state-root divergence has been checked end to end, so the schedule being
+   complete is not evidence that a root this node computes would match the
+   network's. The node can serve a CL's requests but is not yet safe to propose
+   from.
 2. ~~**Add the missing JSON-RPC methods**~~  **Done**, and the framing was wrong:
    they were not missing so much as unexamined. A catch-all clause proxied every
    unknown method, so all eight *answered* — with another node's view. Seven are now
    answered from this node's own state and each says what it is derived from, and
    `eth_getTransactionByBlockHashAndIndex` came along because it shares the
    projection. `eth_createAccessList` is still absent; the blocker is named in Phase 6.
-3. ~~**Wire the per-fork gas table into the EVM.**~~  **Done, with one exception.**
+3. ~~**Wire the per-fork gas table into the EVM.**~~  **Done.**
    *Availability* — an instruction the executing fork does not have is an
    exceptional halt rather than a cheap one, and the fork reaches the interpreter
    through the Env. *Pricing* — `eth_fork_schedule` now owns every price the
    interpreter charges and `eth_evm:base_cost/1`, a second fork-free copy of the
-   schedule, is deleted. What remains is **SSTORE net metering**, which is a live
-   bug rather than a gap: a no-op write is overcharged by 2700 gas net at every
-   fork, because the interpreter uses the slot's *current* value where EIP-2200
-   wants the value it held at the start of the transaction. See the Phase 5 item.
-4. **SSTORE net metering**  *(next)*. Needs the transaction-start value of each
-   slot. The EVM tracks no such thing, and the transient map cannot hold it: that
-   map is transaction-scoped but is discarded on a child revert, whereas the
-   original value must survive one. This is its own change with its own revert
-   semantics, not a table edit.
-5. **EEST conformance work**: run the execution-specs fixtures and record what fails.
+   schedule, is deleted. SSTORE included; see item 4.
+4. ~~**SSTORE net metering.**~~  **Done, Berlin and later.** It needed the
+   transaction-start value of each slot, which the EVM did not track, and the
+   transient map could not hold it: that map is transaction-scoped but is
+   discarded on a child revert, whereas an original value must survive one. It
+   lives in `#ctx.originals` now, recorded on the first write to each
+   `(address, slot)` -- the read that supplies it *is* the transaction-start
+   value, but only because nothing has written the slot yet, which is why the
+   record has to precede the write. The 2700-gas-per-no-op-write overcharge is
+   gone, and with it a second defect the old code had: it priced a *dirty* write
+   as a clean one, because a three-case expression over the slot's current value
+   has nowhere to put one.
+   - **Named, not done: pre-Berlin SSTORE.** Three schedules exist before Berlin
+     -- the flat rule, EIP-1283's net metering at Constantinople, and Petersburg
+     reverting it -- and EIP-1283 is a different schedule, not a restatement of
+     the flat one. Only EIP-2200's text is implemented, so pre-Berlin is
+     **refused** (`sstore_supported/1` -> `{unsupported, {sstore, Fork}}`, which
+     `eth_call` answers with an upstream fallback) rather than priced with a
+     figure that would be right for two spans and wrong for the third.
+5. **EEST conformance work**  *(next)*: run the execution-specs fixtures and record what fails.
    Nothing in this repository has been checked against them (see the note in Phase 8).
 
 ### Deliberately later: the rest of the Engine API
@@ -239,7 +250,7 @@ Recorded because the documentation claimed otherwise, and because each of these 
     reproduce, produced without one error and recorded as a result. `eth_fork_schedule:
     opcode_exists/2` is the new predicate; `eth_evm:run/5` requires a `fork` key in the
     Env and every Env builder sets it.
-  - **Price: done, except SSTORE.** `eth_fork_schedule` is the execution path's only
+  - **Price: done, Berlin and later.** `eth_fork_schedule` is the execution path's only
     source of prices and `eth_evm:base_cost/1` -- a second, fork-free copy of the
     schedule -- is deleted. The sub-points below record what that took, and what
     comparing the two tables turned up on the way.
@@ -278,19 +289,46 @@ Recorded because the documentation claimed otherwise, and because each of these 
     field, so the observable is the **receipts root** — two blocks differing only in timestamp,
     each executing the same transaction at a gas limit both forks accept, must produce
     different roots.
-  - **A live Cancun-era SSTORE bug, found while doing the above and deliberately not fixed
-    here.** A no-op write — storing a slot's existing value back to itself — is charged
-    **2900 with a 100 refund**, netting 2800. EIP-2200 clause (1) says a no-op costs
+  - **A live Cancun-era SSTORE bug, found while doing the above — and a second defect
+    inside the fix.** A no-op write — storing a slot's existing value back to itself — was
+    charged **2900 with a 100 refund**, netting 2800. EIP-2200 clause (1) says a no-op costs
     `SLOAD_GAS` and nothing else: 800 at Berlin, and 100 from EIP-2929. So the interpreter
-    overcharges **2700 gas net on every no-op write at every fork, London included**. The
-    `20000` (create) / `2900` (reset) / `4800` (clear refund) cases beside it are correct,
+    overcharged **2700 gas net on every no-op write at every fork, London included**. The
+    `20000` (create) / `2900` (reset) / `4800` (clear refund) cases beside it were correct,
     which is why this sat unnoticed next to a schedule that had just been called exact.
-    Not fixed here because the correct rule is EIP-2200's *net* metering, which needs the
-    value each slot held **at the start of the transaction**. The EVM tracks no such thing,
-    and the transient map cannot hold it: that map is transaction-scoped but is discarded
-    on a child revert, whereas the original value must survive one. Half-implementing the
-    schedule with the current value in place of the original would be inventing a rule no
-    fork specifies, which is the thing this repository has to avoid.
+    It was not fixable as a table edit, because the correct rule is EIP-2200's *net*
+    metering, which needs the value each slot held **at the start of the transaction**. The
+    EVM tracked no such thing, and the transient map cannot hold it: that map is
+    transaction-scoped but is discarded on a child revert, whereas the original value must
+    survive one. Substituting the current value for the original would have invented a rule
+    no fork specifies, which is the thing this repository has to avoid.
+    - **Fixed** by `eth_fork_schedule:sstore_cost/4` plus a second map in the interpreter,
+      `#ctx.originals`, keyed on `(address, slot)` and recorded on the first write to that
+      slot. `DELEGATECALL` is what makes it observable across a frame boundary: a CALL frame
+      writes its own account's storage and can never touch a slot the parent goes on to
+      write, so a test built on CALL proves nothing about the map.
+    - **The second defect:** the old three-case expression was over the slot's *current*
+      value, so it priced a **dirty** write — the case EIP-2200 exists to price — as a
+      clean one, and there was nowhere in it to put the distinction.
+    - **The first draft of the fix was wrong in a way worth recording.** It reused the
+      existing `mark/2` helper, which writes the **transient** set, because a transient write
+      is a flag. An original value is a word, so it went into the wrong map: every SSTORE
+      was priced as a first write, the dirty write came back out at 2900, and a non-`true`
+      value sat in a map every other reader assumes holds only booleans. Caught by a test
+      asserting a second write to a dirty slot costs 100.
+    - **And a third, in the table:** EIP-2200's arm (2.2.2) is guarded on
+      `original == new`. Dropping that guard is silent — the frame still succeeds and still
+      returns a plausible amount of gas, just 2800 short on the refund. The first
+      `reset_adjustment/2` had a clause returning 0 for any non-zero `new`, which consumed
+      every case the arm was written for. The per-arm table tests caught it.
+    - **Named, not fixed: pre-Berlin SSTORE.** There are *three* pre-Berlin schedules — the
+      flat rule, EIP-1283's net metering at Constantinople, and Petersburg reverting it — and
+      EIP-1283 is a different schedule, not a restatement of the flat one (its title is "Net
+      gas metering for SSTORE without dirty maps"). Only EIP-2200's text is implemented, so
+      pre-Berlin is **refused** (`sstore_supported/1`, reported as
+      `{unsupported, {sstore, Fork}}`, which `eth_call` answers with an upstream fallback)
+      rather than priced with a figure right for two of the three spans and wrong for the
+      third. Unreachable for block execution: this node syncs Sepolia.
   - Fork *selection* is done and driven by real network activation points, including the Merge's total-difficulty activation (`current_fork/4`; see EIP-3675 below).
   - **The fork-parameterized table was dead code, and it was also wrong.** `eth_fork_schedule:gas_cost/3,4` (over `base_gas_cost/3` and `dynamic_gas_cost/4`) took a fork atom, was exported, and had its own unit tests — and nothing in the execution path called it, because the EVM charged `eth_evm:base_cost/1`, which took no fork. So the fork table passing its tests proved nothing about execution.
     - **It is *still* not called from `src/`, deliberately.** The interpreter now charges `constant_cost/2` before the opcode runs and the access term afterwards, because warmth is not knowable before then; `gas_cost/3,4` is the *aggregate* of those two, and an aggregate is the wrong shape for an interpreter that charges at two different moments with two different sets of facts. What is wired in is the table's components, and `gas_cost/3,4` remains the query API that answers "what does this opcode cost at this fork" in one figure — used by its own tests. Anyone reading this as "the table is still disconnected" should check what calls it: nothing in `src/` calls the aggregate, and that is the design.
@@ -302,7 +340,8 @@ Recorded because the documentation claimed otherwise, and because each of these 
     - **`ADDRESS` cost 3, not 2.** It had no clause in `base_cost/1` and fell to the `base_cost(_) -> 3` catch-all -- the same trap that had once mispriced three of the four `CALL` opcodes, which is what "a trap that has now fired twice" in Phase 5 refers to. One gas on every `ADDRESS` in every block, and `gasUsed` is a receipt field. The fork table has 2, so deleting the copy fixed it.
     - **EIP-161's two terms were gated on Berlin.** The 9000 for a value transfer and the 25000 for a new account are Spurious Dragon's, two forks earlier, so a Spurious-Dragon-through-Istanbul `CALL` carrying value paid neither while still being charged the access cost. The gate had never been exercised, because nothing called that function before this change.
   - **EIP-150's pre-Berlin figures existed only in the table and nowhere in execution.** A Frontier `BALANCE` cost 2600, because the interpreter had no path to the pre-Berlin price at all: 400 for `BALANCE` and `EXTCODEHASH`, 700 for `EXTCODESIZE`/`EXTCODECOPY`/the `CALL` family, 200 for `SLOAD`. They are applied now, from one table keyed by opcode rather than taking it as an argument -- the figures differ by opcode and an argument invites the caller to pass the wrong one for its own opcode. `SLOAD` had been a separate function differing in two numbers (200 and 2100 against 400/700 and 2600), which is a second place for the two to drift.
-  - What is still missing is the part neither table covers: `eth_evm` has no EIP-150 pre-Berlin access costs and no per-fork branching for them, so a warm access costs 100 and a cold one 2600/2100 at every fork. `eth_fork_schedule` is no longer missing EIP-3529's refund logic — that is `refund_cap/2` — but its `SSTORE` is still a bare 0, so the table is not yet a complete per-fork schedule either. One thing is named as a gap rather than implemented: **EIP-150's 63/64 gas-retention rule and the 2300 stipend** are applied at every fork. The EIP states the rule it introduced, not the one it replaced, and no client consulted still supports a pre-Whistle block — so the pre-EIP-150 behaviour would have to be invented, and it is not.
+  - What is still missing is the part a price table cannot express at all: **EIP-150's 63/64 gas-retention rule and the 2300 stipend** are applied at every fork. The EIP states the rule it introduced, not the one it replaced, and no client consulted still supports a pre-Whistle block — so the pre-EIP-150 behaviour would have to be invented, and it is not. (An earlier version of this row also claimed `eth_evm` had no EIP-150 pre-Berlin access costs at all. That was fixed in the pass that made the table the only owner of every price — a Frontier `BALANCE` is 400 and a Frontier `SLOAD` 200 — and the row was left behind.)
+  - The table is a per-fork schedule at every fork the node's chain has reached, SSTORE included. Before Berlin the `SSTORE` is *absent* rather than wrong, on purpose: see the pre-Berlin note above.
   - `fork_rank/1` used to collapse Frontier through Petersburg into a single rank 0.
     That was invisible while the only gates were Berlin, London, Shanghai and Cancun,
     and it made the availability question above inexpressible: with `byzantium` and
@@ -386,7 +425,7 @@ Recorded because the documentation claimed otherwise, and because each of these 
   - Fixed: EIP-3860's 2-gas-per-word init-code cost is now charged inside `do_create/3`. `CREATE` pays 2 a word and `CREATE2` pays 8 — the 2 for the init code plus the 6 for hashing it. Before this, `do_create/3` billed `CREATE2` its hashing term and `CREATE` nothing at all, so deploying a large contract cost nothing for the code that was about to run, and `CREATE2` was short two thirds of what it owes. `gasUsed` is a receipt field, so this was a receipts-root difference on every create in a block
   - The two terms do not double-charge, and that is structural rather than lucky: `eth_tx:initcode_gas/3` prices the *transaction's* `data`, and a contract-creation transaction runs that `data` straight through `eth_evm:run/5` in `eth_block:execute_transactions/5` without ever entering `do_create/3`. The opcode's word cost therefore only ever applies to a nested create
   - The Shanghai condition on the init-code term is now applied, in the opcode and in `eth_tx` alike (see the per-fork item above). CREATE2's hashing term is Constantinople's and stays ungated at every fork
-  - **Not fixed, and it is a live Cancun-era overcharge:** a no-op SSTORE is charged 2900 with a 100 refund where EIP-2200 clause (1) says `SLOAD_GAS` and nothing else — 800 at Berlin, 100 from EIP-2929. 2700 gas net, on every no-op write, at London too. Needs the transaction-start value of the slot; see the per-fork item for why the transient map cannot supply it
+  - **Fixed:** a no-op SSTORE was charged 2900 with a 100 refund where EIP-2200 clause (1) says `SLOAD_GAS` and nothing else — 800 at Berlin, 100 from EIP-2929. 2700 gas net, on every no-op write, at London too. It needed the transaction-start value of the slot, which the EVM did not track; see the per-fork item for the map that now holds it and for the pre-Berlin boundary that is still refused rather than priced
   - Run Foundry/vmtests to verify opcode correctness
   - Run generalStateTests to verify state transitions
   - Fix any divergences found
