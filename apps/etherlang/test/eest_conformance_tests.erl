@@ -51,12 +51,32 @@
 %% the runner inherited `ETH_NETWORK` from its caller, so the eunit path ran the
 %% corpus under Sepolia's chain id against fixtures declaring chain 1. Between them
 %% the figure drifted between 2 and 7 across runs of identical code.
--define(EXPECTED, #{match => 5,
+%%
+%% `match' doubled from 5 to 10, and both halves of the move are worth naming because
+%% neither is the state's own doing:
+%%
+%%   - The five EIP-1559 validity fixtures stopped being evidence of a validator that
+%%     *accepted* a type-2 transaction at a pre-London fork. `validate/2' checked only
+%%     that a transaction's type was one it could decode, which is a statement about the
+%%     code rather than about the block. It is now gated on the fork, via
+%%     `eth_fork_schedule:tx_type_available/2'.
+%%   - Those five then had to be checked by *reason*, not merely counted as "the
+%%     validator said no". The runner compared the fixture's `expectException' code
+%%     against the node's own vocabulary, and `rejection_mismatch' fell to 0 with the
+%%     refusal verified rather than merely observed. Without the second half the first
+%%     would have been worth five entries of a harness that could not tell a correct
+%%     refusal from an accidental one.
+%%
+%% `state_mismatch` is unchanged at 249, which is the honest outcome: the 243 coinbase
+%% diffs they carry are now computed against a derived base fee rather than a default
+%% of zero, and none of them flipped, so the base fee was masking those but not causing
+%% them. See the entry in `TASKS.md`.
+-define(EXPECTED, #{match => 10,
                     state_mismatch => 249,
                     tx_decode_failed => 4,
                     tx_roundtrip_mismatch => 0,
                     sender_mismatch => 0,
-                    expected_rejection_not_raised => 5,
+                    expected_rejection_not_raised => 0,
                     rejection_mismatch => 0,
                     fork_unreachable => 3,
                     crash => 0,

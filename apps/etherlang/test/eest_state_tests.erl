@@ -474,13 +474,83 @@ run_tx(Fork, Tx, Entry, Post) ->
         Expected -> expect_rejection(Fork, Tx, Entry, Expected)
     end.
 
+%% Rejecting is only half of refusing a transaction, and the runner used to check
+%% only that half. `rejection_mismatch' meant "the validator said no" with the
+%% reason discarded, so a node that rejected a pre-fork type-2 transaction for
+%% entirely the wrong reason -- a wrong nonce, a bad chain id -- scored the same as
+%% one that refused it for the reason the fixture names. That is precisely the
+%% confusion the outcome vocabulary exists to prevent: a refusal proves nothing
+%% about *what* was refused, and the corpus's whole claim is about which rule fired.
+%%
+%% So the reason is compared against the fixture's `expectException' code. The
+%% mapping below is deliberately short, and a reason with no clause is reported as
+%% unmapped rather than folded into the nearest one. A loose mapping would
+%% manufacture matches, and a manufactured conformance match is the one artefact in
+%% this project that would make every other number here a lie.
 expect_rejection(Fork, Tx, Entry, Expected) ->
     Block = block(Fork, Entry, none),
     State = state_for(Entry, #{}),
     case eth_tx:validate(Tx, validation_ctx(Block, State)) of
-        {error, _Reason} -> {?REJECT_MISMATCH, {expected, Expected}};
-        ok -> {?REJECT_NOT_RAISED, {expected, Expected}}
+        {error, Reason} ->
+            %% The transaction's type is passed in from `Tx' and not read out of the
+            %% fixture's code, because the code is the thing being checked. A
+            %% mapping that derived the expected type from the expectation would
+            %% compare the expectation with itself.
+            Got = node_exception(Reason, eth_tx:tx_type(Tx)),
+            Want = exception_code(Expected),
+            case Want =:= Got of
+                true -> {?MATCH, {rejected, Want}};
+                false -> {?REJECT_MISMATCH, #{expected => Want, got => Got,
+                                              reason => Reason}}
+            end;
+        ok ->
+            {?REJECT_NOT_RAISED, #{expected => exception_code(Expected)}}
     end.
+
+%% The fixture's code, reduced to the name the specification gives it:
+%% `"TransactionException.TYPE_2_TX_PRE_FORK"' -> `TYPE_2_TX_PRE_FORK'.
+%%
+%% `TransactionException' is dropped and that is not a loosening of the comparison.
+%% It is the namespace a *transaction* rule lives in, and every code
+%% `eth_tx:validate/2' can raise belongs to it, so keeping it would mean this
+%% function compared the fixture's namespace against the node's vocabulary and
+%% nothing could ever match -- the first version did exactly that and reported five
+%% correct refusals as five mismatches.
+%%
+%% `BlockchainException' is a different vocabulary and is **kept**: a block-level
+%% failure is not a transaction rule, so a fixture expecting one can never be
+%% satisfied by a validator's answer, and saying so is better than matching it
+%% loosely. Codes this node has no mapping for come back as `{unmapped, Reason}' and
+%% land in `rejection_mismatch', so an unmapped code costs a match rather than
+%% buying one.
+exception_code(<<"TransactionException.", Code/binary>>) -> Code;
+exception_code(Expected) when is_binary(Expected) -> Expected;
+exception_code(Other) ->
+    Other.
+
+%% The code this node would be raising for a given validator error, given the
+%% transaction's type.
+%%
+%% Each clause is here because the error is raised for that reason and no other.
+%% `tx_type_pre_fork' is a single `eth_fork_schedule:tx_type_available/2' call,
+%% whose whole answer is a fork comparison, so it can only mean a type that
+%% postdates the fork -- but which type is not in the error, so the type is threaded
+%% through from the transaction and rendered into the fixture's own vocabulary.
+node_exception(tx_type_pre_fork, eip2930) -> <<"TYPE_1_TX_PRE_FORK">>;
+node_exception(tx_type_pre_fork, eip1559) -> <<"TYPE_2_TX_PRE_FORK">>;
+node_exception(tx_type_pre_fork, eip4844) -> <<"TYPE_3_TX_PRE_FORK">>;
+node_exception(tx_type_pre_fork, eip7702) -> <<"TYPE_4_TX_PRE_FORK">>;
+node_exception(tx_type_pre_fork, Type) -> {unmapped_type, Type};
+node_exception(unsupported_type, _Type) -> <<"TX_TYPE_UNSUPPORTED">>;
+node_exception(intrinsic_gas, _Type) -> <<"INTRINSIC_GAS">>;
+node_exception(calldata_floor, _Type) -> <<"GASLIMIT_TOO_LOW">>;
+node_exception(nonce_too_low, _Type) -> <<"NONCE_TOO_LOW">>;
+node_exception(nonce_too_high, _Type) -> <<"NONCE_TOO_HIGH">>;
+node_exception(insufficient_funds, _Type) -> <<"INSUFFICIENT_BALANCE">>;
+node_exception(bad_chain_id, _Type) -> <<"CHAIN_ID_MISMATCH">>;
+node_exception(blob_fee_too_low, _Type) -> <<"BLOB_GAS_PRICE_TOO_LOW">>;
+node_exception(bad_blob_hashes, _Type) -> <<"INVALID_BLOBS">>;
+node_exception(Reason, _Type) -> {unmapped, Reason}.
 
 %% The block the transaction executes in.
 %%

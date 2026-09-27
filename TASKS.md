@@ -79,17 +79,18 @@ behavioural change per commit, and each step says what it now does.
 5. ~~**EEST conformance work.**~~  **Done as far as it can be, and the answer is
    bad.** `apps/etherlang/test/eest_state_tests.erl` runs the `execution-spec-tests`
    `state_tests` corpus against this node's state transition and classifies every
-   entry. **5 of 266 committed entries match — 1.9% — and the figure is
+   entry. **10 of 266 committed entries match — 3.8% — and the figure is
    reproducible**, identical per entry from a fresh VM and from inside the suite.
    Nothing in this repository had ever been measured against a third party's
    expected results before; the opcode table was cross-checked against instruction
    *counts* and the gas schedule was derived from the EIPs, and a schedule can be
    wrong in both of those senses and still self-consistent.
    - What the corpus found, immediately and without any new code being written for
-     it: the node **accepts a type-2 (EIP-1559) transaction at a pre-London fork**,
+     it: the node **accepted a type-2 (EIP-1559) transaction at a pre-London fork**,
      which the specification rejects — 5 entries, and the worst kind of divergence
-     because it is a validator that admits something invalid. And it **cannot
-     decode an EIP-7702 (type 4) transaction at all**, 4 entries, `eth_tx:from_rlp/1`
+     because it is a validator that admits something invalid. **Fixed and verified**;
+     see the entry below. And it **cannot decode an EIP-7702 (type 4) transaction at
+     all**, 4 entries, `eth_tx:from_rlp/1` — **still open**.
      having no clause for it.
    - `eth_block:run_transaction/5` is now exported for the runner. It was already
      the function `finalize_against/5` calls, so this is not a test-only export; it

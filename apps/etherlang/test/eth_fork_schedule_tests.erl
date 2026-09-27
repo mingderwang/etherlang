@@ -1317,3 +1317,67 @@ a_non_binary_calldata_has_no_floor_test() ->
     %% answer rather than a fabricated one.
     ?assertEqual(0, eth_fork_schedule:calldata_floor(prague, not_a_binary)),
     ?assertEqual(0, eth_fork_schedule:calldata_floor(not_a_fork, <<0>>)).
+
+%% ---------------------------------------------------------------------------
+%% Transaction-type availability
+%% ---------------------------------------------------------------------------
+%% The corpus found the absence of this as a validator that *accepted* an
+%% EIP-1559 transaction inside a Berlin block. Admitting something invalid is the
+%% worse of the two directions: a node that refuses a valid transaction loses one
+%% transaction, whereas a node that accepts an invalid one agrees with nobody about
+%% the chain.
+
+%% The lookup is by the *type* `eth_tx:tx_type/1' reports, which is an atom and not
+%% the wire byte. I wrote the wire numbers first, the test caught it, and it is
+%% worth leaving the distinction visible: the atom is what the rest of the codebase
+%% passes around, and the byte is only ever the first byte of the payload.
+the_typed_transactions_arrive_in_their_own_eips_fork_test() ->
+    ?assertEqual(berlin, eth_fork_schedule:introduced_tx_type(eip2930)),
+    ?assertEqual(london, eth_fork_schedule:introduced_tx_type(eip1559)),
+    ?assertEqual(cancun, eth_fork_schedule:introduced_tx_type(eip4844)),
+    ?assertEqual(prague, eth_fork_schedule:introduced_tx_type(eip7702)),
+    %% `legacy' is not in the table, and deliberately so: it is the type the format
+    %% had before types existed, so there is no fork that introduced it. Asking
+    %% returns `undefined', which is what makes `tx_type_available/2' refuse to use
+    %% the table for it at all rather than accidentally getting an answer.
+    ?assertEqual(undefined, eth_fork_schedule:introduced_tx_type(legacy)),
+    ?assertEqual(undefined, eth_fork_schedule:introduced_tx_type(nonsense)).
+
+a_legacy_transaction_is_available_in_every_fork_test() ->
+    [?assert(eth_fork_schedule:tx_type_available(legacy, F))
+     || F <- [frontier, homestead, byzantium, london, cancun, prague]],
+    %% Including a fork atom this table has never heard of, which is different from
+    %% a fork earlier than Berlin: an unknown fork must not be able to admit a typed
+    %% transaction.
+    ?assert(eth_fork_schedule:tx_type_available(legacy, not_a_fork_at_all)).
+
+a_type_one_needs_berlin_test() ->
+    [?assert(eth_fork_schedule:tx_type_available(eip2930, F))
+     || F <- [berlin, london, cancun, prague]],
+    [?assertNot(eth_fork_schedule:tx_type_available(eip2930, F))
+     || F <- [frontier, homestead, byzantium, constantinople, istanbul]].
+
+a_type_two_needs_london_test() ->
+    %% The exact pair the corpus found: a 1559 transaction is invalid at Berlin and
+    %% valid at London, one fork apart.
+    ?assertNot(eth_fork_schedule:tx_type_available(eip1559, berlin)),
+    ?assert(eth_fork_schedule:tx_type_available(eip1559, london)),
+    [?assertNot(eth_fork_schedule:tx_type_available(eip1559, F))
+     || F <- [frontier, homestead, byzantium, tangerine_whistle, istanbul]].
+
+a_type_three_needs_cancun_test() ->
+    ?assertNot(eth_fork_schedule:tx_type_available(eip4844, london)),
+    ?assert(eth_fork_schedule:tx_type_available(eip4844, cancun)),
+    ?assert(eth_fork_schedule:tx_type_available(eip4844, prague)).
+
+a_type_four_needs_prague_test() ->
+    ?assertNot(eth_fork_schedule:tx_type_available(eip7702, cancun)),
+    ?assert(eth_fork_schedule:tx_type_available(eip7702, prague)).
+
+a_type_this_table_has_never_heard_of_is_not_available_test() ->
+    %% A catch-all returning `legacy's answer would make every unknown type
+    %% admissible in every fork, which is the opposite of the reason this function
+    %% exists. There is no fork for which that is safe.
+    [?assertNot(eth_fork_schedule:tx_type_available(T, F))
+     || T <- [eip7623, set_code, eip1153, garbage],
+        F <- [frontier, berlin, london, cancun, prague]].

@@ -285,7 +285,15 @@ validate(Tx) ->
 
 validate(Tx, Ctx) when is_map(Tx), is_map(Ctx) ->
     try
-        ensure(tx_type(Tx) =/= unsupported, {error, unsupported_type}),
+        Type = tx_type(Tx),
+        ensure(Type =/= unsupported, {error, unsupported_type}),
+        %% The fork gate on the *type*. `unsupported' above only says this node
+        %% cannot decode it, which is a statement about the code and not about the
+        %% block; without this the same check would also have admitted a type-2
+        %% transaction into a Berlin block, which the corpus found it doing. A block
+        %% carrying one would be validated and imported rather than refused whole.
+        ensure(eth_fork_schedule:tx_type_available(Type, ctx_fork(Ctx)),
+               {error, tx_type_pre_fork}),
         Gas = field(Tx, <<"gas">>),
         Value = field(Tx, <<"value">>),
         Nonce = field(Tx, <<"nonce">>, 0),
@@ -689,8 +697,25 @@ check_chain_id(Tx, Ctx) ->
 %% same treatment base_fee gets, and deliberately not the same as omitting the
 %% check: an absent base fee means the ceiling rule is *unchecked*, whereas an
 %% absent fork means the rule is applied under a stated assumption.
+%% The fork a validation context speaks for, or the operator's pin when it says
+%% nothing.
+%%
+%% The first clause's guard is `undefined =/= Fork' and not `is_atom(Fork)', and that
+%% is a real change rather than a style preference. The original was
+%%
+%%     Fork when is_atom(Fork) -> Fork
+%%
+%% which is satisfied by `undefined' -- because `undefined' is an atom -- so the
+%% default was returned as though it were a fork, and `configured_fork/0' below it
+%% was unreachable for any context without a `fork' key. That is every pool and
+%% block-builder call, since both pass a bare context. The consequence was invisible
+%% because `undefined' satisfies every `is_atom(Fork)' guard downstream, so the
+%% schedules it reached simply answered for a fork named `undefined' -- which is not
+%% a fork, and matched no clause, and so fell through to whatever default that
+%% function happened to carry.
 ctx_fork(Ctx) ->
     case maps:get(fork, Ctx, undefined) of
+        undefined -> eth_fork_schedule:configured_fork();
         Fork when is_atom(Fork) -> Fork;
         _ -> eth_fork_schedule:configured_fork()
     end.

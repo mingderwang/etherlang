@@ -61,6 +61,8 @@
           sstore_supported/1,
           initcode_word_cost/1,
           calldata_floor/2,
+          tx_type_available/2,
+          introduced_tx_type/1,
           timestamp_in_frame/3,
           timestamp_frame/2,
           activated_at/2 ]).
@@ -1463,6 +1465,58 @@ sstore_sentry(_Fork) -> 0.
 -spec sstore_supported(atom()) -> boolean().
 sstore_supported(Fork) when is_atom(Fork) -> at_least(Fork, berlin);
 sstore_supported(_Fork) -> false.
+
+%% ---------------------------------------------------------------------------
+%% Transaction-type availability
+%% ---------------------------------------------------------------------------
+%% A typed transaction is a *new wire format*, so unlike an opcode it is not a
+%% cheap instruction that a block could execute anyway: a node that decoded a
+%% Berlin block carrying a type-2 transaction would be decoding bytes the fork it
+%% is executing never defined. The fork schedule therefore gates the *type*, and
+%% `eth_tx:validate/2' asks this rather than deciding it inline, for the reason
+%% `opcode_exists/2' exists: the gas table says what a thing costs once it is
+%% there, and says nothing about whether it is there yet.
+%%
+%% Each activation is the EIP's own, and they are not the fork that introduced the
+%% *feature* the type carries. Type 1 is EIP-2930 (Berlin), type 2 is EIP-1559
+%% (London), type 3 is EIP-4844 (Cancun), and type 4 is EIP-7702 (Prague).
+%%
+%% `legacy' is the type every fork has and is therefore always available; it is
+%% written as a clause rather than a catch-all so that a type this fork table has
+%% never heard of answers `false' instead of inheriting legacy's answer, which is
+%% the mistake a catch-all makes here.
+%%
+%% The corpus found the absence of this as a validator that **accepted** an
+%% EIP-1559 transaction inside a Berlin block. `validate/2' checked only that the
+%% type was one it could decode, so a type-2 transaction at a pre-London fork
+%% validated -- and a block containing one would be accepted rather than refused
+%% whole. Admitting something invalid is the worse of the two directions: a node
+%% that refuses a valid transaction loses a transaction, whereas a node that
+%% accepts an invalid one agrees with nobody about the chain.
+%%
+%% The activations are held once, in `introduced_tx_type/1', and the availability
+%% question is derived from them. A second hand-written list of the same four forks
+%% would be two copies of one fact, and this module's own history is that two copies
+%% drift: `eth_evm:base_cost/1' was a fork-free duplicate of the gas table, and the
+%% two had come to disagree about how they grouped four sets of constants.
+-spec tx_type_available(atom(), atom()) -> boolean().
+tx_type_available(legacy, Fork) when is_atom(Fork) -> true;
+tx_type_available(Type, Fork) when is_atom(Fork) ->
+    case introduced_tx_type(Type) of
+        undefined -> false;
+        At -> at_least(Fork, At)
+    end;
+tx_type_available(_Type, _Fork) -> false.
+
+%% Every transaction type, with the fork that introduced it. `legacy' is absent on
+%% purpose: it is the type the wire format had before types existed, so it has no
+%% introducing fork, and `tx_type_available/2' answers for it without asking.
+-spec introduced_tx_type(atom()) -> atom() | undefined.
+introduced_tx_type(eip2930) -> berlin;
+introduced_tx_type(eip1559) -> london;
+introduced_tx_type(eip4844) -> cancun;
+introduced_tx_type(eip7702) -> prague;
+introduced_tx_type(_Type) -> undefined.
 
 %% EIP-3529 (London) replaces SSTORE_CLEARS_SCHEDULE -- 15000 as EIP-2200 defined
 %% it -- with `SSTORE_RESET_GAS + ACCESS_LIST_STORAGE_KEY_COST', which is

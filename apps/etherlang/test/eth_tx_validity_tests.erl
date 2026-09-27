@@ -910,6 +910,119 @@ a_transaction_below_the_calldata_floor_is_rejected_at_prague_test() ->
         ?assert(london =/= prague)
     end).
 
+%% ---------------------------------------------------------------------------
+%% The transaction *type* is a fork question, and it is not a decode question
+%% ---------------------------------------------------------------------------
+%% A typed transaction is a new wire format, so a fork that never defined the type
+%% cannot have a block containing one. The corpus found this as a validator that
+%% **accepted** an EIP-1559 transaction inside a Berlin block: `validate/2' checked
+%% only that the type was one it could decode, which is a statement about the code
+%% rather than about the block.
+%%
+%% No valid signature is needed for any of this. `validate/2' deliberately does not
+%% recover the sender -- a node validating a block it did not build must accept the
+%% sender the block says -- so these fixtures carry placeholder v/r/s, and a test
+%% that needed a real one would be testing recovery rather than the fork gate.
+
+a_type_two_transaction_is_rejected_before_london_test() ->
+    Tx = typed_1559(#{<<"gas">> => 100000}),
+    ?assertEqual({error, tx_type_pre_fork},
+                 eth_tx:validate(Tx, ctx_at(berlin, Tx))),
+    ?assertEqual({error, tx_type_pre_fork},
+                 eth_tx:validate(Tx, ctx_at(byzantium, Tx))),
+    %% One fork later it is valid, which is what makes the gate a fork question and
+    %% not a rejection of type 2 as such.
+    ?assertEqual(ok, eth_tx:validate(Tx, ctx_at(london, Tx))).
+
+a_type_one_transaction_is_rejected_before_berlin_test() ->
+    Tx = typed_1559(#{<<"gas">> => 100000, <<"accessList">> => []}),
+    Tx1 = Tx#{<<"type">> => <<"0x1">>},
+    ?assertEqual({error, tx_type_pre_fork},
+                 eth_tx:validate(Tx1, ctx_at(istanbul, Tx1))),
+    ?assertEqual(ok, eth_tx:validate(Tx1, ctx_at(berlin, Tx1))).
+
+a_type_three_transaction_is_rejected_before_cancun_test() ->
+    %% This is the regression the missing `ctx_fork/1' resolution caused: ten
+    %% blob-transaction tests across three modules failed on the day the type gate
+    %% went in, and all ten were one defect rather than ten.
+    Tx = (typed_1559(#{<<"gas">> => 100000}))#{
+             <<"type">> => <<"0x3">>,
+             <<"maxFeePerBlobGas">> => <<"0x3b9aca00">>,
+             <<"blobVersionedHashes">> =>
+                 %% A versioned hash whose 31-byte remainder is *not* all zeros.
+                 %% `valid_versioned_hashes/1' rejects an all-zero remainder
+                 %% explicitly, so the obvious placeholder fails here -- and for a
+                 %% real reason rather than a formatting one.
+                 [<<16#01, 1:248>>]},
+    ?assertEqual({error, tx_type_pre_fork},
+                 eth_tx:validate(Tx, ctx_at(london, Tx))),
+    ?assertEqual(ok, eth_tx:validate(Tx, ctx_at(cancun, Tx))).
+
+a_forkless_context_resolves_to_the_operator_pin_test() ->
+    %% `eth_tx:ctx_fork/1' had `Fork when is_atom(Fork) -> Fork' as its first
+    %% clause, and `undefined' is an atom, so the *default* was returned as though
+    %% it were a fork and `configured_fork/0' below it was unreachable for every
+    %% context without a `fork' key -- which is every pool and block-builder call.
+    %% Nothing announced it, because `undefined' satisfies every `is_atom(Fork)'
+    %% guard downstream, so the schedules it reached simply answered for a fork
+    %% named `undefined'.
+    %%
+    %% EIP-7623's floor is what exposed it. Its `calldata_floor/2' answers 0 for a
+    %% fork it does not recognise, so with the fork unresolved the floor silently
+    %% vanished and a transaction below it validated. One zero calldata byte has a
+    %% floor of 21,010 and an intrinsic of 21,004, so a limit of 21,005 is the
+    %% whole gap between the two.
+    with_env("ETH_FORK", "prague", fun() ->
+        Tx = typed_1559(#{<<"gas">> => 21005, <<"input">> => <<"0x00">>}),
+        Ctx = #{base_fee => undefined, gas_limit => 30000, gas_used => 0,
+                chain_id => eth_fork_schedule:chain_id(),
+                balance_of => fun(_) -> {ok, 1000 * ?WEI} end,
+                nonce_of => fun(_) -> {ok, 0} end},
+        ?assertEqual(prague, eth_fork_schedule:configured_fork()),
+        ?assertMatch({error, calldata_floor}, eth_tx:validate(Tx, Ctx)),
+        %% The floor is the only thing at issue, so the same transaction at the
+        %% floor is accepted -- otherwise "rejected" could be satisfied by the
+        %% intrinsic rule alone and the test would prove nothing about EIP-7623.
+        Ok = typed_1559(#{<<"gas">> => 21010, <<"input">> => <<"0x00">>}),
+        ?assertEqual(ok, eth_tx:validate(Ok, Ctx))
+    end).
+
+%% ---------------------------------------------------------------------------
+
+typed_1559(Fields) ->
+    maps:merge(#{<<"type">> => <<"0x2">>,
+                 <<"chainId">> => eth_hex:encode_int(eth_fork_schedule:chain_id()),
+                 <<"nonce">> => <<"0x0">>,
+                 <<"maxPriorityFeePerGas">> => <<"0x1">>,
+                 <<"maxFeePerGas">> => <<"0x2">>,
+                 <<"gas">> => eth_hex:encode_int(100000),
+                 <<"to">> => hex(?PROBE),
+                 <<"value">> => <<"0x0">>,
+                 <<"input">> => <<"0x">>,
+                 %% A placeholder signature. `validate/2' does not recover the
+                 %% sender, and a real one would only make these tests test recovery.
+                 <<"v">> => <<"0x1">>, <<"r">> => <<"0x1">>, <<"s">> => <<"0x1">>},
+            Fields).
+
+ctx_at(Fork, _Tx) ->
+    #{base_fee => undefined, gas_limit => 1000000, gas_used => 0,
+      chain_id => eth_fork_schedule:chain_id(), fork => Fork,
+      %% A funded sender, because a zero balance fails the balance rule and would
+      %% make "accepted at London" unsatisfiable for a reason that is not the fork.
+      balance_of => fun(_) -> {ok, 1000 * ?WEI} end,
+      nonce_of => fun(_) -> {ok, 0} end}.
+
+with_env(Name, Value, Fun) ->
+    Previous = os:getenv(Name),
+    true = os:putenv(Name, Value),
+    try Fun()
+    after
+        case Previous of
+            false -> os:unsetenv(Name);
+            _ -> os:putenv(Name, Previous)
+        end
+    end.
+
 the_evm_allowance_follows_the_blocks_own_fork_test() ->
     Code = <<16#60, 16#00, 16#60, 0, 16#52,
              16#60, 1, 16#60, 0, 16#F3>>,

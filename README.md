@@ -66,8 +66,8 @@ beacon, validators, or block production).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**661 tests, green**).
-* **Status** — v0.7.0; eunit green (661 tests) and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**672 tests, green**).
+* **Status** — v0.7.0; eunit green (672 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -522,7 +522,7 @@ Where the work actually stands:
 | Block execution: receipts, logs, bloom, state root, EIP-4788, EIP-4895, EIP-2935 | done, and the two system-contract EIPs verified against live Sepolia data |
 | Block authoring (proposer duties) | **not done** — the node builds and executes blocks but is never selected to author one |
 | Per-fork exact gas schedule | **done, Berlin and later.** `eth_fork_schedule` owns every price the interpreter charges and `eth_evm:base_cost/1`, a second fork-free copy of the schedule, is deleted. SSTORE included: EIP-2200's net metering, with EIP-2929's figures and EIP-3529's refunds. **Pre-Berlin SSTORE is refused, not priced** — three schedules exist there (the flat rule, EIP-1283 at Constantinople, Petersburg's revert of it) and only EIP-2200's text is implemented, so a single pre-Berlin figure would be right for two spans and wrong for the third. Fork-selected now: every opcode's constant price, EIP-150's pre-Berlin access costs, EIP-2929's warm/cold split, EIP-161's 9000/25000, the refund cap, EIP-6780, EIP-3860, and `eth_tx`'s intrinsic floor. Getting there meant picking one owner of each price's composition — the two tables agreed on most totals and split four groups differently — and comparing them found two live bugs: `ADDRESS` cost 3 where it is 2, and EIP-161's terms gated on Berlin rather than Spurious Dragon. SSTORE net metering needed the transaction-start value of each slot, which this node did not track; it now does, in a map of its own, and the 2700-gas-per-no-op-write overcharge is gone. Whether the gas schedule is the *only* reason this node's state roots do not match the network's is unverified: it cannot be checked end-to-end without real prestate |
-| Conformance against a third party's expected results | **measured, and the measurement is bad.** `eest_state_tests.erl` runs the `execution-spec-tests` `state_tests` corpus. **5 of 266 committed fixtures match — 1.9%** — and the figure is reproducible: identical per entry from a fresh VM and from inside the suite. Two real defects it found with no new code written for it: the node **accepts an EIP-1559 transaction at a pre-London fork**, and it **cannot decode an EIP-7702 (type 4) transaction at all**. Two real defects it found with no new code written for it: the node **accepts an EIP-1559 transaction at a pre-London fork**, and it **cannot decode an EIP-7702 (type 4) transaction at all**. Nothing in this repository had been *run* against a third party's expected results before this; the opcode table was cross-checked against instruction counts and the gas schedule was derived from the EIPs, and a schedule can be wrong in both senses and still self-consistent |
+| Conformance against a third party's expected results | **measured, and the measurement is bad.** `eest_state_tests.erl` runs the `execution-spec-tests` `state_tests` corpus. **10 of 266 committed fixtures match — 3.8%** — and the figure is reproducible: identical per entry from a fresh VM and from inside the suite. Two real defects it found with no new code written for it: the node **accepted an EIP-1559 transaction at a pre-London fork** (now fixed and the five fixtures verify), and it **cannot decode an EIP-7702 (type 4) transaction at all** (still open). A third was hiding underneath the first and only surfaced when the first was fixed: `eth_tx:ctx_fork/1` had a guard that `undefined` satisfied, so the fork a validation context speaks for was never resolved, and ten blob-transaction tests across three modules were passing through a fork named `undefined`. Nothing in this repository had been *run* against a third party's expected results before this; the opcode table was cross-checked against instruction counts and the gas schedule was derived from the EIPs, and a schedule can be wrong in both senses and still self-consistent |
 | Honest stateRoot verification | done for the current block; historical blocks are not re-executed |
 | Receipt verification on the peer path | done — a peer's `receiptsRoot` is recomputed from the executed body and compared, and reported as `{verified, Root} \| {unverified, Reason}` |
 | Transaction validation (nonce, balance, chain ID, gas limit, intrinsic gas, signature) | done — one validator, called on the peer path before execution, with the offending transaction's index reported |
@@ -571,13 +571,20 @@ Where the work actually stands:
   distinct on purpose: a transaction that does not decode, a signature that recovers the wrong address, a
   transaction the node admits that the specification rejects, and a state that comes out different are four
   different bugs with four different owners, and one `fail` bucket would sum them and hide all four.
-  - **5 of 266 entries match — 1.9%.** The gas figure is recovered from the balances the way a state test
+  - **10 of 266 entries match — 3.8%.** The gas figure is recovered from the balances the way a state test
     encodes it, so a divergence reads as a gas number rather than as a wei difference — the first fixture looked
     at reported `45,247` gas, which is EIP-2929's cold account charge and about sixteen times that.
-  - Two findings, neither of which required writing any code to find: the node **accepts a type-2 (EIP-1559)
+  - A **rejection is checked by reason, not merely counted.** `rejection_mismatch` used to mean "the validator
+    said no" with the reason discarded, so a node that refused a pre-fork type-2 transaction for entirely the
+    wrong reason scored the same as one that refused it for the reason the fixture names — a refusal proves
+    nothing about *what* was refused. The fixture's `expectException` code is now compared against the node's
+    own vocabulary, the type is threaded through from the transaction rather than read out of the expectation,
+    and a reason with no mapping is reported as unmapped rather than folded into the nearest one.
+  - Two findings, neither of which required writing any code to find. The node **accepted a type-2 (EIP-1559)
     transaction at a pre-London fork**, which the specification rejects — the worst kind of divergence, because
-    it is a validator admitting something invalid — and `eth_tx:from_rlp/1` **has no clause for an EIP-7702
-    (type 4) transaction**, so it cannot decode one at all.
+    it is a validator admitting something invalid. That is now fixed: the type is a fork question
+    (`eth_fork_schedule:tx_type_available/2`), and the five fixtures verify by reason. And `eth_tx:from_rlp/1`
+    **has no clause for an EIP-7702 (type 4) transaction**, so it cannot decode one at all — still open.
   - **The figure was not reproducible at first, and getting it to be was two real bugs — in the harness, not
     the node.** It drifted between runs of identical code: 5, 6, 7 and 2 were all observed, and one run scored
     *higher* than a clean VM because a fixture was passing on an account another test had left behind, which

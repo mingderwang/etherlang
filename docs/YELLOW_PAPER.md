@@ -1,6 +1,6 @@
 # etherlang — design and current state
 
-**Status**: v1.0 in progress. 661 eunit tests, green.
+**Status**: v1.0 in progress. 672 eunit tests, green.
 
 This document describes what the node *is* and what it is *becoming*: the system
 model, the trust assumptions, the data structures, and — at least as important —
