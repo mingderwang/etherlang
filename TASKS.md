@@ -526,13 +526,15 @@ Recorded because the documentation claimed otherwise, and because each of these 
 
 ## Phase 6: JSON-RPC API Completion (7 tasks)
 - [ ] **Debug API** — `debug_traceTransaction`, `debug_traceBlockByNumber`, `debug_traceBlockByHash`, `debug_traceRawTransaction`
+  - **Not needed, and closing it with a reason rather than leaving it open.** geth-specific, not in EIP-1474, and no consensus layer calls it. The one argument for building it is developer speed: with 249 `state_mismatch` fixtures outstanding, a `structLog` tracer over a failing case would be genuinely useful. It is a tool, not a conformance item, and the corpus plus `eth_call` already give a sharper signal
   - Trace mode: `callTrace`, `structLog`, `builtInTracer`
   - Parity-style trace API compatibility
 - [ ] **Trace API** — `trace_replayTransaction`, `trace_replayBlock`, `trace_filter`, `trace_transaction`
 - [ ] **Miner API** — `miner_start`, `miner_stop`, `miner_setExtra`, `miner_setGasPrice`, `miner_setEtherbase`
-  - No-op in PoS but must respond to avoid client incompatibility
+  - **Answering `ok` would be a claim this node cannot back.** `miner_setEtherbase` and `miner_setGasPrice` configure block *authoring*, and this node never authors a block; `eth_mining` and `eth_hashrate` already answer `false` and `0x0`, which is the truth. A `miner_setEtherbase` that returned `true` would be the same class of answer as the old catch-all: a success flag for something that did not happen. Left unimplemented, and it now **refuses** rather than forwarding
 - [ ] **Admin API** — `admin_nodeInfo`, `admin_peers`, `admin_datadir`, `admin_startRPC`, `admin_stopRPC`
 - [ ] **Personal API** — `personal_importRawKey`, `personal_listAccounts`, `personal_newAccount`, `personal_sign`, `personal_ecRecover`, `personal_sendTransaction`, `personal_unlockAccount`
+  - **This node has no keystore, no unlocked account and no signer**, and `eth_accounts` correctly answers `[]` for exactly that reason. Proxied, `personal_listAccounts` would report *another node's* accounts and `personal_importRawKey` / `personal_sign` would sign with *another node's* key — the most dangerous answer in this phase. Unimplemented is the correct state, and it now refuses rather than forwarding
 - [x] **Eth API completeness** — `eth_*` methods answer in the specification's response shapes. Seven of the eight that a catch-all clause was proxying are now answered from this node's own state, and each says what it is derived from: `eth_accounts` (`[]` — this node owns no accounts, and proxied it returned the *upstream* node's), `eth_getTransactionByHash` and `eth_getTransactionByBlockHashAndIndex` (a stored transaction plus the three positional fields it does not carry), `eth_getBlockReceipts` (stored receipts, distinguishing an empty block from a block whose receipts were never stored — the specification's `4444`), `eth_feeHistory` (from stored headers, refusing rather than inventing a value where the specification is silent), `eth_maxPriorityFeePerGas` (the minimum tip over the transactions this node would include, using the same `tip/2` the block builder selects on), `eth_getProof` (local trie only) and `eth_estimateGas` (a binary search for the least gas that does not run out). 53 tests in `eth_rpc_extra_tests`. Still outstanding:
   - `eth_createAccessList` — **not implemented**, and the blocker is named: `eth_state` and `eth_evm` do not record which accounts or storage slots an execution touched, so the access list cannot be produced at all, and EIP-2930's gas formula cannot be applied to a list that does not exist. Recording them means instrumenting the hot path of the EVM
   - `eth_getTransactionByBlockNumberAndIndex` now shares the same projection and answers the positional fields; noted here because it was the one that was silently wrong for as long as it existed — it returned a stored transaction with no `blockHash`, consistently, because `eth_getBlockByNumber` with `fullTransactions = false` omits exactly those fields for the same reason. Two methods wrong *together* is why no fixture could tell
@@ -551,7 +553,34 @@ Recorded because the documentation claimed otherwise, and because each of these 
   - `eth_getUncleByBlockHashAndIndex`, `eth_getUncleByBlockNumberAndIndex`
   - `eth_getUncleCountByBlockHash`, `eth_getUncleCountByBlockNumber`
   - `eth_getBaseFee`, `eth_getBlobBaseFee`, `eth_getChainId`
-- [ ] **EIP compliance** — EIP-1474 (`eth_feeHistory`) is **done**: the shape comes from `src/eth/fee_market.yaml` in `execution-apis`, not from EIP-1559, which specifies the base fee mechanism and never mentions the method. Three things in it are easy to get wrong and all three are load-bearing — `baseFeePerGas` carries one *more* entry than there are blocks (the next block's, derived from the newest returned block), `gasUsedRatio` carries one per block, so the two arrays are deliberately different lengths, and the ratio is a JSON *number* while every other value in the result is a quantity. EIP-2930 (access lists) is half done: EIP-2930 *transactions* are supported, the `eth_createAccessList` RPC is not. EIP-1898 (`eth_chainId`), EIP-712 (typed data signing) and EIP-2718 (typed transactions) are unchanged
+- [x] **The catch-all, and the three methods it was answering** — done, and it was the
+  item in this phase that mattered
+  - `eth_rpc_handler:dispatch/3` ended in `dispatch(_Method, Params, _State) -> proxy(_Method, Params)`,
+    so **the set of questions this node answered was larger than the set it could
+    answer**: a client asked this node something and was told the answer by a
+    different node, with nothing in the response saying so. The eight `eth_*` methods
+    were unexamined for exactly this reason; the rest of the namespace still was.
+  - It now **refuses** with `-32601` and a message naming the method. The deliberate,
+    documented fallbacks are unaffected and are not in that clause — `eth_getBalance`
+    proxied after a local miss, `eth_estimateGas` when the EVM is disabled — because a
+    fallback with a reason is different in kind from answering everything.
+  - **`eth_chainId`** now answers from `eth_fork_schedule:chain_id/0`, the same source
+    the EVM's `CHAINID` opcode reads, so the RPC surface and the opcode cannot drift.
+    It was answered by the catch-all, so the number described the operator's
+    `UPSTREAM_RPC_URL` rather than the chain this node executes. EIP-695 made it
+    mandatory and every client checks it at startup.
+  - **The six uncle methods** now answer locally as `0` and `null` (EIP-3675; this
+    chain merged at genesis, so every height has none). By hash they answer only for a
+    block this node holds and refuse otherwise, because a hash it does not hold may
+    name a pre-Merge block that really did carry uncles. A *short* hash is `not held`
+    rather than malformed, matching `eth_getBlockByHash/3`, which does not
+    width-check either.
+  - 8 tests in `eth_rpc_local_answers_tests`, all injection-verified. The proof that
+    an answer is local is a **dead upstream**: the client is pointed at a port nothing
+    listens on, so a method that still proxies fails to connect. A control test
+    asserts that a genuinely-proxying method *does* fail, without which every other
+    assertion in the module would be vacuous.
+- [ ] **EIP compliance** — the remainder — EIP-1474 (`eth_feeHistory`) is **done**: the shape comes from `src/eth/fee_market.yaml` in `execution-apis`, not from EIP-1559, which specifies the base fee mechanism and never mentions the method. Three things in it are easy to get wrong and all three are load-bearing — `baseFeePerGas` carries one *more* entry than there are blocks (the next block's, derived from the newest returned block), `gasUsedRatio` carries one per block, so the two arrays are deliberately different lengths, and the ratio is a JSON *number* while every other value in the result is a quantity. EIP-2930 (access lists) is half done: EIP-2930 *transactions* are supported, the `eth_createAccessList` RPC is not. EIP-1898 (`eth_chainId`), EIP-712 (typed data signing) and EIP-2718 (typed transactions) are unchanged
 
 ## Phase 7: Consensus Integration (7 tasks)
 - [ ] **Lighthouse integration** — test with Lighthouse (Rust, Sigma Prime): Engine API, `eth/68`, ForkID, Payload validation

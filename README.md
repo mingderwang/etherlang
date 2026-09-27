@@ -66,8 +66,8 @@ beacon, validators, or block production).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**644 tests, green**).
-* **Status** — v0.7.0; eunit green (644 tests) and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**652 tests, green**).
+* **Status** — v0.7.0; eunit green (652 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -535,6 +535,17 @@ Where the work actually stands:
 **On state roots.** etherlang can execute blocks and report a state root, but that root is **not known** to equal the one the network computed. Two distinct halves of "per-fork exact" are involved and only the first is done:
 
 - *Availability* — an instruction the executing fork does not have is now an exceptional halt that consumes the frame's whole allowance. Before this every clause in `eth_evm:do_op/3` was unconditional, so PUSH0 executed in a Paris block and TSTORE executed anywhere before Cancun, each returning *successfully* — a post-state no other client reproduces, produced without an error.
+- **The JSON-RPC catch-all answered every method, including the ones this node does not implement.**
+  `eth_rpc_handler:dispatch/3` ended in `proxy(_Method, Params)`, so the set of questions this node *answered* was
+  larger than the set it could *answer*: a client asked it something and was told the answer by a different node, with
+  nothing in the response to say so. The concrete hazard was `eth_chainId` — EIP-695 made it mandatory and every client
+  checks it at startup — which was answered from `UPSTREAM_RPC_URL`, so the number described the operator's
+  configuration rather than the chain this node executes. It now answers from `eth_fork_schedule:chain_id/0`, the same
+  source the EVM's `CHAINID` reads. The six uncle methods answer `0`/`null` locally (EIP-3675; this chain merged at
+  genesis), refusing a hash the node does not hold, because such a hash may name a pre-Merge block that really did
+  carry uncles. And the catch-all now **refuses** with `-32601` and the method's name, while the deliberate, documented
+  fallbacks — `eth_getBalance` after a local miss — are untouched, because a fallback with a reason is a different
+  thing from answering everything.
 - *A precompile call charged gas from the wrong pocket.* A CALL's `gas` argument is an allowance: a
   precompile's cost comes out of it and the remainder returns to the caller, so the caller pays exactly the
   cost. `eth_evm` charged the cost against the **caller's remaining gas** instead, and never returned the
