@@ -1,5 +1,7 @@
 -module(eth_header_tests).
 
+-export([sepolia_block/0]).
+
 -include_lib("eunit/include/eunit.hrl").
 
 %% A real Sepolia header (block 0xb2dd74) as returned by eth_getBlockByNumber
@@ -80,3 +82,49 @@ accessors_test() ->
     ?assertEqual(<<"0xaa8a87aa293f5c511e07e472ecaccac27188e68c37651e62158c4a4d6b783740">>,
                  eth_header:parent_hash(B)),
     ?assertEqual(16#b2dd74, eth_header:number(B)).
+
+%% ---------------------------------------------------------------------------
+%% `requestsHash` is the last header field, pinned by a real block
+%% ---------------------------------------------------------------------------
+%% EIP-7685 does not say where the field sits in the RLP list, so its position is not
+%% derivable from the EIP and has to come from somewhere else. It comes from the
+%% fixture above, which is a real Sepolia header -- block 11,722,100, timestamp
+%% 1,789,629,872, long past Sepolia's Prague activation -- carrying the field and
+%% claiming the real hash `0xd79af79...`.
+%%
+%% I removed the field from `eth_header:header_fields/0` once and made `hash/1` refuse
+%% a block carrying it, reasoning that appending it was an invented position. The
+%% fixture already in this file is what showed that to be a regression: appending the
+%% field **last** reproduces the real hash exactly. Refusing would have left this node
+%% unable to hash a real Prague block it had been getting right.
+%%
+%% I also read the field's value, `0xe3b0c442...`, as SHA-256 of nothing and therefore
+%% hand-entered. It is what the network reports, because with EIP-7251 there are no
+%% requests to commit to -- and `eth_getBlockByNumber` returns it verbatim. Both halves
+%% of that were checked against the RPC rather than against my reading of the EIP,
+%% which is the only reason the regression did not ship.
+
+requests_hash_is_the_last_header_field_and_says_so_against_a_real_block_test() ->
+    %% The fixture is a Prague header, so this exercises the twenty-first field and
+    %% not the Cancun twenty. The Cancun shape is covered by the test above, which is
+    %% what makes the two together an assertion about the *order* rather than about a
+    %% set of fields.
+    ?assertNotEqual(undefined, maps:get(<<"requestsHash">>, sepolia_block())),
+    ?assertNotEqual(undefined, maps:get(<<"parentBeaconBlockRoot">>, sepolia_block())),
+    ?assertEqual({ok, maps:get(<<"hash">>, sepolia_block())},
+                 eth_header:hex_hash(sepolia_block())),
+    ?assertMatch({ok, _}, eth_header:verify(sepolia_block())).
+
+a_cancun_shaped_block_has_twenty_fields_and_a_prague_one_twenty_one_test() ->
+    %% Removing `requestsHash` is what a Cancun header looks like, and its hash is
+    %% *not* the block's -- so the twenty-first field is load-bearing here, which is
+    %% the thing a set-membership test would have missed.
+    S = maps:remove(<<"requestsHash">>, sepolia_block()),
+    {ok, Hash} = eth_header:hash(S),
+    ?assertNotEqual(maps:get(<<"hash">>, sepolia_block()), hex0x(Hash)),
+    {ok, CancunFields} = eth_header:to_rlp_list(S),
+    {ok, PragueFields} = eth_header:to_rlp_list(sepolia_block()),
+    ?assertEqual(20, length(CancunFields)),
+    ?assertEqual(21, length(PragueFields)).
+
+hex0x(Bin) -> <<"0x", (string:lowercase(binary:encode_hex(Bin)))/binary>>.

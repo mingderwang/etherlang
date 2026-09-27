@@ -50,8 +50,26 @@ init({Name, Opts}) ->
                              0 -> 8551;
                              P -> P
                          end,
-            start_engine_api(EnginePort, HandlerOpts),
-            {ok, #st{listener = Name, tab = Tab}};
+            %% Propagated, and the failure is fatal. This used to log the error and
+            %% return `ok', and `init/1' ignored the answer anyway, so a node whose
+            %% Engine API port was already taken came up **reporting success** with the
+            %% Engine API silently absent. Everything else in this `case' treats a
+            %% listener failure as `{stop, Reason}', and a consensus client that cannot
+            %% reach the Engine API does not degrade — it fails the node, a slot later,
+            %% with a connection refusal the operator has to correlate back to one log
+            %% line among the startup noise.
+            %%
+            %% Note what this does *not* change: a node with no JWT secret still
+            %% starts, because that is a 503 from the handler, not a listener failure.
+            %% Refusing to serve is the point of that scheme; refusing to boot would be
+            %% a different and much worse answer to it.
+            case start_engine_api(EnginePort, HandlerOpts) of
+                ok ->
+                    {ok, #st{listener = Name, tab = Tab}};
+                {error, EngineReason} ->
+                    _ = try cowboy:stop_listener(Name) catch _:_ -> ok end,
+                    {stop, {engine_api, EngineReason}}
+            end;
         {error, Reason} ->
             {stop, Reason}
     end.
@@ -72,7 +90,7 @@ start_engine_api(Port, HandlerOpts) ->
             ok;
         {error, Reason} ->
             logger:error("etherlang: Engine API failed to start: ~p", [Reason]),
-            ok
+            {error, Reason}
     end.
 
 handle_call(_Req, _From, S) -> {reply, {error, unknown_call}, S}.

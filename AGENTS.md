@@ -431,7 +431,7 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
 | Item | Why |
 |------|-----|
 | `eth_kzg:blob_to_kzg_commitment/1` | Needs the `g1_lin` derivation; no local blob fixture, and the EIP-4844 vector fetch 404'd. |
-| EIP-7685 `requestsHash` | Hashing rule sourced, but the EIP does not fix the header field position, and without EIP-7251 there are no requests. |
+| EIP-7685 `requestsHash` | The EIP does not fix the header field position, and without EIP-7251 there are no requests. **The position is pinned rather than open**: it is the last field, and that is verified against Sepolia block 11,722,100, a real Prague header whose claimed hash `0xd79af79...` is reproduced exactly by appending the field last. See §11. |
 | `TERMINAL_BLOCK_HASH` (EIP-3675) | Chain-config data, not in the EIP. Carried and echoed, never checked against a post-Merge block's difficulty. |
 | Per-fork gas *price* wiring | Done. One owner of every price; the interpreter's duplicate table is deleted. SSTORE included (EIP-2200, Berlin and later). |
 | `eth_tx:intrinsic_gas/1` fork-awareness | Takes no fork and falls back to the operator's `ETH_FORK` pin. Correct for pool admission, where no block exists; wrong for `eth_call`/`eth_estimateGas` and block execution, which pass the block's own fork through `intrinsic_gas/2`. Do not use the one-argument form where a block is in hand. |
@@ -464,8 +464,22 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
   its qualified name. It used to report `baseFeePerGas` as `0x0` on a header with no
   such field, and a zero there is a value a consensus client reads as an answer.
   Absent fields are now absent.
-- `eth_header:header_fields/0` lists `requestsHash`, which is not a header field.
-  Inert, because upstream block JSONs do not carry it.
+- `eth_header:header_fields/0` lists `requestsHash` **last**, which is correct and was
+  nearly "fixed" into a regression. EIP-7685 does not state where the field sits in the
+  RLP list, so I removed it and made `eth_header:hash/1` refuse a block carrying it —
+  on the reasoning that appending was an invented position. The real Sepolia header
+  already committed in `eth_header_tests:sepolia_block/0` is a Prague block, carries
+  the field, and claims the real hash; appending last reproduces it exactly, so the
+  refusal would have left this node unable to hash a real Prague block it had been
+  getting right. Two further mistakes in the same reasoning: I read the field's value
+  `0xe3b0c442...` as SHA-256 of nothing and therefore hand-entered, when it is what
+  the network reports (with EIP-7251 there are no requests to commit to) and
+  `eth_getBlockByNumber` returns it verbatim; and I read the fixture's timestamp as
+  pre-Prague, when 1,789,629,872 is long past Sepolia's Prague activation.
+  The rule this follows is §4.2's — a value that cannot be derived is pinned by a test
+  against real data — and the point is that the pin already existed and I read past
+  it. `requestsHash` was never "inert because upstream JSONs do not carry it": upstream
+  JSONs **do** carry it, from Prague on.
 - `eth_rpc_server:start_engine_api/2` still swallows a listener failure
   (`{error, Reason} -> logger:error(...), ok`).
 - `eth_block:run_transaction/5` is exported for the conformance runner. It is not
