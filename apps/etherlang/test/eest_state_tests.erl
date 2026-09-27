@@ -89,7 +89,77 @@
 -include("eth_block.hrl").
 
 -export([corpus/0, committed/0, entries/0, entries/1, outcomes/0,
-         tally/1, report/0, report/1]).
+         tally/1, report/0, report/1, survey/1, survey/0, files/1]).
+
+%% A streaming pass over a corpus: the tally, a per-fork breakdown, a histogram of
+%% the gas deltas, and a bounded sample of the divergences.
+%%
+%% `entries/1' builds a list of every result *and* keeps every detail map alive,
+%% which is fine for the 266-entry committed subset and hopeless for the full
+%% 2,681-file suite: the run spent over an hour at 100% CPU in `erts_bor', the
+%% garbage collector, because the detail maps -- one per state mismatch, each
+%% holding a diff list and a gas story -- were all retained simultaneously. The
+%% arithmetic never closed because nothing was ever going to.
+%%
+%% So this folds instead of collecting. Nothing here needs the whole result set: the
+%% tally is a fold, the per-fork counts are a fold, the histogram is a fold, and the
+%% only thing worth keeping verbatim is a sample of divergences, which is bounded by
+%% construction. Peak memory is one fixture's decoded JSON rather than the corpus's.
+-spec survey(file:filename_all()) -> map().
+survey(Root) ->
+    with_mainnet(
+      fun() ->
+              eth_test_util:with_local_reads(
+                fun() ->
+                        Files = files(Root),
+                        lists:foldl(fun file_survey/2, initial_survey(length(Files)),
+                                   Files)
+                end)
+      end).
+
+initial_survey(N) ->
+    #{files => N, total => 0, tally => maps:from_list([{O, 0} || O <- outcomes()]),
+      by_fork => #{}, gas => #{}, sample => [], sample_limit => 40}.
+
+%% Fold one file's results in. Reversed so the accumulated list stays cheap.
+file_survey(File, Acc) ->
+    lists:foldl(fun(R, A) -> survey_one(R, A) end, Acc, file_entries(File)).
+
+survey_one({Key, Outcome, Detail, _File} = R, Acc) ->
+    #{total := T, tally := Tl, by_fork := Bf, gas := G, sample := S,
+      sample_limit := Lim} = Acc,
+    Fork = fork_of_key(Key),
+    Acc1 = Acc#{total => T + 1,
+                tally => maps:update_with(Outcome, fun(N) -> N + 1 end, 1, Tl),
+                by_fork => maps:update_with(Fork,
+                                           fun(N) -> [{Outcome, N} | N] end,
+                                           [{Outcome, 1}], Bf),
+                gas => add_gas_delta(G, Outcome, Detail)},
+    Acc2 = case Outcome =:= match orelse length(S) >= Lim of
+               true -> Acc1;
+               false -> Acc1#{sample => [R | S]}
+           end,
+    Acc2.
+
+%% Only deltas in the schedule-sized range are histogrammed. The whole-allowance
+%% ones -- a frame that burned its limit against a fixture that did not -- say
+%% that something is wrong and nothing about which rule, and there are thousands of
+%% them; keeping them drowns the ones that name a constant.
+add_gas_delta(G, Outcome, #{gas := #{delta := D}})
+  when is_integer(D), Outcome =:= state_mismatch, abs(D) =< 100000 ->
+    maps:update_with(D, fun(N) -> N + 1 end, 1, G);
+add_gas_delta(G, _Outcome, _Detail) -> G.
+
+%% The corpus's files, as a list. Split out because `entries/1' and `survey/1' both
+%% need it and the `**' detail is worth saying once.
+-spec files(file:filename_all()) -> [file:filename()].
+files(Root) ->
+    %% `**' rather than `*': the corpus is nested fork/suite/file, so a
+    %% single-level wildcard finds nothing and reports a zero total, which reads
+    %% as "everything passes" rather than as "nothing was run".
+    filelib:wildcard(filename:join([Root, "**", "*.json"])).
+
+survey() -> survey(corpus()).
 
 %% ---------------------------------------------------------------------------
 %% The corpus

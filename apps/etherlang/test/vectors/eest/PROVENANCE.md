@@ -52,9 +52,23 @@ erl -pa _build/default/lib/*/ebin -pa _build/test/lib/etherlang/test \
     -s eest_report main /tmp/eest/fixtures/state_tests
 ```
 
-`eest_report` prints the tally, the breakdown by fork, a histogram of the gas
-deltas, and the divergences by suite. It needs `ETH_NETWORK=mainnet`, which it sets
-itself: the fork schedule is mainnet's, and the fixtures declare chain id 1.
+`eest_report` prints the tally, the breakdown by fork, a histogram of the
+schedule-sized gas deltas, and a bounded sample of the divergences. It needs
+`ETH_NETWORK=mainnet`, which it sets itself: the fork schedule is mainnet's, and the
+fixtures declare chain id 1.
+
+**It folds rather than collects, and that is load-bearing.** The first version
+gathered every result into a list and kept every detail map alive — one per state
+mismatch, each holding a diff list and a gas story. Over the full suite that is
+tens of thousands of retained maps, and the run spent **over an hour at 100% CPU
+inside `erts_bor`**, the garbage collector, without finishing a single fork. It was
+not slow; it was not going to finish. `eest_state_tests:survey/1` folds instead:
+the tally, the per-fork counts and the histogram are all folds, and only a bounded
+sample of divergences is kept. Peak memory is one fixture's decoded JSON.
+
+The non-`static` suites are the practical full run — 235 files, 188 MB, and they
+cover every EIP-named suite upstream has. The `static/` directory is 315 MB of
+legacy VMTests and is where the time goes.
 
 ## The numbers are reproducible, and getting there found two harness bugs
 

@@ -141,6 +141,19 @@ behavioural change per commit, and each step says what it now does.
      fixture stored **0** where the specification says **1** — and a CALL forwarding
      *more* was charged the whole forwarded amount on top of the cost. The fixture's
      delta fell from **+550 to +400**.
+   - **What the remaining 400 actually is, and it is not what I first assumed.** The
+     contract's slot 0 holds `0xdeadbeef` in the pre-state and `1` in the expected
+     post-state, so the `SSTORE` is a write over a **non-zero** slot: EIP-2200
+     clause (2.1.2), `SSTORE_RESET_GAS` = 2,900, with no clear refund because the
+     new value is not 0. I had been reading it as a 0 → 1 create at 20,000, which
+     is why the arithmetic never closed. The frame's costs are
+     `21` (seven `PUSH1`) `+ 2,600` (cold `CALL` to the precompile)
+     `+ 150` (ECADD) `+ 2,900` (the reset) = **5,671**; this node spends **5,674**;
+     the fixture expects **5,274**. Both the sender's balance and the coinbase's
+     independently give 26,274, so the figure is not an artefact of how the runner
+     recovers gas. So there are two separate gaps: **3 gas** between this node and
+     the plain sum of the rules, and **397 gas** between the plain sum and the
+     fixture, which matches no constant in `eth_fork_schedule`. **Unresolved.**
    - **`-1` gas, 3 fixtures, `prague/eip7623_increase_calldata_cost`, the
      `exact_gas` cases.** A one-gas shortfall, on tests whose whole subject is
      hitting an exact gas figure. **Unresolved.**
