@@ -185,11 +185,18 @@ outcomes() ->
      ?REJECT_NOT_RAISED, ?REJECT_MISMATCH, ?FORK_UNREACHABLE, ?CRASH,
      ?NO_POST, ?BAD_FIXTURE].
 
+%% Every outcome, always, including the ones that did not occur.
+%%
+%% Counting only what was seen makes the map's *shape* a function of the corpus,
+%% so a report diff between two runs has to be read against "which keys are
+%% missing" as well as "which counts moved", and an absent key is indistinguishable
+%% from a key that was never possible. Seeding all of them costs nothing and makes
+%% two tallies comparable by value.
 tally(Results) ->
     lists:foldl(fun({_Key, Outcome, _Detail, _File}, Acc) ->
                     maps:update_with(Outcome, fun(N) -> N + 1 end, 1, Acc)
                 end,
-                #{},
+                maps:from_list([{O, 0} || O <- outcomes()]),
                 Results).
 
 %% ---------------------------------------------------------------------------
@@ -224,7 +231,55 @@ entries(Root) ->
     %% A test that does this does not fail, it *hangs*, and EUnit reports a hang
     %% as a cancelled test -- so the symptom is a suite quietly losing tests.
     WithLocal = fun() -> lists:sort(lists:append([file_entries(F) || F <- Files])) end,
-    eth_test_util:with_local_reads(WithLocal).
+    with_mainnet(WithLocal).
+
+%% Run against mainnet's fork schedule, and own that decision rather than leaving
+%% it to the caller.
+%%
+%% Two reasons, and the second is the one that actually cost reproducibility.
+%%
+%% The fork schedule is mainnet's: its block-numbered activations are the ones a
+%% fixture fork name can be mapped onto, and `ETH_NETWORK` is how the runner picks
+%% them. But `eth_fork_schedule:chain_id/0` reads the same variable, and the
+%% fixtures declare `config.chainid: 0x01` -- chain 1, which is mainnet's. Left at
+%% the default the variable is `sepolia`, whose chain id is 11155111, so the node
+%% answered under a chain the fixture is not on.
+%%
+%% The tally moved when this was found, and it moved *differently in different
+%% places*: five EIP-1559 validity fixtures flipped from `expected_rejection_not_
+%% raised' to `rejection_mismatch', because the validator rejects a transaction
+%% from the wrong chain -- correctly -- and so stopped being evidence of the bug
+%% they were evidence of. `homestead/coverage' moved too, on `CHAINID'. A harness
+%% that sets up its own preconditions and then lets the ambient environment pick
+%% the rest is not a harness.
+with_mainnet(Fun) ->
+    Previous = os:getenv("ETH_NETWORK"),
+    os:putenv("ETH_NETWORK", "mainnet"),
+    try Fun()
+    after
+        case Previous of
+            false -> os:unsetenv("ETH_NETWORK");
+            _ -> os:putenv("ETH_NETWORK", Previous)
+        end
+    end.
+
+%% Every state this module builds reads from `empty': an account or slot the
+%% fixture does not declare does not exist, and says so.
+%%
+%% It used to read from the local MPT via `with_local_reads', and that made the
+%% conformance figure depend on what the rest of the test run had left in the trie.
+%% A storage slot that a fixture's code reads but never declares is not knowable
+%% without executing the code, so no amount of seeding removes it. `empty' removes
+%% the dependency instead of reducing it: the answer is now a property of the
+%% fixture, so the tally is reproducible.
+%%
+%% The process-wide `mpt' is still set underneath, and that is deliberate belt and
+%% braces rather than redundancy. `empty' is carried on the state term, so it
+%% covers every read that takes one; `with_local_reads' covers a read that somehow
+%% does not, and turns what would be an HTTP request to a public Sepolia node into
+%% a local answer. The second is a safety net, not the mechanism.
+state_for(Entry, Post) ->
+    eth_state:with_base_source(state(Entry, Post), empty).
 
 file_entries(File) ->
     case read_fixture(File) of
@@ -351,7 +406,7 @@ run_tx(Fork, Tx, Entry, Post) ->
 
 expect_rejection(Fork, Tx, Entry, Expected) ->
     Block = block(Fork, Entry),
-    State = state(Entry, #{}),
+    State = state_for(Entry, #{}),
     case eth_tx:validate(Tx, validation_ctx(Block, State)) of
         {error, _Reason} -> {?REJECT_MISMATCH, {expected, Expected}};
         ok -> {?REJECT_NOT_RAISED, {expected, Expected}}
@@ -503,7 +558,7 @@ fork_of_block(Block) ->
 
 execute(Fork, Tx, Entry, Post) ->
     Block = block(Fork, Entry),
-    PreState = state(Entry, Post),
+    PreState = state_for(Entry, Post),
     {Block1, State1} = eth_block:run_transaction(Block, Tx, PreState,
                                                   base_fee_for(Fork),
                                                   Block#block.gas_limit),

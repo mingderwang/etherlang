@@ -56,23 +56,31 @@ erl -pa _build/default/lib/*/ebin -pa _build/test/lib/etherlang/test \
 deltas, and the divergences by suite. It needs `ETH_NETWORK=mainnet`, which it sets
 itself: the fork schedule is mainnet's, and the fixtures declare chain id 1.
 
-## The numbers are not reproducible, and that is stated everywhere they appear
+## The numbers are reproducible, and getting there found two harness bugs
 
-The tally **depends on what else the test run did first**, and the reason is
-specific. `eth_state:storage/3` and `balance/2` answer from the transaction overlay
-and fall through to `base_source` for anything absent. The conformance run sets
-`base_source` to the local MPT — which is what stops a unit test from fetching over
-HTTP — and the local MPT is process-wide and shared with every other test.
+They were not at first. The tally drifted between runs of identical code — 5, 6, 7
+and 2 were all observed — and one run scored *higher* than a clean VM because a
+fixture was passing on an account another test had left in the store, which is worse
+than flakiness because it is a wrong answer that looks right. Two independent causes:
 
-A storage slot that the fixture's code reads but never declares therefore reads
-whatever another test left in the store. Measured: **6** matches in a fresh VM,
-**7** under eunit, and **2** on a later eunit run, same code both times.
+1. **A storage read the fixture does not declare.** `eth_state:storage/3` and
+   `balance/2` answer from the transaction overlay and fall through to `base_source`
+   for anything absent, which under `with_local_reads` is the process-wide local MPT.
+   Seeding every address and slot the fixture mentions removes most of it — and is
+   done regardless, because it is correct — but it cannot remove the rest: a slot the
+   code reads and never writes is not knowable without executing the code.
+   `eth_state:with_base_source/2` removes the dependency instead of reducing it. The
+   runner gives every state it builds the new `empty` base, so an undeclared account
+   or slot reads as *does not exist*.
 
-Seeding every address the fixture mentions (`pre`, post-state, sender, destination,
-coinbase) and every slot the post-state names removes most of it, and is done
-anyway because it is correct regardless. It cannot remove the rest: a slot the code
-reads and never writes is not knowable without executing the code.
+2. **The runner inherited `ETH_NETWORK` from its caller.** The report tool set it;
+   the in-suite path did not, so it ran the corpus under Sepolia's chain id
+   (11155111) against fixtures declaring chain 1. The runner now owns it and
+   restores it afterwards. This one is worth reading twice: it made the validator
+   *correctly reject* five EIP-1559 transactions from the wrong chain, which
+   reclassified them from `expected_rejection_not_raised` — this node admits
+   something invalid — to `rejection_mismatch`, which reads like the node being
+   right. **The harness was suppressing the exact finding it was added to make.**
 
-So the tally is **reported, not asserted**, and `eest_conformance_tests` pins only
-what does not move. Giving the runner an isolated state base is a task in
-`TASKS.md`, not a footnote.
+With both fixed, the tally is identical per entry from a fresh VM and from inside
+the suite, and `eest_conformance_tests` pins it both exactly and as a bound.

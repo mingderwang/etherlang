@@ -79,11 +79,12 @@ behavioural change per commit, and each step says what it now does.
 5. ~~**EEST conformance work.**~~  **Done as far as it can be, and the answer is
    bad.** `apps/etherlang/test/eest_state_tests.erl` runs the `execution-spec-tests`
    `state_tests` corpus against this node's state transition and classifies every
-   entry. **About 5 to 7 of 266 committed entries match — roughly 2%.** Nothing in
-   this repository had ever been measured against a third party's expected results
-   before; the opcode table was cross-checked against instruction *counts* and the
-   gas schedule was derived from the EIPs, and a schedule can be wrong in both of
-   those senses and still self-consistent.
+   entry. **5 of 266 committed entries match — 1.9% — and the figure is
+   reproducible**, identical per entry from a fresh VM and from inside the suite.
+   Nothing in this repository had ever been measured against a third party's
+   expected results before; the opcode table was cross-checked against instruction
+   *counts* and the gas schedule was derived from the EIPs, and a schedule can be
+   wrong in both of those senses and still self-consistent.
    - What the corpus found, immediately and without any new code being written for
      it: the node **accepts a type-2 (EIP-1559) transaction at a pre-London fork**,
      which the specification rejects — 5 entries, and the worst kind of divergence
@@ -95,24 +96,35 @@ behavioural change per commit, and each step says what it now does.
      is one transaction's effects, and `finalize/1` cannot serve the runner because
      it resolves the parent's state root through `eth_chain` and then requires the
      local MPT to *hold* that root.
-   - **The figure is not reproducible, and that is the next task.** It drifts
-     between runs of the same code — 5, 6, 7 and 2 were all observed — because a
-     storage slot that the fixture's code reads but never declares falls through
-     to `base_source`, which the run points at the local MPT, which is
-     process-wide and shared with the rest of the suite. Seeding everything the
-     fixture mentions removes most of it and is done anyway; the remainder needs an
-     **isolated state base for the runner**, which is a change to how `eth_state`
-     resolves a missing key. Until that exists the tally is reported and not
-     asserted, and `eest_conformance_tests` pins only what does not move.
+   - **Getting the figure to be reproducible found two harness bugs, and one of them
+     was hiding the defect the corpus was added to find.**
+     - A storage slot the fixture's code reads but never declares falls through
+       `eth_state`'s process-wide `base_source` to the local MPT, which is shared
+       with the rest of the suite. Seeding cannot fix it — the slot is not knowable
+       without executing the code. `eth_state:with_base_source/2` now lets a state
+       term carry its own base, and the runner uses a new `empty` source, so an
+       undeclared account or slot reads as *does not exist*.
+     - **The runner inherited `ETH_NETWORK` from its caller.** The eunit path
+       therefore ran the corpus under Sepolia's chain id, 11155111, against
+       fixtures declaring chain 1. Five EIP-1559 validity fixtures flipped from
+       `expected_rejection_not_raised` to `rejection_mismatch` — because the
+       validator correctly rejects a transaction from the wrong chain, so the
+       harness had been suppressing exactly the finding it was written to make. A
+       harness that sets up its own preconditions and then lets the ambient
+       environment choose the rest is not a harness.
    - 25 of upstream's 2,681 files are committed (1.2 MB, one per suite, the
      smallest in each). `PROVENANCE.md` beside them records the release, the rule
      the subset was chosen by, and the command for the full 503 MB run.
-6. **An isolated state base for the conformance runner**  *(next)*. See item 5: the
-   tally cannot be asserted while a storage read the fixture does not declare can
-   reach the process-wide MPT. Two thirds of the reported divergences are
-   `state_mismatch', so the runner is worth trusting; it is the *denominator* that
-   is unstable, and an unstable denominator is the one thing a conformance figure
-   must not have.
+6. ~~**An isolated state base for the conformance runner.**~~  **Done**, as
+   `eth_state:with_base_source/2` and its new `empty` source. See item 5. The tally
+   is now assertable and is asserted, exactly and as a bound.
+7. **Block-level conformance**  *(next)*. The corpus above is state transitions.
+   EEST's `blockchain_tests` and the Ethereum Foundation's own `ethereum/tests`
+   exercise what a state test cannot: state roots, receipts roots, logs blooms and
+   block headers, over multi-block forks and transitions. Two thirds of the current
+   divergences are `state_mismatch`, so fixing those comes first -- but a node that
+   cannot produce a block another client would accept has not been measured at all,
+   and that is the measurement Lighthouse actually cares about.
 
 ### Deliberately later: the rest of the Engine API
 

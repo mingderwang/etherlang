@@ -103,6 +103,16 @@ values:
 - `upstream` — read-only, lazily fetched over RPC. The default.
 - `mpt` — the local trie. **The only source a commitment may be taken from.**
 
+A *state term* may carry its own base via `eth_state:with_base_source/2`, which adds
+a third value:
+
+- `empty` — nothing else exists. An account or slot the caller did not put there
+  reads as zero. Its only caller is the conformance runner, and it is named here so
+  that is not a surprise: a state built from a fixture is complete, and answering
+  for a key it omits from the shared trie is silently wrong rather than loudly
+  absent. The process-wide value is still the default, so nothing relying on it
+  moves — this is an addition, not a replacement.
+
 Only a write under `mpt` is a real commitment. `eth_block:finalize/1` switches
 to `mpt`, executes, and restores it in a `finally`. **If you add a path that
 computes or reports a root, it must set `mpt` first** — a root computed over the

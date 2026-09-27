@@ -43,6 +43,26 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+%% The tally, now that it is reproducible.
+%%
+%% It was not, and the reason is the more useful half of this module's history. Two
+%% independent causes, both fixed: a storage read a fixture's code performs but does
+%% not declare fell through to a process-wide MPT (now `eth_state:'empty''), and
+%% the runner inherited `ETH_NETWORK` from its caller, so the eunit path ran the
+%% corpus under Sepolia's chain id against fixtures declaring chain 1. Between them
+%% the figure drifted between 2 and 7 across runs of identical code.
+-define(EXPECTED, #{match => 5,
+                    state_mismatch => 249,
+                    tx_decode_failed => 4,
+                    tx_roundtrip_mismatch => 0,
+                    sender_mismatch => 0,
+                    expected_rejection_not_raised => 5,
+                    rejection_mismatch => 0,
+                    fork_unreachable => 3,
+                    crash => 0,
+                    no_post_for_fork => 0,
+                    unreadable_fixture => 0}).
+
 %% The traversal needs a long timeout. EUnit's default is five seconds; the subset
 %% is 266 entries and each recovers an ECDSA public key over this node's own
 %% secp256k1, which is bignum arithmetic, about 6.5 seconds for the subset. The
@@ -76,7 +96,19 @@ conformance_tally_is_reported() ->
                     not lists:member(O, eest_state_tests:outcomes())],
     ?assertEqual([], Unknown),
     assert_not_mostly_matching(Results),
-    assert_unreachable_are_reported(Results).
+    assert_unreachable_are_reported(Results),
+    ?assertEqual(?EXPECTED, eest_state_tests:tally(Results)).
+
+
+
+%% The headline claim, as a bound as well as a figure.
+%%
+%% `?EXPECTED' pins the number. This pins the *claim*, and it earns its place
+%% because it fails differently: the exact count is a fact about this corpus on this
+%% day, and a fixture moving from `state_mismatch' to `match' would change the count
+%% without changing the finding. This fails if the runner ever stops comparing at
+%% all -- the failure that would leave every other assertion here passing while the
+%% tally read as total conformance.
 
 %% The headline claim, as a bound rather than a figure.
 %%

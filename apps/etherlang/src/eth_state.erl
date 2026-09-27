@@ -16,6 +16,7 @@
 -export([new/2, overrides_from_json/1,
          account/2, balance/2, nonce/2, code/2, storage/3, exists/2,
          set_balance/3, set_nonce/3, set_code/3, set_storage/4,
+         with_base_source/2,
          mark_created/2, is_created/2, set_destroyed/2, drop_if_empty/2, empty/2,
          commit/1, base_source/0, set_base_source/1,
          chain_id/0, address/1, address_hex/1, hex_to_bin/1]).
@@ -228,6 +229,33 @@ set_base_source(Source) when Source =:= mpt; Source =:= upstream ->
     application:set_env(etherlang, eth_state_base_source, Source),
     ok.
 
+%% Which base a *particular* state reads from.
+%%
+%% `base_source/0' is process-wide, and that is the trap this module's own
+%% documentation keeps warning about: one caller's test changes where every other
+%% reader looks. The process-wide value is still the default, so nothing that
+%% relies on it moves, but a state term may now carry its own answer and this is
+%% what reads it.
+%%
+%% `with_base_source/2` exists because two of the three sources are *lies* for some
+%% caller and only the caller can tell which. `upstream` is a lie for a block this
+%% node does not have. `mpt` is a lie for a state the caller built itself and
+%% declared complete -- and a lie that is silently wrong rather than loudly absent,
+%% because the trie answers for keys the caller never meant to include. The
+%% conformance runner is that caller: it builds a pre-state out of a fixture and an
+%% account or slot the fixture's code touches without declaring is not in the
+%% fixture, so the correct answer for it is "does not exist". Under `mpt` the
+%% answer came from whatever the rest of the test run had left in the trie, which
+%% made the same corpus and the same code score differently from run to run.
+source_of(State) ->
+    maps:get(base_source, State, base_source()).
+
+-spec with_base_source(map(), empty | mpt | upstream) -> map().
+with_base_source(State, Source) when Source =:= empty;
+                                   Source =:= mpt;
+                                   Source =:= upstream ->
+    State#{base_source => Source}.
+
 block(#{block := B}) -> B.
 
 %% Each base read dispatches on base_source/0 directly. Doing it per quantity
@@ -235,25 +263,29 @@ block(#{block := B}) -> B.
 %% -- the point of the split is that they are genuinely different, and a reader
 %% should be able to see both without jumping to another function.
 base_balance(State, A) ->
-    case base_source() of
+    case source_of(State) of
+        empty -> 0;
         mpt -> mpt_default(mpt_balance(A), 0);
         upstream -> upstream_balance(block(State), A)
     end.
 
 base_nonce(State, A) ->
-    case base_source() of
+    case source_of(State) of
+        empty -> 0;
         mpt -> mpt_default(mpt_nonce(A), 0);
         upstream -> upstream_nonce(block(State), A)
     end.
 
 base_code(State, A) ->
-    case base_source() of
+    case source_of(State) of
+        empty -> <<>>;
         mpt -> mpt_default(mpt_code(A), <<>>);
         upstream -> upstream_code(block(State), A)
     end.
 
 base_storage(State, A, Slot) ->
-    case base_source() of
+    case source_of(State) of
+        empty -> 0;
         mpt -> mpt_storage(A, Slot);
         upstream -> upstream_storage(block(State), A, Slot)
     end.

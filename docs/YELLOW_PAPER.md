@@ -1,6 +1,6 @@
 # etherlang — design and current state
 
-**Status**: v1.0 in progress. 632 eunit tests, green.
+**Status**: v1.0 in progress. 638 eunit tests, green.
 
 This document describes what the node *is* and what it is *becoming*: the system
 model, the trust assumptions, the data structures, and — at least as important —
@@ -409,17 +409,28 @@ which needed any new code to surface:
   worst category there is;
 - `eth_tx:from_rlp/1` **has no clause for an EIP-7702 (type 4) transaction**.
 
+**The figure is reproducible, and getting it there was two harness bugs.** It
+drifted at first — 5, 6, 7 and 2 across runs of identical code — for two
+independent reasons. A storage slot a fixture's code reads but never declares fell
+through to a process-wide MPT shared with the rest of the suite, and the runner
+inherited `ETH_NETWORK` from its caller, so the in-suite run answered under
+Sepolia's chain id against fixtures declaring chain 1. The second is the one worth
+remembering: it made the validator *correctly reject* five EIP-1559 transactions
+from the wrong chain, which reclassified them from "this node admits something
+invalid" to "this node rejects it" — the harness suppressing the exact finding it
+was added to make.
+
 The 2% is not a rounding of a good number. It says the EVM and the transaction
 wrapper are broadly not yet conformant, and that every state root this node has
 ever computed was computed by code that disagrees with the specification on the
 large majority of transactions it is given. That is a more useful sentence than the
 one this document used to carry.
 
-**The figure is not reproducible and is not asserted.** It drifts between runs of
-the same code, because a storage read a fixture's code performs but does not
-declare falls through to a process-wide MPT shared with the rest of the suite. A
-pinned conformance number whose expected value flips is worse than no number, so
-the tally is reported and the regression fence pins only what does not move.
+The figure is pinned by the suite, both exactly and as a bound, because it is now
+reproducible. It was briefly not, and the episode is the argument for checking
+whether a number can be asserted before asserting it: a pinned conformance figure
+whose expected value flips between runs is worse than no figure, because it gets
+read as a certificate.
 
 Not covered: EEST's `blockchain_tests` and the Ethereum Foundation's own
 `ethereum/tests`. This is a state-transition measurement, not a block-level one.
