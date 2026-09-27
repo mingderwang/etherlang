@@ -666,6 +666,9 @@ history_get(QueryNumber, AtBlockNumber, State) ->
             coinbase => <<0:160>>, prevrandao => <<0:256>>,
             gas_limit => 0, base_fee => 0,
             chain_id => eth_fork_schedule:chain_id(),
+            %% Prague: EIP-2935's history contract exists from Prague, and the
+            %% frame runs under the fork that deployed it.
+            fork => prague,
             state => State},
     case eth_evm:run(?HISTORY_RUNTIME, Msg, State, Env, 30000000) of
         {ok, Out, _Gas, _St, _Logs} -> {ok, Out};

@@ -6,7 +6,12 @@
                value => 0, data => <<>>, gas_price => 0, static => false, depth => 0}).
 
 -define(STATE, (eth_state:new(0, #{{store, <<0:160>>, 0} => 0}))).
--define(ENV, #{}).
+%% eth_evm:run/5 requires the fork the frame executes under: an instruction the
+%% fork does not have is an exceptional halt, not a cheap one. Every test in
+%% this module states which fork it means rather than leaving it out, because
+%% the interpreter now has no opinion of its own to fall back on. Cancun is the
+%% newest fork this node's chain has reached.
+-define(ENV, #{fork => cancun}).
 -define(GAS, 1000000).
 
 add_return_test() ->
@@ -60,7 +65,7 @@ block_env_test() ->
     Code = <<16#42, 16#60,0, 16#52, 16#60,32, 16#60,0, 16#F3>>,
     Msg0 = ?MSG0,
     Msg = Msg0#{data => <<>>},
-    Env = #{timestamp => 12345},
+    Env = #{timestamp => 12345, fork => cancun},
     {ok, Out, _Gas, _St, []} = eth_evm:run(Code, Msg, ?STATE, Env, ?GAS),
     ?assertEqual(12345, binary:decode_unsigned(Out)).
 
@@ -408,7 +413,7 @@ blobhash_costs_20_test() ->
 %% cannot be moved by choosing a base fee.
 basefee_cost_does_not_depend_on_the_value_test() ->
     {ok, _, Absent, _, _} = eth_evm:run(<<16#48, 16#00>>, ?MSG0, ?STATE, ?ENV, ?GAS),
-    Env = #{base_fee => 1000000000},
+    Env = #{base_fee => 1000000000, fork => cancun},
     {ok, _, Present, _, _} = eth_evm:run(<<16#48, 16#00>>, ?MSG0, ?STATE, Env, ?GAS),
     ?assertEqual(Absent, Present),
     ?assertEqual(?GAS - 20, Present).
@@ -769,3 +774,183 @@ created_address(create2, _Nonce, Init) ->
     <<_:12/binary, Addr:20/binary>> =
         eth_keccak:hash(<<16#FF, ?CALLER/binary, 0:256, H/binary>>),
     Addr.
+
+%% ---------------------------------------------------------------------------
+%% Opcode availability by fork
+%% ---------------------------------------------------------------------------
+%%
+%% An instruction the executing fork does not have is an exceptional halt that
+%% consumes the frame's whole allowance. These tests are the interpreter's half of
+%% the pin; eth_fork_schedule_tests holds the table's half.
+
+%% PUSH0 is Shanghai's (EIP-3855). Before it, the byte is not a cheap way to push
+%% zero -- it is a halt. The frame below is `PUSH0, PUSH1 2, PUSH1 0, RETURN', so
+%% under pre-Shanghai rules it must not return two zero bytes; it must halt.
+%%
+%% RETURN takes the offset on top and the length below it, so the length is pushed
+%% first. The other way round returns nothing at all and the assertion below would
+%% pass at Shanghai for the wrong reason.
+push0_is_an_exceptional_halt_before_shanghai_test() ->
+    Code = <<16#5F, 16#60, 2, 16#60, 0, 16#F3>>,
+    [?assertMatch({error, {undefined_opcode, 16#5F}, _, _},
+                  eth_evm:run(Code, ?MSG0, ?STATE, #{fork => F}, ?GAS))
+     || F <- [frontier, homestead, byzantium, constantinople, petersburg,
+              istanbul, berlin, london, merge, paris]].
+
+push0_runs_from_shanghai_on_test() ->
+    Code = <<16#5F, 16#60, 2, 16#60, 0, 16#F3>>,
+    [?assertMatch({ok, <<0, 0>>, _, _, _},
+                  eth_evm:run(Code, ?MSG0, ?STATE, #{fork => F}, ?GAS))
+     || F <- [shanghai, cancun, prague, osaka, amsterdam]].
+
+%% The Cancun additions, each of which the interpreter used to run in every fork
+%% because every clause in do_op/3 is unconditional. TLOAD is the cheapest to see:
+%% `TSTORE 0, 7, TLOAD 0, PUSH1 0, RETURN' returns the value it just stored, and
+%% before Cancun it must halt on the TSTORE rather than return it.
+%%
+%% The operand order is the one SSTORE and TSTORE both use: the slot is on top
+%% and the value below it, so the pushes are value-then-slot. Written the other
+%% way round this stores 0 into slot 7, reads slot 0, finds it zero, and the test
+%% passes at Cancun for the wrong reason while the pre-Cancun half still fails --
+%% which is not a test that can distinguish a correct gate from a broken one.
+%%
+%% The returned word is decoded rather than compared byte for byte. What is under
+%% test here is the fork gate and the transient round trip; the byte order of a
+%% 32-byte word is a different question with a different test, and asserting the
+%% bytes here would be asserting that question's answer by accident.
+tload_and_tstore_are_missing_before_cancun_test() ->
+    Code = <<16#60, 7, 16#60, 0, 16#5D,          %% PUSH1 7, PUSH1 0, TSTORE
+             16#60, 0, 16#5C,                   %% PUSH1 0, TLOAD
+             16#60, 0, 16#52, 16#60, 32, 16#60, 0, 16#F3>>,
+    PreCancun = [frontier, homestead, byzantium, constantinople, petersburg,
+                 istanbul, berlin, london, merge, paris, shanghai],
+    [?assertMatch({error, {undefined_opcode, 16#5D}, _, _},
+                  eth_evm:run(Code, ?MSG0, ?STATE, #{fork => F}, ?GAS))
+     || F <- PreCancun],
+    {ok, Out, _, _, _} = eth_evm:run(Code, ?MSG0, ?STATE, #{fork => cancun}, ?GAS),
+    ?assertEqual(32, byte_size(Out)),
+    ?assertEqual(7, binary:decode_unsigned(Out)).
+
+%% The other four Cancun arrivals, each checked on its own byte so a failure names
+%% the instruction rather than "one of five". Each code pushes whatever the
+%% instruction needs and stops; the assertion is only ever about whether the halt
+%% names *that* byte, so a code that faults later for an unrelated reason still
+%% passes the pre-Cancun half and is not mistaken for a gate that failed to fire.
+cancun_only_opcodes_are_missing_before_cancun_test() ->
+    Arrivals = [{16#49, <<16#60, 0, 16#49>>, 'BLOBHASH'},
+                {16#4A, <<16#60, 0, 16#4A>>, 'BLOBBASEFEE'},
+                {16#5C, <<16#60, 0, 16#5C>>, 'TLOAD'},
+                {16#5D, <<16#60, 0, 16#60, 0, 16#5D>>, 'TSTORE'},
+                {16#5E, <<16#60, 0, 16#60, 32, 16#60, 0, 16#5E>>, 'MCOPY'}],
+    ?assertEqual([16#49, 16#4A, 16#5C, 16#5D, 16#5E], [Op || {Op, _, _} <- Arrivals]),
+    [begin
+         PreCancun = [frontier, byzantium, constantinople, istanbul, london,
+                      paris, shanghai],
+         [?assertMatch({error, {undefined_opcode, Op}, _, _},
+                       eth_evm:run(Code, ?MSG0, ?STATE, #{fork => F}, ?GAS))
+          || F <- PreCancun],
+         %% At Cancun the gate no longer fires. The frame may still fail -- these
+         %% opcodes read state this fixture does not have -- but it must not fail
+         %% by claiming the instruction does not exist. Compared with =:= rather
+         %% than ?assertNotEqual, whose first argument is used as a pattern and so
+         %% cannot hold a bare `_'.
+         ?assertNotEqual(undefined_opcode,
+                         undefined_opcode_reason(
+                           eth_evm:run(Code, ?MSG0, ?STATE, #{fork => cancun},
+                                       ?GAS)))
+     end || {Op, Code, _Name} <- Arrivals],
+    ok.
+
+%% `undefined_opcode' if the frame halted on a byte the fork does not have, and
+%% anything else otherwise. Deliberately coarse: the question is only ever whether
+%% the availability gate fired, not why the frame failed for some other reason.
+undefined_opcode_reason({error, {undefined_opcode, _}, _, _}) -> undefined_opcode;
+undefined_opcode_reason({error, Reason, _, _}) -> {other_error, Reason};
+undefined_opcode_reason({revert, _, _, _, _}) -> reverted;
+undefined_opcode_reason({ok, _, _, _, _}) -> ran.
+
+%% London's BASEFEE (EIP-3198) and Istanbul's two. Chosen because each reads the
+%% environment rather than memory, so the only way to run one before its fork is
+%% to have executed an instruction that did not exist.
+%%
+%% SELFBALANCE reads the executing account's balance, so the "available at its
+%% fork" half needs the balance in the state's own overlay. Without it eth_state
+%% falls through to its upstream reader and this test performs a lazy JSON-RPC
+%% fetch against the configured public endpoint -- which is a unit test reaching
+%% the network, and it hangs rather than fails when there is none.
+fork_gated_environment_opcodes_test() ->
+    Bases = [{16#48, [frontier, byzantium, constantinople, istanbul, berlin]},
+             {16#46, [frontier, byzantium, constantinople]},
+             {16#47, [frontier, byzantium, constantinople]}],
+    [begin
+         Code = <<Op, 16#60, 0, 16#52, 16#60, 32, 16#60, 0, 16#F3>>,
+         [?assertMatch({error, {undefined_opcode, Op}, _, _},
+                       eth_evm:run(Code, ?MSG0, ?STATE, #{fork => F}, ?GAS))
+          || F <- TooEarly]
+     end || {Op, TooEarly} <- Bases],
+    ?assertMatch({ok, _, _, _, _},
+                 eth_evm:run(<<16#48>>, ?MSG0, ?STATE, #{fork => london}, ?GAS)),
+    ?assertMatch({ok, _, _, _, _},
+                 eth_evm:run(<<16#46>>, ?MSG0, ?STATE, #{fork => istanbul}, ?GAS)),
+    Local = eth_state:new(0, #{{balance, <<0:160>>} => 0}),
+    ?assertMatch({ok, _, _, _, _},
+                 eth_evm:run(<<16#47>>, ?MSG0, Local, #{fork => istanbul}, ?GAS)).
+
+%% A byte nobody ever assigned halts in every fork, and it is a *different*
+%% reason from 0xFE's. 0xFE is a specified halt; an unassigned byte is a missing
+%% instruction. eth_evm keeps them apart so a caller can.
+undefined_byte_and_invalid_are_different_reasons_test() ->
+    %% 0x0C is in the gap between SIGNEXTEND and LT and has never been assigned.
+    ?assertMatch({error, {undefined_opcode, 16#0C}, _, _},
+                 eth_evm:run(<<16#0C>>, ?MSG0, ?STATE, #{fork => cancun}, ?GAS)),
+    ?assertMatch({error, {undefined_opcode, 16#0C}, _, _},
+                 eth_evm:run(<<16#0C>>, ?MSG0, ?STATE, #{fork => frontier}, ?GAS)),
+    %% 0xFE is INVALID, which every fork defines.
+    ?assertMatch({error, invalid_opcode, _, _},
+                 eth_evm:run(<<16#FE>>, ?MSG0, ?STATE, #{fork => cancun}, ?GAS)),
+    ?assertMatch({error, invalid_opcode, _, _},
+                 eth_evm:run(<<16#FE>>, ?MSG0, ?STATE, #{fork => frontier}, ?GAS)).
+
+%% An undefined instruction consumes the frame's whole allowance, as every
+%% exceptional halt does. A halt that returned the remaining gas would be a
+%% refund, and a refund on a halt is a state transition no client reproduces.
+undefined_opcode_consumes_the_whole_allowance_test() ->
+    %% 0x5F is Shanghai's, so at Paris it halts -- and it halts on the first
+    ?assertMatch({error, {undefined_opcode, 16#5F}, _, _},
+                 eth_evm:run(<<16#5F>>, ?MSG0, ?STATE, #{fork => paris}, 100000)),
+    %% instruction, with the entire 100000 unspent and therefore unreportable:
+    %% run/5's error form carries no gas figure precisely because there is none.
+    ?assertMatch({error, {undefined_opcode, 16#5F}, _, _},
+                 eth_evm:run(<<16#5F>>, ?MSG0, ?STATE, #{fork => paris}, 1)).
+
+%% The Env has to say which fork. There is no default, because a default is a
+%% fork this node chose rather than one the chain chose: run against a Paris block
+%% with Cancun's instructions available and the frame succeeds where the chain
+%% says it must halt, and the result is recorded as a state root with nothing in
+%% it to say the rules were wrong.
+env_without_a_fork_is_refused_rather_than_guessed_test() ->
+    ?assertError({badkey, fork},
+                 eth_evm:run(<<16#00>>, ?MSG0, ?STATE, #{}, ?GAS)),
+    ?assertError({badkey, fork},
+                 eth_evm:run(<<16#00>>, ?MSG0, ?STATE, #{number => 1}, ?GAS)).
+
+%% The fork in the Env is what the child frames inherit. A CALL runs under the
+%% caller's rules, not under anything the callee chooses, so a Paris contract
+%% cannot call a PUSH0 into existence by pointing at an account that has one.
+%%
+%% The observable is the CALL's own return value: a child that halts pushes 0 and
+%% the caller carries on, so the parent's success flag says whether the gate fired
+%% in the frame that mattered. The two forks are run over the same bytecode, which
+%% is what rules out "the test is really asserting something else".
+child_frames_inherit_the_fork_from_the_env_test() ->
+    Child = <<16#5F>>,                               %% PUSH0, then fall off the end
+    Parent = <<(call_seq(16#0D, 0, 16#F1))/binary,   %% CALL, leaves 0 or 1
+                16#60, 0, 16#52,                     %% PUSH1 0, MSTORE
+                16#60, 32, 16#60, 0, 16#F3>>,         %% RETURN 32 bytes
+    State = call_state(1000000, Child),
+    {ok, Out, _, _, _} = eth_evm:run(Parent, ?MSG0, State, #{fork => paris}, ?GAS),
+    %% The child's PUSH0 does not exist at Paris, so the child halted, the CALL
+    %% pushed 0, and the parent returned that 0 rather than aborting with it.
+    ?assertEqual(0, binary:decode_unsigned(Out)),
+    {ok, Ok, _, _, _} = eth_evm:run(Parent, ?MSG0, State, #{fork => cancun}, ?GAS),
+    ?assertEqual(1, binary:decode_unsigned(Ok)).

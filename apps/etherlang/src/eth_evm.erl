@@ -16,7 +16,7 @@
             retdata = <<>>, halt = undefined, logs = [], refund = 0,
             dests = undefined}).
 
--record(ctx, {state, env, msg, transient = #{}}).
+-record(ctx, {state, env, msg, transient = #{}, fork}).
 
 -export([run/5, valid_jumpdests/1]).
 
@@ -28,15 +28,28 @@
 %% | {revert, Output, GasLeft, State, Logs}
 %% | {error, Reason, State, Logs}
 run(Code, Msg, State, Env, Gas) when is_binary(Code) ->
-    {Res, _Transient} = run_t(Code, Msg, State, Env, Gas, #{}),
+    {Res, _Transient} = run_t(Code, Msg, State, Env, Gas, #{}, fork_of(Env)),
     Res.
+
+%% The fork this frame executes under, taken from the Env.
+%%
+%% It is a required key, not an optional one with a default. The alternative --
+%% defaulting to the newest fork, or to the operator's ETH_FORK pin -- means a
+%% caller who forgets to set it gets a frame that runs instructions its block
+%% never had, which is not a wrong answer to a question but the wrong question:
+%% the state root afterwards is not a value any other client can reproduce, and
+%% nothing in the result says so. A `badkey' here is the loud version of that,
+%% and every Env builder in src/ sets it (eth_call:env_from_block/2,
+%% eth_block:block_env/2, eth_fork_schedule:run_system_call/6).
+fork_of(Env) -> maps:get(fork, Env).
 
 %% Internal run threading EIP-1153 transient storage. The transient map is
 %% transaction-global: a child frame inherits a copy of the parent map and,
 %% on success, its writes merge back (child wins); on revert/error the
 %% parent map is kept unchanged.
-run_t(Code, Msg, State, Env, Gas, Transient) when is_binary(Code) ->
-    Ctx = #ctx{state = State, env = Env, msg = Msg, transient = Transient},
+run_t(Code, Msg, State, Env, Gas, Transient, Fork) when is_binary(Code) ->
+    Ctx = #ctx{state = State, env = Env, msg = Msg, transient = Transient,
+               fork = Fork},
     E0 = #e{code = Code, gas = max(Gas, 0), dests = valid_jumpdests(Code)},
     try exec(E0, Ctx) of
         {E1, Ctx1} ->
@@ -92,6 +105,27 @@ exec(E = #e{pc = Pc, code = Code}, Ctx) when Pc >= byte_size(Code) ->
     {E#e{halt = stop}, Ctx};
 exec(E, Ctx) ->
     Op = binary:at(E#e.code, E#e.pc),
+    case eth_fork_schedule:opcode_exists(Op, Ctx#ctx.fork) of
+        false -> undefined_opcode(Op, E, Ctx);
+        true -> charge_and_run(Op, E, Ctx)
+    end.
+
+%% An instruction the executing fork does not have is an exceptional halt, not a
+%% cheap one. `do_op/3' would otherwise run it anyway: every clause in this
+%% module is unconditional, so PUSH0 executed in a Shanghai block's parent and
+%% TSTORE executed anywhere before Cancun, each at a price, each returning a
+%% value. The result was a frame that succeeded where the chain's says it must
+%% consume its whole allowance -- a different post-state and a different state
+%% root, produced without a single error and recorded as a result.
+%%
+%% `invalid_opcode' is deliberately NOT the reason reported here. That reason
+%% belongs to 0xFE, which is a specified instruction at every fork; a byte the
+%% fork has never heard of is a different failure and the two are told apart so
+%% a caller can.
+undefined_opcode(Op, E, Ctx) ->
+    {E#e{halt = {error, {undefined_opcode, Op}}}, Ctx}.
+
+charge_and_run(Op, E, Ctx) ->
     case charge(E, base_cost(Op)) of
         {ok, E1} -> do_op(Op, E1, Ctx);
         oog -> oog(E, Ctx)
@@ -806,7 +840,8 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
                                          gas_price => s_msg(gas_price, Ctx, 0),
                                          static => ChildStatic, depth => Depth + 1},
                             {Result, ChildT} = run_t(ChildCode, ChildMsg, StateIn,
-                                                     Env, CallGas, Ctx#ctx.transient),
+                                                     Env, CallGas, Ctx#ctx.transient,
+                                                     Ctx#ctx.fork),
                             handle_child(Result, E, Ctx, StateIn, RetOff, RetLen, ChildT)
                     end
             end
@@ -963,7 +998,8 @@ create_with_value(_Op, Init, Value, Sender, NewAddr, State1, E1, Ctx, ChildGas) 
                  value => Value, data => <<>>,
                  gas_price => s_msg(gas_price, Ctx, 0),
                  static => false, depth => s_msg(depth, Ctx, 0) + 1},
-    Result = run_t(Init, ChildMsg, State2, Env, ChildGas, Ctx#ctx.transient),
+    Result = run_t(Init, ChildMsg, State2, Env, ChildGas, Ctx#ctx.transient,
+                   Ctx#ctx.fork),
     case Result of
         {{ok, Code, Left, St, Logs}, ChildT} when byte_size(Code) =< 24576 ->
             St1 = eth_state:set_code(St, NewAddr, Code),

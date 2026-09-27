@@ -349,8 +349,23 @@ msg_from_tx(Tx, BlockNumber) ->
 env_from_block(Block, BlockParam) ->
     try
         Number = uint(maps:get(<<"number">>, Block)),
+        Timestamp = uint(maps:get(<<"timestamp">>, Block, 0)),
         Env = #{number => Number,
-                timestamp => uint(maps:get(<<"timestamp">>, Block, 0)),
+                timestamp => Timestamp,
+                %% The execution rules this block is subject to, resolved from
+                %% its own number and timestamp. eth_evm:run/5 requires it: a
+                %% call against a pre-Shanghai block must not run PUSH0, and a
+                %% call against a Cancun one must. Simulating "latest" with the
+                %% newest schedule would answer a question about block N with
+                %% the rules of block N+k, and the only symptom would be a
+                %% plausible answer.
+                %%
+                %% current_fork/3 answers {ok, Fork}, and the unwrapping is not
+                %% optional: the {ok, Fork} tuple is not an atom, so it fails
+                %% opcode_exists/2's is_atom/1 guard, every opcode reads as one
+                %% the fork does not have, and every call halts on its first
+                %% instruction with `undefined_opcode'.
+                fork => fork_at(Number, Timestamp),
                 coinbase => eth_state:address(maps:get(<<"miner">>, Block, <<0:160>>)),
                 gas_limit => uint(maps:get(<<"gasLimit">>, Block, ?DEFAULT_GAS)),
                 prevrandao => bin32(maps:get(<<"mixHash">>, Block, <<0:256>>)),
@@ -373,6 +388,19 @@ fetch_block(Param) ->
     case eth_rpc_client:call(<<"eth_getBlockByNumber">>, [param_hex(Param), false]) of
         {ok, Block} when is_map(Block) -> {ok, Block};
         _ -> {error, reason}
+    end.
+
+%% The fork a block executes under, as an atom. Anything other than {ok, _} --
+%% which for current_fork/3 means "this network has no schedule, so use the
+%% operator's ETH_FORK pin" -- is not silently turned into a fork. A call
+%% against a block whose fork cannot be determined is a call this node cannot
+%% simulate, and eth_evm:run/5 refusing a missing `fork' is the honest form of
+%% that; guessing here would be the fabrication.
+fork_at(Number, Timestamp) ->
+    case eth_fork_schedule:current_fork(eth_fork_schedule:configured_network(),
+                                        Number, Timestamp) of
+        {ok, Fork} when is_atom(Fork) -> Fork;
+        _ -> erlang:error({no_fork_for_block, Number, Timestamp})
     end.
 
 param_hex(N) when is_integer(N) -> eth_hex:encode_int(N);

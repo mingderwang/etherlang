@@ -703,3 +703,146 @@ returndata_copy_costs_three_per_word_and_size_costs_nothing_test() ->
     %% EXTCODECOPY keeps its 3-per-word term; the swap above did not disturb it.
     ?assertEqual(2600, eth_fork_schedule:gas_cost(16#3C, cancun, 0)),
     ?assertEqual(2603, eth_fork_schedule:gas_cost(16#3C, cancun, 32)).
+
+%% ---------------------------------------------------------------------------
+%% Opcode availability
+%% ---------------------------------------------------------------------------
+
+%% The whole 0x00-0xFF space, counted per fork. This is the pin for
+%% `opcode_exists/2': a table that loses a byte in one clause, or gains one,
+%% changes a count here rather than quietly changing which instructions a block
+%% will run.
+%%
+%% The counts are the reference implementations', not this module's, and every
+%% one of them is that reference plus one: execution-specs' per-fork `Ops' enums
+%% have no 0xFE key and this table does, because go-ethereum has an INVALID
+%% instruction and eth_evm reports it as `invalid_opcode' -- so subtracting it
+%% would make the pin describe a different interpreter than the one running.
+%% Frontier's 130 is the one count that matches a reference outright, as the
+%% number of instruction keys in go-ethereum's newFrontierInstructionSet().
+%%
+%% The intermediate forks are pinned as well, and not only at the ends, because
+%% the failures this catches are in the middle: a rule attributed to the wrong
+%% fork leaves the newest and oldest counts untouched.
+opcode_availability_is_pinned_test() ->
+    ?assertEqual(130, available_count(frontier)),
+    ?assertEqual(131, available_count(homestead)),
+    ?assertEqual(135, available_count(byzantium)),
+    ?assertEqual(140, available_count(constantinople)),
+    ?assertEqual(140, available_count(petersburg)),
+    ?assertEqual(142, available_count(istanbul)),
+    ?assertEqual(142, available_count(berlin)),
+    ?assertEqual(143, available_count(london)),
+    ?assertEqual(144, available_count(shanghai)),
+    ?assertEqual(149, available_count(cancun)),
+    ?assertEqual(149, available_count(prague)).
+
+%% Availability only ever grows. A fork can add instructions and cannot remove
+%% one, so a smaller set at a later fork would mean the table is not ordered the
+%% way at_least/2 is -- which is the mistake the previous rank compression would
+%% have caused, and the reason the counts above are not enough on their own.
+opcode_availability_only_grows_test() ->
+    Forks = [frontier, homestead, dao, tangerine, spurious_dragon, byzantium,
+             constantinople, petersburg, istanbul, berlin, london, merge, paris,
+             shanghai, cancun, prague, osaka, amsterdam],
+    Counts = [available_count(F) || F <- Forks],
+    ?assertEqual(Counts, lists:sort(Counts)).
+
+%% A byte that has never been assigned is not an instruction in any fork, so
+%% nothing has to be added to make the interpreter refuse it. These are the 107
+%% gaps in the opcode space.
+%%
+%% The last run is 0xF6-0xF9 and 0xFB-0xFC, NOT 0xF6-0xFC: 0xFA is STATICCALL,
+%% defined from Byzantium, so a run written to 0xFC sweeps it in and asserts that
+%% the interpreter must refuse an instruction Byzantium has. The count is what
+%% catches that -- 0xF6-0xFC has 108 entries, and 149 + 108 = 257, which is more
+%% opcodes than there are bytes in the space.
+never_assigned_bytes_are_not_opcodes_in_any_fork_test() ->
+    Unassigned = lists:seq(16#0C, 16#0F) ++ lists:seq(16#1E, 16#1F) ++
+                 lists:seq(16#21, 16#2F) ++ lists:seq(16#4B, 16#4F) ++
+                 lists:seq(16#A5, 16#EF) ++ lists:seq(16#F6, 16#F9) ++
+                 lists:seq(16#FB, 16#FC),
+    ?assertEqual(107, length(Unassigned)),
+    ?assertEqual(256, available_count(amsterdam) + length(Unassigned)),
+    Forks = [frontier, byzantium, constantinople, istanbul, london, shanghai,
+             cancun, prague, osaka, amsterdam],
+    [?assertEqual(false, eth_fork_schedule:opcode_exists(Op, F))
+     || Op <- Unassigned, F <- Forks].
+
+%% Each gated opcode appears at the fork that introduced it and at no fork
+%% before it. The EIP is named in introduced_by/1's comment beside the byte; this
+%% is the same list, so a byte moved to a different fork has to be moved here too.
+gated_opcodes_appear_at_their_owning_fork_test() ->
+    Gated = [{16#F4, homestead},          % DELEGATECALL  EIP-7
+             {16#3D, byzantium},          % RETURNDATASIZE EIP-211
+             {16#3E, byzantium},          % RETURNDATACOPY EIP-211
+             {16#FA, byzantium},          % STATICCALL     EIP-214
+             {16#FD, byzantium},          % REVERT         EIP-140
+             {16#1B, constantinople},     % SHL            EIP-145
+             {16#1C, constantinople},     % SHR            EIP-145
+             {16#1D, constantinople},     % SAR            EIP-145
+             {16#3F, constantinople},     % EXTCODEHASH    EIP-1052
+             {16#F5, constantinople},     % CREATE2        EIP-1014
+             {16#46, istanbul},           % CHAINID        EIP-1344
+             {16#47, istanbul},           % SELFBALANCE    EIP-1884
+             {16#48, london},             % BASEFEE        EIP-3198
+             {16#5F, shanghai},           % PUSH0          EIP-3855
+             {16#49, cancun},             % BLOBHASH       EIP-4844
+             {16#4A, cancun},             % BLOBBASEFEE    EIP-4844
+             {16#5C, cancun},             % TLOAD          EIP-1153
+             {16#5D, cancun},             % TSTORE         EIP-1153
+             {16#5E, cancun}],            % MCOPY          EIP-5656
+    All = [frontier, homestead, dao, tangerine, spurious_dragon, byzantium,
+           constantinople, petersburg, istanbul, muir_glacier, berlin, london,
+           arrow_glacier, gray_glacier, merge, paris, shanghai, cancun, deneb,
+           prague, osaka, bpo1, bpo2, amsterdam],
+    [begin
+         ?assertEqual(true, eth_fork_schedule:opcode_exists(Op, At)),
+         [?assertEqual(false, eth_fork_schedule:opcode_exists(Op, Earlier))
+          || Earlier <- All,
+             not eth_fork_schedule:at_least(Earlier, At)]
+     end || {Op, At} <- Gated].
+
+%% ADDMOD and MULMOD are Frontier. The Byzantium attribution is widespread and
+%% wrong: go-ethereum's Frontier instruction set defines both, execution-specs'
+%% `frontier' fork defines both, and ethereumjs gates neither behind an EIP check.
+%% Nothing refused them before Byzantium, because nothing emitted those bytes
+%% before Byzantium.
+addmod_and_mulmod_are_frontier_test() ->
+    ?assertEqual(true, eth_fork_schedule:opcode_exists(16#08, frontier)),
+    ?assertEqual(true, eth_fork_schedule:opcode_exists(16#09, frontier)),
+    ?assertEqual(true, eth_fork_schedule:opcode_exists(16#08, homestead)),
+    ?assertEqual(true, eth_fork_schedule:opcode_exists(16#09, homestead)).
+
+%% 0xFE is defined, not unassigned, so it reaches do_op/3 and is reported as
+%% `invalid_opcode'. execution-specs has no 0xFE key and would call it an
+%% undefined byte; both halt the frame and consume its whole allowance, so the
+%% two agree on every state root and differ only in the label.
+invalid_is_defined_at_every_fork_test() ->
+    [?assertEqual(true, eth_fork_schedule:opcode_exists(16#FE, F))
+     || F <- [frontier, byzantium, constantinople, istanbul, london, shanghai,
+               cancun, prague, osaka, amsterdam]].
+
+%% A fork this module does not know is not a fork that has Cancun's instructions.
+%% fork_rank/1's catch-all ranks an unrecognised atom with `frontier', so the
+%% genesis set is what such a fork is offered and no more.
+an_unknown_fork_has_only_frontier_opcodes_test() ->
+    ?assertEqual(available_count(frontier), available_count(no_such_fork)),
+    ?assertEqual(false, eth_fork_schedule:opcode_exists(16#5F, no_such_fork)),
+    ?assertEqual(false, eth_fork_schedule:opcode_exists(16#48, no_such_fork)).
+
+%% A non-integer opcode is not an opcode, rather than a crash in the interpreter's
+%% gate. The machine loop only ever passes `binary:at/2', so this is reachable
+%% only by a caller of the table, but a predicate that raises is a predicate
+%% callers learn not to use.
+opcode_exists_rejects_a_non_opcode_test() ->
+    ?assertEqual(false, eth_fork_schedule:opcode_exists(not_a_byte, cancun)),
+    ?assertEqual(false, eth_fork_schedule:opcode_exists(-1, cancun)),
+    ?assertEqual(false, eth_fork_schedule:opcode_exists(16#08, "cancun")),
+    %% An unknown *fork* is not a rejection, though: it ranks with frontier, so a
+    %% Frontier instruction is available in it and nothing later is.
+    ?assertEqual(true, eth_fork_schedule:opcode_exists(16#08, not_a_fork)).
+
+available_count(Fork) ->
+    length([Op || Op <- lists:seq(0, 255),
+                  eth_fork_schedule:opcode_exists(Op, Fork)]).

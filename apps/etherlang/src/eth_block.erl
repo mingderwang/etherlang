@@ -754,11 +754,17 @@ create_address(Sender, Nonce) ->
 %% The execution environment, in the shape eth_evm reads it: flat atom keys.
 %% BLOCKHASH needs a state view to resolve the requested block, so the state is
 %% carried alongside rather than looked up again by the opcode.
-block_env(#block{number = Number, timestamp = Ts, miner = Miner,
-                 gas_limit = GL, base_fee_per_gas = BaseFee,
-                 mix_hash = Mix}, State) ->
+block_env(Block = #block{number = Number, timestamp = Ts, miner = Miner,
+                         gas_limit = GL, base_fee_per_gas = BaseFee,
+                         mix_hash = Mix}, State) ->
     #{number => Number,
       timestamp => Ts,
+      %% eth_evm:run/5 requires the fork. It is resolved from the block's own
+      %% number and timestamp, which is the only pair the fork schedule takes,
+      %% so a payload validated against pre-merge rules is executed under
+      %% pre-merge rules -- including refusing the instructions those rules do
+      %% not have.
+      fork => fork(Block),
       coinbase => Miner,
       prevrandao => Mix,
       gas_limit => GL,

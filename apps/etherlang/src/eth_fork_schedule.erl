@@ -16,6 +16,7 @@
           chain_id/1,
           configured_fork/0,
           at_least/2,
+          opcode_exists/2,
           base_fee/2,
           base_fee/3,
           base_fee_delta/2,
@@ -351,6 +352,7 @@ fork_at(Network, BlockNumber, BlockTimestamp) ->
 
 parse_fork(Value) ->
     case string:lowercase(string:trim(Value)) of
+        "frontier" -> frontier;
         "homestead" -> homestead;
         "dao" -> dao;
         "tangerine" -> tangerine;
@@ -380,36 +382,202 @@ parse_fork(Value) ->
 %% Ranks must agree with activation order, because highest_ranked/1 resolves
 %% two concurrently active forks (a block-numbered one and a timestamped one)
 %% purely by rank. Deneb is the pre-release name for Cancun and so shares its
-%% rank; the difficulty-bomb forks (Muir/Arrow/Gray Glacier) change no
-%% execution rule and share the rank of the fork that introduced the rule they
-%% delay.
-fork_rank(homestead) -> 0;
-fork_rank(dao) -> 0;
-fork_rank(tangerine) -> 0;
-fork_rank(spurious_dragon) -> 0;
-fork_rank(byzantium) -> 0;
-fork_rank(constantinople) -> 0;
-fork_rank(petersburg) -> 0;
-fork_rank(istanbul) -> 1;
-fork_rank(muir_glacier) -> 1;
-fork_rank(berlin) -> 2;
-fork_rank(london) -> 3;
-fork_rank(arrow_glacier) -> 4;
-fork_rank(gray_glacier) -> 5;
-fork_rank(merge) -> 6;
-fork_rank(paris) -> 7;
-fork_rank(shanghai) -> 8;
-fork_rank(cancun) -> 9;
-fork_rank(deneb) -> 9;
-fork_rank(prague) -> 10;
-fork_rank(osaka) -> 11;
-fork_rank(bpo1) -> 12;
-fork_rank(bpo2) -> 13;
-fork_rank(amsterdam) -> 14;
+%% rank.
+%%
+%% Muir Glacier deliberately shares Istanbul's rank, and that is not a
+%% compression to be tidied up. Muir Glacier delays the difficulty bomb and
+%% changes no execution rule, so the fork a caller must be told about is the one
+%% that introduced the rules -- Istanbul. Give Muir Glacier a rank of its own,
+%% one higher, and highest_ranked/1 reports `muir_glacier' for every block from
+%% 12,244,000 onward: mainnet block 12,243,999 stopped answering `istanbul' and
+%% started answering `muir_glacier', which is a name no rule is gated on and no
+%% client reports. fork_selection_test pins this.
+%%
+%% Arrow and Gray Glacier keep ranks of their own, above the fork whose rule they
+%% delay, which is what the old ordering did and what their activation points
+%% imply.
+%%
+%% Every other fork gets a rank of its own. The previous ordering collapsed
+%% Frontier through Petersburg into a single rank 0, which read as harmless --
+%% the only features gated on `at_least/2' were Berlin, London, Shanghai and
+%% Cancun, all unaffected by the compression. What it made impossible was gating
+%% on anything *earlier*: with byzantium and constantinople both at 0,
+%% `at_least(frontier, byzantium)' was true, so a rule introduced by EIP-145 could
+%% not be expressed and nothing could refuse an instruction a fork did not have.
+%% That is the same gap the interpreter's flat gas schedule came from, and
+%% opcode_exists/2 is the first thing to need it fixed.
+fork_rank(frontier) -> 0;
+fork_rank(homestead) -> 1;
+fork_rank(dao) -> 2;
+fork_rank(tangerine) -> 3;
+fork_rank(spurious_dragon) -> 4;
+fork_rank(byzantium) -> 5;
+fork_rank(constantinople) -> 6;
+fork_rank(petersburg) -> 7;
+fork_rank(istanbul) -> 8;
+fork_rank(muir_glacier) -> 8;
+fork_rank(berlin) -> 9;
+fork_rank(london) -> 10;
+fork_rank(arrow_glacier) -> 11;
+fork_rank(gray_glacier) -> 12;
+fork_rank(merge) -> 13;
+fork_rank(paris) -> 14;
+fork_rank(shanghai) -> 15;
+fork_rank(cancun) -> 16;
+fork_rank(deneb) -> 16;
+fork_rank(prague) -> 17;
+fork_rank(osaka) -> 18;
+fork_rank(bpo1) -> 19;
+fork_rank(bpo2) -> 20;
+fork_rank(amsterdam) -> 21;
+%% An atom this module does not know ranks with `frontier', which makes
+%% at_least(Unknown, Feature) false for every feature that came after genesis
+%% and true for none of them -- the safe direction, since a rule wrongly believed
+%% inactive is a rule the node declines to apply, and opcode_exists/2 answers
+%% false for such a fork rather than admitting Cancun's instructions to it.
 fork_rank(_) -> 0.
 
 at_least(Fork, Feature) ->
     fork_rank(Fork) >= fork_rank(Feature).
+
+%% ---------------------------------------------------------------------------
+%% Opcode availability
+%% ---------------------------------------------------------------------------
+%% ---------------------------------------------------------------------------
+%% An opcode the executing fork does not have is not a cheap instruction, it is
+%% an exceptional halt that consumes the frame's whole gas allowance. That is
+%% the difference between a state root and a wrong one, and the interpreter
+%% cannot get it from the gas table: a price says what an opcode costs *once it
+%% is there*, and says nothing about whether it is there. So availability is its
+%% own question with its own answer.
+%%
+%% The data below is derived, not guessed. Every entry names the fork that
+%% introduced the opcode and the EIP that did it, and the whole 0x00-0xFF space
+%% is pinned per fork by opcode_availability_is_pinned_test
+%% -- so a typo in a single byte here fails a test rather than silently
+%% enabling an instruction a fork does not have (or, worse, disabling one it
+%% does).
+%%
+%% Two things are deliberately *not* gated here, because both are false before
+%% the fork that introduced them and true after it, rather than absent:
+%%
+%%   * 0x44 is DIFFICULTY at Frontier and PREVRANDAO from Paris. The byte is
+%%     defined in every fork; only its meaning changes, and that is handled
+%%     where the value is read, not here.
+%%   * 0xFE INVALID is defined from Frontier. It halts, but it is a specified
+%%     halt rather than a missing instruction, and eth_evm reports it as
+%%     `invalid_opcode' rather than as an undefined byte.
+%%
+%% Anything `introduced_by/1' does not name is not an opcode in any fork: the 107
+%% gaps in the 0x00-0xFF space (0x0C-0x0F, 0x1E-0x1F, 0x21-0x2F, 0x4B-0x4F,
+%% 0xA5-0xEF, 0xF6-0xF9, 0xFB-0xFC) have never been assigned. Note that the last
+%% run stops short of 0xFC and skips 0xFA: 0xFA is STATICCALL, so a run written
+%% 0xF6-0xFC would both sweep in an instruction Byzantium has and make the table
+%% claim more opcodes than the space contains. `opcode_exists/2' answers false for
+%% the gaps in every fork, so the interpreter halts on them rather than falling
+%% through to a cost of 3.
+%%
+%% The `undefined' clause is load-bearing rather than defensive. `at_least/2'
+%% compares ranks, and fork_rank/1's catch-all ranks an unrecognised atom at 0 --
+%% the rank of `frontier'. So at_least(cancun, undefined) is *true*, and writing
+%% the answer as a bare at_least/2 call would report every unassigned byte in the
+%% opcode space as available in every fork.
+-spec opcode_exists(integer(), atom()) -> boolean().
+opcode_exists(Opcode, Fork) when is_integer(Opcode), is_atom(Fork) ->
+    case introduced_by(Opcode) of
+        undefined -> false;
+        At -> at_least(Fork, At)
+    end;
+opcode_exists(_Opcode, _Fork) ->
+    false.
+
+%% Every opcode, with the fork that introduced it. This is one table rather than
+%% a genesis set plus a list of later arrivals because the two are not separable
+%% questions: whether a byte is an opcode at all, and which fork introduced it,
+%% are one lookup, and splitting them is how the first version of this got it
+%% wrong -- it asked the genesis set about the post-genesis arrivals, which by
+%% construction are not in it, so 0xFD REVERT and 0x1B SHR were reported missing
+%% in every fork and 18 of this module's tests failed.
+%%
+%% The genesis set is verified, not recalled. It is the yellow paper's appendix
+%% H, and it is byte-for-byte the 130 instruction keys of go-ethereum's
+%% newFrontierInstructionSet() (core/vm/jump_table.go). The later forks were
+%% cross-checked the same way against the `Ops' enums in execution-specs'
+%% per-fork vm/instructions/__init__.py, whose counts this reproduces exactly:
+%% Byzantium 134, Constantinople 139, Istanbul 141, London 142, Shanghai 143,
+%% Cancun 148.
+%%
+%% Two points where the references differ from each other, or from what is
+%% commonly written, and what this table does about it:
+%%
+%%   * ADDMOD and MULMOD are Frontier, not Byzantium. The Byzantium attribution
+%%     is widespread and wrong: go-ethereum's Frontier instruction set defines
+%%     both, execution-specs' `frontier' fork's Ops enum defines both, and
+%%     ethereumjs gates neither behind an EIP check in its interpreter. No
+%%     implementation consulted refuses them before Byzantium, because before
+%%     Byzantium no compiler emitted those bytes.
+%%   * 0xFE is defined, not unassigned. go-ethereum has an INVALID instruction
+%%     and eth_evm reports it as `invalid_opcode'; execution-specs has no 0xFE
+%%     key, so there it is an undefined byte. Both halt the frame and consume its
+%%     whole allowance, so the two agree on every state root and disagree only on
+%%     the label. This table follows go-ethereum, which is the reading that lets
+%%     the existing `invalid_opcode' reason keep its meaning.
+%%
+%% Grouped into the runs that share a contiguous range in the table -- 0x50-0x5B,
+%% the stack and storage block; 0x60-0x9F, the three stack-shuffling runs -- and
+%% named individually elsewhere, because a range that spans an unassigned byte is
+%% how an opcode nobody has assigned ends up looking defined. The upper bound of
+%% the first run is 0x5B and not 0x5F for exactly that reason: 0x5C-0x5E are
+%% Cancun's transient storage and MCOPY, and 0x5F is Shanghai's PUSH0, so a
+%% range to 0x5F would have declared all four to be Frontier.
+%%
+%%   0x1B SHL / 0x1C SHR / 0x1D SAR  EIP-145  Constantinople
+%%   0x3D RETURNDATASIZE            EIP-211  Byzantium
+%%   0x3E RETURNDATACOPY            EIP-211  Byzantium
+%%   0x3F EXTCODEHASH               EIP-1052 Constantinople
+%%   0x46 CHAINID                   EIP-1344 Istanbul
+%%   0x47 SELFBALANCE               EIP-1884 Istanbul
+%%   0x48 BASEFEE                   EIP-3198 London
+%%   0x49 BLOBHASH                  EIP-4844 Cancun
+%%   0x4A BLOBBASEFEE               EIP-4844 Cancun
+%%   0x5C TLOAD                     EIP-1153 Cancun
+%%   0x5D TSTORE                    EIP-1153 Cancun
+%%   0x5E MCOPY                     EIP-5656 Cancun
+%%   0x5F PUSH0                     EIP-3855 Shanghai
+%%   0xF4 DELEGATECALL              EIP-7    Homestead
+%%   0xF5 CREATE2                   EIP-1014 Constantinople
+%%   0xFA STATICCALL                EIP-214  Byzantium
+%%   0xFD REVERT                    EIP-140  Byzantium
+introduced_by(Op) when Op >= 16#00, Op =< 16#0B -> frontier;
+introduced_by(Op) when Op >= 16#10, Op =< 16#1A -> frontier;
+introduced_by(Op) when Op >= 16#30, Op =< 16#3C -> frontier;
+introduced_by(Op) when Op >= 16#40, Op =< 16#45 -> frontier;
+introduced_by(Op) when Op >= 16#50, Op =< 16#5B -> frontier;
+introduced_by(Op) when Op >= 16#60, Op =< 16#9F -> frontier;
+introduced_by(Op) when Op >= 16#A0, Op =< 16#A4 -> frontier;
+introduced_by(Op) when
+      Op =:= 16#20; Op =:= 16#FE; Op =:= 16#FF;
+      Op =:= 16#F0; Op =:= 16#F1; Op =:= 16#F2; Op =:= 16#F3 -> frontier;
+introduced_by(16#1B) -> constantinople;
+introduced_by(16#1C) -> constantinople;
+introduced_by(16#1D) -> constantinople;
+introduced_by(16#3D) -> byzantium;
+introduced_by(16#3E) -> byzantium;
+introduced_by(16#3F) -> constantinople;
+introduced_by(16#46) -> istanbul;
+introduced_by(16#47) -> istanbul;
+introduced_by(16#48) -> london;
+introduced_by(16#49) -> cancun;
+introduced_by(16#4A) -> cancun;
+introduced_by(16#5C) -> cancun;
+introduced_by(16#5D) -> cancun;
+introduced_by(16#5E) -> cancun;
+introduced_by(16#5F) -> shanghai;
+introduced_by(16#F4) -> homestead;
+introduced_by(16#F5) -> constantinople;
+introduced_by(16#FA) -> byzantium;
+introduced_by(16#FD) -> byzantium;
+introduced_by(_) -> undefined.
 
 %% ---------------------------------------------------------------------------
 %% EIP-1559
@@ -784,7 +952,7 @@ process_beacon_roots(Timestamp, Root, State, Fork) ->
             {ok, State};
         true ->
             run_system_call(Root, Timestamp, 0, State,
-                            ?BEACON_ROOTS_ADDRESS, ?BEACON_ROOTS_GAS)
+                            ?BEACON_ROOTS_ADDRESS, ?BEACON_ROOTS_GAS, Fork)
     end.
 
 %% The shape both system operations share: call the contract as the system
@@ -798,7 +966,7 @@ process_beacon_roots(Timestamp, Root, State, Fork) ->
 %% block's timestamp while pinning the number to 0 (or the reverse) states that
 %% the unused opcode is genuinely unobserved by the deployed code, rather than
 %% feeding it a value that would only be right by accident.
-run_system_call(Calldata, Timestamp, BlockNumber, State, Address, Gas) ->
+run_system_call(Calldata, Timestamp, BlockNumber, State, Address, Gas, Fork) ->
     Code = eth_state:code(State, Address),
     case Code of
         <<>> ->
@@ -817,6 +985,13 @@ run_system_call(Calldata, Timestamp, BlockNumber, State, Address, Gas) ->
                     coinbase => <<0:160>>, prevrandao => <<0:256>>,
                     gas_limit => 0, base_fee => 0,
                     chain_id => chain_id(),
+                    %% The fork, from the caller that already resolved it. Both
+                    %% system contracts are Cancun- and Prague-era code
+                    %% respectively, so running either under the wrong schedule
+                    %% would be a fork-gate answering the wrong question -- but
+                    %% the gate is checked there, and a frame still needs a fork
+                    %% to execute under.
+                    fork => Fork,
                     state => State},
             %% The call must "execute to completion" or "fail silently", so
             %% neither outcome is an error here -- and neither is charged to the
@@ -946,7 +1121,7 @@ process_history(ParentHash, BlockNumber, State, Fork) ->
             {ok, State};
         true ->
             run_system_call(ParentHash, 0, BlockNumber, State,
-                            ?HISTORY_STORAGE_ADDRESS, ?HISTORY_GAS)
+                            ?HISTORY_STORAGE_ADDRESS, ?HISTORY_GAS, Fork)
     end.
 
 %% Prague and later. Unlike EIP-4788 there is no zero-placeholder exemption: the
