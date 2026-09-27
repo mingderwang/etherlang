@@ -359,3 +359,69 @@ to_payload_round_trips_a_real_paris_block_test() ->
     %% A Paris payload has no withdrawals field at all.
     ?assertNot(maps:is_key(<<"withdrawals">>, Encoded)),
     ?assertNot(maps:is_key(<<"blobGasUsed">>, Encoded)).
+
+%% ---------------------------------------------------------------------------
+%% There is exactly one header encoder, and its field list is the fork's
+%% ---------------------------------------------------------------------------
+%% `eth_block:to_rlp/1' and `eth_block:hash/1' used to be a second encoder. It emitted
+%% nineteen header fields unconditionally -- the fifteen of Frontier, then
+%% `baseFeePerGas`, then `withdrawalsRoot`, then EIP-4844's two blob fields -- so it
+%% was wrong at every fork, and at Cancun it was short and long at once because
+%% EIP-4788's `parentBeaconBlockRoot` had no term in it. They are deleted, and these
+%% tests are what the deletion is worth: they pin the surviving encoder's field list
+%% per fork against the real blocks, so a second one cannot be reintroduced by someone
+%% who believes the first was missing something.
+
+the_header_encoder_is_not_reachable_except_through_a_payload_test() ->
+    %% There is no `eth_block:to_rlp/1' and no `eth_block:hash/1' to reach for. A
+    %% second encoder that computes a header hash is the one thing that must not come
+    %% back, because a block hash that is merely *computable* is indistinguishable
+    %% from a correct one.
+    ?assertEqual(false, erlang:function_exported(eth_block, to_rlp, 1)),
+    ?assertEqual(false, erlang:function_exported(eth_block, hash, 1)).
+
+a_paris_header_carries_no_withdrawal_or_blob_field_test() ->
+    %% Paris is 16 fields: the fifteen of Frontier plus EIP-1559's `baseFeePerGas`.
+    %% EIP-4895's `withdrawalsRoot` is Shanghai's, so including it here produced a
+    %% header sixteen bytes too long -- and a header RLP prefixes by length, so one
+    %% extra field shifts every byte after it.
+    Payload = maps:get(payload, eth_payload_fixture:paris()),
+    ?assertEqual(undefined, maps:get(<<"blobGasUsed">>, Payload, undefined)),
+    ?assertEqual(undefined, maps:get(<<"withdrawals">>, Payload, undefined)),
+    ?assertNotEqual(undefined, maps:get(<<"baseFeePerGas">>, Payload)),
+    assert_hash(eth_payload_fixture:paris()).
+
+a_shanghai_header_adds_withdrawals_and_no_blob_field_test() ->
+    %% 17 fields.
+    %%
+    %% The payload carries the withdrawals *list* and not `withdrawalsRoot', and that
+    %% is worth asserting rather than working around: the header commits to the root
+    %% of a trie the payload does not hand over, so the root has to be computed from
+    %% the list. I wrote an assertion that the payload contains `withdrawalsRoot' and
+    %% the test caught it -- a payload that contained the root would be circular,
+    %% because the whole point is that this node derives it and checks it against the
+    %% network rather than reading its own answer back.
+    Payload = maps:get(payload, eth_payload_fixture:shanghai()),
+    ?assertNotEqual(undefined, maps:get(<<"withdrawals">>, Payload)),
+    ?assertEqual(undefined, maps:get(<<"withdrawalsRoot">>, Payload, undefined)),
+    ?assertNotEqual(undefined, maps:get(withdrawals_root, eth_payload_fixture:shanghai())),
+    ?assertEqual(undefined, maps:get(<<"blobGasUsed">>, Payload, undefined)),
+    assert_hash(eth_payload_fixture:shanghai()).
+
+a_cancun_header_carries_both_blob_fields_and_the_beacon_root_test() ->
+    %% 20 fields: EIP-4844's two blob fields and EIP-4788's `parentBeaconBlockRoot`,
+    %% which is in the *header* as well as being the value handed to the system call.
+    %% The deleted encoder had 19 and no term for the beacon root.
+    Payload = maps:get(payload, eth_payload_fixture:cancun()),
+    ?assertNotEqual(undefined, maps:get(<<"blobGasUsed">>, Payload)),
+    ?assertNotEqual(undefined, maps:get(<<"excessBlobGas">>, Payload)),
+    ?assertNotEqual(undefined, maps:get(<<"parentBeaconBlockRoot">>, Payload)),
+    assert_hash(eth_payload_fixture:cancun()).
+
+%% A header field the fork does not have must be *absent*, not zero. `engine_getPayload'
+%% returns whatever `to_payload/1' builds, and `0x0' there is a number a consensus
+%% client would read as an answer about the chain rather than as an absence.
+an_absent_base_fee_is_absent_and_not_zero_test() ->
+    Block = (eth_block:new(<<0:256>>, 1))#block{base_fee_per_gas = undefined},
+    ?assertEqual(undefined, maps:get(<<"baseFeePerGas">>, eth_block:header(Block))),
+    ?assertNotEqual(<<"0x0">>, maps:get(<<"baseFeePerGas">>, eth_block:header(Block))).

@@ -17,7 +17,6 @@
 -export([ new/2,
           new/3,
           header/1,
-          hash/1,
           add_transaction/2,
           declare_state_root/2,
           finalize/1,
@@ -1285,14 +1284,24 @@ header(#block{parent_hash = ParentHash, number = Number,
         <<"extraData">> => Extra,
         <<"mixHash">> => Mix,
         <<"nonce">> => Nonce,
-        <<"baseFeePerGas">> => case BaseFee of
-            undefined -> <<"0x0">>;
-            BF -> eth_hex:encode_int(BF)
-        end,
+        %% A field the header does not have is **absent**, not zero. `0x0' would be a
+        %% number this node invented for a field the fork it is describing does not
+        %% contain, and `to_payload/1' merges this map straight into the
+        %% `ExecutionPayload' that `engine_getPayload' returns -- so a zero here is a
+        %% value a consensus client would read as an answer. The three post-London
+        %% fields are the ones that can be absent; the rest cannot, so they are
+        %% unconditional and the omission is not spread around.
+        <<"baseFeePerGas">> => maybe_hex_int(BaseFee),
         <<"withdrawalsRoot">> => WdRoot,
         <<"blobGasUsed">> => BG,
         <<"excessBlobGas">> => EG
     }.
+
+%% `undefined' for a field the header does not carry. JSON-RPC's `0x0' and an absent
+%% key are not the same thing and the difference is the whole point: one is a value,
+%% the other is an absence, and only one of them is a claim about the chain.
+maybe_hex_int(undefined) -> undefined;
+maybe_hex_int(V) -> eth_hex:encode_int(V).
 
 %% The withdrawal list, in the JSON-RPC shape from_json/1 accepts.
 withdrawal_to_json(#{index := I, validatorIndex := V, address := A,
@@ -1317,23 +1326,28 @@ default_withdrawal(_) ->
 %% Hashing and serialization
 %% ---------------------------------------------------------------------------
 
-hash(Block) ->
-    eth_keccak:hash(to_rlp(Block)).
-
-to_rlp(#block{parent_hash = PH, number = N, timestamp = Ts,
-               miner = Miner, difficulty = Diff, gas_limit = GL,
-               gas_used = GU, logs_bloom = Bloom, state_root = SR,
-               transactions_root = TR, receipts_root = RR,
-               extra_data = Extra, nonce = Nonce, mix_hash = Mix,
-               sha3_uncles = SU, base_fee_per_gas = BaseFee,
-               blob_gas_used = BG, excess_blob_gas = EG,
-               withdrawals_root = WR} = _Block) ->
-    BaseFeeInt = case BaseFee of
-        undefined -> 0;
-        BF -> BF
-    end,
-    eth_rlp:encode([PH, SU, Miner, SR, TR, RR, Bloom, Diff, N, GL, GU,
-                    Ts, Extra, Mix, Nonce, BaseFeeInt, WR, BG, EG]).
+%% `to_rlp/1' and `hash/1' used to live here. Both are gone.
+%%
+%% `to_rlp/1' emitted nineteen header fields unconditionally: the fifteen of Frontier,
+%% then `baseFeePerGas', then `withdrawalsRoot', then EIP-4844's two blob fields. So
+%% it was wrong at *every* fork -- too many before London, too many before Shanghai,
+%% and at Cancun it was short and long at once, because EIP-4788 put
+%% `parentBeaconBlockRoot' in the header and this encoder had no term for it while
+%% `payload_header_rlp/4' does.
+%%
+%% The live encoder is `payload_header_rlp/4'. It is selected by the fork the payload
+%% itself describes, and it is verified against three real Sepolia blocks: Paris
+%% 1450507, Shanghai 3001655 and Cancun 6985356. A second encoder disagreeing with it
+%% at every fork is the mistake this repository has already made once and had to
+%% delete -- `eth_evm:base_cost/1' was a fork-free duplicate of the gas table, and the
+%% two had come to disagree about how they grouped four sets of constants. A header
+%% hash is worse than a gas table: a duplicate does not merely drift, it produces a
+%% block hash that looks computable and is not.
+%%
+%% `hash/1' had exactly one caller, which was `to_rlp/1', and that had none --
+%% `AGENTS.md' listed them as "unused in `src/`, tests only", which a grep showed was
+%% true of neither. Deleting the pair is the fix; a fork-aware rewrite would have
+%% been a third encoder to keep in step with the first two.
 
 %% ---------------------------------------------------------------------------
 %% Roots

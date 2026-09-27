@@ -430,7 +430,6 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
 | EIP-7685 `requestsHash` | Hashing rule sourced, but the EIP does not fix the header field position, and without EIP-7251 there are no requests. |
 | `TERMINAL_BLOCK_HASH` (EIP-3675) | Chain-config data, not in the EIP. Carried and echoed, never checked against a post-Merge block's difficulty. |
 | Per-fork gas *price* wiring | Done. One owner of every price; the interpreter's duplicate table is deleted. SSTORE included (EIP-2200, Berlin and later). |
-| `eth_block:to_rlp/1` fork-awareness | It unconditionally includes the Cancun trailing fields, so it is only correct for Cancun-or-later headers. Pre-existing, documented, unfixed. |
 | `eth_tx:intrinsic_gas/1` fork-awareness | Takes no fork and falls back to the operator's `ETH_FORK` pin. Correct for pool admission, where no block exists; wrong for `eth_call`/`eth_estimateGas` and block execution, which pass the block's own fork through `intrinsic_gas/2`. Do not use the one-argument form where a block is in hand. |
 | EIP-150's 63/64 rule and 2300 stipend | Applied at every fork. The EIP states the rule it introduced, not the one it replaced, and no consulted client still supports a pre-Whistle block — so the earlier behaviour would have to be invented. |
 | Pre-Berlin SSTORE | Refused, not priced. Three schedules exist before Berlin (the flat rule, EIP-1283 at Constantinople, Petersburg's revert of it) and only EIP-2200's text is implemented. `eth_call` falls back upstream; block execution is unreachable on a post-Merge chain. See §3 "Fork awareness". |
@@ -443,8 +442,24 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
   `eth_block` (a 24-byte nonce, the empty trie root standing in for the uncle hash,
   the same substitution for the transactions and receipts roots) and it discarded
   every `payloadAttributes` field. It builds through `eth_block:new/3` now.
-- `eth_block:hash/1`, `eth_block:header/1`, `eth_block:to_rlp/1` — unused in
-  `src/`, tests only.
+- `eth_block:to_rlp/1` and `eth_block:hash/1` are **gone**, and this section listed
+  them as "unused in `src/`, tests only" — which a grep showed was true of neither.
+  `to_rlp/1` was a *second* header encoder that emitted nineteen fields
+  unconditionally: the fifteen of Frontier, then `baseFeePerGas`, then
+  `withdrawalsRoot`, then EIP-4844's two blob fields. So it was wrong at every fork,
+  and at Cancun it was short and long at once because EIP-4788's
+  `parentBeaconBlockRoot` had no term in it. The live encoder is
+  `payload_header_rlp/4`, selected by the fork the payload describes and pinned
+  against three real Sepolia blocks. **Deleting the pair is the fix, not a
+  fork-aware rewrite of it** — a rewrite would have been a third encoder to keep in
+  step with the other two, which is the `eth_evm:base_cost/1` mistake again with a
+  block hash instead of a gas table.
+- `eth_block:header/1` **is** used — by `to_payload/1`, on the `engine_getPayload`
+  path — so it was not deleted. A grep for `eth_block:header` missed it because the
+  call is unqualified and intra-module; grep for the *definition's callers*, not for
+  its qualified name. It used to report `baseFeePerGas` as `0x0` on a header with no
+  such field, and a zero there is a value a consensus client reads as an answer.
+  Absent fields are now absent.
 - `eth_header:header_fields/0` lists `requestsHash`, which is not a header field.
   Inert, because upstream block JSONs do not carry it.
 - `eth_rpc_server:start_engine_api/2` still swallows a listener failure
