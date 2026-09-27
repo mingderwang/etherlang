@@ -284,3 +284,59 @@ pairing_off_curve_g2_test() ->
 
 pairing_recognized_test() ->
     ?assertEqual(true, eth_evm_precompiles:is_precompile(8, ?FORK)).
+
+%% ---------------------------------------------------------------------------
+%% The pairing check's *price*, per fork, at the precompile rather than the table
+%% ---------------------------------------------------------------------------
+%% `eth_pairing_bn128:check_pairing/1` used to return `{ok, Out, 34000*K + 45000}` --
+%% EIP-1108's Istanbul column, hard-coded in a module that has no fork and cannot
+%% know one. `eth_evm_precompiles:run/3` matched a two-element `{ok, Out}`, so a
+%% three-element reply matched nothing and fell through to the catch-all, handing the
+%% caller that figure unchanged. Byzantium's pairing check therefore cost 45,000
+%% instead of 100,000, and the fork plumbing added in its place was never reached.
+%%
+%% The test that should have caught it pinned `eth_fork_schedule:bn128_cost/2` at every
+%% fork and passed. **Pinning a table is not pinning a caller**, and that is the whole
+%% lesson: the table was right, the test was green, and the code that should have read
+%% the table was dead. So these are at the precompile.
+%%
+%% The corpus found it as the largest single divergence it had: two fixtures
+%% (`byzantium/eip197_ec_pairing/test_gas_costs`, the `enough_gas_False` cases) where
+%% the node spent its whole 1,000,000 gas limit and the chain spent 56,723. The callee
+%% forwards `0xafc7` = 44,999 gas to 0x08 with **empty input**, and Istanbul's empty
+%% pairing check costs 45,000 -- so the call must fail by **one gas**. Priced at
+%% 45,000 by a module that could not know the fork, the Byzantium case failed to fail.
+
+the_pairing_check_is_priced_by_the_fork_and_not_by_its_own_module_test() ->
+    %% Empty input, so `k = 0` and the figure is the base alone: 100,000 at
+    %% Byzantium, 45,000 from Istanbul.
+    [?assertEqual({ok, <<1:256>>, 100000},
+                  eth_evm_precompiles:precompile(8, <<>>, F))
+     || F <- [byzantium, constantinople, petersburg]],
+    [?assertEqual({ok, <<1:256>>, 45000},
+                  eth_evm_precompiles:precompile(8, <<>>, F))
+     || F <- [istanbul, london, berlin, cancun, prague]],
+    %% And the pairing check does not exist before Byzantium at all. I listed
+    %% `spurious_dragon' on the Byzantium side first, and it answered `unsupported',
+    %% which looked like a bug in the price table and was not: Spurious Dragon is mainnet
+    %% block 2,675,000 and Byzantium is 4,370,000, so Spurious Dragon is the earlier of
+    %% the two. (5,280,000, which is what I remembered, is Constantinople.) The fork
+    %% table's order is right and my recollection of the block numbers was not, which
+    %% is the same lesson as the layout, arriving from the other direction.
+    [?assertEqual(unsupported, eth_evm_precompiles:precompile(8, <<>>, F))
+     || F <- [frontier, homestead, tangerine, spurious_dragon]].
+
+the_pairing_check_adds_eighty_thousand_a_pair_at_byzantium_test() ->
+    %% One pair of G1 and G2: the generator, which is on both curves, so the check is
+    %% well formed and the difference from the base is exactly the per-pair term.
+    One = <<(pairing_g1())/binary, (pairing_g2())/binary>>,
+    ?assertEqual(100000 + 80000,
+                 element(3, eth_evm_precompiles:precompile(8, One, byzantium))),
+    ?assertEqual(45000 + 34000,
+                 element(3, eth_evm_precompiles:precompile(8, One, istanbul))).
+
+the_pairing_module_does_not_price_anything_test() ->
+    %% The shape, not just the number. A three-element reply is what fell through the
+    %% match and bypassed the fork, so the arity is the thing that has to be pinned.
+    ?assertEqual({ok, <<1:256>>}, eth_pairing_bn128:check_pairing(<<>>)),
+    ?assertEqual(2, tuple_size(eth_pairing_bn128:check_pairing(<<>>))).

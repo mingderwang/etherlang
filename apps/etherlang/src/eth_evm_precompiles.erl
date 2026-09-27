@@ -65,6 +65,10 @@ run(ecadd, Data, Fork) ->
 run(ecmul, Data, Fork) ->
     bn128_mul(Data, Fork);
 run(ecpairing, Data, Fork) ->
+    %% The pair count is read from the input's *length*, and the price from the fork
+    %% table. Both belong here: the count is a property of the input, and the price is
+    %% a property of the fork, and `eth_pairing_bn128' is given neither the fork nor
+    %% any reason to know the price. See the note on that module's `check_pairing/1'.
     case eth_pairing_bn128:check_pairing(Data) of
         {ok, Out} -> {ok, Out, bn128_cost(ecpairing, Fork, pairings(Data))};
         Error -> Error

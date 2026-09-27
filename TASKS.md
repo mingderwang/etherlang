@@ -245,13 +245,42 @@ behavioural change per commit, and each step says what it now does.
      must fail and leave `RETURNDATASIZE` at 0 — and the SSTORE that stores it is the
      dominant term in the expected figure. **Unresolved: the three are not yet
      explained, and the arithmetic above is a hypothesis, not a finding.**
-   - **`+56668` and `+56665`.** The largest systematic bucket in the earlier
-     fingerprint pass. **Unresolved**, and the bins have since moved — a current run
-     of the same corpus shows the largest positive deltas at ~986,000 on
-     `berlin/eip2929_gas_cost_increases/test_call.py::test_call_insufficient_balance`
-     and `berlin/eip2930_access_list/test_acl.py::test_repeated_address_acl` — so the
-     +56668 pair is no longer the biggest thing in the histogram and the fingerprint
-     has to be re-derived rather than chased.
+   - **The pairing check was priced by a second module. Fixed** (`v1.31`).
+     `eth_pairing_bn128:check_pairing/1` returned `{ok, Out, 34000*K + 45000}` — a
+     **three**-element tuple carrying EIP-1108's Istanbul column, hard-coded in a
+     module that has no fork and cannot know one. The bug was not a wrong number but a
+     wrong *shape*: `eth_evm_precompiles:run/3` matched a two-element `{ok, Out}`, so a
+     three-element reply matched nothing and fell through to the catch-all, handing
+     the caller that figure unchanged. **Every fork from Byzantium onward was priced
+     at Istanbul rates, including the fork that motivated
+     `eth_fork_schedule:bn128_cost/2` in the first place**, and the fork plumbing
+     added there was never reached. Byzantium's empty pairing check cost 45,000
+     instead of 100,000.
+     **The lesson is the one this repository keeps having to learn, and it is worth
+     more than the fix.** A test pinned `eth_fork_schedule:bn128_cost/2` at *every
+     fork* and passed. The table was right, the test was green, and the code that
+     should have read the table was dead. **Pinning a table is not pinning a caller.**
+     The new tests are at the precompile, and one of them pins the *arity* of the
+     reply, because the arity is the thing that fell through the match.
+   - **The largest remaining positive bucket, and it is not the pairing price.**
+     Two fixtures in `byzantium/eip197_ec_pairing/test_gas_costs` — the
+     `enough_gas_False` cases — where the node spends its whole **1,000,000** gas
+     limit and the chain spends 56,723 (Istanbul) or 56,712 (Byzantium). The node's
+     receipt says `status = 1`, so the transaction **succeeds** where the chain's
+     expectation implies it stops early; it is not an out-of-gas and not a revert.
+     The callee is nineteen bytes: `PUSH1 0` five times, `PUSH1 8`, `PUSH2 0xafc7`,
+     `CALL`, `PUSH1 0`, `SSTORE` — so it forwards **0xafc7 = 44,999** gas to the
+     pairing check at 0x08 with **empty input**, and Istanbul's empty pairing check
+     costs 45,000. The call must therefore fail by **one gas**, `SSTORE` stores the
+     failure, and the transaction ends. Fixing Byzantium's price does not move it: the
+     Istanbul figure was already 45,000. **Unresolved.** The next step is a gas trace
+     of the callee to find where the node spends 979,000 that the chain does not, and
+     the specific suspicion is the failed-CALL path in `eth_evm:run_call/10` returning
+     the forwarded allowance rather than consuming it.
+   - **`+56668` and `+56665`.** **Unresolved**, and no longer the largest thing in the
+     histogram: a current run of the same corpus puts the biggest positive deltas on
+     the `enough_gas_False` pairing cases above, so this fingerprint has to be
+     re-derived rather than chased.
    - **`-1208` gas, 1 fixture, `homestead/coverage` at Homestead.** **Unresolved.**
    - **Precompile pricing took no fork at all. Fixed** (`v1.27`). This was a
      structural gap rather than a corpus finding, and it was a large one:

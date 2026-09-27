@@ -12,8 +12,25 @@
 %% variant can be verified against this implementation in the future.
 %%
 %% Entry point check_pairing/1 takes the raw precompile input and returns
-%% {ok, 32-byte 0/1, Gas} or `unsupported` (bad length, bad points, or any
-%% internal error -> the caller proxies upstream, never wrong data).
+%% `{ok, 32-byte 0/1}'` or `unsupported` (bad length, bad points, or any internal
+%% error -> the caller proxies upstream, never wrong data).
+%%
+%% **It used to return the gas cost as a third element, and that was a second owner of
+%% a consensus constant.** The figure was `34000 * K + 45000` -- EIP-1108's Istanbul
+%% column -- hard-coded here, where this module has no fork and cannot know one. The
+%% consequence was not a wrong number but a wrong *shape*: `eth_evm_precompiles' own
+%% fork plumbing matched a two-element `{ok, Out}', so a three-element reply matched
+%% nothing and fell through to the catch-all, handing the caller this module's figure
+%% unchanged. Every fork from Byzantium onward was therefore priced at Istanbul rates,
+%% including the one that motivated `eth_fork_schedule:bn128_cost/2` in the first
+%% place.
+%%
+%% That is worth stating plainly because it is the shape of bug this repository is
+%% supposed to be immune to, and it got in anyway: a test pinned the *table's* answer
+%% for every fork and passed, while the code that should have consulted the table was
+%% never reached. Pinning a table is not pinning a caller. The cost is now computed
+%% once, in `eth_fork_schedule:bn128_cost/2', from a fork this module is not given --
+%% so a precompile module cannot price anything.
 
 -export([check_pairing/1]).
 
@@ -36,7 +53,7 @@ check_pairing(Data) ->
                     true -> 1;
                     false -> 0
                 end,
-            {ok, <<V:256>>, 34000 * K + 45000};
+            {ok, <<V:256>>};
         unsupported ->
             unsupported
     catch _:_ ->
