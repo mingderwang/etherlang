@@ -151,8 +151,11 @@ estimate(Tx, BlockParam, Overrides) ->
                 {error, Reason} -> {error, {insufficient_gas, Gas, Reason}}
             end;
         _ ->
-            Floor = intrinsic_floor(Tx),
-            Ceil = block_gas_limit(BlockParam),
+            {Ceil, Fork} = case block_gas_limit_and_fork(BlockParam) of
+                               {ok, L, F} -> {L, F};
+                               undefined -> {undefined, eth_fork_schedule:configured_fork()}
+                           end,
+            Floor = intrinsic_floor(Tx, Fork),
             case Ceil of
                 undefined ->
                     {error, no_block};
@@ -179,16 +182,42 @@ gas_option(Tx) ->
     end.
 
 %% The floor below which no execution can succeed, because the EVM charges
-%% intrinsic gas before the first instruction. `eth_tx:intrinsic_gas/1' is the one
+%% intrinsic gas before the first instruction. `eth_tx:intrinsic_gas/2' is the one
 %% schedule in this codebase, and it is the same one a transaction pays, so the
 %% estimate cannot be lower than what the transaction would be charged.
-intrinsic_floor(Tx) ->
-    try eth_tx:intrinsic_gas(Tx) catch _:_ -> 0 end.
+%%
+%% The fork is the one resolved from the block being simulated, by
+%% block_gas_limit_and_fork/1. Passing nothing would fall back to the operator's
+%% ETH_FORK pin, which is the documented weakening rather than an answer about
+%% this block.
+intrinsic_floor(Tx, Fork) ->
+    try eth_tx:intrinsic_gas(Tx, Fork) catch _:_ -> 0 end.
 
-block_gas_limit(BlockParam) ->
+%% The gas limit and the fork, from one fetch.
+%%
+%% These are asked together because they are read off the same block map and
+%% asking separately would fetch it twice -- and `eth_call' has no block cache, so
+%% a second fetch is a second round trip to whatever upstream is configured, on a
+%% path (`eth_estimateGas') that a client may call in a loop. Two reads of the
+%% same block that disagree would be worse than slow: the floor would be priced
+%% under one fork's rules and the ceiling under another's.
+block_gas_limit_and_fork(BlockParam) ->
     case fetch_block(BlockParam) of
-        {ok, Block} -> quantity_of(maps:get(<<"gasLimit">>, Block, undefined));
-        _ -> undefined
+        {ok, Block} ->
+            try
+                {ok, quantity_of(maps:get(<<"gasLimit">>, Block, undefined)),
+                 fork_at(uint(maps:get(<<"number">>, Block)),
+                         uint(maps:get(<<"timestamp">>, Block, 0)))}
+            catch
+                %% A block whose number or timestamp will not decode still has a
+                %% gas limit worth answering with, so the fork falls back to the
+                %% operator's pin rather than failing the whole estimate. The
+                %% alternative is refusing to price a block we can otherwise read.
+                _:_ -> {ok, quantity_of(maps:get(<<"gasLimit">>, Block, undefined)),
+                        eth_fork_schedule:configured_fork()}
+            end;
+        _ ->
+            undefined
     end.
 
 %% One attempt, reduced to the three answers the search needs.

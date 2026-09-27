@@ -54,8 +54,12 @@ run_t(Code, Msg, State, Env, Gas, Transient, Fork) when is_binary(Code) ->
     try exec(E0, Ctx) of
         {E1, Ctx1} ->
             GasUsed = E0#e.gas - E1#e.gas,
-            %% EIP-2200: refunds capped at half gas used.
-            MaxRefund = GasUsed div 2,
+            %% EIP-2200 (Berlin) capped refunds at gasUsed/2; EIP-3529 (London)
+            %% cut that to gasUsed/5. The cap was Berlin's divisor while the
+            %% refund amounts it capped were London's, so a London frame could
+            %% hand back up to half of what it spent when the rule allows a
+            %% fifth. See eth_fork_schedule:refund_cap/2.
+            MaxRefund = eth_fork_schedule:refund_cap(Fork, GasUsed),
             Refund = min(E1#e.refund, MaxRefund),
             FinalGas = E1#e.gas + Refund,
             Res = case E1#e.halt of
@@ -625,9 +629,14 @@ do_op(16#FF, E, Ctx) ->
             Beneficiary = eth_state:address(eth_word:to_bytes(Ben, 20)),
             State = Ctx#ctx.state,
             State1 = transfer(State, Addr, Beneficiary, eth_state:balance(State, Addr)),
-            %% EIP-6780: the balance always moves; code/storage are deleted
-            %% only when this account was created in the same transaction.
-            State2 = case eth_state:is_created(State1, Addr) of
+            %% The balance always moves. Whether code and storage are deleted
+            %% depends on the fork: before Cancun they always were, and from
+            %% EIP-6780 they are only for an account created in this
+            %% transaction. The cost is 5000 either way, so this is a question
+            %% about what the instruction destroys and not a price -- see
+            %% eth_fork_schedule:selfdestruct_deletes/1.
+            State2 = case eth_fork_schedule:selfdestruct_deletes(Ctx#ctx.fork)
+                          orelse eth_state:is_created(State1, Addr) of
                          true -> eth_state:set_destroyed(State1, Addr);
                          false -> State1
                      end,

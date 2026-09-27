@@ -556,6 +556,11 @@ validation_ctx(Block, State, BaseFee, GasLimit) ->
       gas_limit => GasLimit,
       gas_used => Block#block.gas_used,
       chain_id => eth_fork_schedule:chain_id(),
+      %% The block's own fork, so EIP-3860's init-code term is charged under the
+      %% rules of the block being validated rather than under whatever the
+      %% operator pinned. Without it a pre-Shanghai block's creation transaction
+      %% is refused for carrying 2 gas per word of gas it does not owe.
+      fork => fork(Block),
       balance_of => fun(Address) ->
           {ok, maps:get(balance, eth_state:account(State, Address), 0)}
       end,
@@ -587,7 +592,11 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     Nonce = eth_state:nonce(State, Sender),
     ContractAddress = create_address(Sender, Nonce),
     Target = case IsCreate of true -> ContractAddress; false -> To end,
-    Intrinsic = eth_tx:intrinsic_gas(Tx),
+    %% The block's own fork, not eth_tx's configured_fork/0 fallback: EIP-3860's
+    %% init-code term is Shanghai's, so a pre-Shanghai block's creation
+    %% transactions are charged without it. The fallback is right for admission,
+    %% where no block exists, and wrong here, where one does.
+    Intrinsic = eth_tx:intrinsic_gas(Tx, fork(Block)),
     %% Everything a transaction does to state outside the EVM's own frame. The
     %% EVM only executes code; the nonce bump, the value transfer, the gas
     %% purchase and the coinbase payment are the *transaction*'s effects, and

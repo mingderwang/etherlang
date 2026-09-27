@@ -142,9 +142,18 @@ chain chose, and the only symptom is a plausible answer.
 The gas *table* (`gas_cost/3,4`) is a different question and is still
 disconnected: it is fork-parameterized and unit-tested, but **nothing in the
 execution path calls it** — `eth_evm:base_cost/1` applies one flat Cancun-era
-schedule. Wiring it in is a refactor, not a substitution, because the two tables
-agree on every total but not on how it is composed. A known, documented, unticked
-item.
+schedule for the *access* costs. Four other rules are now fork-selected (the
+refund cap, EIP-6780, EIP-3860, and `eth_tx`'s intrinsic floor). Wiring the
+access costs in is a refactor, not a substitution, because the two tables agree on
+every total but not on how it is composed.
+
+**SSTORE net metering is not implemented, and a no-op write is mispriced.** A
+no-op is charged 2900 with a 100 refund where EIP-2200 clause (1) says
+`SLOAD_GAS` and nothing else — 800 at Berlin, 100 from EIP-2929. That is 2700 gas
+net overcharged on every no-op write, at London too. It needs the value each slot
+held at the *start of the transaction*, which the EVM does not track and the
+transient map cannot hold (it is discarded on a child revert, and the original
+value must survive one). Do not substitute the current value for the original.
 
 ---
 
@@ -375,7 +384,9 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
 | `TERMINAL_BLOCK_HASH` (EIP-3675) | Chain-config data, not in the EIP. Carried and echoed, never checked against a post-Merge block's difficulty. |
 | Per-fork gas *price* wiring | A refactor, not a substitution. Availability is done; pricing is not. |
 | `eth_block:to_rlp/1` fork-awareness | It unconditionally includes the Cancun trailing fields, so it is only correct for Cancun-or-later headers. Pre-existing, documented, unfixed. |
-| `eth_tx:initcode_gas/1` fork-awareness | Charges EIP-3860 init-code gas at every fork, so a pre-Shanghai creation transaction is overcharged at admission. A transaction has no block context to resolve a fork from, and the pool has none. |
+| `eth_tx:intrinsic_gas/1` fork-awareness | Takes no fork and falls back to the operator's `ETH_FORK` pin. Correct for pool admission, where no block exists; wrong for `eth_call`/`eth_estimateGas` and block execution, which pass the block's own fork through `intrinsic_gas/2`. Do not use the one-argument form where a block is in hand. |
+| EIP-150's 63/64 rule and 2300 stipend | Applied at every fork. The EIP states the rule it introduced, not the one it replaced, and no consulted client still supports a pre-Whistle block — so the earlier behaviour would have to be invented. |
+| SSTORE net metering | Not implemented, and a no-op write is mispriced by 2700 gas net. See §3 "Fork awareness". |
 
 ## 11. Known dead code
 

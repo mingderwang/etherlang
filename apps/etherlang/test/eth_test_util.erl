@@ -9,7 +9,7 @@
          %% out of finalize/1 had no way to get one and resorted to writing the
          %% verdict term by hand. See finalize_ctx/1.
          finalize_ctx/1, store_parent/1, seed_account/0, inbound_block/2,
-         seed_root_with_parent/1]).
+         seed_root_with_parent/1, with_local_reads/1]).
 
 start_apps() ->
     {ok, _} = application:ensure_all_started(crypto),
@@ -224,6 +224,33 @@ make_blocks(From, Count, Parent, Salt) ->
 %% while eth_block produces a 3-tuple for the state root: the test passed and the
 %% engine answered SYNCING for a wrong state root. Fixtures must come from the
 %% code's real output, not from a guess at it.
+
+%% Run Fun with eth_state's reads answered from the local trie rather than from
+%% upstream, so a test that reads an account this node does not hold gets 0 or
+%% <<>> and stops -- instead of performing a lazy JSON-RPC fetch against whatever
+%% endpoint is configured.
+%%
+%% This is not a convenience. `eth_rpc_client' is process-wide and defaults to a
+%% public Sepolia node, so a test that reads a missing account does not fail: it
+%% blocks in httpc until the 20 s client timeout, and EUnit reports a *cancelled*
+%% test, which reads like the runner gave up and is not that. It has happened here
+%% more than once, always on the assertion rather than on the code under test.
+%%
+%% Prefer seeding the overlay, which needs no global at all. Reach for this when
+%% the account is one the code under test *removes* -- a destroyed SELFDESTRUCT
+%% target, say -- because then there is nothing left to seed.
+%%
+%% Restores the previous setting in an `after', because base_source/0 is
+%% process-wide and a leak redirects every other module's reads for the rest of
+%% the run.
+with_local_reads(Fun) ->
+    _ = ensure_started(eth_mpt),
+    Previous = eth_state:base_source(),
+    ok = eth_state:set_base_source(mpt),
+    try Fun()
+    after
+        _ = eth_state:set_base_source(Previous)
+    end.
 
 %% Run Fun against a fresh MPT and chain store, leaving the process-wide
 %% base-source setting as it was found.

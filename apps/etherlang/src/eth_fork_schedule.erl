@@ -50,6 +50,9 @@
           apply_withdrawals_to_state/2,
           gas_cost/3,
           gas_cost/4,
+          refund_cap/2,
+          selfdestruct_deletes/1,
+          initcode_word_cost/1,
           timestamp_in_frame/3,
           timestamp_frame/2,
           activated_at/2 ]).
@@ -1307,6 +1310,56 @@ call_cost(Fork, Args) ->
 account_creation_cost(_Fork) -> 32000.
 selfdestruct_cost(_Fork) -> 5000.
 
+%% ---------------------------------------------------------------------------
+%% Rules the fork selects, as opposed to prices it supplies
+%% ---------------------------------------------------------------------------
+%% ---------------------------------------------------------------------------
+%% Not every fork-dependent rule is a number in a table. Some of them are a
+%% question with a boolean answer -- may this frame delete an account's storage,
+%% may this transaction's refunds exceed this -- and those are here, next to the
+%% prices, so that "what does this fork do" is answerable from one module.
+
+%% EIP-3529 (London) sets MAX_REFUND_QUOTIENT to 5 and caps the refund at
+%% `gas_used // 5'. Before it, EIP-2200 (Berlin) capped at `gas_used // 2', and
+%% the ratio is 1/2 in the EIP-3529 motivation section's own description of the
+%% rule it replaces. The two are not interchangeable and the difference is not
+%% small: at London a transaction may refund a fifth of what it spent rather than
+%% half, so a frame that refunds the maximum comes back with 40% less gas.
+%%
+%% The EVM applied EIP-2200's divisor while applying EIP-3529's refund amounts, so
+%% the cap and the refund it was capping came from different forks. That is not a
+%% rounding difference: it is the difference between a frame that ends with gas
+%% left and one that runs out.
+-spec refund_cap(atom(), integer()) -> integer().
+refund_cap(Fork, GasUsed) when is_atom(Fork), is_integer(GasUsed), GasUsed >= 0 ->
+    case at_least(Fork, london) of
+        true -> GasUsed div 5;
+        false -> GasUsed div 2
+    end;
+refund_cap(_Fork, _GasUsed) ->
+    0.
+
+%% Does SELFDESTRUCT delete an account's code and storage *unconditionally* at
+%% this fork?
+%%
+%% True before Cancun, where it always did. From EIP-6780 (Cancun) it deletes
+%% them only for an account created in the same transaction, so the answer is
+%% false and the caller has to supply the same-transaction test itself. The EIP
+%% states both sides -- "the new functionality will be only to send all Ether in
+%% the account ... except that the current behaviour is preserved when
+%% SELFDESTRUCT is called in the same transaction a contract was created" -- so
+%% this is read off the EIP rather than inferred.
+%%
+%% Named as a question rather than folded into a price because it is not one: the
+%% gas cost of SELFDESTRUCT is 5000 at every fork, and only *what it destroys*
+%% changes. A schedule carrying this as a number would be claiming the price
+%% varies when it does not.
+-spec selfdestruct_deletes(atom()) -> boolean().
+selfdestruct_deletes(Fork) when is_atom(Fork) ->
+    not at_least(Fork, cancun);
+selfdestruct_deletes(_Fork) ->
+    false.
+
 dynamic_gas_cost(16#20, _Fork, Length, _Args) -> 6 * ((Length + 31) div 32);
 dynamic_gas_cost(16#37, _Fork, Length, _Args) -> 3 * ((Length + 31) div 32);
 dynamic_gas_cost(16#39, _Fork, Length, _Args) -> 3 * ((Length + 31) div 32);
@@ -1317,13 +1370,39 @@ dynamic_gas_cost(16#5E, _Fork, Length, _Args) -> 3 * ((Length + 31) div 32);
 dynamic_gas_cost(Op, _Fork, Length, _Args) when Op >= 16#A0, Op =< 16#A4 ->
     8 * Length;
 %% EIP-3860 (Shanghai): both creators are charged 2 gas per 32-byte word of
-%% init code. eth_tx:initcode_gas/2 charges the same cost in a transaction's
-%% intrinsic gas, so the two agree rather than the opcode double-counting.
-dynamic_gas_cost(16#F0, _Fork, Length, _Args) -> 2 * ((Length + 31) div 32);
+%% init code, through initcode_word_cost/1 below. eth_tx:initcode_gas/3 charges
+%% the same cost in a transaction's intrinsic gas, so the two agree rather than
+%% the opcode double-counting.
+%%
+%% The condition is Shanghai's and it was not applied. Before EIP-3860 neither
+%% CREATE nor CREATE2 paid anything for the init code about to run, so charging
+%% it at a pre-Shanghai block overcharges every contract creation there by two
+%% gas per word of init code.
+%%
+%% The term is factored out rather than written into each clause because
+%% `eth_tx' has to charge the identical figure for a creation transaction's
+%% `data', and two copies of a consensus constant is one too many.
+dynamic_gas_cost(16#F0, Fork, Length, _Args) ->
+    initcode_word_cost(Fork) * ((Length + 31) div 32);
 %% CREATE2 additionally hashes the init code, at KECCAK256's per-word price.
-dynamic_gas_cost(16#F5, _Fork, Length, _Args) ->
-    6 * ((Length + 31) div 32) + 2 * ((Length + 31) div 32);
+%% The hashing term is not Shanghai's -- it is CREATE2's from Constantinople --
+%% so it is charged at every fork and only the init-code term is gated.
+dynamic_gas_cost(16#F5, Fork, Length, _Args) ->
+    Words = (Length + 31) div 32,
+    6 * Words + initcode_word_cost(Fork) * Words;
 dynamic_gas_cost(_Op, _Fork, _Length, _Args) -> 0.
+
+%% EIP-3860's per-word init-code charge, which is 2 from Shanghai and 0 before
+%% it. Exported because eth_tx:initcode_gas/3 charges the same term for a
+%% creation transaction's data, and the two must not be able to disagree.
+-spec initcode_word_cost(atom()) -> non_neg_integer().
+initcode_word_cost(Fork) when is_atom(Fork) ->
+    case at_least(Fork, shanghai) of
+        true -> 2;
+        false -> 0
+    end;
+initcode_word_cost(_Fork) ->
+    0.
 
 %% ---------------------------------------------------------------------------
 %% Internal helpers

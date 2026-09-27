@@ -14,7 +14,7 @@
 
 -export([to_rlp/1, from_rlp/1, tx_root/1, sender/1,
          blob_versioned_hashes/1, valid_versioned_hashes/1,
-         validate/1, validate/2, intrinsic_gas/1, intrinsic_gas/3, tx_type/1]).
+         validate/1, validate/2, intrinsic_gas/1, intrinsic_gas/2, tx_type/1]).
 
 %% The first byte of every versioned hash, per EIP-4844. Only the KZG-commitment
 %% variant is defined, so a transaction carrying anything else is invalid.
@@ -303,7 +303,7 @@ validate(Tx, Ctx) when is_map(Tx), is_map(Ctx) ->
                {error, invalid_fee}),
         ensure(fee_ceiling_ok(Tx, MaxFee, GasPrice, Ctx), {error, fee_too_low}),
         ok = check_blobs(Tx, Ctx),
-        ensure(Gas >= intrinsic_gas(Data, IsCreate, AccessList),
+        ensure(Gas >= intrinsic_gas(Data, IsCreate, AccessList, ctx_fork(Ctx)),
                {error, intrinsic_gas}),
         ensure(valid_signature(Tx), {error, bad_signature}),
         ok = check_chain_id(Tx, Ctx),
@@ -534,10 +534,26 @@ check_blobs(Tx, Ctx) ->
 %% the integer 0. A <<0>> pattern would silently charge every byte the non-zero
 %% rate.
 intrinsic_gas(Tx) ->
-    {_To, IsCreate} = to_field(Tx),
-    intrinsic_gas(data_field(Tx), IsCreate, access_list_field(Tx)).
+    intrinsic_gas(Tx, eth_fork_schedule:configured_fork()).
 
-intrinsic_gas(Data, IsCreate, AccessList) when is_binary(Data), is_list(AccessList) ->
+%% The fork matters for exactly one term: EIP-3860's 2-gas-per-word init-code
+%% charge, which is Shanghai's. A creation transaction's intrinsic gas is
+%% therefore a function of the block it would go in, and the one-argument form
+%% cannot supply that.
+%%
+%% What it supplies instead is the operator's ETH_FORK pin, and that is a
+%% *documented weakening*, not a resolution: on a chain whose head is not the
+%% pinned fork, this overcharges a pre-Shanghai creation and undercharges a
+%% post-Shanghai one. It is the right answer for admission, where no block exists
+%% yet, and the wrong one to rely on -- so every caller that does have a block
+%% passes the block's own fork, and eth_block does. A caller that has a block and
+%% uses this form is silently getting the pin.
+intrinsic_gas(Tx, Fork) when is_atom(Fork) ->
+    {_To, IsCreate} = to_field(Tx),
+    intrinsic_gas(data_field(Tx), IsCreate, access_list_field(Tx), Fork).
+
+intrinsic_gas(Data, IsCreate, AccessList, Fork)
+  when is_binary(Data), is_list(AccessList), is_atom(Fork) ->
     Base = case IsCreate of
         true -> 53000;
         false -> 21000
@@ -548,12 +564,20 @@ intrinsic_gas(Data, IsCreate, AccessList) when is_binary(Data), is_list(AccessLi
     AccessGas = lists:foldl(fun({_Addr, Slots}, A) ->
         A + 2400 + 1900 * length(Slots)
     end, 0, AccessList),
-    Base + DataGas + AccessGas + initcode_gas(Data, IsCreate);
-intrinsic_gas(_Data, _IsCreate, _AccessList) ->
+    Base + DataGas + AccessGas + initcode_gas(Data, IsCreate, Fork);
+intrinsic_gas(_Data, _IsCreate, _AccessList, _Fork) ->
     0.
 
-initcode_gas(_Data, false) -> 0;
-initcode_gas(Data, true) -> 2 * ((byte_size(Data) + 31) div 32).
+%% The same term the CREATE and CREATE2 opcodes charge, and gated the same way,
+%% because the two must agree: eth_block:execute_transactions/5 runs a creation
+%% transaction's `data' straight through eth_evm without ever reaching the
+%% opcode, so exactly one of the two ever applies to it. When they disagreed the
+%% intrinsic charge and the execution charge would differ, and which of them the
+%% transaction actually paid would depend on the path it took.
+initcode_gas(_Data, false, _Fork) -> 0;
+initcode_gas(Data, true, Fork) when is_binary(Data), is_atom(Fork) ->
+    eth_fork_schedule:initcode_word_cost(Fork) * ((byte_size(Data) + 31) div 32);
+initcode_gas(_Data, _IsCreate, _Fork) -> 0.
 
 %% Signature validity has two independent parts, and only the second is usually
 %% noticed:
@@ -644,6 +668,23 @@ check_chain_id(Tx, Ctx) ->
     case maps:get(chain_id, Ctx, undefined) of
         undefined -> ok;
         Expected -> ensure(tx_chain_id(Tx) =:= Expected, {error, wrong_chain_id})
+    end.
+
+%% The fork validity is priced under. Only EIP-3860's init-code term depends on
+%% it, and only a creation transaction pays it.
+%%
+%% A caller that has a block puts the block's fork in the context -- eth_block
+%% does, and it is the only caller for which an answer about *this* block is the
+%% right one. A caller that does not (the pool, at admission) gets the
+%% operator's ETH_FORK pin, which is a documented weakening rather than a
+%% resolution: no block exists yet, so there is nothing better to say. It is the
+%% same treatment base_fee gets, and deliberately not the same as omitting the
+%% check: an absent base fee means the ceiling rule is *unchecked*, whereas an
+%% absent fork means the rule is applied under a stated assumption.
+ctx_fork(Ctx) ->
+    case maps:get(fork, Ctx, undefined) of
+        Fork when is_atom(Fork) -> Fork;
+        _ -> eth_fork_schedule:configured_fork()
     end.
 
 tx_chain_id(Tx) ->

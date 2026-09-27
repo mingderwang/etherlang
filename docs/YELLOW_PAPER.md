@@ -1,6 +1,6 @@
 # etherlang — design and current state
 
-**Status**: v1.0 in progress. 583 eunit tests, green.
+**Status**: v1.0 in progress. 597 eunit tests, green.
 
 This document describes what the node *is* and what it is *becoming*: the system
 model, the trust assumptions, the data structures, and — at least as important —
@@ -274,7 +274,7 @@ Two halves of "per-fork exact" must not be confused:
 | | Status |
 |---|---|
 | **Availability** — may this fork run this instruction at all? | **Done.** An instruction the fork lacks is an exceptional halt consuming the frame's whole allowance. |
-| **Price** — what does it cost? | **Not done.** `eth_evm:base_cost/1` takes no fork; one Cancun-era schedule is applied to every block. |
+| **Price** — what does it cost? | **Partly done.** Four rules are fork-selected; the access costs are not. |
 
 The availability half was the more dangerous of the two, because every clause in
 `do_op/3` was unconditional: PUSH0 executed in a Paris block and TSTORE executed
@@ -282,27 +282,69 @@ anywhere before Cancun, each pushing a value and each returning *successfully*. 
 frame that succeeds where the chain's must halt is a different post-state, and
 nothing in the result says so.
 
-The price half is still open, and specifically:
+### 7.2.1 What per-fork pricing now selects
 
-- no EIP-150 pre-Berlin access costs — `SLOAD` is 200, `BALANCE`/`EXTCODESIZE`/
-  `EXTCODEHASH` 700, the `CALL` family 700, where the Berlin+ figures are
-  2100/2600/100;
-- no EIP-3529 refund cap — the interpreter caps refunds at `gasUsed div 2` (the
-  EIP-2200 figure) while applying EIP-3529's 4800 clear refund, so the cap and
-  the refund it caps come from different forks;
-- no EIP-6780 gating on SELFDESTRUCT — the same-transaction rule is applied at
-  every fork, where before Cancun storage was always deleted;
-- EIP-3860's init-code cost is charged at every fork, and the Shanghai condition
-  belongs with the per-fork branching.
+Four rules, each read off the EIP's own text rather than recalled, each pinned by
+a test that fails if the gate is removed:
 
-**Wiring the price half is a refactor, not a substitution.** The two tables agree
-on every opcode's *total* but not on how it is composed: `eth_evm:base_cost/1`
-prices a warm access at 100 and its handler adds the cold surcharge separately
-(2500 account, 2000 slot), while `eth_fork_schedule:access_cost/3` returns the
-**total** (2600 or 2100) in one figure. Swapping the fork table in for the EVM's
-base would charge a cold `BALANCE` 5100 instead of 2600, a cold `SLOAD` 4100
-instead of 2100, and a cold `CALL` 5200 instead of 2600. One owner of the
-composition has to be chosen and the other side changed to match.
+- **The refund cap.** EIP-2200 (Berlin) allowed `gas_used // 2`; EIP-3529 (London)
+  sets `MAX_REFUND_QUOTIENT` to 5 and allows `gas_used // 5`. The interpreter was
+  applying Berlin's divisor to London's refund *amounts*, so cap and refund came
+  from different forks — and a frame refunding the maximum got 40% more gas back
+  than London allows.
+- **EIP-6780 (Cancun) on SELFDESTRUCT.** The balance always moves; code and
+  storage are deleted only for an account created in the same transaction, where
+  before Cancun they were always deleted. A *question* rather than a price,
+  because the cost is 5000 at every fork and only what it destroys changes.
+- **EIP-3860's init-code term**, Shanghai-gated, in the CREATE and CREATE2
+  opcodes *and* in a creation transaction's intrinsic gas — which had been
+  charging it at every fork, overcharging a pre-Shanghai creation by 2 gas a
+  word. Enough to refuse a transaction minted exactly at the pre-Shanghai floor.
+  CREATE2's hashing term is Constantinople's and stays ungated.
+- **The fork's reach into `eth_tx`.** The validator's intrinsic check had no fork
+  to consult at all. It does now, from the block's own, supplied by
+  `eth_block:validation_ctx/4`. Where no block exists — pool admission — the
+  operator's `ETH_FORK` pin is used instead, which is a stated weakening rather
+  than a resolution.
+
+### 7.2.2 What is still missing
+
+- **The access costs.** `eth_evm:base_cost/1` takes no fork, so a warm access
+  costs 100 and a cold one 2600/2100 at every fork. EIP-150's pre-Berlin figures
+  — `SLOAD` 200, `BALANCE`/`EXTCODEHASH` 400, `EXTCODESIZE`/`EXTCODECOPY` 700, the
+  `CALL` family 700 — are not applied anywhere. **Wiring these is a refactor, not
+  a substitution**: the two tables agree on every opcode's *total* but not on how
+  it is composed. `base_cost/1` prices a warm access at 100 and its handler adds
+  the cold surcharge separately (2500 account, 2000 slot), while
+  `eth_fork_schedule:access_cost/3` returns the **total** (2600 or 2100) in one
+  figure. Swapping the fork table in for the EVM's base would charge a cold
+  `BALANCE` 5100 instead of 2600, a cold `SLOAD` 4100 instead of 2100, and a cold
+  `CALL` 5200 instead of 2600. One owner of the composition has to be chosen and
+  the other side changed to match.
+- **EIP-150's 63/64 gas-retention rule and the 2300 stipend**, applied at every
+  fork. Named as a gap rather than implemented: the EIP states the rule it
+  introduced and not the one it replaced, and no client consulted still supports a
+  pre-Whistle block, so the earlier behaviour would have to be invented.
+- **SSTORE net metering** — see below; this one is a live bug, not a gap.
+
+### 7.2.3 A live SSTORE bug, named rather than fixed
+
+A no-op write — storing a slot's existing value back to itself — is charged **2900
+with a 100 refund**, netting 2800. EIP-2200 clause (1) says a no-op costs
+`SLOAD_GAS` and nothing else: 800 at Berlin, 100 from EIP-2929. The interpreter
+therefore overcharges **2700 gas net on every no-op write at every fork, London
+included**.
+
+The `20000` / `2900` / `4800` cases beside it are correct, which is why this sat
+undetected next to a schedule that had just been described as exact within
+Cancun-era rules.
+
+It is not fixed here because the correct rule is EIP-2200's **net** metering,
+which needs the value each slot held *at the start of the transaction*. The EVM
+tracks no such thing, and the transient map cannot hold it: that map is
+transaction-scoped but is discarded on a child revert, whereas the original value
+must survive one. Substituting the current value for the original would be
+inventing a schedule no fork specifies.
 
 ### 7.3 The engine's status mapping
 

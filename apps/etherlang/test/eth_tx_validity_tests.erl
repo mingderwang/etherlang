@@ -646,3 +646,208 @@ the_intrinsic_floor_is_the_same_everywhere_test() ->
     Create = signed(Priv, #{to => <<>>, gas => 100000, input => <<>>}),
     ?assertEqual(21000, eth_tx:intrinsic_gas(Call)),
     ?assertEqual(53000, eth_tx:intrinsic_gas(Create)).
+
+%% ---------------------------------------------------------------------------
+%% Intrinsic gas is priced under a fork
+%% ---------------------------------------------------------------------------
+%%
+%% EIP-3860's 2-gas-per-word init-code charge is Shanghai's, and it is the only
+%% term of a transaction's intrinsic gas that moves with the fork. This was charged
+%% unconditionally, so a pre-Shanghai creation transaction was refused for
+%% carrying gas it does not owe: 32 bytes of init code is one word, and the floor
+%% was 2 too high, which is enough to reject a transaction minted exactly at the
+%% pre-Shanghai floor.
+
+%% The term, measured rather than restated, so a change to the schedule cannot
+%% make both sides of this wrong together.
+%%
+%% Every assertion here is *relative* to the same transaction at London, and
+%% deliberately not an absolute figure. The calldata itself is charged too -- four
+%% gas a zero byte, sixteen a non-zero one -- so an absolute number would be
+%% asserting the calldata rate as well, and would have been wrong for a reason
+%% that has nothing to do with the fork. What is under test is how much the fork
+%% moves the floor, and nothing else.
+initcode_gas_is_only_charged_from_shanghai_test() ->
+    Priv = eth_secp256k1:generate_key(),
+    %% 64 bytes of init code: exactly two 32-byte words.
+    Data = <<0:512>>,
+    Create = signed(Priv, #{to => <<>>, gas => 200000, input => Data}),
+    Words = (byte_size(Data) + 31) div 32,
+    ?assertEqual(2, Words),
+    Base = eth_tx:intrinsic_gas(Create, london),
+    Pre = [frontier, homestead, byzantium, constantinople, petersburg, istanbul,
+           berlin, london, paris, merge],
+    Post = [shanghai, cancun, prague, osaka],
+    %% Before Shanghai the floor does not move with the fork.
+    [?assertEqual(Base, eth_tx:intrinsic_gas(Create, F)) || F <- Pre],
+    %% From Shanghai it carries two gas a word for the init code, and only that.
+    [?assertEqual(Base + 2 * Words, eth_tx:intrinsic_gas(Create, F)) || F <- Post],
+    %% A call carries no init code at all, so the fork cannot move its floor.
+    Call = signed(Priv, #{to => ?PROBE, gas => 200000}),
+    CallBase = eth_tx:intrinsic_gas(Call, london),
+    [?assertEqual(CallBase, eth_tx:intrinsic_gas(Call, F)) || F <- Pre ++ Post],
+    %% And the call's floor really is the plain transfer price, so the "does not
+    %% move" assertion above is not vacuous.
+    ?assertEqual(21000, CallBase).
+
+%% A creation whose init code is not a whole number of words still pays for the
+%% partial word, at both ends of the fork boundary. This is the rounding a length
+%% argument gets wrong most easily, and the boundary sits exactly at 32 bytes: at
+%% 31 the fork makes no difference and at 32 it makes one of 2.
+initcode_gas_rounds_a_partial_word_up_at_both_forks_test() ->
+    Priv = eth_secp256k1:generate_key(),
+    Floor = fun(Len) ->
+        signed(Priv, #{to => <<>>, gas => 200000, input => <<0:(Len * 8)>>})
+    end,
+    %% Every length from 1 to 65 bytes: the Shanghai floor is London's plus two
+    %% gas per word, rounded up, with no length at which the two agree.
+    [begin
+         T = Floor(Len),
+         ?assertEqual(2 * ((Len + 31) div 32),
+                      eth_tx:intrinsic_gas(T, shanghai) -
+                          eth_tx:intrinsic_gas(T, london))
+     end || Len <- lists:seq(1, 65)],
+    %% The calldata rate moves with the length too, so the *total* floor is not
+    %% just the creation price plus a word count. Asserted so that a future
+    %% reader does not "simplify" the difference above into an absolute figure.
+    ?assertNotEqual(eth_tx:intrinsic_gas(Floor(1), london),
+                    eth_tx:intrinsic_gas(Floor(33), london)).
+
+%% The one-argument form falls back to the operator's pin, and says so.
+%%
+%% It is a documented weakening rather than a resolution: no block exists at
+%% admission, so there is nothing better to say. What it must not be is a
+%% *different* answer from the two-argument form under the same fork, or a
+%% validator and a block executor would price the same transaction differently
+%% for no stated reason.
+intrinsic_gas_without_a_fork_matches_the_pinned_fork_test() ->
+    Priv = eth_secp256k1:generate_key(),
+    Create = signed(Priv, #{to => <<>>, gas => 200000, input => <<0:512>>}),
+    Pinned = eth_fork_schedule:configured_fork(),
+    ?assertEqual(eth_tx:intrinsic_gas(Create, Pinned),
+                 eth_tx:intrinsic_gas(Create)),
+    ?assertEqual(eth_tx:intrinsic_gas(signed(Priv, #{to => ?PROBE, gas => 100000}),
+                                      Pinned),
+                 eth_tx:intrinsic_gas(signed(Priv, #{to => ?PROBE, gas => 100000}))).
+
+%% ---------------------------------------------------------------------------
+%% The block's own fork reaches the intrinsic-gas floor
+%% ---------------------------------------------------------------------------
+%%
+%% EIP-3860's init-code term is Shanghai's, so a creation transaction's floor is a
+%% function of the block it would go in. Two things have to be true for that to
+%% hold, and neither was observable before:
+%%
+%%   * eth_block:validation_ctx/4 puts the *block's* fork in the context, rather
+%%     than leaving eth_tx to fall back to the operator's ETH_FORK pin; and
+%%   * eth_tx:validate/2 reads that fork out of the context.
+%%
+%% Both were found untested by injection, not by reading: hardcoding the fork
+%% inside eth_tx, and separately dropping it from eth_block's context, each left
+%% every test in this module green. The table was pinned; the wiring was not.
+%%
+%% The observable is a transaction minted exactly at the pre-Shanghai floor. It
+%% is accepted by a pre-Shanghai block and refused by a post-Shanghai one, because
+%% the latter requires two more gas per word of init code than the sender offered.
+%% A transaction that sits well above both floors would pass either way and prove
+%% nothing, which is why the `gas' below is the London floor and not a round
+%% number.
+the_intrinsic_floor_follows_the_blocks_own_fork_test() ->
+    with_ctx(fun() ->
+        %% One word of init code, so the Shanghai floor is exactly 2 higher.
+        Code = <<16#60, 16#00, 16#60, 0, 16#52,
+                16#60, 1, 16#60, 0, 16#F3>>,
+        {Priv, Sender} = new_key(),
+        fund(Sender, 1000 * ?WEI, 0),
+        London = eth_tx:intrinsic_gas(
+                   signed(Priv, #{to => <<>>, gas => 200000, input => Code}),
+                   london),
+        ?assertEqual(London, eth_tx:intrinsic_gas(
+                              signed(Priv, #{to => <<>>, gas => 200000,
+                                             input => Code}), paris)),
+        ?assertEqual(London + 2, eth_tx:intrinsic_gas(
+                                  signed(Priv, #{to => <<>>, gas => 200000,
+                                                 input => Code}), shanghai)),
+        Mint = signed(Priv, #{to => <<>>, gas => London, input => Code}),
+
+        %% The precondition: the two blocks really are on opposite sides of
+        %% Shanghai. Sepolia activates it at 1677557088, and `fork/1' reads the
+        %% block's own timestamp, so this is the only thing that differs.
+        ?assertEqual(london, fork_at(0)),
+        ?assertEqual(shanghai, fork_at(1677557088)),
+
+        %% Refused by the post-Shanghai block, which does charge the term.
+        %% Deliberately first: a refused block commits nothing, so the chain
+        %% store and the trie are untouched and the next block can be built off
+        %% the same parent. `store_parent/1' always anchors at height 0, so the
+        %% two blocks cannot be chained -- the order is what makes them
+        %% comparable rather than a sequence.
+        Parent = store_parent(eth_mpt:state_root()),
+        ?assertMatch({error, {invalid_transaction, 0, intrinsic_gas}},
+                     eth_block:finalize(stamped(Parent, 1, [Mint], 1677557088))),
+
+        %% And accepted by the pre-Shanghai block, which does not. Same
+        %% transaction, same sender, same declared gas -- only the block's
+        %% timestamp differs, so the difference in outcome is the fork.
+        {ok, _, _} = eth_block:finalize(stamped(Parent, 1, [Mint], 0))
+    end).
+
+%% The block fork the test above depends on, resolved the way the node resolves
+%% it, so the precondition cannot drift from the thing under test.
+fork_at(Timestamp) ->
+    {ok, F} = eth_fork_schedule:current_fork(
+                eth_fork_schedule:configured_network(), 1, Timestamp),
+    F.
+
+stamped(Parent, Number, Txs, Timestamp) ->
+    (child_block(Parent, Number, Txs))#block{timestamp = Timestamp}.
+
+%% The *other* place the block's fork is used, and the one a validator test
+%% cannot see.
+%%
+%% eth_block computes the intrinsic floor twice: once inside eth_tx:validate/2,
+%% which decides acceptance, and once again in run_transaction/5 to work out how
+%% much gas the EVM frame starts with. The second use is not observable through
+%% acceptance -- a frame that is two gas short or two gas long still runs -- so
+%% dropping the block's fork there left every test green while quietly moving
+%% `gasUsed' by two gas per word of init code. `gasUsed' is a receipt field, the
+%% receipts root is in the block header, and the header is hashed.
+%%
+%% So the observable is the receipts root: two blocks differing only in
+%% timestamp, each executing the same transaction at a gas limit both forks
+%% accept, must produce *different* receipts roots. Were the floor taken from one
+%% fork for both, the roots would be equal -- and equal roots are exactly what a
+%% node reports when it has stopped pricing per fork.
+the_evm_allowance_follows_the_blocks_own_fork_test() ->
+    Code = <<16#60, 16#00, 16#60, 0, 16#52,
+             16#60, 1, 16#60, 0, 16#F3>>,
+    Root = fun(Timestamp) ->
+        with_ctx(fun() ->
+            {Priv, Sender} = new_key(),
+            fund(Sender, 1000 * ?WEI, 0),
+            %% A limit both forks accept, so acceptance cannot be what differs.
+            Tx = signed(Priv, #{to => <<>>, gas => 100000, input => Code}),
+            Parent = store_parent(eth_mpt:state_root()),
+            {ok, _Block, Verification} =
+                eth_block:finalize(stamped(Parent, 1, [Tx], Timestamp)),
+            %% `verified' and not `unverified': an unrooted execution would satisfy
+            %% "the two differ" for a reason that has nothing to do with the fork.
+            {verified, R} = maps:get(receipts_root, Verification),
+            R
+        end)
+    end,
+    ?assertEqual(london, fork_at(0)),
+    ?assertEqual(shanghai, fork_at(1677557088)),
+    London = Root(0),
+    Shanghai = Root(1677557088),
+    %% Both blocks really executed and reported a root, rather than either
+    %% leaving the field absent -- without this, "they differ" could be satisfied
+    %% by one of them being `unverified'.
+    ?assert(is_binary(London)),
+    ?assert(is_binary(Shanghai)),
+    ?assertEqual(32, byte_size(London)),
+    ?assertEqual(32, byte_size(Shanghai)),
+    %% And they differ, which is the whole claim: the same transaction, the same
+    %% declared gas, and a different receipts root because the frame it was given
+    %% was sized under a different fork's floor.
+    ?assertNotEqual(London, Shanghai).

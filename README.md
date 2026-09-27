@@ -66,8 +66,8 @@ beacon, validators, or block production).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**583 tests, green**).
-* **Status** — v0.7.0; eunit green (583 tests) and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**597 tests, green**).
+* **Status** — v0.7.0; eunit green (597 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -534,9 +534,10 @@ Where the work actually stands:
 **On state roots.** etherlang can execute blocks and report a state root, but that root is **not known** to equal the one the network computed. Two distinct halves of "per-fork exact" are involved and only the first is done:
 
 - *Availability* — an instruction the executing fork does not have is now an exceptional halt that consumes the frame's whole allowance. Before this every clause in `eth_evm:do_op/3` was unconditional, so PUSH0 executed in a Paris block and TSTORE executed anywhere before Cancun, each returning *successfully* — a post-state no other client reproduces, produced without an error.
-- *Pricing* — **not done.** `eth_evm:base_cost/1` still takes no fork, so one Cancun-era schedule prices every block. Specifically absent: EIP-150 pre-Berlin access costs, the EIP-3529 refund cap (the interpreter caps at `gasUsed div 2` while applying EIP-3529's 4800 clear refund, so cap and refund come from different forks), EIP-6780 gating on SELFDESTRUCT, and the Shanghai condition on EIP-3860 init-code gas. The fork-parameterized table that *looks* finished is not reachable from execution, and when it was finally checked against the live one it turned out to be wrong for 19 of the 256 opcodes while its own tests passed. Wiring it in is a refactor of the charging path, not a substitution — the two tables agree on every total but not on its composition, so a cold `BALANCE` would be charged 5100 instead of 2600.
+- *Pricing* — **partly done.** Four rules are now fork-selected, each derived from the EIP text and pinned: the **refund cap** (EIP-2200's `gasUsed/2` before London, EIP-3529's `gasUsed/5` from it — the interpreter applied the first while applying the second's refund *amounts*, so cap and refund came from different forks); **EIP-6780** on SELFDESTRUCT (always deletes before Cancun, only for a same-transaction account from it); **EIP-3860**'s init-code term (Shanghai-gated, in the CREATE/CREATE2 opcodes *and* in a transaction's intrinsic gas, which had been charging it at every fork and so overcharged a pre-Shanghai creation by 2 gas a word); and the fork now reaches `eth_tx`'s intrinsic check, which it did not before. Still absent: the **access costs** — `eth_evm:base_cost/1` takes no fork, so a warm access is 100 and a cold one 2600/2100 at every fork, where EIP-150's pre-Berlin 700/200 apply. Wiring those is a refactor of the charging path, not a substitution: the two tables agree on every total but not on its composition, so a cold `BALANCE` would be charged 5100 instead of 2600.
+- **A live Cancun-era SSTORE bug, found while doing the above and not fixed.** A no-op write — storing a slot's existing value back to itself — is charged **2900 with a 100 refund**, netting 2800. EIP-2200 clause (1) says a no-op costs `SLOAD_GAS` and nothing else, which is 800 at Berlin and 100 from EIP-2929. So the interpreter overcharges 2700 gas net on every no-op write at every fork, London included. The `20000`/`2900`/`4800` cases beside it are correct. It is not fixed here because the correct schedule is EIP-2200's *net* metering, which needs the value each slot held at the start of the transaction; the EVM tracks no such thing, and the transient map cannot hold it because it is discarded on a child revert while the original value must survive. That is its own change with its own revert semantics.
 
-It is **not** established that the gas schedule is the *only* remaining divergence, because that cannot be checked without real prestate. KZG commitment verification is listed above and is also not done.
+It is **not** established that the gas schedule is the *only* remaining divergence, because that cannot be checked without real prestate. The SSTORE bug above is a second, independent reason not to treat the schedule as close. KZG commitment verification is listed above and is also not done.
 
 **Dependencies:** None — this is pure Erlang/OTP, no external consensus libraries needed.
 

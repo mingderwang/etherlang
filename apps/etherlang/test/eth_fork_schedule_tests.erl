@@ -4,6 +4,7 @@
 
 -define(GWEI, 1000000000).
 -define(MAINNET_GAS_LIMIT, 30000000).
+-define(CREATE_BASE, 32000).
 -define(TARGET, 20000000).
 
 %% ---------------------------------------------------------------------------
@@ -846,3 +847,129 @@ opcode_exists_rejects_a_non_opcode_test() ->
 available_count(Fork) ->
     length([Op || Op <- lists:seq(0, 255),
                   eth_fork_schedule:opcode_exists(Op, Fork)]).
+
+%% ---------------------------------------------------------------------------
+%% Fork-selected rules: refunds, SELFDESTRUCT, init code
+%% ---------------------------------------------------------------------------
+
+%% EIP-3529 (London) sets MAX_REFUND_QUOTIENT to 5; EIP-2200 (Berlin) capped at
+%% half. This is the test that would have caught the interpreter applying Berlin's
+%% divisor to London's refund amounts, which is a 40% difference in what a frame
+%% gets back and not a rounding difference.
+refund_cap_is_a_fifth_from_london_and_a_half_before_test() ->
+    [?assertEqual(1000 div 5, eth_fork_schedule:refund_cap(F, 1000))
+     || F <- [london, arrow_glacier, gray_glacier, merge, paris, shanghai, cancun,
+              prague, osaka, amsterdam]],
+    [?assertEqual(1000 div 2, eth_fork_schedule:refund_cap(F, 1000))
+     || F <- [frontier, homestead, byzantium, constantinople, petersburg, istanbul,
+              berlin, muir_glacier]],
+    %% The cap is a fifth, not a half: the two differ on every input large enough
+    %% to divide, and 2000 is the first where they differ by more than a unit.
+    ?assertNotEqual(eth_fork_schedule:refund_cap(berlin, 2000),
+                    eth_fork_schedule:refund_cap(london, 2000)).
+
+%% A cap is a cap: it cannot exceed what was spent, and it is monotonic in what
+%% was spent. A negative or non-integer gas figure is refused rather than turned
+%% into a negative divisor, which in Erlang would floor toward negative infinity
+%% and produce a *negative* refund cap -- an upper bound below zero, so every
+%% refund would be clamped to it.
+refund_cap_never_exceeds_the_gas_used_test() ->
+    Forks = [frontier, berlin, london, shanghai, cancun],
+    [begin
+         [?assert(eth_fork_schedule:refund_cap(F, G) =< G)
+          || G <- lists:seq(0, 40)]
+     end || F <- Forks],
+    ?assertEqual(0, eth_fork_schedule:refund_cap(cancun, 0)),
+    ?assertEqual(0, eth_fork_schedule:refund_cap(cancun, -1)),
+    ?assertEqual(0, eth_fork_schedule:refund_cap(cancun, not_a_number)),
+    %% The cap rises with spend, and never faster than one-for-one.
+    [begin
+         Prev = eth_fork_schedule:refund_cap(F, 999),
+         Here = eth_fork_schedule:refund_cap(F, 1000),
+         ?assert(Here >= Prev)
+     end || F <- Forks].
+
+%% EIP-6780: before Cancun SELFDESTRUCT always deleted code and storage; from
+%% Cancun it deletes them only for an account created in the same transaction. The
+%% predicate answers the *unconditional* half, so it is true before Cancun and
+%% false from Cancun -- and getting that polarity backwards is the whole bug, so
+%% both directions are asserted rather than one.
+selfdestruct_deletes_unconditionally_only_before_cancun_test() ->
+    [?assertEqual(true, eth_fork_schedule:selfdestruct_deletes(F))
+     || F <- [frontier, homestead, byzantium, constantinople, petersburg, istanbul,
+              berlin, london, paris, shanghai, merge]],
+    [?assertEqual(false, eth_fork_schedule:selfdestruct_deletes(F))
+     || F <- [cancun, deneb, prague, osaka, amsterdam]],
+    %% An unknown fork is pre-Cancun by `fork_rank/1''s catch-all, and the safe
+    %% direction for a deletion rule is the destructive one: refusing to delete
+    %% leaves storage that the chain would have removed.
+    ?assertEqual(true, eth_fork_schedule:selfdestruct_deletes(no_such_fork)).
+
+%% EIP-3860 (Shanghai): 2 gas per 32-byte word of init code. Zero before it,
+%% because the charge did not exist -- not "small", zero.
+initcode_word_cost_is_two_from_shanghai_and_nothing_before_test() ->
+    [?assertEqual(2, eth_fork_schedule:initcode_word_cost(F))
+     || F <- [shanghai, cancun, prague, osaka, amsterdam]],
+    [?assertEqual(0, eth_fork_schedule:initcode_word_cost(F))
+     || F <- [frontier, homestead, byzantium, constantinople, petersburg, istanbul,
+              berlin, london, merge, paris]].
+
+%% The init-code term as the opcodes charge it, which is the only place the
+%% EIP-3860 figure is applied to a length. CREATE's whole dynamic cost is the
+%% term; CREATE2's is the term plus KECCAK256's per-word hashing, which is
+%% Constantinople's and so is charged at every fork. Getting that wrong in the
+%% other direction -- gating the hashing term on Shanghai -- would undercharge
+%% every CREATE2 at a pre-Shanghai block by 6 gas a word.
+%%
+%% Asserted on the *dynamic* part, with CREATE's 32000 base subtracted, because
+%% gas_cost/3 is base + dynamic and the base is not what is under test. That the
+%% base is fork-invariant is asserted rather than assumed, since the subtraction
+%% depends on it.
+initcode_gas_is_shanghai_gated_but_create2_hashing_is_not_test() ->
+    Len = 64,
+    ?assertEqual(?CREATE_BASE, eth_fork_schedule:gas_cost(16#F0, berlin, 0)),
+    ?assertEqual(?CREATE_BASE, eth_fork_schedule:gas_cost(16#F0, cancun, 0)),
+    %% CREATE: two words of init code, two gas a word from Shanghai and nothing
+    %% before it.
+    ?assertEqual(0, dyn(16#F0, berlin, Len)),
+    ?assertEqual(0, dyn(16#F0, london, Len)),
+    ?assertEqual(4, dyn(16#F0, shanghai, Len)),
+    ?assertEqual(4, dyn(16#F0, cancun, Len)),
+    %% CREATE2 pays the hashing term at every fork, and the init-code term only
+    %% from Shanghai: 6 a word always, plus 2 a word from Shanghai.
+    ?assertEqual(12, dyn(16#F5, berlin, Len)),
+    ?assertEqual(12, dyn(16#F5, london, Len)),
+    ?assertEqual(16, dyn(16#F5, shanghai, Len)),
+    ?assertEqual(16, dyn(16#F5, cancun, Len)),
+    %% A partial word still costs a whole one, at both ends of the fork boundary,
+    %% which is the rounding a length argument is most likely to get wrong.
+    ?assertEqual(2, dyn(16#F0, shanghai, 1)),
+    ?assertEqual(2, dyn(16#F0, shanghai, 32)),
+    ?assertEqual(4, dyn(16#F0, shanghai, 33)),
+    ?assertEqual(0, dyn(16#F0, berlin, 33)).
+
+dyn(Op, Fork, Len) ->
+    eth_fork_schedule:gas_cost(Op, Fork, Len) -
+        eth_fork_schedule:gas_cost(Op, Fork, 0).
+
+%% The opcode and the transaction have to charge the same term, because exactly
+%% one of them ever applies: eth_block:execute_transactions/5 runs a creation
+%% transaction's `data' straight through the EVM without reaching the CREATE
+%% opcode, so the intrinsic charge is the only one that fires for it. If the two
+%% figures could differ, which of them a transaction paid would depend on the
+%% path it took, and neither path would be wrong on its own.
+%%
+%% CREATE's base term is 32000 at every fork, so subtracting it leaves the
+%% dynamic part -- which for CREATE is the init-code term and nothing else. That
+%% the base really is fork-invariant is asserted rather than assumed, because the
+%% subtraction is what makes this comparison work.
+initcode_gas_agrees_with_the_opcode_term_test() ->
+    ?CREATE_BASE = 32000,
+    Len = 96,
+    Words = (Len + 31) div 32,
+    [begin
+         Base = eth_fork_schedule:gas_cost(16#F0, F, 0),
+         ?assertEqual(?CREATE_BASE, Base),
+         ?assertEqual(eth_fork_schedule:initcode_word_cost(F) * Words,
+                      eth_fork_schedule:gas_cost(16#F0, F, Len) - Base)
+     end || F <- [frontier, berlin, london, shanghai, cancun, prague]].

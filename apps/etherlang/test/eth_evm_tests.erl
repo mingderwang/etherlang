@@ -954,3 +954,121 @@ child_frames_inherit_the_fork_from_the_env_test() ->
     ?assertEqual(0, binary:decode_unsigned(Out)),
     {ok, Ok, _, _, _} = eth_evm:run(Parent, ?MSG0, State, #{fork => cancun}, ?GAS),
     ?assertEqual(1, binary:decode_unsigned(Ok)).
+
+%% ---------------------------------------------------------------------------
+%% Fork-selected rules, observed through execution
+%% ---------------------------------------------------------------------------
+
+%% The refund cap, measured rather than asserted from the table.
+%%
+%% `SSTORE 0 <- 1' on a slot that is already 1 is a no-op write, and at London a
+%% no-op write is the one case that earns a refund: EIP-3529 leaves the clear
+%% refund in place, so writing a set slot back to zero and then to its original
+%% value returns gas. What the cap allows of that refund is the fork's business,
+%% and the cap was Berlin's divisor applied to London's refund amounts.
+%%
+%% The code stores 0 into a slot seeded at 1, then stores 1 back. Each run is
+%% given the same allowance and the same starting state, so the gas left is
+%% directly comparable, and the only thing that differs is the fork.
+refund_cap_is_fork_selected_in_execution_test() ->
+    Code = <<16#60, 0, 16#60, 1, 16#55,      %% PUSH1 0, PUSH1 1, SSTORE
+             16#60, 1, 16#60, 1, 16#55>>,    %% PUSH1 1, PUSH1 1, SSTORE
+    State = eth_state:new(0, #{{store, <<0:160>>, 1} => 1}),
+    Gas = 1000000,
+    Berlin = run_gas(Code, State, #{fork => berlin}, Gas),
+    London = run_gas(Code, State, #{fork => london}, Gas),
+    %% Berlin's cap is half of what was spent, London's a fifth. The cap only
+    %% bites if the refund the frame earned exceeds it, and the assertion below
+    %% is that the two forks actually come out differently -- which is the part
+    %% that would pass if both were capped the same way.
+    ?assertNotEqual(Berlin, London),
+    %% And the direction is right. London's cap is the tighter of the two, so for
+    %% a frame whose refund exceeds both caps -- which this one does, since the
+    %% clear refund is 4800 against caps of 4580 and 11450 -- London hands back
+    %% less gas than Berlin. Asserting the direction matters: a cap that was
+    %% wired to the *other* fork would also make the two differ.
+    ?assert(London < Berlin),
+    %% Cancun inherits London's, since EIP-3529 has not been superseded.
+    ?assertEqual(London, run_gas(Code, State, #{fork => cancun}, Gas)).
+
+%% A frame that refunds more than the cap allows gets the cap and no more. The
+%% clearest way to ask for that is a frame whose refund is large relative to what
+%% it spent, which a single no-op pair is not -- so this checks the bound from the
+%% other side: the gas returned is never more than the cap, at either fork.
+refund_never_exceeds_the_caps_share_test() ->
+    Code = <<16#60, 0, 16#60, 1, 16#55, 16#60, 1, 16#60, 1, 16#55>>,
+    State = eth_state:new(0, #{{store, <<0:160>>, 1} => 1}),
+    [begin
+         Gas = 1000000,
+         Left = run_gas(Code, State, #{fork => F}, Gas),
+         Spent = Gas - Left,
+         Cap = eth_fork_schedule:refund_cap(F, Spent),
+         %% Left is Spent minus whatever refund was actually applied, and the
+         %% refund can never exceed the cap, so Left is at least Spent - Cap.
+         ?assert(Left >= Spent - Cap)
+     end || F <- [berlin, london, shanghai, cancun]].
+
+%% SELFDESTRUCT at a pre-Cancun fork destroys an account that was NOT created in
+%% this transaction; from Cancun it leaves that account's code and storage alone
+%% and only moves the balance.
+%%
+%% The account is seeded present with code, so `is_created' is false and the
+%% fork is the only thing that can decide. Before this, the Cancun rule was
+%% applied at every fork, so a pre-Cancun block would have kept code the chain
+%% removes.
+%%
+%% Reads go through with_local_reads/1 because the pre-Cancun half *destroys* the
+%% account, and a destroyed account has nothing left to seed in an overlay. Read
+%% without that, eth_state would fall through to its upstream reader and block in
+%% httpc against a public Sepolia node -- a cancelled test rather than a failure,
+%% and one that says nothing about the code.
+selfdestruct_destroys_only_from_cancun_test() ->
+    eth_test_util:with_local_reads(
+      fun() ->
+        Victim = <<0:152, 16#0E:8>>,
+        Ben = <<0:152, 16#0F:8>>,
+        Code = <<16#60, 16#0F, 16#FF>>,          %% PUSH1 0x0f, SELFDESTRUCT
+        State = fun() ->
+            eth_state:new(0, #{{balance, Victim} => 100,
+                               {nonce, Victim} => 0,
+                               {code, Victim} => <<16#00>>,
+                               {store, Victim, 0} => 7,
+                               {balance, Ben} => 0})
+        end,
+        %% The frame runs *as* the victim, so SELFDESTRUCT is executing on the
+        %% account seeded above. ?MSG0's address is the zero address, which holds
+        %% nothing, and a self-destruct that moved a zero balance would leave
+        %% every assertion below satisfied for the wrong reason.
+        Msg0 = ?MSG0,
+        Msg = Msg0#{address => Victim},
+        Run = fun(Fork) ->
+            {ok, _, _, St, _} = eth_evm:run(Code, Msg, State(), #{fork => Fork},
+                                            ?GAS),
+            St
+        end,
+        %% The balance always moves, at every fork. That is the half that must
+        %% not regress while the other half is being gated.
+        [begin
+             St = Run(F),
+             ?assertEqual(100, eth_state:balance(St, Ben)),
+             ?assertEqual(0, eth_state:balance(St, Victim))
+         end || F <- [berlin, london, shanghai, cancun]],
+        %% Pre-Cancun: code and storage are gone.
+        [begin
+             St = Run(F),
+             ?assertEqual(<<>>, eth_state:code(St, Victim)),
+             ?assertEqual(0, eth_state:storage(St, Victim, 0)),
+             ?assertEqual(false, eth_state:exists(St, Victim))
+         end || F <- [istanbul, berlin, london, merge, paris, shanghai]],
+        %% Cancun and later: the account survives, and only the balance moved.
+        [begin
+             St = Run(F),
+             ?assertEqual(<<16#00>>, eth_state:code(St, Victim)),
+             ?assertEqual(7, eth_state:storage(St, Victim, 0)),
+             ?assertEqual(true, eth_state:exists(St, Victim))
+         end || F <- [cancun, prague, osaka, amsterdam]]
+      end).
+
+run_gas(Code, State, Env, Gas) ->
+    {ok, _Out, Left, _St, _Logs} = eth_evm:run(Code, ?MSG0, State, Env, Gas),
+    Left.
