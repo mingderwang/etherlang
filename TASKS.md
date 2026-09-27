@@ -85,13 +85,45 @@ behavioural change per commit, and each step says what it now does.
    expected results before; the opcode table was cross-checked against instruction
    *counts* and the gas schedule was derived from the EIPs, and a schedule can be
    wrong in both of those senses and still self-consistent.
+   - **EIP-7702 (type 4): representation done, state transition not.** The corpus
+     reported four entries as `tx_decode_failed`, which is the weakest of the
+     outcomes — it says the node cannot *represent* the transaction, not that the
+     state differs — and it concealed that three separate things were missing:
+     - `eth_tx:from_rlp/1` had no type-4 clause, so a type-4 transaction could not
+       be decoded at all.
+     - `eth_tx:sighash/1` had no type-4 clause either. **This is the part that
+       mattered.** The first fix decoded the transaction and re-encoded it
+       byte-for-byte, and it still had no recoverable sender: `sighash/1` fell
+       through to its `unsupported` clause and `sender/1` — which catches every
+       exception — answered `{error, bad_signature}`. Three capabilities and no way
+       to get from one to another, and the only symptom was that four transactions
+       had nobody who had signed them.
+     - `eth_tx:intrinsic_gas/2` charged nothing for the authorization list. The EIP
+       prices it at `PER_EMPTY_ACCOUNT_COST * authorization list length` (25,000 a
+       tuple) and says the sender "will pay for all authorization tuples, regardless
+       of validity or duplication", so the price is a function of the list's
+       *length* and nothing about a tuple's contents may appear in it.
+     - Both validity rules the EIP states are implemented and verified: a
+       zero-length authorization list is invalid, and — because the outer fields
+       follow EIP-4844's semantics — a null destination is invalid, which is a
+       change from every earlier type and is checked for type 4 only.
+     - **What is NOT implemented is the state transition, and this is the open gap.**
+       EIP-7702 writes `0xef0100 || address` into each authority's code, makes every
+       code-executing operation load and follow that delegation, stops after the
+       first hop so a chain of delegations cannot loop, treats a precompile target
+       as empty code, charges `PER_AUTH_BASE_COST` (12,500) per tuple as a
+       *processing* cost, and relaxes EIP-3607 so such an account may originate a
+       transaction. None of that is here. A type-4 transaction is priced, validated
+       and executed as though it carried no authorizations at all, so the corpus's
+       three type-4 execution entries land in `state_mismatch` — the correct verdict,
+       and a more informative one than the `tx_decode_failed` they replace.
    - What the corpus found, immediately and without any new code being written for
      it: the node **accepted a type-2 (EIP-1559) transaction at a pre-London fork**,
      which the specification rejects — 5 entries, and the worst kind of divergence
      because it is a validator that admits something invalid. **Fixed and verified**;
      see the entry below. And it **cannot decode an EIP-7702 (type 4) transaction at
-     all**, 4 entries, `eth_tx:from_rlp/1` — **still open**.
-     having no clause for it.
+     all**, 4 entries — **now implemented; the state transition is not**, see the
+     entry above.
    - `eth_block:run_transaction/5` is now exported for the runner. It was already
      the function `finalize_against/5` calls, so this is not a test-only export; it
      is one transaction's effects, and `finalize/1` cannot serve the runner because

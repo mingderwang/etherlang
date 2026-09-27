@@ -531,6 +531,14 @@ exception_code(Other) ->
 %% The code this node would be raising for a given validator error, given the
 %% transaction's type.
 %%
+%% Every code below is one the corpus has actually asked for. That is the rule, and
+%% it is why the list is short: a code invented from the EIP's prose rather than
+%% read off a fixture would be a guess about the corpus's vocabulary, and a wrong
+%% guess here is a *manufactured conformance match*. The type-4 null-destination
+%% rule is implemented (`eth_tx:check_set_code/1') and deliberately absent from this
+%% table, because no committed fixture asks for its code. Until one does it reports
+%% as unmapped, which costs a match -- the correct direction to be wrong in.
+%%
 %% Each clause is here because the error is raised for that reason and no other.
 %% `tx_type_pre_fork' is a single `eth_fork_schedule:tx_type_available/2' call,
 %% whose whole answer is a fork comparison, so it can only mean a type that
@@ -541,6 +549,7 @@ node_exception(tx_type_pre_fork, eip1559) -> <<"TYPE_2_TX_PRE_FORK">>;
 node_exception(tx_type_pre_fork, eip4844) -> <<"TYPE_3_TX_PRE_FORK">>;
 node_exception(tx_type_pre_fork, eip7702) -> <<"TYPE_4_TX_PRE_FORK">>;
 node_exception(tx_type_pre_fork, Type) -> {unmapped_type, Type};
+node_exception(empty_auth_list, eip7702) -> <<"TYPE_4_EMPTY_AUTHORIZATION_LIST">>;
 node_exception(unsupported_type, _Type) -> <<"TX_TYPE_UNSUPPORTED">>;
 node_exception(intrinsic_gas, _Type) -> <<"INTRINSIC_GAS">>;
 node_exception(calldata_floor, _Type) -> <<"GASLIMIT_TOO_LOW">>;

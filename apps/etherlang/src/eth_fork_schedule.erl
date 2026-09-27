@@ -63,6 +63,7 @@
           calldata_floor/2,
           tx_type_available/2,
           introduced_tx_type/1,
+          set_code_auth_cost/1,
           timestamp_in_frame/3,
           timestamp_frame/2,
           activated_at/2 ]).
@@ -72,6 +73,10 @@
 %% is not restated here because it is already charged by `eth_tx:intrinsic_gas/4'
 %% and restating a price in two places is how they drift.
 -define(TOTAL_COST_FLOOR_PER_TOKEN, 10).
+%% EIP-7702's PER_EMPTY_ACCOUNT_COST. Its PER_AUTH_BASE_COST is a processing cost
+%% metered during the state transition and is not implemented; see the note beside
+%% `set_code_auth_cost/1'.
+-define(PER_EMPTY_ACCOUNT_COST, 25000).
 -define(BASE_FEE_INITIAL, 1000000000).
 -define(MIN_BASE_FEE, 7).
 -define(MAX_WITHDRAWALS_PER_PAYLOAD, 16).
@@ -1499,6 +1504,36 @@ sstore_supported(_Fork) -> false.
 %% would be two copies of one fact, and this module's own history is that two copies
 %% drift: `eth_evm:base_cost/1' was a fork-free duplicate of the gas table, and the
 %% two had come to disagree about how they grouped four sets of constants.
+%% ---------------------------------------------------------------------------
+%% EIP-7702: the authorization list
+%% ---------------------------------------------------------------------------
+%% A type-4 transaction carries a list of authorization tuples, and the EIP's
+%% "Gas Costs" section prices them:
+%%
+%%   The intrinsic cost of the new transaction is inherited from EIP-2930 ...
+%%   Additionally, add a cost of PER_EMPTY_ACCOUNT_COST * authorization list
+%%   length. The transaction sender will pay for all authorization tuples,
+%%   regardless of validity or duplication.
+%%
+%% with PER_EMPTY_ACCOUNT_COST = 25000. So the charge is 25,000 per tuple and it
+%% does not depend on whether a tuple turns out to be usable -- "the sender pays
+%% for all of them" is the EIP's wording and the reason the price is a function of
+%% the list's *length* rather than of anything recovered from it.
+%%
+%% (PER_AUTH_BASE_COST = 12500 is the EIP's other parameter. It is the *processing*
+%% cost of recovering and applying one tuple, metered in the state transition, and
+%% it is **not** implemented here. It is named so that its absence is a named
+%% absence rather than an oversight; see TASKS.md.)
+%%
+%% Zero before Prague, which makes the one caller a no-op rather than a branch.
+-spec set_code_auth_cost(atom()) -> non_neg_integer().
+set_code_auth_cost(Fork) when is_atom(Fork) ->
+    case at_least(Fork, prague) of
+        true -> ?PER_EMPTY_ACCOUNT_COST;
+        false -> 0
+    end;
+set_code_auth_cost(_Fork) -> 0.
+
 -spec tx_type_available(atom(), atom()) -> boolean().
 tx_type_available(legacy, Fork) when is_atom(Fork) -> true;
 tx_type_available(Type, Fork) when is_atom(Fork) ->

@@ -1023,6 +1023,183 @@ with_env(Name, Value, Fun) ->
         end
     end.
 
+%% ---------------------------------------------------------------------------
+%% EIP-7702, the set code transaction
+%% ---------------------------------------------------------------------------
+%% `eth_tx:from_rlp/1` had no clause for type 4 at all, so the corpus reported four
+%% entries as `tx_decode_failed'. That outcome does not mean "the state differs" --
+%% it means the node cannot *represent* the transaction, which is a weaker and less
+%% specific kind of failing, and it hides which of the other three capabilities are
+%% also missing. They all were:
+%%
+%%   - no decode clause, so no representation;
+%%   - no `sighash/1' clause, so no sender: the transaction decoded, re-encoded
+%%     byte-for-byte, and still had nobody who had signed it;
+%%   - no intrinsic cost, so the authorization list was free.
+%%
+%% What is **not** implemented is the state transition. EIP-7702 writes
+%% `0xef0100 || address` into each authority's code and makes every code-executing
+%% operation load and follow it, with EIP-3607 relaxed for such accounts. None of
+%% that is here, so a type-4 transaction is priced, validated and executed as
+%% though it carried no authorizations at all, and the corpus's three type-4
+%% execution entries land in `state_mismatch' rather than passing. That is the
+%% honest state of it and is recorded in TASKS.md as an open gap, not a rounding
+%% error.
+%%
+%% PER_AUTH_BASE_COST (12500) is also not implemented: it is a *processing* cost
+%% metered while each tuple is recovered and applied, and there is no recovery to
+%% meter. What the EIP prices as intrinsic -- PER_EMPTY_ACCOUNT_COST, 25000 per
+%% tuple -- is implemented, and by the list's length, because the EIP says "the
+%% transaction sender will pay for all authorization tuples, regardless of validity
+%% or duplication".
+
+a_type_four_transaction_recovers_its_sender_test() ->
+    with_ctx(fun() ->
+        {Priv, Sender} = new_key(),
+        Tx = signed_7702(Priv, #{<<"gas">> => 100000}),
+        ?assertEqual({ok, Sender}, eth_tx:sender(Tx)),
+        %% And the bytes survive a decode/encode round trip, which is the only
+        %% non-circular check available: a fixture whose transactions were
+        %% re-encoded with this codec would make the transaction root circular.
+        {ok, Raw} = eth_tx:to_rlp(Tx),
+        ?assertEqual(4, binary:first(Raw)),
+        %% Bytes, not the decoded map. A map comparison would be a comparison of two
+        %% conventions for the same value -- this module's fixtures hold quantities as
+        %% integers where `from_rlp/1' holds them as `0x' strings -- and it would
+        %% fail for a representation difference while saying nothing about whether the
+        %% encoding is right. The bytes are the thing that goes on the wire and into a
+        %% transactions root, and re-encoding what was decoded is the only
+        %% non-circular check: a fixture whose transactions had been re-encoded with
+        %% this codec would make the root check circular.
+        {ok, Decoded} = eth_tx:from_rlp(Raw),
+        ?assertEqual({ok, Raw}, eth_tx:to_rlp(Decoded))
+    end).
+
+a_type_four_transaction_is_rejected_before_prague_test() ->
+    Tx = signed_7702(new_key_priv(), #{<<"gas">> => 100000}),
+    ?assertEqual({error, tx_type_pre_fork},
+                 eth_tx:validate(Tx, ctx_at(cancun, Tx))),
+    ?assertNotEqual({error, tx_type_pre_fork},
+                    eth_tx:validate(Tx, ctx_at(prague, Tx))).
+
+a_type_four_transaction_with_no_authorization_is_invalid_test() ->
+    %% The EIP: "The transaction is considered invalid if the length of
+    %% authorization_list is zero." A zero-length list is not a transaction with no
+    %% authorizations, it is a type-4 transaction with none of the thing that makes
+    %% it type 4.
+    Tx = signed_7702(new_key_priv(), #{<<"gas">> => 100000,
+                                       <<"authorizationList">> => []}),
+    ?assertEqual({error, empty_auth_list},
+                 eth_tx:validate(Tx, ctx_at(prague, Tx))).
+
+a_type_four_transaction_may_not_create_a_contract_test() ->
+    %% The EIP: the outer fields "follow the same semantics as EIP-4844. Note, this
+    %% implies a null destination is not valid." That is a change from every earlier
+    %% type -- a type-2 transaction may create a contract -- so the rule is checked
+    %% for type 4 only. If it leaked to other types it would refuse contract
+    %% creation, which is the opposite of right.
+    Tx = signed_7702(new_key_priv(), #{<<"gas">> => 100000,
+                                       <<"to">> => <<"0x">>}),
+    ?assertEqual({error, null_destination},
+                 eth_tx:validate(Tx, ctx_at(prague, Tx))),
+    Legacy = signed(new_key_priv(), #{gas => 100000, to => <<>>}),
+    ?assertEqual(ok, eth_tx:validate(Legacy, ctx_at(prague, Legacy))).
+
+a_type_four_transaction_pays_twenty_five_thousand_per_authorization_test() ->
+    %% EIP-7703's... EIP-7702's: "add a cost of PER_EMPTY_ACCOUNT_COST *
+    %% authorization list length", with PER_EMPTY_ACCOUNT_COST = 25000.
+    One = one_auth_tuple(1),
+    Two = one_auth_tuple(2),
+    Three = one_auth_tuple(3),
+    {_, Fork} = {ok, prague},
+    Base = eth_tx:intrinsic_gas(#{<<"input">> => <<"0x">>, <<"to">> => hex(?PROBE)}, Fork),
+    ?assertEqual(21000, Base),
+    ?assertEqual(Base + 25000,
+                 eth_tx:intrinsic_gas(#{<<"input">> => <<"0x">>, <<"to">> => hex(?PROBE),
+                                        <<"authorizationList">> => One}, Fork)),
+    ?assertEqual(Base + 50000,
+                 eth_tx:intrinsic_gas(#{<<"input">> => <<"0x">>, <<"to">> => hex(?PROBE),
+                                        <<"authorizationList">> => Two}, Fork)),
+    ?assertEqual(Base + 75000,
+                 eth_tx:intrinsic_gas(#{<<"input">> => <<"0x">>, <<"to">> => hex(?PROBE),
+                                        <<"authorizationList">> => Three}, Fork)),
+    %% And nothing before Prague, where the type does not exist and the field is not
+    %% on the wire. A 25,000 charge before Prague would be a consensus bug on every
+    %% fork that cannot carry the list.
+    [?assertEqual(Base,
+                  eth_tx:intrinsic_gas(#{<<"input">> => <<"0x">>, <<"to">> => hex(?PROBE),
+                                         <<"authorizationList">> => One}, F))
+     || F <- [frontier, berlin, london, cancun]].
+
+a_type_four_transaction_below_its_own_authorization_cost_is_rejected_test() ->
+    %% The two rules meet: the intrinsic check has to include the authorization list
+    %% or the gas limit that covers the list alone would validate.
+    Tx0 = signed_7702(new_key_priv(), #{<<"gas">> => 21000,
+                                        <<"authorizationList">> => one_auth_tuple(1)}),
+    ?assertEqual({error, intrinsic_gas}, eth_tx:validate(Tx0, ctx_at(prague, Tx0))),
+    Tx1 = Tx0#{<<"gas">> => 46000},
+    ?assertEqual(ok, eth_tx:validate(Tx1, ctx_at(prague, Tx1))).
+
+a_type_four_transaction_with_a_malformed_authorization_is_refused_test() ->
+    %% A tuple that is not six items is malformed bytes, not a tuple with defaults.
+    %% The EIP's own position is that a transaction is invalid "when any field in an
+    %% authorization tuple cannot fit within the following bounds".
+    [?assertThrow({error, invalid_authorization_list},
+                  eth_tx:intrinsic_gas(#{<<"input">> => <<"0x">>, <<"to">> => hex(?PROBE),
+                                         <<"authorizationList">> => [T]}, prague))
+     || T <- [[[1]], [[1, 2, 3, 4, 5]], [not_a_tuple], [#{<<"chainId">> => <<"0x1">>}]]].
+
+%% ---------------------------------------------------------------------------
+
+one_auth_tuple(N) ->
+    [#{<<"chainId">> => eth_hex:encode_int(1),
+       <<"address">> => hex(<<N:160>>),
+       <<"nonce">> => <<"0x0">>,
+       <<"yParity">> => <<"0x1">>,
+       <<"r">> => hex(<<2:256>>),
+       <<"s">> => hex(<<3:256>>)}
+     || _ <- lists:seq(1, N)].
+
+new_key_priv() -> {P, _} = new_key(), P.
+
+%% A genuinely signed type-4 transaction, so `sender/1' is under test rather than a
+%% fixture with a plausible-looking v/r/s.
+signed_7702(Priv, Fields) ->
+    Tx = maps:merge(#{<<"type">> => <<"0x4">>,
+                       <<"chainId">> => eth_hex:encode_int(eth_fork_schedule:chain_id()),
+                       <<"nonce">> => <<"0x0">>,
+                       <<"maxPriorityFeePerGas">> => <<"0x1">>,
+                       <<"maxFeePerGas">> => <<"0x2">>,
+                       <<"gas">> => eth_hex:encode_int(100000),
+                       <<"to">> => hex(?PROBE),
+                       <<"value">> => <<"0x0">>,
+                       <<"input">> => <<"0x">>,
+                       <<"accessList">> => [],
+                       <<"authorizationList">> => one_auth_tuple(1)},
+                   Fields),
+    F = [eth_hex:decode(maps:get(<<"chainId">>, Tx)),
+         eth_hex:decode(maps:get(<<"nonce">>, Tx)),
+         eth_hex:decode(maps:get(<<"maxPriorityFeePerGas">>, Tx)),
+         eth_hex:decode(maps:get(<<"maxFeePerGas">>, Tx)),
+         eth_hex:decode(maps:get(<<"gas">>, Tx)),
+         hex_to_bin(maps:get(<<"to">>, Tx)),
+         eth_hex:decode(maps:get(<<"value">>, Tx)),
+         hex_to_bin(maps:get(<<"input">>, Tx)),
+         [],
+         [begin
+              C = eth_hex:decode(maps:get(<<"chainId">>, A)),
+              Ad = hex_to_bin(maps:get(<<"address">>, A)),
+              N = eth_hex:decode(maps:get(<<"nonce">>, A)),
+              Y = eth_hex:decode(maps:get(<<"yParity">>, A)),
+              R = eth_hex:decode(maps:get(<<"r">>, A)),
+              Sv = eth_hex:decode(maps:get(<<"s">>, A)),
+              [C, Ad, N, Y, R, Sv]
+          end || A <- maps:get(<<"authorizationList">>, Tx)]],
+    Digest = eth_keccak:hash(<<16#04, (eth_rlp:encode(F))/binary>>),
+    {R, S, Y} = eth_secp256k1:sign(Digest, Priv),
+    Tx#{<<"r">> => hex(int_to_32(R)), <<"s">> => hex(int_to_32(S)),
+        <<"v">> => eth_hex:encode_int(Y)}.
+
 the_evm_allowance_follows_the_blocks_own_fork_test() ->
     Code = <<16#60, 16#00, 16#60, 0, 16#52,
              16#60, 1, 16#60, 0, 16#F3>>,

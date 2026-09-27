@@ -71,9 +71,18 @@
 %% diffs they carry are now computed against a derived base fee rather than a default
 %% of zero, and none of them flipped, so the base fee was masking those but not causing
 %% them. See the entry in `TASKS.md`.
--define(EXPECTED, #{match => 10,
-                    state_mismatch => 249,
-                    tx_decode_failed => 4,
+%%
+%% `tx_decode_failed` went 4 -> 0, `sender_mismatch` and `tx_roundtrip_mismatch` are
+%% 0, and one type-4 fixture is now a *verified* refusal. `state_mismatch` went 249 ->
+%% 252 and that is the honest direction of travel: the three type-4 execution entries
+%% could not previously be represented at all, and now reach the state transition and
+%% differ. EIP-7702's authorization list is decoded, priced and validated but **not
+%% applied** -- no delegation indicator is written and no authority's code is loaded --
+%% so "the state differs" is the correct verdict for them and "could not represent the
+%% transaction" was the less informative one.
+-define(EXPECTED, #{match => 11,
+                    state_mismatch => 252,
+                    tx_decode_failed => 0,
                     tx_roundtrip_mismatch => 0,
                     sender_mismatch => 0,
                     expected_rejection_not_raised => 0,

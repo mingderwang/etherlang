@@ -1381,3 +1381,24 @@ a_type_this_table_has_never_heard_of_is_not_available_test() ->
     [?assertNot(eth_fork_schedule:tx_type_available(T, F))
      || T <- [eip7623, set_code, eip1153, garbage],
         F <- [frontier, berlin, london, cancun, prague]].
+
+%% ---------------------------------------------------------------------------
+%% EIP-7702: the authorization list's intrinsic cost
+%% ---------------------------------------------------------------------------
+%% EIP-7702's "Gas Costs" section: "add a cost of PER_EMPTY_ACCOUNT_COST *
+%% authorization list length", with PER_EMPTY_ACCOUNT_COST = 25000. Priced by
+%% *length*, because the EIP says "the transaction sender will pay for all
+%% authorization tuples, regardless of validity or duplication" -- so a tuple's
+%% contents may not appear in the price.
+
+the_authorization_list_costs_twenty_five_thousand_a_tuple_at_prague_test() ->
+    [?assertEqual(25000, eth_fork_schedule:set_code_auth_cost(F))
+     || F <- [prague, osaka]].
+
+no_fork_before_prague_charges_for_the_authorization_list_test() ->
+    %% The type does not exist before Prague and the field is not on the wire, so a
+    %% charge there would be a consensus bug on every fork that cannot carry a list.
+    [?assertEqual(0, eth_fork_schedule:set_code_auth_cost(F))
+     || F <- [frontier, homestead, byzantium, istanbul, berlin, london, cancun]],
+    ?assertEqual(0, eth_fork_schedule:set_code_auth_cost(not_a_fork)),
+    ?assertEqual(0, eth_fork_schedule:set_code_auth_cost(<<"prague">>)).

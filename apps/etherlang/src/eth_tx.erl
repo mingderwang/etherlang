@@ -57,6 +57,23 @@ to_rlp(Tx) when is_map(Tx) ->
                               q(Tx, <<"maxFeePerBlobGas">>),
                               blob_versioned_hashes(Tx),
                               q(Tx, <<"v">>), q(Tx, <<"r">>), q(Tx, <<"s">>)]))/binary>>};
+        eip7702 ->
+            %% EIP-7702's payload, in the EIP's order:
+            %%   rlp([chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas,
+            %%        gas_limit, destination, value, data, access_list,
+            %%        authorization_list, signature_y_parity, signature_r,
+            %%        signature_s])
+            %% and the digest is keccak256(0x04 || payload), which is the same shape
+            %% every typed transaction already uses -- only the type byte differs.
+            {ok, <<16#04, (eth_rlp:encode(
+                             [q(Tx, <<"chainId">>), q(Tx, <<"nonce">>),
+                              q(Tx, <<"maxPriorityFeePerGas">>),
+                              q(Tx, <<"maxFeePerGas">>),
+                              q(Tx, <<"gas">>),
+                              addr(Tx), q(Tx, <<"value">>), data(Tx, <<"input">>),
+                              access_list(Tx),
+                              authorization_list(Tx),
+                              q(Tx, <<"v">>), q(Tx, <<"r">>), q(Tx, <<"s">>)]))/binary>>};
         unsupported ->
             {error, unsupported_tx_type}
     end.
@@ -126,6 +143,35 @@ do_from_rlp(<<16#03, _/binary>> = Bin) ->
         _ ->
             {error, bad_tx}
     end;
+%% EIP-7702, the "set code transaction". The thirteen fields are the EIP's, in its
+%% order, and `authorization_list' is the only one this node had no notion of: a
+%% list of `[chain_id, address, nonce, y_parity, r, s]' tuples.
+%%
+%% This clause did not exist, so a type-4 transaction could not be decoded at all
+%% and the corpus reported four entries as `tx_decode_failed'. Note what that
+%% outcome means: not "the state differs" but "this node cannot represent the
+%% transaction", which is a strictly weaker form of failing.
+do_from_rlp(<<16#04, _/binary>> = Bin) ->
+    Rest = binary:part(Bin, 1, byte_size(Bin) - 1),
+    case eth_rlp:decode(Rest) of
+        {ok, [ChainID, Nonce, MaxPrio, MaxFee, Gas, To, Value, Input, AL,
+              AuthList, V, R, S], <<>>} ->
+            {ok, #{<<"type">> => <<"0x4">>,
+                   <<"chainId">> => hexq(ChainID),
+                   <<"nonce">> => hexq(Nonce),
+                   <<"maxPriorityFeePerGas">> => hexq(MaxPrio),
+                   <<"maxFeePerGas">> => hexq(MaxFee),
+                   <<"gas">> => hexq(Gas),
+                   <<"to">> => hexdata(To),
+                   <<"value">> => hexq(Value),
+                   <<"input">> => hexdata(Input),
+                   <<"accessList">> => from_access_list(AL),
+                   <<"authorizationList">> => from_authorization_list(AuthList),
+                   <<"v">> => hexq(V), <<"r">> => hexq(R), <<"s">> => hexq(S),
+                   <<"hash">> => hexdata(eth_keccak:hash(Bin))}};
+        _ ->
+            {error, bad_tx}
+    end;
 do_from_rlp(Bin) ->
     case eth_rlp:decode(Bin) of
         {ok, [Nonce, GasPrice, Gas, To, Value, Input, V, R, S], <<>>} ->
@@ -155,6 +201,46 @@ from_access_list(AL) when is_list(AL) ->
        <<"storageKeys">> => [hexdata(K) || K <- Keys]} || [A, Keys] <- AL];
 from_access_list(_) ->
     throw(bad_tx).
+
+%% One authorization tuple, in the EIP's order and field names. A tuple that is not
+%% six items is a bad transaction rather than a partial one: the EIP says a
+%% transaction "is also considered invalid when any field in an authorization tuple
+%% cannot fit within the following bounds", so a short tuple is malformed bytes and
+%% not a tuple with defaults.
+from_authorization_list(List) when is_list(List) ->
+    [#{<<"chainId">> => hexq(ChainID),
+       <<"address">> => hexdata(Address),
+       <<"nonce">> => hexq(Nonce),
+       <<"yParity">> => hexq(YParity),
+       <<"r">> => hexq(R),
+       <<"s">> => hexq(S)}
+     || [ChainID, Address, Nonce, YParity, R, S] <- List];
+from_authorization_list(_) ->
+    throw(bad_tx).
+
+%% The same tuples back to wire form, for `to_rlp/1'. Each is a six-item RLP *list*,
+%% which is what makes it distinguishable on the wire from the flat fields around it.
+authorization_list(Tx) ->
+    case maps:get(<<"authorizationList">>, Tx,
+                  maps:get(<<"authorization_list">>, Tx, [])) of
+        L when is_list(L) -> [authorization_tuple(A) || A <- L];
+        _ -> []
+    end.
+
+authorization_tuple(A) when is_map(A) ->
+    %% `auth_address/1`, not `addr/1'. `addr/1' reads the key `<<"to">'`, which is
+    %% the *transaction's* destination; an authorization tuple names its authority
+    %% under `<<"address">>'. Reusing `addr/1' here therefore did not fail -- it
+    %% answered `<<>>' for a key that was simply not there -- so every tuple
+    %% re-encoded with an empty authority and the round trip was 20 bytes short per
+    %% tuple. The corpus caught it as `tx_roundtrip_mismatch', which is what that
+    %% check exists for: it compares bytes rather than fields, and a field that
+    %% silently became empty is invisible to a field-by-field comparison.
+    [required(A, <<"chainId">>), auth_address(A),
+     required(A, <<"nonce">>),
+     required(A, <<"yParity">>), required(A, <<"r">>), required(A, <<"s">>)];
+authorization_tuple(Tuple) when is_list(Tuple) ->
+    Tuple.
 
 %% A quantity, in the minimal hex form JSON-RPC requires ("0x0", "0x7", never
 %% "0x07"). RLP decodes an integer to a binary, so the bytes are folded back
@@ -235,6 +321,34 @@ sighash(Tx) ->
                    blob_versioned_hashes(Tx)],
             {eth_keccak:hash(<<16#03, (eth_rlp:encode(Pay))/binary>>),
              q(Tx, <<"v">>)};
+        %% EIP-7702, and the same shape as 4844: the preimage stops after the
+        %% authorization list, and the type prefix is what distinguishes it from the
+        %% full encoding rather than a flag byte.
+        %%
+        %% This clause was missing while `from_rlp/1' and `to_rlp/1' already handled
+        %% type 4, so a type-4 transaction decoded, re-encoded byte-for-byte, and
+        %% still had no recoverable sender: `sighash/1' fell through to its
+        %% `unsupported' clause and `sender/1' turned that into `{error,
+        %% bad_signature}'. Three capabilities and no way to get from one to another.
+        eip7702 ->
+            Pay = [q(Tx, <<"chainId">>), q(Tx, <<"nonce">>),
+                   q(Tx, <<"maxPriorityFeePerGas">>),
+                   q(Tx, <<"maxFeePerGas">>),
+                   q(Tx, <<"gas">>),
+                   addr(Tx), q(Tx, <<"value">>), data(Tx, <<"input">>),
+                   access_list(Tx),
+                   %% `authorization_list/1' already yields tuples in the EIP's
+                   %% order, and a tuple's signing preimage *is* its encoding -- so
+                   %% the same function serves both, which is why there is no second
+                   %% one here. The first version had `auth_preimage/1' as a separate
+                   %% `is_map'-guarded function applied to the list's elements, which
+                   %% were already lists, so it raised `function_clause' on every
+                   %% tuple; `sender/1' catches every exception and answers
+                   %% `{error, bad_signature}', so the cause was invisible and the
+                   %% only symptom was that four transactions had no sender.
+                   authorization_list(Tx)],
+            {eth_keccak:hash(<<16#04, (eth_rlp:encode(Pay))/binary>>),
+             q(Tx, <<"v">>)};
         unsupported ->
             throw(unsupported_tx_type)
     end.
@@ -311,8 +425,10 @@ validate(Tx, Ctx) when is_map(Tx), is_map(Ctx) ->
                {error, invalid_fee}),
         ensure(fee_ceiling_ok(Tx, MaxFee, GasPrice, Ctx), {error, fee_too_low}),
         ok = check_blobs(Tx, Ctx),
+        ok = check_set_code(Tx),
         Fork = ctx_fork(Ctx),
-        ensure(Gas >= intrinsic_gas(Data, IsCreate, AccessList, Fork),
+        ensure(Gas >= intrinsic_gas(Data, IsCreate, AccessList, Fork,
+                                    authorization_list_field(Tx)),
                {error, intrinsic_gas}),
         %% EIP-7623, the validity half: a transaction whose gas limit is below the
         %% calldata floor is invalid, "because transactions must cover the floor price
@@ -462,6 +578,59 @@ access_list_field(Tx) ->
         _ -> throw({error, invalid_access_list})
     end.
 
+%% EIP-7702's authorization list, normalized to the `{ChainID, Address, Nonce,
+%% YParity, R, S}' tuples the RLP form uses. Only the *length* is ever priced, so
+%% the normalization exists to count the tuples and to refuse a malformed one --
+%% not to supply fields any rule reads.
+authorization_list_field(Tx) ->
+    case maps:get(<<"authorizationList">>, Tx,
+                  maps:get(<<"authorization_list">>, Tx, [])) of
+        L when is_list(L) -> [authorization_tuple_fields(A) || A <- L];
+        _ -> throw({error, invalid_authorization_list})
+    end.
+
+authorization_tuple_fields(A) when is_map(A) ->
+    %% Every field is required. `q/2' answers 0 for a missing key, and a tuple whose
+    %% `yParity' defaulted to 0 would be indistinguishable from one that genuinely
+    %% signed with parity 0 -- a difference that matters the moment the state
+    %% transition recovers these signatures. Refusing is the EIP's own position: a
+    %% transaction is invalid "when any field in an authorization tuple cannot fit
+    %% within the following bounds", so a missing field is malformed rather than
+    %% zero.
+    {required(A, <<"chainId">>), required_bytes(A, <<"address">>),
+     required(A, <<"nonce">>), required(A, <<"yParity">>),
+     required(A, <<"r">>), required(A, <<"s">>)};
+authorization_tuple_fields([_, _, _, _, _, _] = Tuple) -> Tuple;
+authorization_tuple_fields(_) ->
+    throw({error, invalid_authorization_list}).
+
+%% A field that must be present, read the way `q/2' reads one. A key that is absent
+%% is refused rather than folded to `q/2's' zero default, for the reason given on
+%% `authorization_tuple_fields/1'.
+required(M, K) ->
+    case maps:find(K, M) of
+        {ok, V} -> scalar(V);
+        error -> throw({error, invalid_authorization_list})
+    end.
+
+%% `q/2` without the map, so the two read identically.
+scalar(V) when is_integer(V) -> V;
+scalar(V) when is_binary(V) ->
+    try eth_hex:decode(V) catch _:_ -> 0 end;
+scalar(_) -> 0.
+
+required_bytes(M, K) ->
+    case maps:find(K, M) of
+        {ok, V} -> addr(#{<<"to">> => V});
+        error -> throw({error, invalid_authorization_list})
+    end.
+
+%% An authorization tuple's authority, 20 bytes, or empty -- the fixtures carry
+%% tuples whose authority is an empty string, and refusing those would refuse the
+%% corpus's own data rather than the specification.
+auth_address(A) when is_map(A) ->
+    required_bytes(A, <<"address">>).
+
 normalize_access_entry({Addr, Slots}) when is_list(Slots) ->
     {access_address(Addr), [access_slot(S) || S <- Slots]};
 normalize_access_entry(#{<<"address">> := Addr, <<"storageKeys">> := Slots})
@@ -540,6 +709,34 @@ check_blobs(Tx, Ctx) ->
             ok
     end.
 
+%% EIP-7702's two validity rules that are not about gas. Both are the EIP's own
+%% sentences:
+%%
+%%   The transaction is considered invalid if the length of authorization_list is
+%%   zero.
+%%
+%%   The fields chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas,
+%%   gas_limit, destination, value, data, and access_list of the outer transaction
+%%   follow the same semantics as EIP-4844 . Note, this implies a null destination is
+%%   not valid.
+%%
+%% The second is a change from every earlier type rather than a restatement, which
+%% is why it is worth stating that it is EIP-4844's semantics and not the legacy
+%% rule: a type-2 transaction may create a contract, and a type-4 may not. Note also
+%% that this is checked *only* for type 4 -- refusing a null destination on a legacy
+%% transaction would refuse contract creation, which is the opposite of right.
+check_set_code(Tx) ->
+    case tx_type(Tx) of
+        eip7702 ->
+            {_, IsCreate} = to_field(Tx),
+            ensure(not IsCreate, {error, null_destination}),
+            %% Read through the same accessor the intrinsic cost uses, so a
+            %% malformed tuple is refused here rather than counted as zero tuples.
+            ensure(authorization_list_field(Tx) =/= [], {error, empty_auth_list});
+        _ ->
+            ok
+    end.
+
 %% Intrinsic gas: the floor a transaction pays whatever it does, from the
 %% transaction's own shape. 21000 for a call, 53000 for contract creation, 4 per
 %% zero byte and 16 per non-zero byte of calldata, plus EIP-2930 access list costs
@@ -566,9 +763,10 @@ intrinsic_gas(Tx) ->
 %% uses this form is silently getting the pin.
 intrinsic_gas(Tx, Fork) when is_atom(Fork) ->
     {_To, IsCreate} = to_field(Tx),
-    intrinsic_gas(data_field(Tx), IsCreate, access_list_field(Tx), Fork).
+    intrinsic_gas(data_field(Tx), IsCreate, access_list_field(Tx), Fork,
+                  authorization_list_field(Tx)).
 
-intrinsic_gas(Data, IsCreate, AccessList, Fork)
+intrinsic_gas(Data, IsCreate, AccessList, Fork, AuthList)
   when is_binary(Data), is_list(AccessList), is_atom(Fork) ->
     Base = case IsCreate of
         true -> 53000;
@@ -580,8 +778,19 @@ intrinsic_gas(Data, IsCreate, AccessList, Fork)
     AccessGas = lists:foldl(fun({_Addr, Slots}, A) ->
         A + 2400 + 1900 * length(Slots)
     end, 0, AccessList),
-    Base + DataGas + AccessGas + initcode_gas(Data, IsCreate, Fork);
-intrinsic_gas(_Data, _IsCreate, _AccessList, _Fork) ->
+    Base + DataGas + AccessGas + initcode_gas(Data, IsCreate, Fork)
+        + set_code_gas(AuthList, Fork);
+intrinsic_gas(_Data, _IsCreate, _AccessList, _Fork, _AuthList) ->
+    0.
+
+%% EIP-7702 prices the authorization list by its *length*, and "the transaction
+%% sender will pay for all authorization tuples, regardless of validity or
+%% duplication" -- so nothing about a tuple's contents may appear here. Charging
+%% only the tuples that recover successfully would be a different rule and would
+%% make a transaction's cost depend on state the sender does not control.
+set_code_gas(AuthList, Fork) when is_list(AuthList), is_atom(Fork) ->
+    eth_fork_schedule:set_code_auth_cost(Fork) * length(AuthList);
+set_code_gas(_AuthList, _Fork) ->
     0.
 
 %% The same term the CREATE and CREATE2 opcodes charge, and gated the same way,
@@ -802,7 +1011,7 @@ tx_type(Tx) ->
         <<"0x1">> -> eip2930;
         <<"0x2">> -> eip1559;
         <<"0x3">> -> eip4844;
-        <<"0x4">> -> unsupported;
+        <<"0x4">> -> eip7702;
         undefined ->
             case maps:is_key(<<"maxFeePerGas">>, Tx) of
                 true -> eip1559;
