@@ -173,6 +173,8 @@ unsupported(What, E, Ctx) -> {E#e{halt = {error, {unsupported, What}}}, Ctx}.
 charge(E, Cost) when E#e.gas >= Cost -> {ok, E#e{gas = E#e.gas - Cost}};
 charge(_E, _Cost) -> oog.
 
+add_gas(E, N) -> E#e{gas = E#e.gas + N}.
+
 %% ---------------------------------------------------------------------------
 %% Stack / memory helpers
 %% ---------------------------------------------------------------------------
@@ -828,35 +830,66 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
     Env = Ctx#ctx.env,
     Depth = s_msg(depth, Ctx, 0),
     case Depth >= 1024 of
-        true -> finish_call(E, Ctx, Ctx#ctx.state, <<>>, RetOff, RetLen, 0, 0);
+        true -> finish_call(E, Ctx, Ctx#ctx.state, <<>>, RetOff, RetLen, 0);
         false ->
             case eth_evm_precompiles:is_precompile(ToW) of
                 true ->
-                    case eth_evm_precompiles:precompile(ToW, Args) of
-                        {ok, Out, Cost} ->
-                            case charge(E, Cost) of
-                                {ok, E1} ->
-                                    %% Precompiles move value exactly like a
-                                    %% regular CALL (checked first).
-                                    From = s_msg(address, Ctx, <<0:160>>),
-                                    case check_call_value(Kind, Ctx#ctx.state, From, To, Value) of
-                                        {error, insufficient_balance} ->
-                                            finish_call(E1, Ctx, Ctx#ctx.state, <<>>, RetOff, RetLen, 0, 0);
-                                        {ok, St0} ->
-                                            finish_call(E1, Ctx, St0, Out, RetOff, RetLen, 1, E1#e.gas)
-                                    end;
-                                oog -> finish_call(E, Ctx, Ctx#ctx.state, <<>>, RetOff, RetLen, 0, 0)
-                            end;
-                        unsupported ->
-                            unsupported({precompile, ToW}, E, Ctx);
-                        %% A precompile that ran and failed. This is a halt, not
-                        %% a fallback: the EIP says the call fails and the frame's
-                        %% gas is gone. The error form carries no gas figure, and
-                        %% handle_child/7's error clause adds nothing back, so the
-                        %% whole allowance is consumed -- which is the point. (0x0A
-                        %% is the only precompile that returns this today.)
-                        {error, Reason} ->
-                            {E#e{halt = {error, Reason}}, Ctx}
+                    %% A precompile's cost is paid out of the gas the CALL
+                    %% forwarded, and whatever is left of that forwarded allowance
+                    %% returns to the caller. Both halves were wrong.
+                    %%
+                    %% The cost was charged against the *caller's* remaining gas
+                    %% (`charge(E, Cost)'), and the unused forwarded gas was never
+                    %% returned at all -- `finish_call/8' discarded its `Left'
+                    %% argument, and the regular CALL path does its own refund in
+                    %% `handle_child/9', so nothing else did it either. The two
+                    %% errors are opposite in direction and both are visible:
+                    %%
+                    %%   * a CALL forwarding exactly the precompile's cost failed
+                    %%     when the caller's own remainder had dipped below that
+                    %%     cost -- `charge/2' ran out of gas and the call answered
+                    %%     false. Six `eip196_ec_add_mul' fixtures do exactly this,
+                    %%     at every fork from Berlin to Prague, and the contract
+                    %%     involved forwards 150 gas to a 150-gas ECADD and stores
+                    %%     the success flag. It stored 0 where the specification
+                    %%     says 1;
+                    %%   * and a CALL forwarding *more* than the cost was charged
+                    %%     the whole forwarded amount on top of the cost, stranding
+                    %%     the remainder. A tight call -- the case where forwarding
+                    %%     a specific amount is the whole point -- paid twice.
+                    %%
+                    %% `CallGas' was already deducted from the caller before
+                    %% `run_call/11', so the cost is not charged again here: the net
+                    %% effect is that the caller pays exactly `Cost'.
+                    From = s_msg(address, Ctx, <<0:160>>),
+                    case check_call_value(Kind, Ctx#ctx.state, From, To, Value) of
+                        {error, insufficient_balance} ->
+                            %% The call cannot happen. The forwarded allowance is
+                            %% still spent: the CALL opcode has already paid for it.
+                            finish_call(E, Ctx, Ctx#ctx.state, <<>>, RetOff, RetLen, 0);
+                        {ok, St0} ->
+                            case eth_evm_precompiles:precompile(ToW, Args) of
+                                {ok, Out, Cost} when CallGas >= Cost ->
+                                    finish_call(add_gas(E, CallGas - Cost), Ctx, St0,
+                                                Out, RetOff, RetLen, 1);
+                                {ok, _Out, _Cost} ->
+                                    %% Not enough forwarded gas for the precompile.
+                                    %% The call fails and the whole forwarded
+                                    %% allowance is gone -- it was not a CALL frame,
+                                    %% so there is nothing to hand the remainder to.
+                                    finish_call(E, Ctx, St0, <<>>, RetOff, RetLen, 0);
+                                unsupported ->
+                                    unsupported({precompile, ToW}, E, Ctx);
+                                {error, Reason} ->
+                                    %% A precompile that ran and failed. This is a
+                                    %% halt, not a fallback: the EIP says the call
+                                    %% fails and the frame's gas is gone. The error
+                                    %% form carries no gas figure and nothing is
+                                    %% added back, so the whole allowance is
+                                    %% consumed -- which is the point. (0x0A is the
+                                    %% only precompile that returns this today.)
+                                    {E#e{halt = {error, Reason}}, Ctx}
+                            end
                     end;
                 false ->
                     CurAddr = s_msg(address, Ctx, <<0:160>>),
@@ -873,7 +906,7 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
                         {error, insufficient_balance} ->
                             %% Caller cannot cover Value: fail with no state
                             %% change (same shape as the depth-limit failure).
-                            finish_call(E, Ctx, Ctx#ctx.state, <<>>, RetOff, RetLen, 0, 0);
+                            finish_call(E, Ctx, Ctx#ctx.state, <<>>, RetOff, RetLen, 0);
                         {ok, StateIn} ->
                             ChildStatic = Kind =:= staticcall orelse s_msg(static, Ctx, false),
                             ChildMsg = #{address => ChildAddr, caller => ChildCaller,
@@ -918,7 +951,7 @@ handle_child({ok, Out, Left, St, Logs}, E, Ctx, _StateIn, RetOff, RetLen, ChildT
     MergedT = maps:merge(Ctx#ctx.transient, ChildT),
     E1 = E#e{gas = E#e.gas + Left, retdata = Out, logs = E#e.logs ++ Logs},
     finish_call(E1, Ctx#ctx{state = St, transient = MergedT, originals = ChildO},
-                St, Out, RetOff, RetLen, 1, Left);
+                St, Out, RetOff, RetLen, 1);
 handle_child({revert, Out, Left, _St, _Logs}, E, Ctx, _StateIn, RetOff, RetLen,
              _ChildT, ChildO) ->
     %% A revert discards the whole child frame INCLUDING the CALL value
@@ -928,18 +961,29 @@ handle_child({revert, Out, Left, _St, _Logs}, E, Ctx, _StateIn, RetOff, RetLen,
     Pre = Ctx#ctx.state,
     finish_call(E#e{gas = E#e.gas + Left, retdata = Out},
                 Ctx#ctx{state = Pre, originals = ChildO},
-                Pre, Out, RetOff, RetLen, 0, Left);
+                Pre, Out, RetOff, RetLen, 0);
 handle_child({error, Reason, _St, _Logs}, E, Ctx, _StateIn, RetOff, RetLen,
              _ChildT, ChildO) ->
     case Reason of
         {unsupported, What} -> unsupported(What, E, Ctx);
         _ -> Pre = Ctx#ctx.state,
              finish_call(E#e{retdata = <<>>}, Ctx#ctx{state = Pre, originals = ChildO},
-                         Pre, <<>>, RetOff, RetLen, 0, 0)
+                         Pre, <<>>, RetOff, RetLen, 0)
     end.
 
 %% Write the (truncated) child output to memory, push success flag.
-finish_call(E, Ctx, State, Out, RetOff, RetLen, Success, _Left) ->
+%% The child's unused gas used to be an eighth argument here, named `Left', and
+%% was discarded -- `_Left'. It read as load-bearing and was not: the regular CALL
+%% path does its own refund in `handle_child/9' (`E#e{gas = E#e.gas + Left}') and
+%% passes nothing here, so no regular call ever read it.
+%%
+%% Meanwhile the precompile path *did* pass a refund in and received nothing back,
+%% because this function dropped it. So the one argument every regular call ignored
+%% was the only thing the precompile path was relying on, which is how a tight call
+%% to a precompile could be charged for gas nobody received. The parameter is gone
+%% rather than renamed: a refund belongs where the child frame's result is, and
+%% there is exactly one of those.
+finish_call(E, Ctx, State, Out, RetOff, RetLen, Success) ->
     CopyLen = min(RetLen, byte_size(Out)),
     OutBin = binary:part(Out, 0, CopyLen),
     E1 = case RetLen > 0 andalso CopyLen > 0 of
@@ -1032,7 +1076,7 @@ do_create(Op, E, Ctx) ->
 run_create(Op, Init, Salt, Value, E, Ctx) ->
     case s_msg(depth, Ctx, 0) >= 1024 of
         true ->
-            finish_call(E, Ctx, Ctx#ctx.state, <<>>, 0, 0, 0, 0);
+            finish_call(E, Ctx, Ctx#ctx.state, <<>>, 0, 0, 0);
         false ->
             run_create1(Op, Init, Salt, Value, E, Ctx)
     end.
@@ -1045,7 +1089,7 @@ run_create1(Op, Init, Salt, Value, E, Ctx) ->
     case eth_state:exists(State1, NewAddr) of
         true ->
             finish_call(E#e{retdata = <<>>}, Ctx#ctx{state = State1},
-                        State1, <<>>, 0, 0, 0, 0);
+                        State1, <<>>, 0, 0, 0);
         false ->
             Avail = E#e.gas,
             ChildGas = Avail - Avail div 64,
@@ -1053,7 +1097,7 @@ run_create1(Op, Init, Salt, Value, E, Ctx) ->
             case can_transfer(State1, Sender, Value) of
                 false ->
                     %% Nonce stays consumed (as in geth); no value moves.
-                    finish_call(E1, Ctx, State1, <<>>, 0, 0, 0, 0);
+                    finish_call(E1, Ctx, State1, <<>>, 0, 0, 0);
                 true ->
                     create_with_value(Op, Init, Value, Sender, NewAddr, State1, E1, Ctx, ChildGas)
             end

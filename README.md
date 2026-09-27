@@ -66,8 +66,8 @@ beacon, validators, or block production).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**638 tests, green**).
-* **Status** — v0.7.0; eunit green (638 tests) and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**644 tests, green**).
+* **Status** — v0.7.0; eunit green (644 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -535,6 +535,17 @@ Where the work actually stands:
 **On state roots.** etherlang can execute blocks and report a state root, but that root is **not known** to equal the one the network computed. Two distinct halves of "per-fork exact" are involved and only the first is done:
 
 - *Availability* — an instruction the executing fork does not have is now an exceptional halt that consumes the frame's whole allowance. Before this every clause in `eth_evm:do_op/3` was unconditional, so PUSH0 executed in a Paris block and TSTORE executed anywhere before Cancun, each returning *successfully* — a post-state no other client reproduces, produced without an error.
+- *A precompile call charged gas from the wrong pocket.* A CALL's `gas` argument is an allowance: a
+  precompile's cost comes out of it and the remainder returns to the caller, so the caller pays exactly the
+  cost. `eth_evm` charged the cost against the **caller's remaining gas** instead, and never returned the
+  unused allowance — `finish_call/8` accepted the child's leftover gas and discarded it (`_Left`), while the
+  regular CALL path does its own refund in `handle_child/9` and passed nothing. So the one argument every
+  regular call ignored was the only thing the precompile path relied on. The two errors had opposite signs,
+  which is why neither read as a consistent overcharge: a CALL forwarding *exactly* the precompile's cost
+  failed whenever the caller's own remainder had dipped below it — the arrangement a tight transaction is in,
+  and how six `eip196_ec_add_mul` fixtures ended up storing `0` where the specification says `1` — and a CALL
+  forwarding *more* was charged the whole forwarded amount on top of the cost. Found by the conformance corpus,
+  not by reading.
 - *Pricing* — **done.** `eth_fork_schedule` now owns every price the interpreter charges, and `eth_evm:base_cost/1` — a second, fork-free copy of the schedule — is deleted. That is what "one owner of the composition" means, and it was the whole difficulty: the two tables agreed on most totals and decomposed four groups differently (a warm base plus a hardcoded cold surcharge here, the whole figure there; a flat 375 for LOG here, `375 * (topics + 1)` there), so neither could be substituted for the other. What is now fork-selected: every opcode's constant price; **EIP-150's** pre-Berlin access costs (`BALANCE`/`EXTCODEHASH` 400, `EXTCODESIZE`/`EXTCODECOPY`/the `CALL` family 700, `SLOAD` 200 — a Frontier `BALANCE` cost 2600, because the pre-Berlin figures existed only in the table and nowhere in execution); **EIP-2929**'s warm/cold split; **EIP-161's** 9000 and 25000, which were gated on Berlin and are Spurious Dragon's; the **refund cap**; **EIP-6780**; **EIP-3860**; and `eth_tx`'s intrinsic floor. Two live bugs fell out of the comparison: `ADDRESS` cost 3 where it is 2 (it had no clause and fell to the catch-all — 1 gas on every `ADDRESS` in every block), and EIP-161's terms were unreachable at the forks they belong to. **SSTORE** is now fork-selected too, and is the one price that cannot be derived from the frame: EIP-2200's net metering needs the value each slot held at the *start of the transaction*, as against the value it holds now, and the interpreter keeps those in a second map (`eth_evm`'s `#ctx.originals`) precisely because the transient map cannot hold them — see the entry below.
 - **The Cancun-era SSTORE bug is fixed, and fixing it found a second one inside the fix.** A no-op write — storing a slot's existing value back to itself — was charged **2900 with a 100 refund**, netting 2800, where EIP-2200 clause (1) says `SLOAD_GAS` and nothing else: 100 from EIP-2929. That was 2700 gas net overcharged on every no-op write at every fork, London included. The whole of the old implementation was a three-case expression over the slot's *current* value, so it also had nowhere to put a *dirty* write — the case EIP-2200 exists to price — and charged one as a clean one. `eth_fork_schedule:sstore_cost/4` now implements the decision tree arm by arm with EIP-2929's figures and EIP-3529's refunds, and the interpreter supplies it with the transaction-start value.
   - The interpreter needed the value each slot held when the transaction began, and tracked no such thing. It records one per `(address, slot)` on the **first** write to that slot, in its own map rather than the transient one: the read that supplies it is the transaction-start value *only because nothing has written the slot yet*, which is why it has to happen before the write. The transient map could not hold it — that map is transaction-scoped but is discarded on a child revert, and an original value has to survive one.

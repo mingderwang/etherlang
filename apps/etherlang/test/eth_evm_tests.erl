@@ -1252,6 +1252,11 @@ log_charges_eight_a_byte_plus_memory_test() ->
 %% The account the top-level frame writes to: ?MSG0's own address.
 -define(ACCT, <<0:160>>).
 
+%% ?MSG0's own address, which is where a top-level frame's SSTORE lands. Spelled
+%% out rather than reused from the Msg map, because a storage read that had to be
+%% dug out of a map would read as the test being about the map.
+-define(MSG0_ADDRESS, <<0:160>>).
+
 %% `PUSH1 Val, PUSH1 Slot, SSTORE'. Slot is on top, so it is pushed last --
 %% SSTORE pops key first, then value.
 sstore_op(Val, Slot) -> <<16#60,Val, 16#60,Slot, 16#55>>.
@@ -1429,3 +1434,156 @@ sstore_before_berlin_is_refused_rather_than_priced_test() ->
     %% And Berlin is not refused, which is what makes the boundary the boundary.
     ?assertMatch({ok, _, _, _, _},
                  eth_evm:run(Code, ?MSG0, St, #{fork => berlin}, ?GAS)).
+
+%% ---------------------------------------------------------------------------
+%% Calling a precompile
+%% ---------------------------------------------------------------------------
+%%
+%% A CALL's `gas' argument is an *allowance*: the callee may spend up to that much
+%% and the rest comes back. For a precompile -- which is not a frame, has no code to
+%% run and returns immediately -- the whole cost is paid out of that allowance, and
+%% whatever is left of it returns to the caller. So a caller pays exactly the
+%% precompile's cost, and forwarding a specific amount is a way of *capping* that
+%% cost, not of adding to it.
+%%
+%% It was wrong in both directions at once, and the two errors had opposite signs,
+%% so neither showed up as a consistent overcharge:
+%%
+%%   * the cost was charged against the *caller's* remaining gas rather than
+%%     against the forwarded allowance, and the unused allowance was never returned
+%%     at all. `finish_call/8' took the child's leftover gas as an argument and
+%%     discarded it (`_Left'); the regular CALL path does its own refund in
+%%     `handle_child/9' and passed nothing, so the one argument every regular call
+%%     ignored was the only thing the precompile path was relying on;
+%%   * so a CALL forwarding *exactly* the precompile's cost failed whenever the
+%%     caller's own remainder had dipped below it -- `charge/2' ran out and the
+%%     call answered false -- and a CALL forwarding *more* was charged the whole
+%%     forwarded amount on top of the cost.
+%%
+%% ECADD at 150 gas and a contract forwarding exactly 150 is the case that shows it:
+%% six `eip196_ec_add_mul' fixtures, at every fork from Berlin to Prague, stored 0
+%% where the specification says 1.
+
+%% PUSH1 0 x5 (retLen, retOff, argLen, argOff, value), PUSH1 6 (ECADD),
+%% PUSH1 Gas (the allowance), CALL, PUSH1 0, SSTORE -- so the contract stores the
+%% call's success flag at slot 0.
+%%
+%% `Gas' is a `PUSH1' operand and so is truncated to a byte: 256 arrives as 0.
+%% Every value used below is under 256, and the helper says so rather than
+%% leaving it to be discovered.
+precompile_call_sstoring_flag(Gas) when Gas >= 0, Gas =< 255 ->
+    <<16#60,0, 16#60,0, 16#60,0, 16#60,0, 16#60,0, 16#60,6, 16#60,Gas, 16#F1,
+      16#60,0, 16#55>>.
+
+%% The same call, with the success flag popped instead of stored.
+precompile_call_discarding_flag(Gas) when Gas >= 0, Gas =< 255 ->
+    <<16#60,0, 16#60,0, 16#60,0, 16#60,0, 16#60,0, 16#60,6, 16#60,Gas, 16#F1,
+      16#50, 16#00>>.
+
+%% PUSH1 0 x5, PUSH1 6, PUSH1 Gas, CALL, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0,
+%% RETURN -- the same call, but the success flag comes back in the return data
+%% instead of going to storage. Storing it would cost 20,000 gas, which is the
+%% opposite of what this program is for: it has to be able to run in a frame too
+%% tight to afford an SSTORE, because a tight frame is the case under test.
+precompile_call_returning_flag(Gas) when Gas >= 0, Gas =< 255 ->
+    <<16#60,0, 16#60,0, 16#60,0, 16#60,0, 16#60,0, 16#60,6, 16#60,Gas, 16#F1,
+      16#60,0, 16#52, 16#60,32, 16#60,0, 16#F3>>.
+
+%% The gas at which the call is *tight*: enough for the seven pushes and the cold
+%% access to the precompile's address, plus a little over the forwarded allowance,
+%% so the caller's own remainder after forwarding is smaller than the precompile's
+%% cost. That is the arrangement the old code got wrong -- it charged the cost out
+%% of the remainder, which by construction was too small -- and it is the
+%% arrangement every `eip196_ec_add_mul' fixture is in.
+-define(TIGHT_GAS, 2790).
+
+returned_flag(Code, Gas) ->
+    {ok, Out, _Left, _St, _Logs} = eth_evm:run(Code, ?MSG0, pc_state(), ?ENV, Gas),
+    binary:decode_unsigned(binary:part(Out, 31, 1)).
+
+pc_state() -> eth_state:with_base_source(?STATE, empty).
+
+run_pc(Code, Gas) ->
+    {ok, _Out, Left, St, _Logs} =
+        eth_evm:run(Code, ?MSG0, pc_state(), ?ENV, Gas),
+    {Gas - Left, St}.
+
+a_call_forwarding_exactly_the_precompiles_cost_succeeds_test() ->
+    %% ECADD costs 150. Forward 150 and the call must succeed -- this is the case
+    %% that failed before, because the cost was taken out of the caller's pocket
+    %% rather than out of the 150 the caller had just set aside for it.
+    {_Spent, St} = run_pc(precompile_call_sstoring_flag(150), 100000),
+    ?assertEqual(1, eth_state:storage(St, ?MSG0_ADDRESS, 0)).
+
+a_tight_frame_forwarding_exactly_the_precompiles_cost_still_succeeds_test() ->
+    %% The fixture's actual failure, reproduced.
+    %%
+    %% With 2,790 gas the frame can afford the pushes, the cold access to 0x06 and
+    %% the 150 forwarded -- and then has 19 gas left, which is less than the 150 the
+    %% ECADD costs. Charging that cost out of the caller's remainder is what made
+    %% the call answer false, and the contract stored 0 where the specification says
+    %% 1. Against 100,000 gas of headroom the same defect is invisible, which is
+    %% why the ample-gas version of this test is the one that did *not* bite when
+    %% the accounting was put back.
+    ?assertEqual(1, returned_flag(precompile_call_returning_flag(150), ?TIGHT_GAS)),
+    %% And one gas less is not enough, in the same frame, so the boundary is the
+    %% cost and not the headroom.
+    ?assertEqual(0, returned_flag(precompile_call_returning_flag(149), ?TIGHT_GAS)),
+    %% Forwarding more than the frame can spare is capped by EIP-150's 63/64 rule
+    %% rather than failing, and still succeeds.
+    ?assertEqual(1, returned_flag(precompile_call_returning_flag(250), ?TIGHT_GAS)).
+
+a_call_forwarding_less_than_the_precompiles_cost_fails_test() ->
+    %% 149 of an allowance that costs 150: the call fails, and the flag is 0.
+    {_Spent, St} = run_pc(precompile_call_sstoring_flag(149), 100000),
+    ?assertEqual(0, eth_state:storage(St, ?MSG0_ADDRESS, 0)).
+
+a_call_forwarding_more_than_the_precompiles_cost_pays_only_for_the_cost_test() ->
+    %% The point of an allowance. Forwarding 500 and forwarding 150 to the same
+    %% 150-gas precompile must cost the same, because the caller pays the
+    %% precompile's cost and gets the rest of its allowance back.
+    %%
+    %% Before the fix this differed by 350: the 500-forwarding call was charged its
+    %% whole allowance *and* the cost, and the 150 one was charged its allowance
+    %% and then failed for want of the caller's own gas. Differencing two runs is
+    %% what makes the assertion about the refund rather than about either total.
+    {Exact, _} = run_pc(precompile_call_discarding_flag(150), 100000),
+    {More, _} = run_pc(precompile_call_discarding_flag(250), 100000),
+    ?assertEqual(Exact, More).
+
+a_failed_call_consumes_exactly_the_allowance_it_was_given_test() ->
+    %% A call that cannot cover the precompile's cost is not free and is not
+    %% charged the cost: the whole forwarded allowance is gone. 149 and 100 differ
+    %% by exactly 49, which is what makes this a statement about the allowance
+    %% rather than about either total.
+    {Hundred, _} = run_pc(precompile_call_discarding_flag(100), 100000),
+    {FortyNine, _} = run_pc(precompile_call_discarding_flag(149), 100000),
+    ?assertEqual(49, FortyNine - Hundred).
+
+the_allowance_boundary_is_the_precompiles_cost_exactly_test() ->
+    %% One gas apart, and the success flag flips between them. 149 cannot cover a
+    %% 150-gas precompile and the whole 149 is consumed; 150 can, and 150 is spent.
+    %% So the two frames differ by exactly 1 gas and disagree about whether the call
+    %% happened.
+    %%
+    %% Two things were wrong in the first version of this test and both were in the
+    %% test. It asserted that forwarding 151 costs one gas *more* than forwarding
+    %% 150, which is backwards -- the extra gas is refunded, so they cost the same
+    %% -- and it forwarded 5000 through a `PUSH1', which truncated it to 136, so the
+    %% call failed and the frame came out *cheaper* than the 150 case. That read as
+    %% the node refunding gas it had never been handed. It was caught only because
+    %% the number was measured rather than reasoned to.
+    %% The two frames are differenced on the *discarding* program, so the only thing
+    %% that differs between them is the allowance. Doing it on the storing program
+    %% measures two things at once: the one gas of allowance, and 20,000 - 100 of
+    %% SSTORE, because the succeeding frame writes 1 over 0 and the failing one
+    %% writes 0 over 0. That is 19,901, and it is the right answer to a different
+    %% question.
+    {OneShort, _} = run_pc(precompile_call_discarding_flag(149), 100000),
+    {Exact, _} = run_pc(precompile_call_discarding_flag(150), 100000),
+    ?assertEqual(1, Exact - OneShort),
+    %% And the flag, on its own, is the boundary stated as an outcome.
+    {_, FlagShort} = run_pc(precompile_call_sstoring_flag(149), 100000),
+    {_, FlagExact} = run_pc(precompile_call_sstoring_flag(150), 100000),
+    ?assertEqual(0, eth_state:storage(FlagShort, ?MSG0_ADDRESS, 0)),
+    ?assertEqual(1, eth_state:storage(FlagExact, ?MSG0_ADDRESS, 0)).

@@ -123,16 +123,24 @@ behavioural change per commit, and each step says what it now does.
    histogram is: a delta of a few thousand gas repeats because it is one missing
    schedule term, and a delta in the millions means a frame consumed its whole
    allowance where the fixture's did not. Of 229 comparable deltas:
-   - **`+550` gas, 6 fixtures, `byzantium/eip196_ec_add_mul`, all forks Berlin →
-     Prague, one contract.** Identical at every fork, so it is not a schedule term
-     and not fork-dependent. The contract is `PUSH1 0` ×5, `PUSH1 6`, `PUSH1 150`,
-     `CALL`, `PUSH1 0`, `SSTORE` — it forwards 150 gas to ECADD and stores the
-     success flag. The fixture expects the slot at **1**; this node leaves it at
-     **0**, and spends 26,824 gas where 26,274 is expected. So the call **fails
-     where it must succeed**. `eth_evm_precompiles:precompile(6, <<>>)` does return
-     `{ok, 64 zero bytes, 150}` when called directly, so the precompile handles the
-     point at infinity correctly and the fault is in the CALL path around it — not
-     in the curve arithmetic. **Unresolved.**
+   - **~~`+550` gas, 6 fixtures, `byzantium/eip196_ec_add_mul`, all forks Berlin →
+     Prague~~ — cause found and fixed; the fixtures still diverge and the remaining
+     400 gas is unresolved.** The contract forwards 150 gas to ECADD and stores the
+     success flag. A CALL's `gas` argument is an *allowance*: the precompile's cost
+     comes out of it and the rest returns to the caller, so the caller pays exactly
+     the cost. `eth_evm` did neither half. The cost was charged against the
+     **caller's remaining gas** rather than the forwarded allowance, and the unused
+     allowance was **never returned** — `finish_call/8` took the child's leftover gas
+     as an argument and discarded it (`_Left`), while the regular CALL path does its
+     own refund in `handle_child/9` and passed nothing, so the one argument every
+     regular call ignored was the only thing the precompile path relied on. Fixed;
+     `add_gas/2` and the misleading `Left` parameter are gone rather than renamed.
+     The two errors had opposite signs, so neither read as a consistent overcharge:
+     a CALL forwarding *exactly* the cost failed whenever the caller's own remainder
+     had dipped below it — the arrangement a tight transaction is in, and why the
+     fixture stored **0** where the specification says **1** — and a CALL forwarding
+     *more* was charged the whole forwarded amount on top of the cost. The fixture's
+     delta fell from **+550 to +400**.
    - **`-1` gas, 3 fixtures, `prague/eip7623_increase_calldata_cost`, the
      `exact_gas` cases.** A one-gas shortfall, on tests whose whole subject is
      hitting an exact gas figure. **Unresolved.**
