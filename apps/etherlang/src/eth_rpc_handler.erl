@@ -225,7 +225,7 @@ dispatch(<<"eth_hashrate">>, _Params, _State) ->
 dispatch(<<"eth_getBlockByNumber">>, [NumHex, Full], State) when
         is_binary(NumHex), is_boolean(Full) ->
     Chain = maps:get(chain, State, eth_chain),
-    Num = resolve_num(Chain, NumHex),
+    Num = eth_rpc_projection:resolve_block_number(Chain, NumHex),
     case eth_chain:get_by_number(Chain, Num) of
         {ok, _Block, FullStored} when Full andalso not FullStored ->
             proxy(<<"eth_getBlockByNumber">>, [num_or_tag(NumHex, Num), Full]);
@@ -249,7 +249,7 @@ dispatch(<<"eth_getBlockByHash">>, [Hash, Full], State) when
 
 dispatch(<<"eth_getBlockTransactionCountByNumber">>, [NumHex], State) ->
     Chain = maps:get(chain, State, eth_chain),
-    Num = resolve_num(Chain, NumHex),
+    Num = eth_rpc_projection:resolve_block_number(Chain, NumHex),
     case eth_chain:get_by_number(Chain, Num) of
         {ok, Block, _} ->
             {ok, eth_hex:encode_int(length(maps:get(<<"transactions">>, Block, [])))};
@@ -268,7 +268,7 @@ dispatch(<<"eth_getBlockTransactionCountByHash">>, [Hash], State) ->
 
 dispatch(<<"eth_getTransactionByBlockNumberAndIndex">>, [NumHex, IndexHex], State) ->
     Chain = maps:get(chain, State, eth_chain),
-    Num = resolve_num(Chain, NumHex),
+    Num = eth_rpc_projection:resolve_block_number(Chain, NumHex),
     case eth_chain:get_by_number(Chain, Num) of
         {ok, Block, true} ->
             Txs = maps:get(<<"transactions">>, Block, []),
@@ -353,8 +353,215 @@ dispatch(<<"eth_getLogs">>, [Filter], State) when is_map(Filter) ->
         {error, _} -> proxy(<<"eth_getLogs">>, [Filter])
     end;
 
+%% ===========================================================================
+%% Methods that were proxied and are now answered from what this node holds
+%% ===========================================================================
+%%
+%% Every clause below follows the same shape: answer locally when this node holds
+%% the data, and proxy when it does not. None of them invents a value, and the
+%% comments say what the local answer is derived from -- because a local answer that
+%% is a *guess* would be worse than the proxy it replaced, and the only way to keep
+%% that true is to be explicit about the derivation.
+
+dispatch(<<"eth_accounts">>, _Params, _State) ->
+    %% "Returns a list of addresses owned by client."
+    %%
+    %% An empty array, and it is the correct answer rather than a placeholder. This
+    %% node has no keystore, no unlocked account and no signer: it relays
+    %% transactions other people signed and it builds blocks for a fee recipient the
+    %% consensus client named. So the set of accounts it owns is empty, and `[]' is
+    %% that set. Proxied, this returned the *upstream* node's accounts, which is a
+    %% different node's answer to a question about this one.
+    {ok, []};
+
+dispatch(<<"eth_getBlockReceipts">>, [BlockParam], State) ->
+    Chain = maps:get(chain, State, eth_chain),
+    case resolve_block(Chain, BlockParam) of
+        {ok, Num} ->
+            case eth_rpc_projection:block_receipts(Chain, Num) of
+                {ok, Receipts} ->
+                    {ok, Receipts};
+                {error, {pruned_history, _Num}} ->
+                    %% The specification names this case on this method: 4444, "Pruned
+                    %% history unavailable". The block is held; its receipts are not. A
+                    %% block this node never fetched receipts for is exactly that, and
+                    %% `null' would be indistinguishable from "this block has no
+                    %% transactions" -- a different fact about a real block, and one a
+                    %% client indexing the chain would act on.
+                    {error, {code, 4444, <<"pruned history unavailable">>}};
+                {error, not_found} ->
+                    proxy(<<"eth_getBlockReceipts">>, [BlockParam])
+            end;
+        {error, _} ->
+            proxy(<<"eth_getBlockReceipts">>, [BlockParam])
+    end;
+
+dispatch(<<"eth_getTransactionByHash">>, [TxHash], State)
+  when is_binary(TxHash) ->
+    Chain = maps:get(chain, State, eth_chain),
+    case eth_rpc_projection:transaction_by_hash(Chain, TxHash) of
+        {ok, Tx} -> {ok, Tx};
+        {error, not_found} -> proxy(<<"eth_getTransactionByHash">>, [TxHash])
+    end;
+
+%% The ByHashAndIndex pair of the method above, added because it shares the
+%% projection: the stored transaction object plus the same three positional fields.
+%% Phase 6 lists it as missing and it was missing for the same reason -- nothing
+%% projected a stored transaction -- so it cost two lines here.
+dispatch(<<"eth_getTransactionByBlockHashAndIndex">>, [Hash, IndexHex], State)
+  when is_binary(Hash), is_binary(IndexHex) ->
+    Chain = maps:get(chain, State, eth_chain),
+    case eth_chain:get_by_hash(Chain, norm(Hash)) of
+        {ok, Block, _} when is_map(Block) ->
+            case index_of(Chain, Block, IndexHex) of
+                {ok, Tx} -> {ok, Tx};
+                {error, _} = E -> E
+            end;
+        _ ->
+            proxy(<<"eth_getTransactionByBlockHashAndIndex">>, [Hash, IndexHex])
+    end;
+
+dispatch(<<"eth_feeHistory">>, [CountHex, Newest, Percentiles], State) ->
+    Chain = maps:get(chain, State, eth_chain),
+    Count = quantity_of(CountHex),
+    case eth_rpc_projection:fee_history(Chain, Count, Newest, Percentiles) of
+        {ok, Result} ->
+            {ok, Result};
+        {error, invalid_block_count} ->
+            %% No oldestBlock exists for a zero-block range and the field is
+            %% required, so the argument is what is wrong. -32602 rather than a
+            %% result, because a convention here would be a height this node invented.
+            {error, {code, -32602, <<"invalid block count">>}};
+        {error, invalid_percentiles} ->
+            {error, {code, -32602, <<"invalid reward percentiles">>}};
+        {error, {newest_not_held, N}} ->
+            %% The block is real and this node simply does not hold it. Another node
+            %% will, so this is a fallback and not a refusal.
+            proxy(<<"eth_feeHistory">>,
+                  [CountHex, eth_hex:encode_int(N), Percentiles]);
+        {error, _} = E ->
+            E
+    end;
+
+dispatch(<<"eth_maxPriorityFeePerGas">>, _Params, _State) ->
+    case eth_block_builder:suggested_tip() of
+        {ok, Tip} -> {ok, eth_hex:encode_int(Tip)};
+        undefined ->
+            %% This node's pool is empty or holds nothing it can price, so it has no
+            %% evidence about the network's next block. Answering 0 would tell a
+            %% client the next block pays no tip, which is a claim about the chain
+            %% derived from a fact about this node.
+            proxy(<<"eth_maxPriorityFeePerGas">>, [])
+    end;
+
+dispatch(<<"eth_getProof">>, [Address, Slots], State) ->
+    proof_dispatch(Address, Slots, latest, State, 2);
+dispatch(<<"eth_getProof">>, [Address, Slots, Block], State) ->
+    proof_dispatch(Address, Slots, Block, State, 3);
+
+dispatch(<<"eth_estimateGas">>, Params, _State) ->
+    case eth_config:evm_enabled() of
+        false ->
+            proxy(<<"eth_estimateGas">>, Params);
+        true ->
+            case eth_call:estimate_gas(Params) of
+                {ok, Gas} -> {ok, eth_hex:encode_int(Gas)};
+                {error, {bad_params, Why}} -> {error, {bad_params, Why}};
+                {error, Reason} -> {error, {code, -32000, to_bin(Reason)}}
+            end
+    end;
+
 dispatch(_Method, Params, _State) ->
     proxy(_Method, Params).
+
+%% `BlockNumberOrTagOrHash' -- the parameter of eth_getBlockReceipts -- is the tag
+%% vocabulary *or* a 32-byte hash. A hash is not a height, so it cannot go through
+%% resolve_block_number/2 at all: that decodes any binary as a QUANTITY, and
+%% `eth_hex:decode/1' on a 32-byte hash yields a 256-bit integer. Passing one there
+%% would resolve the requested block to an arbitrary height, and a client asking for
+%% "the receipts of block 0x1541..." would be served some other block's receipts
+%% without an error. So a 32-byte value is recognised as a hash and routed by hash,
+%% and only a tag or a short hex string is a height.
+resolve_block(Chain, Param) ->
+    case is_hash(Param) of
+        true ->
+            case eth_chain:get_by_hash(Chain, norm(Param)) of
+                {ok, Block, _} when is_map(Block) ->
+                    case quantity_of(maps:get(<<"number">>, Block, undefined)) of
+                        undefined -> {error, no_number};
+                        N -> {ok, N}
+                    end;
+                _ ->
+                    {error, not_found}
+            end;
+        false ->
+            {ok, eth_rpc_projection:resolve_block_number(Chain, Param)}
+    end.
+
+%% 32 bytes is a hash and nothing else in this parameter's grammar: a height is a
+%% QUANTITY and a tag is a word. There is no overlap, so the width alone decides.
+is_hash(V) when is_binary(V) ->
+    case eth_hex:decode_bytes(V) of
+        {ok, Bytes} -> byte_size(Bytes) =:= 32;
+        error -> false
+    end;
+is_hash(_) -> false.
+
+%% eth_chain is keyed on the `hash' field of the block map it stores, which is the
+%% 0x-prefixed lower-case hex string of an eth_getBlockByNumber response. A client
+%% may send the upper-case form, and that is the same block.
+norm(H) when is_binary(H) ->
+    case H of
+        <<"0x", Rest/binary>> -> <<"0x", (string:lowercase(Rest))/binary>>;
+        _ -> <<"0x", (string:lowercase(H))/binary>>
+    end;
+norm(H) when is_integer(H) -> eth_hex:encode_int(H).
+
+%% An index within a held block. `null' for an index the block does not have -- the
+%% specification's `notFound' -- and 4444 for a block stored without its transaction
+%% list, which is this method's own "pruned history unavailable".
+index_of(Chain, Block, IndexHex) ->
+    Num = quantity_of(maps:get(<<"number">>, Block, undefined)),
+    case is_integer(Num) of
+        false ->
+            {ok, null};
+        true ->
+            case eth_rpc_projection:transaction_at(Chain, Num,
+                                                   quantity_of(IndexHex)) of
+                {ok, Tx} -> {ok, Tx};
+                {error, {pruned_history, _N}} ->
+                    {error, {code, 4444, <<"pruned history unavailable">>}};
+                {error, not_found} ->
+                    {ok, null}
+            end
+    end.
+
+%% `AccountProof' is `additionalProperties: false' with seven required fields, every
+%% one a fact about a state trie. This node's reads come from upstream by default and
+%% it holds no trie to prove against, and a peer sends balances rather than the RLP
+%% nodes a proof is made of -- so there is no proof it could construct. Another node
+%% holds the state, so this proxies rather than answering.
+proof_dispatch(Address, Slots, Block, _State, Arity) ->
+    Params = [Address, Slots, Block],
+    case is_list(Slots) andalso is_binary(Address) of
+        false ->
+            {error, {code, -32602, <<"invalid params">>}};
+        true ->
+            case eth_rpc_projection:account_proof(Address, Slots, Block) of
+                {ok, Proof} -> {ok, Proof};
+                {error, {state_not_local, _}} ->
+                    proxy(<<"eth_getProof">>, lists:sublist(Params, Arity));
+                {error, account_not_local} ->
+                    proxy(<<"eth_getProof">>, lists:sublist(Params, Arity));
+                {error, _} = E ->
+                    E
+            end
+    end.
+
+quantity_of(V) when is_integer(V), V >= 0 -> V;
+quantity_of(V) when is_binary(V) ->
+    try eth_hex:decode(V) catch _:_ -> undefined end;
+quantity_of(_) -> undefined.
 
 %% Local account field (balance/nonce) from the snap store, keyed by
 %% address hash. Values stored as account RLP; quantities re-encoded.
@@ -490,8 +697,8 @@ find_idx(BlockHash, Num, TxHash, [{Tx, R} | Rest], Idx, PrevCum)
     TxGas = Cum - PrevCum,
     case maps:get(<<"hash">>, Tx, undefined) of
         TxHash ->
-            {ok, receipt_response(BlockHash, Num, TxHash, Idx, Tx, R,
-                                  Cum, TxGas)};
+            {ok, eth_rpc_projection:receipt_response(
+                   BlockHash, Num, TxHash, Idx, Tx, R, Cum, TxGas)};
         _ ->
             find_idx(BlockHash, Num, TxHash, Rest, Idx + 1, Cum)
     end;
@@ -506,32 +713,6 @@ to_int(I) when is_integer(I) -> I;
 to_int(B) when is_binary(B) ->
     try eth_hex:decode(B) catch _:_ -> 0 end;
 to_int(_) -> 0.
-
-receipt_response(BlockHash, Num, TxHash, Idx, Tx, R, Cum, TxGas) ->
-    Logs = enrich_logs(maps:get(<<"logs">>, R, []), BlockHash, Num, TxHash, Idx, 0),
-    #{<<"transactionHash">> => TxHash,
-      <<"transactionIndex">> => eth_hex:encode_int(Idx),
-      <<"blockHash">> => BlockHash,
-      <<"blockNumber">> => eth_hex:encode_int(Num),
-      <<"from">> => maps:get(<<"from">>, Tx, null),
-      <<"to">> => maps:get(<<"to">>, Tx, null),
-      <<"cumulativeGasUsed">> => eth_hex:encode_int(Cum),
-      <<"gasUsed">> => eth_hex:encode_int(TxGas),
-      <<"contractAddress">> => maps:get(<<"contractAddress">>, R, null),
-      <<"logs">> => Logs,
-      <<"logsBloom">> => maps:get(<<"logs_bloom">>, R, maps:get(<<"logsBloom">>, R, <<"0x">>)),
-      <<"status">> => maps:get(<<"status">>, R, <<"0x1">>),
-      <<"type">> => maps:get(<<"type">>, R, <<"0x0">>)}.
-
-enrich_logs([], _, _, _, _, _) -> [];
-enrich_logs([L | Rest], BlockHash, Num, TxHash, TxIdx, LogIdx) ->
-    [L#{<<"blockHash">> => BlockHash,
-        <<"blockNumber">> => eth_hex:encode_int(Num),
-        <<"transactionHash">> => TxHash,
-        <<"transactionIndex">> => eth_hex:encode_int(TxIdx),
-        <<"logIndex">> => eth_hex:encode_int(LogIdx),
-        <<"removed">> => false}
-     | enrich_logs(Rest, BlockHash, Num, TxHash, TxIdx, LogIdx + 1)].
 
 %% Local log filter over stored receipts. Range capped to keep scans bounded.
 -define(MAX_LOG_RANGE, 1024).
@@ -553,24 +734,18 @@ local_logs(Chain, Filter) ->
         {error, bad_filter}
     end.
 
+%% One tag vocabulary, through eth_rpc_projection:resolve_block_number/2, for the
+%% same reason every other method that takes a BlockNumberOrTag goes through it. This
+%% function had its own copy -- `log_num/2', beside a `resolve_num/2' with identical
+%% clauses -- and the two were free to drift, so `finalized' could come to mean one
+%% height in a log filter and another in a block lookup.
 log_range(Chain, Filter) ->
-    HeadN = local_head_num(Chain),
-    From = case maps:get(<<"fromBlock">>, Filter, <<"latest">>) of
-               <<"earliest">> -> 0;
-               B when is_binary(B) -> log_num(Chain, B)
-           end,
-    To = case maps:get(<<"toBlock">>, Filter, <<"latest">>) of
-             <<"earliest">> -> 0;
-             B2 when is_binary(B2) -> log_num(Chain, B2)
-         end,
+    HeadN = eth_rpc_projection:resolve_block_number(Chain, <<"latest">>),
+    From = eth_rpc_projection:resolve_block_number(
+             Chain, maps:get(<<"fromBlock">>, Filter, <<"latest">>)),
+    To = eth_rpc_projection:resolve_block_number(
+           Chain, maps:get(<<"toBlock">>, Filter, <<"latest">>)),
     {max(From, 0), min(To, HeadN)}.
-
-log_num(Chain, <<"latest">>) -> max(local_head_num(Chain), 0);
-log_num(Chain, <<"pending">>) -> max(local_head_num(Chain), 0);
-log_num(Chain, <<"finalized">>) -> finality_num(Chain);
-log_num(Chain, <<"safe">>) -> finality_num(Chain);
-log_num(_Chain, <<"earliest">>) -> 0;
-log_num(_Chain, Hex) -> eth_hex:decode(Hex).
 
 log_addrs(undefined) -> any;
 log_addrs(A) when is_binary(A) -> [norm_hex(A)];
@@ -580,13 +755,27 @@ block_logs(Chain, N, Addrs, Topics) ->
     case (try eth_chain:get_by_number(Chain, N) catch _:_ -> not_found end) of
         {ok, Block, true} ->
             case (try eth_chain:receipts(Chain, N) catch _:_ -> not_found end) of
-                {ok, Receipts} ->
+                {ok, Receipts} when is_list(Receipts) ->
                     BlockHash = maps:get(<<"hash">>, Block, undefined),
                     Txs = maps:get(<<"transactions">>, Block, []),
+                    %% Paired by position, up to the shorter of the two lists.
+                    %%
+                    %% This was `lists:zip(lists:zip(Txs, Receipts), ...)', and
+                    %% `lists:zip/2' requires the lists to be the *same length*. A
+                    %% block with three transactions and no stored receipts -- which is
+                    %% every block this node synced without fetching receipts -- raised
+                    %% function_clause, and `local_logs/2' catches everything and returns
+                    %% `{error, bad_filter}', so the whole filter fell back to the
+                    %% upstream. The failure was invisible: `eth_getLogs' answered, from
+                    %% another node, and a caller comparing the two results would see a
+                    %% difference in coverage with nothing in the response to explain
+                    %% it. A block whose receipts are partly stored contributes the
+                    %% receipts it has and says nothing about the rest.
+                    N2 = min(length(Txs), length(Receipts)),
                     lists:append(
-                      [receipt_logs(BlockHash, N, Tx, R, Idx, Addrs, Topics) ||
-                          {{Tx, R}, Idx} <- lists:zip(lists:zip(Txs, Receipts),
-                                                      lists:seq(0, length(Receipts) - 1))]);
+                      [receipt_logs(BlockHash, N, lists:nth(I + 1, Txs),
+                                    lists:nth(I + 1, Receipts), I, Addrs, Topics)
+                       || I <- lists:seq(0, N2 - 1)]);
                 _ ->
                     []
             end;
@@ -598,7 +787,8 @@ receipt_logs(_BlockHash, _N, Tx, _R, _Idx, _Addrs, _Topics) when not is_map(Tx) 
     [];
 receipt_logs(BlockHash, N, Tx, R, Idx, Addrs, Topics) when is_map(R) ->
     TxHash = maps:get(<<"hash">>, Tx, undefined),
-    Logs = enrich_logs(maps:get(<<"logs">>, R, []), BlockHash, N, TxHash, Idx, 0),
+    Logs = eth_rpc_projection:enrich_logs(maps:get(<<"logs">>, R, []),
+                                         BlockHash, N, TxHash, Idx, 0),
     [L || L <- Logs, log_matches(L, Addrs, Topics)].
 
 log_matches(Log, any, []) -> is_map(Log);
@@ -646,29 +836,11 @@ hex_to_bin(<<"0x", Rest/binary>>) -> binary:decode_hex(Rest);
 hex_to_bin(B) when is_binary(B) -> binary:decode_hex(B).
 
 %% Resolve a block-number reference ("latest"/"earliest"/"pending"/
-%% "finalized"/"safe" or a 0x-hex number) to an actual block number for the
-%% local store. `safe' is approximated by the finalized checkpoint we track.
-resolve_num(Chain, <<"latest">>) -> max(local_head_num(Chain), 0);
-resolve_num(Chain, <<"pending">>) -> max(local_head_num(Chain), 0);
-resolve_num(Chain, <<"finalized">>) -> finality_num(Chain);
-resolve_num(Chain, <<"safe">>) -> finality_num(Chain);
-resolve_num(_Chain, <<"earliest">>) -> 0;
-resolve_num(_Chain, Hex) -> eth_hex:decode(Hex).
-
-finality_num(Chain) ->
-    case try eth_chain:finalized(Chain) catch _:_ -> error end of
-        F when is_integer(F) -> F;
-        _ -> max(local_head_num(Chain), 0)
-    end.
-
-%% Pass tags through to upstream verbatim, otherwise use the raw hex number.
+%% Resolving a tag to a height is eth_rpc_projection:resolve_block_number/2, for
+%% every method that takes one. This stays only to hand the *original* tag to
+%% upstream when a local lookup misses, so the peer resolves the tag the client
+%% wrote rather than one this node re-spelled.
 num_or_tag(Hex, _Num) -> Hex.
-
-local_head_num(Chain) ->
-    case eth_chain:head(Chain) of
-        {N, _} -> N;
-        undefined -> 0
-    end.
 
 %% Serve-time totalDifficulty compat (see defines at top of file). Only
 %% fills the field when absent AND the block is provably post-merge on a

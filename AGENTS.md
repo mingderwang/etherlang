@@ -388,19 +388,21 @@ The authoritative version of this list is the "What to do next, in order" sectio
 the top of `TASKS.md`, which also records the Engine API work that is deliberately
 **later** and why. Kept here only as a pointer, because this file is read more often.
 
-1. Add the missing RPC methods: `eth_estimateGas`, `eth_feeHistory`,
-   `eth_getTransactionByHash`, `eth_maxPriorityFeePerGas`, `eth_createAccessList`,
-   `eth_getBlockReceipts`, `eth_getProof`, `eth_accounts`.
-2. Wire the per-fork gas table into the EVM — a refactor, and a precondition for
+1. Wire the per-fork gas table into the EVM — a refactor, and a precondition for
    any state-root claim, and for a block this node builds being proposable.
-3. Run the EEST fixtures and record what fails.
+2. Run the EEST fixtures and record what fails.
 
 Done, and no longer listed:
 
 - Payload-decoder work, committed and tagged `v1.10-versioned-engine`.
 - `eth_block_builder` started and `payloadAttributes` acted on, so `forkchoiceUpdated`
   returns a `payloadId` and `getPayload` returns a real block. Its state root will not
-  match the network's until the gas table is wired — that is item 2 above.
+  match the network's until the gas table is wired — that is item 1 above.
+- The eight "missing" RPC methods. They were not missing so much as unexamined: a
+  catch-all clause proxied every unknown method, so all eight answered — with another
+  node's view. Seven now answer from this node's own state, in `eth_rpc_projection`,
+  and each says what it is derived from. `eth_createAccessList` is the one that is
+  genuinely absent.
 - `with_ctx/1` + `store_parent/1` + the rest of the execution context, extracted
   into `eth_test_util`.
 - Engine V2/V3, `forkchoiceUpdatedV3`, `getPayloadV3`, the `-32602` / `-38005` /

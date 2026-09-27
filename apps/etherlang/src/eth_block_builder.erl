@@ -78,7 +78,10 @@
           %% `blockValue' field of getPayloadV2/V3, i.e. what the fee recipient is
           %% promised, and a wrong one is a proposer that under- or over-states its
           %% own revenue.
-          block_value/1 ]).
+          block_value/1,
+          suggested_tip/0,
+          min_includable_tip/2,
+          next_base_fee/1 ]).
 
 -include_lib("etherlang/include/eth_block.hrl").
 
@@ -336,6 +339,140 @@ include([Entry | Rest], Block, BaseFee, Limit, UsedGas, Acc) ->
 %% The base fee is burned, not paid out, so it is maxPriorityFeePerGas that counts
 %% -- and for a legacy transaction, gasPrice minus the base fee, floored at zero
 %% because a transaction that pays no tip still pays the burn.
+%% eth_maxPriorityFeePerGas, answered from this node's own pool.
+%%
+%% "Returns the current maxPriorityFeePerGas per gas in wei." The specification
+%% gives no formula, and there is nothing to derive: what a client wants is "what
+%% tip do I have to offer to get into the next block", and the only honest answer
+%% this node can construct is the tip of the cheapest transaction it holds that
+%% would actually be included next. That is the minimum tip among pending
+%% transactions whose tip exceeds the next block's base fee -- the same `tip/2'
+%% the block builder orders its own selection by, so the figure this method
+%% reports and the figure a proposer would earn are the same number.
+%%
+%% Two things it deliberately does not do:
+%%
+%%   - It does not answer 0 when the pool is empty. 0 would be a claim that the
+%%     network's next block pays no tip, and this node has no evidence for that:
+%%     an empty pool is a fact about this node, not about the chain. It answers
+%%     `undefined' and the handler proxies, so the client gets the network's
+%%     figure or nothing rather than a fabricated zero that would make a client
+%%     underbid.
+%%   - It does not return a percentile of recent tips, which is what geth does.
+%%     A percentile is a policy choice over a window this node does not have the
+%%     receipts for at this layer, and quoting one would be inventing a rule.
+-spec suggested_tip() -> {ok, non_neg_integer()} | undefined.
+suggested_tip() ->
+    case next_base_fee() of
+        undefined ->
+            undefined;
+        {ok, BaseFee} ->
+            min_includable_tip(safe_pending_entries(), BaseFee)
+    end.
+
+%% The minimum tip among the transactions that would be *included* in a block with
+%% this base fee -- the answer to "what tip do I have to offer to get in next".
+%%
+%% The first version filtered on `tip > 0', which is a different predicate and the
+%% wrong one. It confuses the tip with the cap: a transaction bidding
+%% maxPriorityFeePerGas = 2 gwei against a 1 gwei base fee has a tip of 2 gwei and
+%% is includable, and one bidding maxFeePerGas = 1 gwei with a zero priority fee
+%% has a tip of *0* and is still includable -- it pays the proposer nothing beyond
+%% the burn, but it is in the block. Excluding it dropped a real transaction out of
+%% the set whose minimum the method is reporting, so the figure was higher than the
+%% truth. And "tip must beat the base fee" is not a rule anywhere: EIP-1559's
+%% inclusion test is `maxFeePerGas >= baseFeePerGas' and nothing about the tip.
+%%
+%% So inclusion is `includable/2' -- the cap against the base fee -- and the
+%% reported figure is the minimum tip over the includable set, which may be 0 when
+%% every includable transaction bids a zero priority fee. That 0 is derived, not
+%% fabricated: it says what this node's pool would pay, and it is a different claim
+%% from the 0 that an *empty* pool must not produce.
+%%
+%% An empty pool, or a pool of transactions that none of them could include, answers
+%% `undefined' rather than 0. `undefined' lets the handler ask another node, which
+%% is the honest answer when this node has no evidence; a 0 would tell a client the
+%% network's next block pays no tip, derived from a fact about this node.
+%%
+%% Exported and pure in its arguments, so the inclusion rule can be tested without a
+%% signed transaction, a pool and a chain -- and the boundary is where the rule is:
+%% a cap of exactly the base fee is includable, one wei less is not.
+-spec min_includable_tip([map()], integer()) -> {ok, non_neg_integer()} | undefined.
+min_includable_tip(Entries, BaseFee) ->
+    case [T || E <- Entries, includable(E, BaseFee), T <- [tip(E, BaseFee)],
+               is_integer(T)] of
+        [] -> undefined;
+        Tips -> {ok, lists:min(Tips)}
+    end.
+
+%% EIP-1559's inclusion test, and the only one: a transaction goes in if it can pay
+%% the base fee. The tip plays no part in whether it is included, only in what it
+%% pays the proposer afterwards.
+includable(Entry, BaseFee) ->
+    Tx = maps:get(tx, Entry, #{}),
+    MaxFee = quantity_or(maps:get(<<"maxFeePerGas">>, Tx, undefined), undefined),
+    GasPrice = quantity_or(maps:get(<<"gasPrice">>, Tx, undefined), undefined),
+    case {MaxFee, GasPrice} of
+        {undefined, undefined} ->
+            %% Neither field readable, so there is no cap to test and the transaction
+            %% is not a candidate. Not an error: a transaction this node cannot price
+            %% is not one it can offer a figure about.
+            false;
+        {undefined, Price} when is_integer(Price) ->
+            %% A legacy transaction is all cap: its price is what it pays.
+            Price >= BaseFee;
+        {Cap, _Price} when is_integer(Cap) ->
+            %% A typed transaction's cap governs, and a `gasPrice' a node may also
+            %% carry alongside it is ignored -- it is not a consensus field of that
+            %% type, so letting it decide would make the answer depend on an
+            %% annotation.
+            Cap >= BaseFee
+    end.
+
+%% The base fee of the block after the head, from the head's own header.
+%%
+%% EIP-1559's update, which is `eth_fork_schedule:base_fee/3` -- the same one the
+%% engine uses to price a block it is about to build, and the same one
+%% `eth_rpc_projection' uses for `eth_feeHistory's extra base fee. Three call
+%% sites of one formula in one place, which is the point of it being in
+%% `eth_fork_schedule'.
+-spec next_base_fee() -> {ok, non_neg_integer()} | undefined.
+next_base_fee() ->
+    %% Guarded because the chain is not always running and `suggested_tip/0' is
+    %% called from an RPC handler: an unguarded gen_server:call raises
+    %% exit:{noproc, ...}, and the handler's safe-call turns that into -32603 for
+    %% a question that has a perfectly good answer -- no chain, so no head, so no
+    %% next base fee, so no tip.
+    Head = try eth_chain:head(eth_chain) catch _:_ -> no_chain end,
+    case Head of
+        undefined ->
+            undefined;
+        no_chain ->
+            undefined;
+        {Num, _Hash} ->
+            case (try eth_chain:get_by_number(eth_chain, Num)
+                  catch _:_ -> not_found end) of
+                {ok, Block, _} when is_map(Block) ->
+                    next_base_fee(Block);
+                _ ->
+                    undefined
+            end
+    end.
+
+%% A block with no `baseFeePerGas' is pre-EIP-1559 and has no next base fee to
+%% report. Zero is the right answer there rather than a derived figure, and it is
+%% also what the base fee would be under a schedule that starts at zero -- so a
+%% client is not misled into paying a burn it does not owe.
+next_base_fee(#{<<"baseFeePerGas">> := Fee, <<"gasUsed">> := Used,
+                <<"gasLimit">> := Limit}) ->
+    try
+        {ok, eth_fork_schedule:base_fee(eth_hex:decode(Used),
+                                         eth_hex:decode(Limit),
+                                         eth_hex:decode(Fee))}
+    catch _:_ -> undefined
+    end;
+next_base_fee(_Block) -> undefined.
+
 tip(Entry, BaseFee) ->
     Tx = maps:get(tx, Entry, #{}),
     Priority = quantity_or(maps:get(<<"maxPriorityFeePerGas">>, Tx, undefined), undefined),

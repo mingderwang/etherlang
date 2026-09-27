@@ -36,6 +36,7 @@
           get_code/1,
           state_root/0,
           prove_account/1,
+          storage_root/1,
           prove_storage/2,
           verify_proof/3,
           verify_storage_proof/4,
@@ -188,6 +189,15 @@ handle_call({prove_storage, Addr, Slot}, _From, S) ->
     Proof = eth_trie:prove(storage_trie(S, Addr), storage_hashed_key(Slot)),
     {reply, {ok, Proof}, S};
 
+%% The account's storage root, from the same function the state root is rebuilt
+%% with. Exposed because eth_getProof's `storageHash' is a required field of the
+%% specification's `AccountProof', and recomputing it at the call site would be a
+%% second answer to "what is this account's storage root" -- and a storage proof
+%% verified against a root that is not the one the state commits to is a proof of
+%% nothing. One function, so the two cannot disagree.
+handle_call({storage_root, Addr}, _From, S) ->
+    {reply, {ok, storage_root(S, Addr)}, S};
+
 handle_call(clear, _From, S) ->
     {reply, ok, rebuild(S#st{accounts = #{}, storages = #{}, code = #{}})};
 handle_call(_Req, _From, S) ->
@@ -235,6 +245,11 @@ prove_account(Addr) when is_binary(Addr) ->
 
 prove_storage(Addr, Slot) when is_binary(Addr), is_integer(Slot) ->
     gen_server:call(?MODULE, {prove_storage, Addr, Slot}).
+
+%% 32 bytes: the root of the account's storage trie, or the empty trie's root if
+%% it has no storage. Same value the state root commits to.
+storage_root(Addr) when is_binary(Addr) ->
+    gen_server:call(?MODULE, {storage_root, Addr}).
 
 verify_proof(Root, Key, Proof) ->
     eth_trie:verify_proof(Root, Key, Proof).
