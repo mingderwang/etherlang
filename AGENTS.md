@@ -51,7 +51,11 @@ where the code says "broken" is a bug, not modesty.
 `warnings_as_errors`, so **any warning fails the build** — including "function
 X is unused", which is how a refactor that orphans a helper announces itself.
 
-Erlang/OTP 29 (pinned in `mise.toml`). No CT suites exist; CI's
+Erlang/OTP 29 (pinned in `mise.toml`, which says `erlang = "29.1"`). The
+Docker images are pinned to the same `erlang:29.1`, and the runtime stage asserts
+`erlang:system_info(otp_release)` rather than trusting the tag: the images were on
+`erlang:27` for the whole life of the Dockerfile, so `make docker-test` was
+exercising a runtime nothing else in this repository ran. No CT suites exist; CI's
 `rebar3 do eunit, ct` runs eunit only.
 
 ### rebar3 compiles by mtime. This will lie to you.

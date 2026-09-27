@@ -1,4 +1,4 @@
-FROM erlang:27
+FROM erlang:29.1
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends rebar3 git ca-certificates \

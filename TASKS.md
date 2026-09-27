@@ -288,7 +288,8 @@ they are not forgotten rather than worked on prematurely.
 
 
 ## Phase 1: Engine API — Consensus Layer Interface (14 tasks)
-- [ ] **Engine API server** — `eth_engine` serves ten methods over real HTTP with the response shapes the specification defines and a JWT check on every request: `newPayload`, `forkchoiceUpdated` and `getPayload` at V1, V2 and V3, plus `engine_exchangeTransitionConfigurationV1`. The four V1 methods named here previously were all of them, and a post-Merge consensus client — which calls `forkchoiceUpdatedV3` and `getPayloadV3` every slot — got `-32601 method not found` for both. This item stays open on the missing methods listed at the end of this section. `newPayload` now decodes, checks the block hash, executes and maps the verdict. It still cannot hold the state an arbitrary payload needs, so it answers `SYNCING` in practice. This item stays open on the missing methods listed at the end of this section. What each method actually does:
+- [ ] **Engine API server** — `eth_engine` serves ten methods over real HTTP with the response shapes the specification defines and a JWT check on every request: `newPayload`, `forkchoiceUpdated` and `getPayload` at V1, V2 and V3, plus `engine_exchangeTransitionConfigurationV1`. The four V1 methods named here previously were all of them, and a post-Merge consensus client — which calls `forkchoiceUpdatedV3` and `getPayloadV3` every slot — got `-32601 method not found` for both. `newPayload` now decodes, checks the block hash, executes and maps the verdict. It still cannot hold the state an arbitrary payload needs, so it answers `SYNCING` in practice.
+  The **server** half of this item is done: the ten methods are dispatched, the response shapes are the specification's, and a node with no JWT secret refuses the port rather than serving it open. What keeps the box unchecked is the named remainder at the end of this section — `getPayloadBodiesBy*V1`, `notifyHeaders`, and `createAccessList` — which are absences rather than defects in what is there. (This paragraph previously ended with "This item stays open on the missing methods listed at the end of this section." twice.) What each method actually does:
   - `engine_newPayloadV1` decodes the payload with `eth_block:from_payload/1`, checks `blockHash` against the header the payload's own fields imply, calls `eth_block:finalize/1`, and maps the resulting verdicts. It answers `INVALID_BLOCK_HASH` for a payload whose `blockHash` is not `Keccak256(RLP(header))`, `INVALID` for one that will not decode or a transaction that is invalid, and **`SYNCING`** for a well-formed payload whose parent state this node does not hold — which, for an arbitrary payload, is always. That `SYNCING` is the specification's status for a payload whose "requisite data for the payload's acceptance or validation is missing", and it is honest rather than a fallback: the transactions root *is* verified even with no prestate, because it covers only the block's own transaction list
   - It does not answer `ACCEPTED` either, and that is a deliberate change. `ACCEPTED` is in the status enum, so returning it looks right, but the specification makes it a claim with preconditions — every transaction non-empty, `blockHash` equal to `Keccak256(RLP(header))`, the payload not extending the canonical chain, not fully validated, and its ancestors known and well-formed. None is checked here, so `ACCEPTED` is as unsupported as `VALID`
   - `engine_forkchoiceUpdatedV1` records the client's `headBlockHash`, `safeBlockHash` and `finalizedBlockHash` as this node's head, safe block and finalized checkpoint, and answers **`SYNCING`** for any head it has not itself validated. Per the specification that method's `VALID` *is* the verdict on executing the block, so the previous unconditional `VALID` was the claim the node actually made: a block reported valid without executing it, decoding it, or checking a single one of its three roots. `VALID` is still returned for the one case with nothing to judge — no head claimed and no payload to build on
@@ -337,7 +338,8 @@ they are not forgotten rather than worked on prematurely.
   - An implementation was written and then **removed** for this reason, which is worth recording. Projecting the stored maps cannot work, and the first version matched `#block{}` records — which nothing on the read path ever builds, since `eth_block:from_json/1` has no caller in `src/`. It would have compiled, passed no test that did not also drive the chain, and returned `null` for every block in production. A method that answers `null` for everything looks conformant and is not, which is why this is listed as a gap rather than shipped
   - Lighthouse requires both methods, so "Lighthouse-compatible" is not currently true of the engine surface
 - [ ] **`engine_notifyHeaders`** — absent (see the Beacon requests item under Phase 3). The clause does not appear in any per-fork file of the `execution-apis` repository (`paris`, `shanghai`, `cancun`, `prague`, `osaka`, `amsterdam`, `bogota`, `common`); only the V2 `getPayloadBodiesBy*` methods appear under those names. Its shape would have to be guessed, so it is left undone rather than invented
-- [ ] **Block authoring** — no `payloadAttributes` handling, so `forkchoiceUpdated` can never return a `payloadId` and the node cannot build a block for the CL. This is the remaining reason the engine cannot be used in production: it can neither validate what the CL proposes nor produce what the CL should propose
+- [x] **Block authoring** — `payloadAttributes` are read, `forkchoiceUpdated` returns a `payloadId`, and `getPayload` returns a real block. This item said "no `payloadAttributes` handling, so `forkchoiceUpdated` can never return a `payloadId` and the node cannot build a block for the CL", which was true when written and stopped being true when `eth_block_builder` was added to the supervisor's child list; the box outlived the sentence. The builder was rewritten rather than switched on, because the dead version assembled a block with its own header constants, three of which were wrong in ways already found and fixed in `eth_block`, and discarded every `payloadAttributes` field.
+  **The block it builds is still not the block the network would build.** Its state root does not match the network's, for the reasons in item 7 — the same gas-schedule divergences that make the conformance tally 11 of 266. So the item is closed as *wiring* and the divergence is tracked where it can be seen, not here.
 
 ### What the engine could not do before this pass
 
@@ -368,7 +370,7 @@ Recorded because the documentation claimed otherwise, and because each of these 
 - [x] **`eth_getStorageAt`** — `eth_mpt:get_storage/2` with proof verification
 
 ## Phase 3: Block Production (7 tasks)
-- [ ] **Block builder** — construct execution payloads from the transaction pool:
+- [x] **Block builder** — constructs execution payloads from the transaction pool through `eth_block:new/3` (not through a second header assembly of its own):
   - The sub-tasks are listed as work to do, but the code for most of them is
     already written in `eth_block_builder` and is unreachable. The module is a
     `gen_server` that nothing starts — it is in neither `etherlang.app.src`'s
@@ -425,8 +427,7 @@ Recorded because the documentation claimed otherwise, and because each of these 
 - [x] **State root verification** — recompute the state root after executing a block and report `{verified, Root}` or `{unverified, Reason}`. A locally built block has no root to check against and is reported unverified rather than stamped. This is not an EIP; it is a property of the node, and it was previously labelled EIP-4788, which is the beacon-roots system call.
 
 ## Phase 5: Protocol Compliance (13 tasks)
-- [ ] **Per-fork exact gas schedule** — give the gas schedule the per-fork branching it lacks
-  - This item is two questions and only the first has been answered.
+- [ ] **Per-fork exact gas schedule** — *the pricing half is done; what remains is the conformance measurement, not the schedule.* This item is two questions and only the first has been answered.
   - **Availability: done.** An instruction the executing fork does not have is an
     exceptional halt that consumes the frame's whole allowance, and the interpreter
     now says so. Before this, every clause in `eth_evm:do_op/3` was unconditional, so
@@ -703,7 +704,18 @@ Recorded because the documentation claimed otherwise, and because each of these 
   instruction counts is a weaker claim than running the fixtures
 
 ## Phase 9: Infrastructure & Operations (10 tasks)
-- [ ] **Docker image** — multi-stage build, optimized production image
+- [x] **Docker image** — two-stage build (`Dockerfile`: a build stage that compiles and
+  releases, a runtime stage that copies the release and runs as a non-root `ethnode`),
+  plus `Dockerfile.test`, `docker-compose.yml`, and `docker-build` / `docker-run` /
+  `docker-test` / `compose-up` / `compose-down` / `compose-logs` in the `Makefile`.
+  **It was on the wrong Erlang.** All three images were `FROM erlang:27` for the whole
+  life of the Dockerfile while `mise.toml` pins `erlang = "29.1"` and every test and
+  every measurement in this repository ran on OTP 29. So `make docker-test` — the
+  container path CI uses — was testing a runtime nothing else here ever ran, and a
+  real incompatibility would have surfaced at release time rather than at build time.
+  Both are now `erlang:29.1`, identical to the pin, and the runtime stage **asserts**
+  `erlang:system_info(otp_release)` matches so the next bump of one without the other
+  fails the build instead of passing quietly.
 - [ ] **Release process** — automated versioning, changelog generation
 - [ ] **Monitoring** — Prometheus metrics, Grafana dashboards
 - [ ] **Logging** — structured JSON logging, log rotation
