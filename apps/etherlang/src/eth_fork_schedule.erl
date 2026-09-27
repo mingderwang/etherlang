@@ -60,11 +60,16 @@
           sstore_sentry/1,
           sstore_supported/1,
           initcode_word_cost/1,
+          calldata_floor/2,
           timestamp_in_frame/3,
           timestamp_frame/2,
           activated_at/2 ]).
 
 -define(BASE_FEE_MAX_CHANGE_DENOMINATOR, 8).
+%% EIP-7623's TOTAL_COST_FLOOR_PER_TOKEN. Its STANDARD_TOKEN_COST stays 4, which
+%% is not restated here because it is already charged by `eth_tx:intrinsic_gas/4'
+%% and restating a price in two places is how they drift.
+-define(TOTAL_COST_FLOOR_PER_TOKEN, 10).
 -define(BASE_FEE_INITIAL, 1000000000).
 -define(MIN_BASE_FEE, 7).
 -define(MAX_WITHDRAWALS_PER_PAYLOAD, 16).
@@ -1572,6 +1577,60 @@ reset_adjustment(_Original, _New) ->
 %% question with a boolean answer -- may this frame delete an account's storage,
 %% may this transaction's refunds exceed this -- and those are here, next to the
 %% prices, so that "what does this fork do" is answerable from one module.
+
+%% ---------------------------------------------------------------------------
+%% EIP-7623: the calldata floor
+%% ---------------------------------------------------------------------------
+%% EIP-7623 raises the *floor* under a transaction's gas without raising the
+%% marginal price of calldata, so that a block's size is bounded by what its
+%% transactions must pay rather than by what they happen to execute. Prague.
+%%
+%% Its text:
+%%
+%%     tokens_in_calldata = zero_bytes_in_calldata + nonzero_bytes_in_calldata * 4
+%%
+%%     tx.gasUsed = 21000 + max(STANDARD_TOKEN_COST * tokens_in_calldata
+%%                              + execution_gas_used
+%%                              + isContractCreation * (32000 + INITCODE_WORD_COST
+%%                                                      * words(calldata)),
+%%                              TOTAL_COST_FLOOR_PER_TOKEN * tokens_in_calldata)
+%%
+%% with STANDARD_TOKEN_COST = 4 and TOTAL_COST_FLOOR_PER_TOKEN = 10.
+%%
+%% The floor term is `21000 + 10 * tokens', and everything else in the `max' is what
+%% this node already charges as `intrinsic + execution'. So the whole rule is one
+%% `max' on the total, and it is applied in `eth_block:run_transaction/5' where the
+%% total exists. Validation is a separate clause of the EIP -- a transaction whose
+%% gas limit is below the floor is invalid -- and that is `eth_tx:validate/2'.
+%%
+%% Two things are deliberately *not* here. The floor counts **calldata only**:
+%% `tokens_in_calldata' is defined over the transaction's data and says nothing
+%% about access-list items, which are priced by EIP-2930's own schedule. And it
+%% does not touch the marginal price: a zero byte still costs 4 and a non-zero byte
+%% still costs 16, which is what `eth_tx:intrinsic_gas/4' charges. The floor is a
+%% minimum total, not a new price.
+-spec calldata_floor(atom(), binary()) -> non_neg_integer().
+calldata_floor(Fork, Data) when is_atom(Fork), is_binary(Data) ->
+    case at_least(Fork, prague) of
+        false ->
+            0;
+        true ->
+            Zero = count_byte(0, Data, 0),
+            NonZero = byte_size(Data) - Zero,
+            21000 + ?TOTAL_COST_FLOOR_PER_TOKEN * (Zero + 4 * NonZero)
+    end;
+calldata_floor(_Fork, _Data) ->
+    0.
+
+count_byte(Byte, Bin, Acc) ->
+    count_byte(Byte, Bin, Acc, byte_size(Bin)).
+
+count_byte(_Byte, _Bin, Acc, 0) -> Acc;
+count_byte(Byte, Bin, Acc, N) ->
+    case binary:at(Bin, N - 1) of
+        Byte -> count_byte(Byte, Bin, Acc + 1, N - 1);
+        _ -> count_byte(Byte, Bin, Acc, N - 1)
+    end.
 
 %% ---------------------------------------------------------------------------
 %% Rules the fork selects, as opposed to prices it supplies

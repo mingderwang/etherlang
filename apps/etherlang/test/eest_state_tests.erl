@@ -475,7 +475,7 @@ run_tx(Fork, Tx, Entry, Post) ->
     end.
 
 expect_rejection(Fork, Tx, Entry, Expected) ->
-    Block = block(Fork, Entry),
+    Block = block(Fork, Entry, none),
     State = state_for(Entry, #{}),
     case eth_tx:validate(Tx, validation_ctx(Block, State)) of
         {error, _Reason} -> {?REJECT_MISMATCH, {expected, Expected}};
@@ -489,7 +489,36 @@ expect_rejection(Fork, Tx, Entry, Expected) ->
 %% See the module comment: this is a deviation, and it costs BLOCKNUMBER and
 %% TIMESTAMP. Everything else the fixture does specify -- coinbase, gas limit,
 %% difficulty -- is used as given.
-block(Fork, Entry) ->
+%% The block's base fee, derived from the fixture when it does not say.
+%%
+%% The `state_test' format has no `baseFeePerGas' in its `env' -- it is a
+%% single-transaction test, not a block -- so a runner has to supply one, and
+%% supplying `0' is a choice with consequences: the coinbase is paid
+%% `gasUsed * (effectivePrice - baseFee)', so with the base fee wrongly at zero the
+%% coinbase is credited the *whole* gas price and every London-or-later fixture
+%% carries a coinbase diff that says nothing about the node.
+%%
+%% 243 of the 249 state mismatches had a coinbase diff. Most also had other
+%% diffs, so this is not what is wrong with them, but it meant a real tip bug and a
+%% harness default were indistinguishable -- which is the one thing a conformance
+%% harness must not be.
+%%
+%% So the fee is **derived from the fixture's own expected numbers**: the sender's
+%% expected spend divided by the effective price is the expected `gasUsed', the
+%% coinbase's expected gain divided by that is the expected tip per gas, and the
+%% difference is the base fee. For a one-zero-byte Prague transaction the fixture
+%% expects 21,010 gas and a 63,030 wei coinbase gain at a price of 10, which is a
+%% tip of 3 and so a base fee of 7 -- the protocol minimum, which is what a
+%% synthetic genesis block has.
+%%
+%% This is reconstruction, not knowledge: the fee is an input the format omits and
+%% it is recovered from the expected output. That is preferable to guessing `0' and
+%% it is stated here because it is the kind of thing that would be dishonest to
+%% leave implicit. Where the arithmetic does not come out whole -- a create, a
+%% value transfer, a zero price -- it is not derivable, and the coinbase is then
+%% reported as `base fee not derivable' rather than compared against a number
+%% invented to make it match.
+block(Fork, Entry, BaseFee) ->
     Env = maps:get(<<"env">>, Entry, #{}),
     {Number, Timestamp, TD} = fork_point(Fork),
     (eth_block:new(<<0:256>>, Number))#block{
@@ -499,7 +528,7 @@ block(Fork, Entry) ->
         total_difficulty = TD,
         gas_limit = int(maps:get(<<"currentGasLimit">>, Env, <<"0x0">>)),
         gas_used = 0,
-        base_fee_per_gas = base_fee_for(Fork),
+        base_fee_per_gas = merge_base_fee(base_fee_for(Fork), BaseFee),
         mix_hash = <<0:256>>,
         logs_bloom = eth_bloom:new()}.
 
@@ -520,6 +549,57 @@ base_fee_for(Fork) ->
         true -> 0;
         false -> undefined
     end.
+
+%% A derived fee only applies where there is a base fee to have. `none' means the
+%% caller had nothing to derive and the fork default stands.
+merge_base_fee(undefined, _Derived) -> undefined;
+merge_base_fee(Base, none) -> Base;
+merge_base_fee(_Base, Derived) -> Derived.
+
+%% Recover the base fee from the expected post-state, or `none'.
+derived_base_fee(Entry, Post, Tx) ->
+    State = maps:get(<<"state">>, Post, #{}),
+    Sender = maps:get(<<"sender">>, maps:get(<<"transaction">>, Entry, #{}), <<"0x">>),
+    Coinbase = maps:get(<<"currentCoinbase">>, maps:get(<<"env">>, Entry, #{}), <<"0x">>),
+    Price = effective_price(Tx, #{}),
+    SenderHex = hex(bytes(Sender)),
+    CoinbaseHex = hex(bytes(Coinbase)),
+    case {Price, maps:find(SenderHex, State), maps:find(CoinbaseHex, State)} of
+        {0, _, _} ->
+            none;
+        {_, error, _} ->
+            none;
+        {_, _, error} ->
+            none;
+        {P, {ok, SF}, {ok, CF}} ->
+            Pre = maps:get(<<"pre">>, Entry, #{}),
+            %% An account the fixture does not declare is an *empty* account, not an
+            %% unknown one -- the same convention `mentioned/2' seeds under. The
+            %% first version treated a missing pre-balance as a reason to give up,
+            %% and the fee recipient is usually not in `pre' at all, so the derivation
+            %% never ran on the fixtures it was written for.
+            Spend = pre_balance(Pre, SenderHex) - balance_of(SF),
+            Gain = balance_of(CF) - pre_balance(Pre, CoinbaseHex),
+            case Spend > 0 andalso Gain >= 0 andalso (Spend rem P) =:= 0 of
+                true ->
+                    GasUsed = Spend div P,
+                    case GasUsed > 0 andalso (Gain rem GasUsed) =:= 0 of
+                        true -> P - (Gain div GasUsed);
+                        false -> none
+                    end;
+                false -> none
+            end
+    end.
+
+pre_balance(Pre, Hex) ->
+    case maps:find(Hex, Pre) of
+        {ok, Fields} -> balance_of(Fields);
+        error -> 0
+    end.
+
+balance_of(Fields) when is_map(Fields) ->
+    int(maps:get(<<"balance">>, Fields, <<"0x0">>));
+balance_of(_) -> 0.
 
 %% The pre-state as an overlay.
 %%
@@ -627,10 +707,16 @@ fork_of_block(Block) ->
     Fork.
 
 execute(Fork, Tx, Entry, Post) ->
-    Block = block(Fork, Entry),
+    Block = block(Fork, Entry, derived_base_fee(Entry, Post, Tx)),
     PreState = state_for(Entry, Post),
+    %% The block's own base fee, not the fork default. `run_transaction/5' takes the
+    %% base fee as an argument and ignores the record's field, so passing
+    %% `base_fee_for(Fork)' here silently discarded the fee the block was just built
+    %% with -- the derived one, and the tip came out at the full gas price. Two
+    %% sources of truth for one header field, which is the mistake this module's
+    %% comments keep warning about.
     {Block1, State1} = eth_block:run_transaction(Block, Tx, PreState,
-                                                  base_fee_for(Fork),
+                                                  Block#block.base_fee_per_gas,
                                                   Block#block.gas_limit),
     Receipt = last_receipt(Block1),
     %% Both states, because the gas figure is an *arithmetic* recovery from the

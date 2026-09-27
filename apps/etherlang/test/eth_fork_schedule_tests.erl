@@ -1245,3 +1245,75 @@ sstore_is_refused_before_berlin_test() ->
     %% And the refusal is a refusal, not a price: the fallback answers 0.
     ?assertEqual({0, 0}, eth_fork_schedule:sstore_cost(constantinople, 0, 0, 1)),
     ?assertEqual({0, 0}, eth_fork_schedule:sstore_cost(frontier, 7, 7, 0)).
+
+%% ---------------------------------------------------------------------------
+%% EIP-7623: the calldata floor
+%% ---------------------------------------------------------------------------
+%%
+%% The EIP's text, which is the whole of it:
+%%
+%%   tokens_in_calldata = zero_bytes_in_calldata + nonzero_bytes_in_calldata * 4
+%%   tx.gasUsed = 21000 + max(STANDARD_TOKEN_COST * tokens_in_calldata
+%%                            + execution_gas_used
+%%                            + isContractCreation * (32000 + INITCODE_WORD_COST
+%%                                                    * words(calldata)),
+%%                            TOTAL_COST_FLOOR_PER_TOKEN * tokens_in_calldata)
+%%
+%% with STANDARD_TOKEN_COST = 4 and TOTAL_COST_FLOOR_PER_TOKEN = 10. So the floor
+%% term is `21000 + 10 * tokens' and everything else in the `max' is what this node
+%% already charges. Prague.
+%%
+%% It was not implemented at all, and the corpus found it as a **one gas**
+%% discrepancy: a one-zero-byte Prague transaction whose frame happened to use
+%% exactly 5 gas came to 21,009 where the floor is 21,010. The one gas was
+%% coincidence -- the node was not applying a floor, it was landing one gas under
+%% one -- which is worth recording, because a 1-gas bug reads like an off-by-one
+%% and would have sent a reader looking at rounding rather than at a missing rule.
+
+there_is_no_calldata_floor_before_prague_test() ->
+    [?assertEqual(0, eth_fork_schedule:calldata_floor(F, D))
+     || F <- [frontier, byzantium, istanbul, berlin],
+        D <- [<<>>, <<0>>, <<1>>, <<0,1,2,255>>]],
+    %% Berlin is the point of the test: EIP-2929 landed there, and the floor did
+    %% not, so a base fee of 0 and a floor of 0 coexist until Prague.
+    ?assertEqual(0, eth_fork_schedule:calldata_floor(berlin, <<0,0,0>>)).
+
+the_floor_is_ten_wei_of_token_over_twenty_one_thousand_test() ->
+    %% One **zero** byte is one token: 21000 + 10. One **non-zero** byte is four,
+    %% so the same length of calldata costs 40. I wrote `<<1>>' at the zero-byte
+    %% price first and the test caught it, which is the whole rule in one line: a
+    %% token is a zero byte or a *quarter* of a non-zero one.
+    ?assertEqual(21010, eth_fork_schedule:calldata_floor(prague, <<0>>)),
+    ?assertEqual(21040, eth_fork_schedule:calldata_floor(prague, <<1>>)),
+    ?assertEqual(21080, eth_fork_schedule:calldata_floor(prague, <<1,1>>)),
+    ?assertEqual(21120, eth_fork_schedule:calldata_floor(prague, <<1,1,1>>)),
+    %% And the two together, which is the fixture's shape: `0x00' is a zero byte.
+    ?assertEqual(21010, eth_fork_schedule:calldata_floor(prague, <<0>>)),
+    ?assertEqual(21020, eth_fork_schedule:calldata_floor(prague, <<0,0>>)),
+    ?assertEqual(21050, eth_fork_schedule:calldata_floor(prague, <<0,1>>)).
+
+the_floor_counts_zero_bytes_and_four_tokens_per_non_zero_byte_test() ->
+    %% 0,0,0,0,0,0,0 -> 7 tokens -> 21070
+    ?assertEqual(21070, eth_fork_schedule:calldata_floor(prague, <<0,0,0,0,0,0,0>>)),
+    %% 1,2,3,4,5,6,7 -> 7 non-zero -> 28 tokens -> 21280
+    ?assertEqual(21280, eth_fork_schedule:calldata_floor(prague, <<1,2,3,4,5,6,7>>)),
+    %% Mixed: 2 zero + 5 non-zero = 2 + 20 = 22 tokens -> 21220
+    ?assertEqual(21220,
+                 eth_fork_schedule:calldata_floor(prague, <<0,0,1,2,3,4,5>>)).
+
+no_calldata_is_no_tokens_test() ->
+    [?assertEqual(21000, eth_fork_schedule:calldata_floor(prague, <<>>))
+     || _ <- [1]].
+
+the_floor_is_a_prague_rule_and_stays_one_test() ->
+    %% Every fork from Prague on, and only those.
+    [?assertEqual(21010, eth_fork_schedule:calldata_floor(F, <<0>>))
+     || F <- [prague, osaka, bpo1, amsterdam]],
+    [?assertEqual(0, eth_fork_schedule:calldata_floor(F, <<0>>))
+     || F <- [shanghai, cancun, paris, gray_glacier, arrow_glacier, london]].
+
+a_non_binary_calldata_has_no_floor_test() ->
+    %% The fallback, so a caller that cannot supply calldata gets the pre-Prague
+    %% answer rather than a fabricated one.
+    ?assertEqual(0, eth_fork_schedule:calldata_floor(prague, not_a_binary)),
+    ?assertEqual(0, eth_fork_schedule:calldata_floor(not_a_fork, <<0>>)).

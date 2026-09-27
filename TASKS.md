@@ -154,9 +154,40 @@ behavioural change per commit, and each step says what it now does.
      recovers gas. So there are two separate gaps: **3 gas** between this node and
      the plain sum of the rules, and **397 gas** between the plain sum and the
      fixture, which matches no constant in `eth_fork_schedule`. **Unresolved.**
-   - **`-1` gas, 3 fixtures, `prague/eip7623_increase_calldata_cost`, the
-     `exact_gas` cases.** A one-gas shortfall, on tests whose whole subject is
-     hitting an exact gas figure. **Unresolved.**
+   - ~~**`-1` gas, 3 fixtures, `prague/eip7623_increase_calldata_cost`**~~ — cause
+     found and fixed; the fixtures no longer diverge on gas.
+     The one gas was a coincidence and the cause was a whole missing rule. The
+     transaction is one **zero** calldata byte, so EIP-7623's floor is
+     `21000 + 10 * 1 = 21,010`; the node charged 21,009 because it applies no floor
+     at all and the frame happened to use exactly 5 gas. It read as an off-by-one
+     and would have sent a reader looking at rounding.
+     EIP-7623 is now implemented from the EIP's own text:
+     `eth_fork_schedule:calldata_floor/2` holds the rule (Prague and later; a token
+     is a zero byte or a *quarter* of a non-zero one, so `0x00` is 10 of floor and
+     `0x01` is 40), `eth_tx:validate/2` rejects a limit below the floor, and
+     `eth_block:run_transaction/5` charges it.
+     - **The half that is easy to get wrong, and was:** the floor has to be charged
+       to the *sender*, not merely reported. `settle_gas/8` settles a sender by
+       refunding the unused allowance against the price `buy_gas/4` charged, so a
+       `gasUsed` raised after that settlement is a number the sender was never
+       billed. The first version reported 21,010 and credited the coinbase a tip on
+       21,010 while the sender's balance still showed 21,009 — `gasUsed` right and
+       the post-state wrong, which is a divergence that announces itself in neither
+       number. Three end-to-end tests, two injections, both verified.
+   - **Unresolved, and it is a measurement defect rather than a node defect.** 243
+     of the 249 `state_mismatch` entries carry a coinbase balance diff, because the
+     coinbase is paid `gasUsed * (effectivePrice - baseFee)` and the `state_test`
+     format has no `baseFeePerGas` in its `env`. The runner used to supply `0`, so
+     every London-or-later fixture had a coinbase diff that said nothing about the
+     node — a real tip bug and a harness default were indistinguishable, which is
+     the one thing a conformance harness must not be. The fee is now **derived from
+     each fixture's own expected numbers** (7 for every London+ fork in the corpus,
+     which is the protocol minimum a synthetic genesis block has), and where the
+     arithmetic does not come out whole the derivation reports itself rather than
+     inventing a number. Only 15 of the 243 have the coinbase as their *only* diff,
+     so this is not what is wrong with the other 228 — but the remaining coinbase
+     diffs are now unexplained rather than known-noise, and that is the next thing
+     to run down.
    - **`+56668` and `+56665`, 12 fixtures each.** The largest systematic bucket and
      the one most likely to be a single cause. **Unresolved.**
    - **`-1208` gas, 1 fixture, `homestead/coverage` at Homestead.** **Unresolved.**

@@ -303,8 +303,16 @@ validate(Tx, Ctx) when is_map(Tx), is_map(Ctx) ->
                {error, invalid_fee}),
         ensure(fee_ceiling_ok(Tx, MaxFee, GasPrice, Ctx), {error, fee_too_low}),
         ok = check_blobs(Tx, Ctx),
-        ensure(Gas >= intrinsic_gas(Data, IsCreate, AccessList, ctx_fork(Ctx)),
+        Fork = ctx_fork(Ctx),
+        ensure(Gas >= intrinsic_gas(Data, IsCreate, AccessList, Fork),
                {error, intrinsic_gas}),
+        %% EIP-7623, the validity half: a transaction whose gas limit is below the
+        %% calldata floor is invalid, "because transactions must cover the floor price
+        %% of their calldata without relying on the execution of the transaction".
+        %% The EIP says the limit must clear the larger of this and the intrinsic
+        %% cost, and the intrinsic check above already covers that half.
+        ensure(Gas >= eth_fork_schedule:calldata_floor(Fork, Data),
+               {error, calldata_floor}),
         ensure(valid_signature(Tx), {error, bad_signature}),
         ok = check_chain_id(Tx, Ctx),
         ok = check_block_gas(Gas, Ctx),

@@ -669,13 +669,33 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
         end,
     %% Gas charged is what the transaction was given minus what it returned. An
     %% exceptional halt returns nothing, so it is charged its whole limit.
-    GasCharged = case Result of
-                     error -> GasLimitTx;
-                     _ -> GasLimitTx - GasLeft
-                 end,
+    GasCharged0 = case Result of
+                      error -> GasLimitTx;
+                      _ -> GasLimitTx - GasLeft
+                  end,
+    %% EIP-7623: the total is floored at `21000 + 10 * tokens_in_calldata', where a
+    %% token is a zero calldata byte or a quarter of a non-zero one. Everything else
+    %% in the EIP's `max' is what `GasCharged0' already is -- the intrinsic plus the
+    %% execution, with the refund already netted off, because `GasLeft' carries it --
+    %% so the whole rule is this one `max'.
+    %%
+    %% It is Prague, and before Prague the floor is 0 and this is a no-op. The
+    %% `max' is also why the `error' arm needs no special case: a frame that consumed
+    %% its whole allowance is charged its whole allowance, which is already at or
+    %% above the floor because validation refuses a limit below it.
+    GasCharged = max(GasCharged0, eth_fork_schedule:calldata_floor(fork(Block), Data)),
+    %% The floor is a **charge**, not an accounting entry, and this is the half that is
+    %% easy to miss. `settle_gas/7' settles the sender by refunding the unused
+    %% allowance against the price `buy_gas/4' charged, so the sender's net is
+    %% `GasCharged0 * price' whatever `GasCharged' is set to afterwards. The first
+    %% version of this fix therefore reported a `gasUsed' of 21,010 -- the floor --
+    %% while the sender was still billed 21,009 and the coinbase was paid a tip on
+    %% 21,010. `gasUsed' is a receipt field, so the block would have carried a number
+    %% the sender was not charged, and the base fee would have been burned on gas
+    %% nobody paid for.
     State1 = settle_gas(deploy(StateRun, Result, Output, Target, IsCreate),
                         Block, Sender, GasLeft, GasCharged, EffectiveGasPrice,
-                        base_fee_of(BaseFee)),
+                        base_fee_of(BaseFee), GasCharged - GasCharged0),
     Cumulative = Block#block.gas_used + GasCharged,
     Index = length(Block#block.receipts),
     Block1 = Block#block{
@@ -757,11 +777,18 @@ transfer(State, From, To, Value) ->
 %% the coinbase. The two are different amounts on purpose: the sender gets
 %% effective price, the coinbase gets effective price minus base fee, and the
 %% base fee portion is burned.
-settle_gas(State, Block, Sender, GasLeft, GasCharged, EffectivePrice, BaseFee) ->
+%% `FloorExtra' is the amount by which EIP-7623's floor raised the charge above what
+%% the frame actually consumed. It comes off the sender, because the floor is a
+%% minimum the transaction must pay: it is not a refund to anyone and not a tip, so
+%% it reaches the coinbase only through the tip on the larger `GasCharged'.
+settle_gas(State, Block, Sender, GasLeft, GasCharged, EffectivePrice, BaseFee,
+           FloorExtra) ->
     Miner = Block#block.miner,
     Tip = max(0, EffectivePrice - BaseFee),
     S1 = eth_state:set_balance(State, Sender,
-                               eth_state:balance(State, Sender) + GasLeft * EffectivePrice),
+                               eth_state:balance(State, Sender)
+                               + GasLeft * EffectivePrice
+                               - FloorExtra * EffectivePrice),
     S2 = eth_state:set_balance(S1, Miner,
                                eth_state:balance(S1, Miner) + GasCharged * Tip),
     %% The coinbase is "touched" by receiving a payment even if the payment is

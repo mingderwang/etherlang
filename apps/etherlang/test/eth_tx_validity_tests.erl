@@ -818,6 +818,98 @@ stamped(Parent, Number, Txs, Timestamp) ->
 %% accept, must produce *different* receipts roots. Were the floor taken from one
 %% fork for both, the roots would be equal -- and equal roots are exactly what a
 %% node reports when it has stopped pricing per fork.
+%% ---------------------------------------------------------------------------
+%% EIP-7623: the calldata floor, end to end
+%% ---------------------------------------------------------------------------
+%%
+%% The table test pins the arithmetic. This pins the two things only execution can
+%% show, and the second is the one that is easy to get wrong:
+%%
+%%   1. the floor raises the transaction's `gasUsed', which is a receipt field and
+%%      so a receipts root and a block hash;
+%%   2. **the sender pays it.** `settle_gas/8' settles a sender by refunding the
+%%      unused allowance against the price `buy_gas/4' charged, so a `gasUsed' that is
+%%      raised *after* that settlement is a number the sender was never billed. The
+%%      first version of this fix did exactly that: the receipt said 21,010 and the
+%%      coinbase was paid a tip on 21,010, while the sender's balance still showed
+%%      21,009. `gasUsed' would have been right and the post-state wrong, which is a
+%%      divergence that does not announce itself -- both numbers are plausible.
+%%
+%% A one-zero-byte transaction whose frame uses almost nothing keeps the arithmetic
+%% checkable: the floor is 21,010 and the intrinsic is 21,004, so the floor is six
+%% above it and the difference is not lost in the frame's own cost.
+
+the_calldata_floor_is_charged_to_the_sender_and_reported_test() ->
+    with_ctx(fun() ->
+        {ok, Prague} = eth_fork_schedule:current_fork(
+                         eth_fork_schedule:configured_network(), 1, 1750000000),
+        ?assertEqual(prague, Prague),
+        {Priv, Sender} = new_key(),
+        fund(Sender, 1000 * ?WEI, 0),
+        %% `0x00' is one zero byte: one token, so the floor is 21000 + 10.
+        Tx = signed(Priv, #{to => ?PROBE, gas => 100000, gas_price => 1,
+                            input => <<0>>}),
+        Block = (eth_block:new(<<0:256>>, 1))#block{timestamp = 1750000000,
+                                                    gas_limit = 1000000},
+        {Block1, State1} = eth_block:run_transaction(Block, Tx, eth_state:new(0, #{}),
+                                                    undefined, 1000000),
+        [Receipt] = Block1#block.receipts,
+        GasUsed = maps:get(<<"gasUsed">>, Receipt),
+        ?assertEqual(21010, GasUsed),
+        %% And the sender's balance fell by the floor at the price, not by the
+        %% intrinsic. This is the assertion that would have failed on the first
+        %% version, because the receipt and the balance disagreed there and the
+        %% receipt was the one under test.
+        ?assertEqual(1000 * ?WEI - 21010,
+                     eth_state:balance(State1, Sender))
+    end).
+
+%% The floor is a Prague rule, so the same transaction at Cancun is billed its
+%% intrinsic and nothing more. Without this, "the sender pays the floor" could be
+%% satisfied by a sender that always charges 21,010.
+the_calldata_floor_is_not_charged_before_prague_test() ->
+    with_ctx(fun() ->
+        {Priv, Sender} = new_key(),
+        fund(Sender, 1000 * ?WEI, 0),
+        Tx = signed(Priv, #{to => ?PROBE, gas => 100000, gas_price => 1,
+                            input => <<0>>}),
+        Block = (eth_block:new(<<0:256>>, 1))#block{timestamp = 1720000000,
+                                                    gas_limit = 1000000},
+        ?assertEqual(cancun, fork_at(1720000000)),
+        {Block1, State1} = eth_block:run_transaction(Block, Tx, eth_state:new(0, #{}),
+                                                    undefined, 1000000),
+        [Receipt] = Block1#block.receipts,
+        ?assert(21010 > maps:get(<<"gasUsed">>, Receipt)),
+        ?assertEqual(1000 * ?WEI - maps:get(<<"gasUsed">>, Receipt),
+                     eth_state:balance(State1, Sender))
+    end).
+
+%% The validity half: a transaction whose limit is below the floor cannot rely on
+%% execution to cover it, so it is rejected outright.
+a_transaction_below_the_calldata_floor_is_rejected_at_prague_test() ->
+    with_ctx(fun() ->
+        {Priv, Sender} = new_key(),
+        fund(Sender, 1000 * ?WEI, 0),
+        %% One non-zero byte is four tokens, so the floor is 21040, and the
+        %% intrinsic is 21016. A limit of 21020 clears the intrinsic and not the
+        %% floor, which is the case the EIP's second paragraph is about.
+        Tx = signed(Priv, #{to => ?PROBE, gas => 21020, gas_price => 1,
+                            input => <<1>>}),
+        State = eth_state:new(0, #{{balance, Sender} => 1000 * ?WEI,
+                                  {nonce, Sender} => 0}),
+        Ctx = #{base_fee => undefined, gas_limit => 1000000, gas_used => 0,
+                chain_id => eth_fork_schedule:chain_id(), fork => prague,
+                balance_of => fun(A) -> {ok, eth_state:balance(State, A)} end,
+                nonce_of => fun(A) -> {ok, eth_state:nonce(State, A)} end},
+        ?assertMatch({error, calldata_floor}, eth_tx:validate(Tx, Ctx)),
+        %% And one gas more is accepted, so the threshold is the floor and not a
+        %% round number or the intrinsic.
+        Ok = signed(Priv, #{to => ?PROBE, gas => 21040, gas_price => 1,
+                           input => <<1>>}),
+        ?assertEqual(ok, eth_tx:validate(Ok, Ctx)),
+        ?assert(london =/= prague)
+    end).
+
 the_evm_allowance_follows_the_blocks_own_fork_test() ->
     Code = <<16#60, 16#00, 16#60, 0, 16#52,
              16#60, 1, 16#60, 0, 16#F3>>,
