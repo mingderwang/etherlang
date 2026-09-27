@@ -26,24 +26,13 @@ peer_sync() ->
         ExpectHead = {5, maps:get(<<"hash">>, element(2, lists:nth(6, NumBlocks)))},
         PrivA = eth_secp256k1:generate_key(),
         PrivB = eth_secp256k1:generate_key(),
-        BPort = eth_test_util:free_port(),
-        {ok, _} = eth_discv4:start_link(#{name => disc_ps_b, port => BPort,
-                                          privkey => PrivB, bootnodes => []}),
-        #{port := UdpB, id := IDB} = eth_discv4:status(disc_ps_b),
-        EnodeB = lists:flatten(io_lib:format("enode://~s@127.0.0.1:~p",
-                                             [binary_to_list(binary:encode_hex(IDB)),
-                                              UdpB])),
-        {ok, _} = eth_discv4:start_link(#{name => disc_ps_a, port => 0,
-                                          privkey => PrivA,
-                                          bootnodes => [EnodeB]}),
-        {ok, _} = eth_peer:start_link(#{name => peer_ps_b, port => BPort,
-                                        privkey => PrivB, disc => disc_ps_b,
-                                        target => 0, interval => 200,
-                                        chain => chain_ps_srv}),
-        {ok, _} = eth_peer:start_link(#{name => peer_ps_a, port => 0,
-                                        privkey => PrivA, disc => disc_ps_a,
-                                        target => 2, interval => 200,
-                                        chain => chain_ps_con}),
+        %% One port for both a UDP discv4 socket and a TCP peer listener. That is
+        %% legal -- different protocols -- but it means two binds on the number
+        %% free_port/0 just released, which is exactly the window that produced
+        %% an eaddrinuse cancellation here. with_port/2 retries on a fresh port.
+        ok = eth_test_util:with_port(fun(BPort) ->
+            start_peer_stack(BPort, PrivA, PrivB)
+        end),
         {ok, _} = eth_sync:start_link(sync_ps,
                                       #{chain => chain_ps_con,
                                         peer_mgr => peer_ps_a,
@@ -74,6 +63,40 @@ peer_sync() ->
     after
         (try gen_server:stop(chain_ps_srv) catch _:_ -> ok end),
         (try gen_server:stop(chain_ps_con) catch _:_ -> ok end)
+    end.
+
+%% Bring up discv4 + the peer managers on BPort. Returns ok so with_port/2 sees
+%% a success and does not retry.
+%%
+%% The cleanup matters: with_port/2 retries by calling this again, and
+%% start_link/1 fails outright if the name is already registered. A partial
+%% start that left disc_ps_b or peer_ps_a running would therefore turn the
+%% second attempt into a name clash rather than a port clash, and the retry
+%% would mask the real cause.
+start_peer_stack(BPort, PrivA, PrivB) ->
+    try
+        {ok, _} = eth_discv4:start_link(#{name => disc_ps_b, port => BPort,
+                                          privkey => PrivB, bootnodes => []}),
+        #{port := UdpB, id := IDB} = eth_discv4:status(disc_ps_b),
+        EnodeB = lists:flatten(io_lib:format("enode://~s@127.0.0.1:~p",
+                                             [binary_to_list(binary:encode_hex(IDB)),
+                                              UdpB])),
+        {ok, _} = eth_discv4:start_link(#{name => disc_ps_a, port => 0,
+                                          privkey => PrivA,
+                                          bootnodes => [EnodeB]}),
+        {ok, _} = eth_peer:start_link(#{name => peer_ps_b, port => BPort,
+                                        privkey => PrivB, disc => disc_ps_b,
+                                        target => 0, interval => 200,
+                                        chain => chain_ps_srv}),
+        {ok, _} = eth_peer:start_link(#{name => peer_ps_a, port => 0,
+                                        privkey => PrivA, disc => disc_ps_a,
+                                        target => 2, interval => 200,
+                                        chain => chain_ps_con}),
+        ok
+    catch
+        Class:Reason:Stack ->
+            stop(peer_ps_a), stop(peer_ps_b), stop(disc_ps_a), stop(disc_ps_b),
+            erlang:raise(Class, Reason, Stack)
     end.
 
 wait_head(_Chain, _Expect, 0) -> error(peer_sync_timeout);

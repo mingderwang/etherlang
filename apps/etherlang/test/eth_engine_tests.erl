@@ -23,7 +23,11 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
--define(NO_TTD, 16#ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff).
+%% The sentinel for an undecided TERMINAL_TOTAL_DIFFICULTY, written as the
+%% decimal the specification prints so this fixture is a transcription of the
+%% clause rather than a copy of the source's expression. It equals 2^256-2^10.
+%% It was 16#ffff...ff, i.e. 2^256-1, which is 1023 too high.
+-define(NO_TTD, 115792089237316195423570985008687907853269984665640564039457584007913129638912).
 
 %% ===========================================================================
 %% newPayload: no status this node cannot support
@@ -33,21 +37,49 @@
 %% derived from execution could describe it.
 new_payload_without_a_parent_hash_is_invalid_test() ->
     with_engine(fun() ->
-        ?assertEqual({<<"INVALID">>, missing_parent_hash},
-                     eth_engine:new_payload(#{
-                         <<"blockNumber">> => <<"0x1">>,
-                         <<"stateRoot">> => hex(<<16#cd, 0:248>>)
-                     }))
+        ?assertEqual({<<"INVALID">>, {missing_field, <<"parentHash">>}},
+                     eth_engine:new_payload(maps:remove(
+                         <<"parentHash">>, real_payload())))
     end).
 
 %% The specification's ACCEPTED is a claim with preconditions -- non-empty
 %% transactions, a blockHash equal to Keccak256(RLP(header)), a non-canonical
 %% payload, known and well-formed ancestors. None is checked here, and nothing is
 %% executed, so ACCEPTED and VALID are both unsupported.
+%% A real, well-formed Cancun block. This node holds no state for its parent and
+%% no chain to resolve it against, so it cannot execute it, and SYNCING is the
+%% specification's status for exactly that. What it must not do is answer VALID,
+%% or ACCEPTED, or INVALID: the block is not bad, and this node has not checked it.
 new_payload_never_reports_a_block_it_did_not_execute_test() ->
     with_engine(fun() ->
-        Status = eth_engine:new_payload(payload()),
-        ?assertEqual(<<"SYNCING">>, Status)
+        ?assertEqual(<<"SYNCING">>, eth_engine:new_payload(payload()))
+    end).
+
+%% The three that are still refusals of *this* payload, not of the engine's
+%% ability to validate it: a payload that does not decode, and a payload whose
+%% block hash is not the hash of its own header.
+new_payload_rejects_a_payload_that_does_not_decode_test() ->
+    with_engine(fun() ->
+        ?assertEqual({<<"INVALID">>, {missing_field, <<"stateRoot">>}},
+                     eth_engine:new_payload(
+                         maps:remove(<<"stateRoot">>, real_payload())))
+    end).
+
+new_payload_rejects_a_block_hash_that_is_not_its_own_test() ->
+    with_engine(fun() ->
+        %% A different block's hash, 32 bytes and the right length.
+        Forged = hex(<<16#99, 0:248>>),
+        ?assertMatch({<<"INVALID_BLOCK_HASH">>, {block_hash_mismatch, _, _}},
+                     eth_engine:new_payload(
+                         maps:put(<<"blockHash">>, Forged, real_payload())))
+    end).
+
+new_payload_rejects_a_block_hash_of_the_wrong_width_test() ->
+    with_engine(fun() ->
+        ?assertEqual({<<"INVALID_BLOCK_HASH">>,
+                      missing_or_malformed_block_hash},
+                     eth_engine:new_payload(
+                         maps:put(<<"blockHash">>, <<"0xabcd">>, real_payload())))
     end).
 
 %% The web browser attack the authentication document names is a malicious page
@@ -55,32 +87,47 @@ new_payload_never_reports_a_block_it_did_not_execute_test() ->
 %% Every lookup in the module used to be `maps:get("someKey", ...)`, so a
 %% binary-keyed payload -- which is what a decoded JSON object always is -- was
 %% read as empty and answered INVALID for a parent hash it was carrying.
+%% A decoded JSON object has binary keys, and every lookup in the engine used to
+%% be `maps:get("someKey", ...)' with a string, so nothing was ever read over HTTP.
+%% The real fixture is binary-keyed, so this fails if that comes back.
 new_payload_reads_the_keys_a_json_request_carries_test() ->
     with_engine(fun() ->
-        ?assertEqual(<<"SYNCING">>, eth_engine:new_payload(payload()))
+        P = payload(),
+        ?assertEqual([], [K || K <- maps:keys(P), is_list(K)]),
+        ?assertEqual(<<"SYNCING">>, eth_engine:new_payload(P))
     end).
 
 new_payload_rejects_a_malformed_parent_hash_test() ->
     with_engine(fun() ->
-        ?assertMatch({<<"INVALID">>, {malformed_parent_hash, {wrong_length, 32}}},
-                     eth_engine:new_payload(#{
-                         <<"parentHash">> => <<"0xabcd">>,
-                         <<"blockNumber">> => <<"0x1">>
-                     })),
-        ?assertMatch({<<"INVALID">>, {malformed_parent_hash, not_data}},
-                     eth_engine:new_payload(#{<<"parentHash">> => 42}))
+        %% Too short to be a 32-byte hash.
+        ?assertMatch({<<"INVALID">>, {bad_field, <<"parentHash">>, _}},
+                     eth_engine:new_payload(
+                         maps:put(<<"parentHash">>, <<"0xabcd">>, real_payload()))),
+        %% Right length, but not hex.
+        ?assertMatch({<<"INVALID">>, {bad_field, <<"parentHash">>, _}},
+                     eth_engine:new_payload(
+                         maps:put(<<"parentHash">>,
+                                  non_hex_data(), real_payload())))
     end).
 
-%% An in-process caller holds raw bytes, a JSON caller holds a hex string, and
-%% the record stores raw bytes so both sides of every comparison agree.
+%% A decoded JSON object carries a DATA field as a 0x-prefixed *string*; the
+%% record stores it as raw bytes, and an in-process caller naturally holds the
+%% bytes. Accepting only one of the two forms means refusing either every real
+%% payload or every caller in the same VM -- and the raw form is the one the
+%% record stores, so a decoder that rejected it would be rejecting its own output.
 new_payload_accepts_a_parent_hash_as_raw_bytes_test() ->
     with_engine(fun() ->
-        Parent = <<16#ab, 0:248>>,
-        ?assertEqual(<<"SYNCING">>,
-                     eth_engine:new_payload(#{
-                         <<"parentHash">> => Parent,
-                         <<"blockNumber">> => <<"0x1">>
-                     }))
+        P = real_payload(),
+        Raw = maps:put(<<"parentHash">>, unhex(maps:get(<<"parentHash">>, P)), P),
+        ?assertEqual(32, byte_size(maps:get(<<"parentHash">>, Raw))),
+        ?assertEqual(<<"SYNCING">>, eth_engine:new_payload(Raw))
+    end).
+
+new_payload_rejects_a_parent_hash_that_is_not_data_test() ->
+    with_engine(fun() ->
+        ?assertMatch({<<"INVALID">>, {bad_field, <<"parentHash">>, _}},
+                     eth_engine:new_payload(
+                         maps:put(<<"parentHash">>, 42, real_payload())))
     end).
 
 new_payload_needs_a_map_test() ->
@@ -88,6 +135,153 @@ new_payload_needs_a_map_test() ->
         ?assertEqual({<<"INVALID">>, payload_not_an_object},
                      eth_engine:new_payload(<<"not a map">>))
     end).
+
+%% The engine's own fixture is a payload whose parent this node cannot resolve,
+%% so every status below is reached through the real decode-then-verify path
+%% rather than through a shortcut. These are the three that matter:
+%% - a payload whose declared roots disagree with what execution produced is
+%%   INVALID, and a payload whose parent is unknown is SYNCING. Reporting both as
+%%   one status would leave a client unable to tell a bad block from an
+%%   unfinished check.
+
+%% ===========================================================================
+%% The verdict mapping
+%% ===========================================================================
+%%
+%% A payload whose parent this node cannot resolve never gets as far as a verdict,
+%% so every test above lands on SYNCING and the mapping below it is untested by
+%% them. These cover it directly.
+%%
+%% The Verification maps are the shapes eth_finalize_tests produces from blocks
+%% that actually execute, so the two halves of the path -- finalize/1 producing
+%% these verdicts, and the engine mapping them onto statuses -- are each pinned
+%% where they can be, rather than one test pretending to have executed a block.
+
+all_three_roots_verified_is_valid_test() ->
+    R = eth_trie:root([]),
+    ?assertEqual(<<"VALID">>,
+                 eth_engine:status_for_verification(
+                   #{state_root => {verified, R},
+                     transactions_root => {verified, R},
+                     receipts_root => {verified, R}})).
+
+%% A commitment that was checked and does not match is INVALID. Reporting it as
+%% SYNCING instead would leave a client unable to tell a block this node has
+%% found bad from one it has not finished looking at -- and the block is never
+%% going to become valid, so there is nothing to wait for.
+%%
+%% Every term below is the one eth_block:finalize/1 actually produced, taken from
+%% the Verification map of a block that really executed. They are not written out
+%% by hand, and that is the whole point of this test: the mismatch reasons are
+%% not one shape. check_state_root/2 reports a 3-tuple
+%% `{mismatch, Declared, Computed}' and check_commitment/3 a 4-tuple
+%% `{mismatch, Which, Declared, Computed}', and the earlier version of this test
+%% hand-wrote the 4-tuple for all three roots. So it passed against an engine
+%% that matched only the 4-tuple -- which is to say it passed against an engine
+%% that answered SYNCING for a payload declaring a wrong state root, the
+%% commitment this node is most entitled to have an opinion about. A test that
+%% builds its fixture in the shape the code under test expects cannot catch the
+%% code disagreeing with eth_block about what shape that is.
+a_mismatched_state_root_is_invalid_test() ->
+    eth_test_util:finalize_ctx(fun() ->
+        ParentRoot = eth_test_util:seed_account(),
+        Parent = eth_test_util:store_parent(ParentRoot),
+        Lying = eth_block:declare_state_root(eth_block:new(Parent, 1),
+                                             <<16#99:256>>),
+        {ok, _, V} = eth_block:finalize(Lying),
+        ?assertMatch({unverified, {mismatch, <<16#99:256>>, _}},
+                     maps:get(state_root, V)),
+        ?assertMatch({<<"INVALID">>, {unverified, {mismatch, _, _}}},
+                     eth_engine:status_for_verification(V))
+    end).
+
+a_mismatched_receipts_root_is_invalid_test() ->
+    eth_test_util:finalize_ctx(fun() ->
+        Parent = eth_test_util:store_parent(eth_test_util:seed_account()),
+        Lying = eth_test_util:inbound_block(
+                  hex(Parent), #{<<"receiptsRoot">> => hex(<<16#77:256>>)}),
+        {ok, _, V} = eth_block:finalize(Lying),
+        ?assertMatch({unverified, {mismatch, receipts_root, <<16#77:256>>, _}},
+                     maps:get(receipts_root, V)),
+        ?assertMatch({<<"INVALID">>, {unverified, {mismatch, receipts_root, _, _}}},
+                     eth_engine:status_for_verification(V))
+    end).
+
+a_mismatched_transactions_root_is_invalid_test() ->
+    eth_test_util:finalize_ctx(fun() ->
+        Parent = eth_test_util:store_parent(eth_test_util:seed_account()),
+        Lying = eth_test_util:inbound_block(
+                  hex(Parent), #{<<"transactionsRoot">> => hex(<<16#66:256>>)}),
+        {ok, _, V} = eth_block:finalize(Lying),
+        ?assertMatch({unverified, {mismatch, transactions_root, <<16#66:256>>, _}},
+                     maps:get(transactions_root, V)),
+        ?assertMatch({<<"INVALID">>, {unverified, {mismatch, transactions_root, _, _}}},
+                     eth_engine:status_for_verification(V))
+    end).
+
+%% A commitment this node could not check is not the same thing, and must not be
+%% reported the same way: nothing is known against the block.
+an_unchecked_root_is_syncing_test() ->
+    R = eth_trie:root([]),
+    ?assertEqual(<<"SYNCING">>,
+                 eth_engine:status_for_verification(
+                   #{state_root => {unverified, state_not_local},
+                     transactions_root => {verified, R},
+                     receipts_root => {unverified, not_executed}})).
+
+%% A mismatch outranks an unchecked root: if anything is known to be wrong, that
+%% is the answer, whatever else could not be checked. Built from a real finalize
+%% result, so the state root here is the 3-tuple eth_block produces and the
+%% receipts root is the {unverified, not_executed} of a block whose body was
+%% never executed.
+a_mismatch_outranks_an_unchecked_root_test() ->
+    eth_test_util:finalize_ctx(fun() ->
+        ParentRoot = eth_test_util:seed_account(),
+        Parent = eth_test_util:store_parent(ParentRoot),
+        %% No transactions, so the declared content roots are the empty-trie
+        %% roots and both check out. The state root is made to lie.
+        Lying = eth_block:declare_state_root(
+                  eth_test_util:inbound_block(
+                    hex(Parent),
+                    #{<<"receiptsRoot">> => hex(eth_trie:root([])),
+                      <<"transactionsRoot">> => hex(eth_trie:root([]))}),
+                  <<16#99:256>>),
+        {ok, _, V} = eth_block:finalize(Lying),
+        ?assertEqual({verified, eth_trie:root([])}, maps:get(receipts_root, V)),
+        ?assertEqual({verified, eth_trie:root([])},
+                     maps:get(transactions_root, V)),
+        ?assertMatch({<<"INVALID">>, {unverified, {mismatch, _, _}}},
+                     eth_engine:status_for_verification(V))
+    end).
+
+%% A declared root this node could not even interpret is a mismatch, not an
+%% absence: the payload is claiming something, and the claim is unreadable.
+an_uninterpretable_declared_root_is_invalid_test() ->
+    ?assertMatch({<<"INVALID">>, {unverified, {invalid_declared, _}}},
+                 eth_engine:status_for_verification(
+                   #{state_root => {verified, eth_trie:root([])},
+                     transactions_root => {unverified, {invalid_declared,
+                                                       transactions_root}},
+                     receipts_root => {verified, eth_trie:root([])}})).
+
+%% The same mapping, applied to what finalizing returns rather than to the
+%% verdicts alone.
+
+an_unknown_parent_is_syncing_test() ->
+    ?assertEqual(<<"SYNCING">>,
+                 eth_engine:status_for_finalize(
+                     {error, {unknown_parent, <<16#ab, 0:248>>}})).
+
+%% A block containing an invalid transaction is not a block, and no amount of
+%% waiting changes that -- so INVALID, not SYNCING.
+an_invalid_transaction_is_invalid_test() ->
+    ?assertEqual({<<"INVALID">>, {invalid_transaction, 0, bad_nonce}},
+                 eth_engine:status_for_finalize(
+                     {error, {invalid_transaction, 0, bad_nonce}})).
+
+an_unrecognised_finalize_error_is_invalid_test() ->
+    ?assertEqual({<<"INVALID">>, some_other_failure},
+                 eth_engine:status_for_finalize({error, some_other_failure})).
 
 %% ===========================================================================
 %% forkchoiceUpdated: not "VALID" about an unvalidated head
@@ -210,8 +404,9 @@ exchange_transition_configuration_decodes_hex_quantities_test() ->
     end).
 
 %% The specification: in the absence of a TERMINAL_TOTAL_DIFFICULTY value both
-%% layers must use 2^256-1, so a client and a node that have not decided can
-%% still compare equal.
+%% layers must use 2^256-2^10, so a client and a node that have not decided can
+%% still compare equal. This was 2^256-1, 1023 higher than the specification
+%% says; see eth_engine for the clause and what a wrong value here costs.
 exchange_transition_configuration_reports_the_absent_total_difficulty_test() ->
     with_engine(fun() ->
         {ok, Cfg} = eth_engine:exchange_transition_config(
@@ -220,6 +415,34 @@ exchange_transition_configuration_reports_the_absent_total_difficulty_test() ->
         %% An all-zero terminal block hash is the "not decided" marker, not a
         %% block hash, so it is reported as absent.
         ?assertEqual(undefined, maps:get(terminal_block_hash, Cfg))
+    end).
+
+%% A test that asserts against the source's own expression cannot catch the
+%% source being wrong, so this one pins the decimal string from the
+%% specification's text and separately checks the arithmetic. Both have to hold
+%% for the node to report the specified sentinel:
+%%
+%%   115792089237316195423570985008687907853269984665640564039457584007913129638912
+%%   = 2^256 - 2^10
+%%
+%% The first is what the consensus client compares; the second is why. Note this
+%% is *not* 2^256-1, which is the value the code used to report.
+exchange_transition_configuration_pins_the_undecided_ttd_sentinel_test() ->
+    with_engine(fun() ->
+        Spec = "115792089237316195423570985008687907853269984665640564039457584007913129638912",
+        {ok, Cfg} = eth_engine:exchange_transition_config(
+            #{<<"terminalBlockHash">> => hex(<<0:2048>>)}),
+        TD = maps:get(terminal_total_difficulty, Cfg),
+        ?assertEqual(list_to_integer(Spec), TD),
+        ?assertEqual(1 bsl 256 - 1024, TD),
+        %% And it is the encoding the wire carries, not just the decoded value.
+        %% Lowercase, which is what eth_hex:encode_int/1 emits; binary:encode_hex
+        %% emits uppercase, so the expected side is lowercased rather than
+        %% trusting the two to agree.
+        ?assertEqual(<<"0x",
+                       (string:lowercase(
+                          binary:encode_hex(<<TD:256>>)))/binary>>,
+                     eth_hex:encode_int(TD))
     end).
 
 %% The configuration map used to be built from the *previous* state's values, so
@@ -506,6 +729,560 @@ base64url_decodes_the_url_safe_alphabet_test() ->
     ?assertEqual({error, not_base64url}, eth_jwt:b64url_decode(<<"!!!!">>)).
 
 %% ===========================================================================
+%% Versioned methods: the structure and fork gates
+%% ===========================================================================
+%%
+%% These are the checks that decide whether a payload is *processed* at all, and
+%% they were absent: the node implemented only V1, so every call a post-Merge
+%% consensus client makes was answered -32601. The rules below are transcribed from
+%% execution-apis src/engine/{paris,shanghai,cancun}.md, and each test names the
+%% clause it comes from, because the differences between versions are the whole
+%% content of these functions and a test that did not distinguish them would pass
+%% against an implementation that ignored the version entirely.
+
+%% V1 has no parameter gate. paris.md's engine_newPayloadV1 lists six
+%% specification items and none is a structure check, and the string -32602 does
+%% not occur in paris.md at all -- the clause arrives with V2 and V3. So a payload
+%% carrying Cancun fields is admitted by newPayloadV1, and a test that "fixed"
+%% this by tightening V1 would be encoding a rule the specification does not state.
+v1_admits_a_payload_with_later_fork_fields_test() ->
+    Cancun = payload(),
+    ?assert(maps:is_key(<<"blobGasUsed">>, Cancun)),
+    ?assertEqual(ok, eth_engine:payload_admission(Cancun, 1)).
+
+%% shanghai.md, engine_newPayloadV2: "ExecutionPayloadV1 MUST be used if the
+%% `timestamp' value is lower than the Shanghai timestamp, ExecutionPayloadV2 MUST
+%% be used if the `timestamp' value is greater or equal to the Shanghai
+%% timestamp, Client software MUST return -32602: Invalid params error if the
+%% wrong version of the structure is used in the method call."
+%%
+%% So the structure V2 demands is a function of the timestamp, in both directions.
+v2_structure_follows_the_timestamp_test() ->
+    Pre = v1_payload(shanghai_at(sepolia) - 1),
+    Post = v2_payload(shanghai_at(sepolia)),
+    ?assertEqual(paris, eth_engine:structure_for_version(2, shanghai_at(sepolia) - 1)),
+    ?assertEqual(shanghai, eth_engine:structure_for_version(2, shanghai_at(sepolia))),
+    %% Below Shanghai, V2 wants the V1 structure, so a payload carrying
+    %% `withdrawals' is the wrong version of the structure.
+    ?assertMatch({error, -32602, _},
+                 eth_engine:payload_admission(Pre#{<<"withdrawals">> => []}, 2)),
+    %% And a V2 payload at a pre-Shanghai timestamp is the same failure.
+    ?assertMatch({error, -32602, _},
+                 eth_engine:payload_admission(v2_payload(shanghai_at(sepolia) - 1), 2)),
+    %% At or after Shanghai it wants the V2 structure, so a payload without
+    %% `withdrawals' is the wrong version.
+    ?assertMatch({error, -32602, _},
+                 eth_engine:payload_admission(maps:remove(<<"withdrawals">>, Post), 2)),
+    ?assertEqual(ok, eth_engine:payload_admission(Pre, 2)),
+    ?assertEqual(ok, eth_engine:payload_admission(Post, 2)).
+
+%% "strictly matches the expected one" (cancun.md item 1) taken literally: the
+%% appended keys must *equal* the required set, not merely contain it. ExecutionPayloadV3
+%% is a superset of V2, so a presence-only check would admit a Prague payload on a
+%% V2 method -- a node that cannot execute Prague rules agreeing to process one.
+v2_refuses_a_superset_structure_test() ->
+    Prague = (v2_payload(far_future()))#{<<"blobGasUsed">> => <<"0x0">>,
+                                        <<"excessBlobGas">> => <<"0x0">>},
+    ?assert(maps:is_key(<<"blobGasUsed">>, Prague)),
+    ?assertMatch({error, -32602, _}, eth_engine:payload_admission(Prague, 2)).
+
+%% cancun.md, engine_newPayloadV3: V3 is Cancun, so it demands all three appended
+%% keys and refuses the payload if any is missing.
+v3_requires_every_appended_key_test() ->
+    P = payload(),
+    [?assert(maps:is_key(Key, P))
+     || Key <- [<<"withdrawals">>, <<"blobGasUsed">>, <<"excessBlobGas">>]],
+    ?assertEqual(ok, eth_engine:payload_admission(P, 3)),
+    [?assertMatch({error, -32602, _},
+                  eth_engine:payload_admission(maps:remove(Key, P), 3))
+     || Key <- [<<"withdrawals">>, <<"blobGasUsed">>, <<"excessBlobGas">>]].
+
+%% cancun.md item 1: "Any field having `null' value MUST be considered as not
+%% provided." A payload that carries a key set to null is therefore short a field,
+%% and a decoder that read null as a value would admit it.
+null_counts_as_not_provided_test() ->
+    P = payload(),
+    ?assertMatch({error, -32602, _},
+                 eth_engine:payload_admission(P#{<<"blobGasUsed">> => null}, 3)),
+    ?assertMatch({error, -32602, _},
+                 eth_engine:payload_admission(P#{<<"excessBlobGas">> => undefined}, 3)).
+
+%% cancun.md item 2 for all three V3 entry points: "MUST return -38005: Unsupported
+%% fork error if the `timestamp' of the payload does not fall within the time frame
+%% of the Cancun fork." The frame is half open, [cancun, prague), so a payload on
+%% the Prague activation instant is out of it.
+v3_rejects_timestamps_outside_the_cancun_frame_test() ->
+    Cancun = cancun_at(sepolia),
+    Prague = after_cancun_at(sepolia),
+    P0 = payload(),
+    At = fun(T) -> P0#{<<"timestamp">> => hexq(T)} end,
+    ?assertEqual({error, -38005, <<"unsupported fork">>},
+                 eth_engine:payload_admission(At(Cancun - 1), 3)),
+    ?assertEqual(ok, eth_engine:payload_admission(At(Cancun), 3)),
+    ?assertEqual(ok, eth_engine:payload_admission(At(Prague - 1), 3)),
+    ?assertEqual({error, -38005, <<"unsupported fork">>},
+                 eth_engine:payload_admission(At(Prague), 3)),
+    ?assertEqual({error, -38005, <<"unsupported fork">>},
+                 eth_engine:payload_admission(At(Cancun - 1), 3)),
+    ?assertEqual({error, -38005, <<"unsupported fork">>},
+                 eth_engine:payload_admission(At(Prague + 1000), 3)).
+
+%% The fork frame is read from the *network's* schedule, so the same payload
+%% timestamp is in frame on one network and not on another. If the gate ignored the
+%% network it would be checking a constant, and a node configured for the wrong
+%% chain would admit payloads it cannot execute.
+v3_frame_is_per_network_test() ->
+    SepCancun = cancun_at(sepolia),
+    MainCancun = cancun_at(mainnet),
+    P = payload(),
+    At = fun(T) -> P#{<<"timestamp">> => hexq(T)} end,
+    with_network("sepolia",
+                 fun() ->
+                     ?assertEqual(ok, eth_engine:payload_admission(At(SepCancun), 3))
+                 end),
+    with_network("mainnet",
+                 fun() ->
+                     %% Same timestamp, and mainnet's Cancun had not started yet.
+                     ?assertEqual({error, -38005, <<"unsupported fork">>},
+                                  eth_engine:payload_admission(At(SepCancun), 3)),
+                     ?assertEqual(ok,
+                                  eth_engine:payload_admission(At(MainCancun), 3))
+                 end).
+
+%% Only V3 carries the -38005 clause. paris.md has no versioned-fork rule and
+%% shanghai.md puts no upper bound on V2, so a post-Cancun timestamp on V2 is
+%% admitted -- imposing the Cancun window there would refuse payloads the
+%% specification says to accept.
+only_v3_has_the_fork_frame_test() ->
+    %% A V2-structure payload, so the only thing under test is the timestamp.
+    P = v2_payload(shanghai_at(sepolia)),
+    Far = v2_payload(far_future()),
+    ?assertEqual(ok, eth_engine:payload_admission(P, 1)),
+    ?assertEqual(ok, eth_engine:payload_admission(Far, 2)),
+    %% A Cancun-structure payload at a post-Cancun timestamp is the -38005 case.
+    ?assertEqual({error, -38005, <<"unsupported fork">>},
+                 eth_engine:payload_admission(
+                   (payload())#{<<"timestamp">> => hexq(far_future())}, 3)),
+    %% The structure check comes first, so a V2-structure payload on V3 is refused
+    %% for its keys before its frame is considered -- the order the specification
+    %% lists them in, and the order that decides which code a client reads.
+    %% A plain match, not ?assertMatch: the assertion macro matches inside a
+    %% match spec, so a variable written in its pattern is not bound outside.
+    {error, -32602, Message} = eth_engine:payload_admission(Far, 3),
+    %% The message has to name the keys that are missing -- that is what tells a
+    %% client what to send instead -- and it has to name the ones this payload
+    %% actually lacks, which is not the same as naming all three.
+    [?assert(binary:match(Message, Key) =/= nomatch)
+     || Key <- [<<"blobGasUsed">>, <<"excessBlobGas">>]].
+
+%% An unreadable timestamp is a shape failure, not a fork failure: "does not fall
+%% within the time frame" cannot be evaluated, and V2's structure choice depends on
+%% the timestamp, so a default of 0 would silently pick the wrong structure.
+an_unreadable_timestamp_is_invalid_params_not_unsupported_fork_test() ->
+    P = payload(),
+    ?assertEqual({error, -32602, <<"invalid params">>},
+                 eth_engine:payload_admission(maps:remove(<<"timestamp">>, P), 3)),
+    ?assertEqual({error, -32602, <<"invalid params">>},
+                 eth_engine:payload_admission(P#{<<"timestamp">> => <<"not hex">>}, 3)),
+    ?assertEqual({error, -32602, <<"invalid params">>},
+                 eth_engine:payload_admission(P#{<<"timestamp">> => null}, 3)),
+    ?assertEqual({error, -32602, <<"invalid params">>},
+                 eth_engine:payload_admission(P#{<<"timestamp">> => <<"-1">>}, 3)).
+
+%% A payload that is not an object cannot match any structure.
+a_payload_that_is_not_an_object_is_invalid_params_test() ->
+    [?assertEqual({error, -32602, <<"invalid params">>},
+                  eth_engine:payload_admission(Bad, V))
+     || Bad <- [not_a_map, <<"a string">>, 42, [1, 2, 3]], V <- [2, 3]].
+
+%% ===========================================================================
+%% payloadAttributes admission
+%% ===========================================================================
+
+%% cancun.md, engine_forkchoiceUpdatedV3 item 2, which extends point (8) of the V1
+%% specification. PayloadAttributesV3 is V2 plus parentBeaconBlockRoot, so V3
+%% demands all three appended keys and -38003 -- not -32602 -- on a mismatch: the
+%% attributes are a second parameter, and -38003 is the code the specification
+%% names for them.
+attributes_v3_requires_both_appended_keys_test() ->
+    A = attributes(cancun),
+    ?assertEqual(ok, eth_engine:attributes_admission(A, 3)),
+    ?assertMatch({error, -38003, _},
+                 eth_engine:attributes_admission(maps:remove(<<"withdrawals">>, A), 3)),
+    ?assertMatch({error, -38003, _},
+                 eth_engine:attributes_admission(maps:remove(<<"parentBeaconBlockRoot">>,
+                                                            A), 3)),
+    %% V2 demands withdrawals and must refuse parentBeaconBlockRoot, or a V2 build
+    %% would be started with a beacon root the method does not define.
+    A2 = attributes(shanghai),
+    ?assertEqual(ok, eth_engine:attributes_admission(A2, 2)),
+    ?assertMatch({error, -38003, _},
+                 eth_engine:attributes_admission(A, 2)).
+
+%% cancun.md item 2.2: the *attributes'* timestamp is the one that must be in
+%% frame, because it is the timestamp the new block would carry. A head timestamp
+%% is not what is being checked, and using the wrong one would build for the fork
+%% the head is in rather than the fork being built.
+attributes_timestamp_is_the_one_checked_against_the_frame_test() ->
+    Cancun = cancun_at(sepolia),
+    Prague = after_cancun_at(sepolia),
+    A = attributes(cancun),
+    At = fun(T) -> A#{<<"timestamp">> => hexq(T)} end,
+    ?assertEqual(ok, eth_engine:attributes_admission(At(Cancun), 3)),
+    ?assertEqual({error, -38005, <<"unsupported fork">>},
+                 eth_engine:attributes_admission(At(Prague), 3)),
+    ?assertEqual({error, -38005, <<"unsupported fork">>},
+                 eth_engine:attributes_admission(At(Cancun - 1), 3)).
+
+%% `payloadAttributes' is `Object|null', so null is the normal case for a
+%% forkchoice update that starts no build. It must not be an error, on any
+%% version, or a CL that only wants to move the head could never call the method.
+null_attributes_are_accepted_on_every_version_test() ->
+    [?assertEqual(ok, eth_engine:attributes_admission(null, V)) || V <- [1, 2, 3]],
+    [?assertEqual(ok, eth_engine:attributes_admission(undefined, V)) || V <- [1, 2, 3]].
+
+%% Attributes that are not an object cannot match any structure, and the code is
+%% -38003 because the specification names it for payloadAttributes specifically.
+malformed_attributes_are_38003_test() ->
+    [?assertEqual({error, -38003, <<"invalid payload attributes">>},
+                  eth_engine:attributes_admission(Bad, 3))
+     || Bad <- [<<"a string">>, 42, [1, 2, 3]]].
+
+%% ===========================================================================
+%% INVALID_BLOCK_HASH is supplanted from V2
+%% ===========================================================================
+
+%% shanghai.md, engine_newPayloadV2, Response: "values of the `status' field are
+%% restricted in the following way: INVALID_BLOCK_HASH status value is supplanted
+%% by INVALID." V1 keeps it; V2 and V3 must not emit it, because a client reading
+%% INVALID_BLOCK_HASH on a V2 method is reading a value the specification withdrew
+%% from that method -- and it is the value that distinguishes a corrupt payload
+%% from a valid block the node chose to reject.
+invalid_block_hash_is_supplanted_from_v2_test() ->
+    S = fun eth_engine:status_for_version/2,
+    ?assertEqual(<<"INVALID_BLOCK_HASH">>, S(<<"INVALID_BLOCK_HASH">>, 1)),
+    [?assertEqual(<<"INVALID">>, S(<<"INVALID_BLOCK_HASH">>, V)) || V <- [2, 3]],
+    %% Every other status is unchanged by the version.
+    [?assertEqual(St, S(St, V))
+     || St <- [<<"VALID">>, <<"INVALID">>, <<"SYNCING">>, <<"ACCEPTED">>],
+        V <- [1, 2, 3]].
+
+%% ===========================================================================
+%% Blob versioned hashes (newPayloadV3 item 3)
+%% ===========================================================================
+
+%% "If the payload has no blob transactions the expected array MUST be []." So an
+%% empty expected array against a payload with no blob transactions is the passing
+%% case, and any hash at all is a mismatch.
+blob_hashes_of_a_payload_with_no_blob_transactions_test() ->
+    P = payload(),
+    ?assertEqual(ok, eth_engine:blob_hashes_admission(
+                       P#{<<"transactions">> => []}, [])),
+    %% Either form of DATA: the 0x-hex the wire carries, or the 32 raw bytes an
+    %% in-process caller holds. eth_block:payload_data/2 accepts both.
+    %% The reported tuple is {invalid, Expected, Actual}, in that order.
+    ?assertMatch({invalid, [_], []},
+                 eth_engine:blob_hashes_admission(
+                   P#{<<"transactions">> => []}, [versioned_hash(1)])),
+    ?assertMatch({invalid, [_], []},
+                 eth_engine:blob_hashes_admission(
+                   P#{<<"transactions">> => []}, [hex(versioned_hash(1))])).
+
+%% A mismatch is INVALID and is reported as INVALID. It is a *status* and not an
+%% error code, unlike the structure and fork gates above: the payload is well
+%% formed and aimed at the right fork, and it is the contents that are wrong.
+blob_hashes_that_disagree_are_a_mismatch_test() ->
+    P = payload(),
+    Empty = P#{<<"transactions">> => []},
+    ?assertMatch({invalid, [_], []},
+                 eth_engine:blob_hashes_admission(Empty, [versioned_hash(7)])).
+
+%% The actual array is the concatenation, in order of inclusion, of each blob
+%% transaction's own hashes. This is checked against a real transaction encoded by
+%% this repo's codec, so it pins the ordering and the normalisation rather than a
+%% hand-written list -- a hand-written list would agree with the implementation by
+%% construction.
+blob_hashes_concatenate_in_order_of_inclusion_test() ->
+    Txs = [blob_tx(#{1 => versioned_hash(11), 2 => versioned_hash(12)}),
+           blob_tx(#{1 => versioned_hash(21)})],
+    P = payload_with_transactions(Txs),
+    [A, B] = Txs,
+    %% eth_block:hex_data/1, not eth_hex:decode/1: the latter returns an integer,
+    %% and from_rlp/1 on an integer is a function_clause. The same mistake the
+    %% production code made twice.
+    %% Uppercase: a lowercase-initial name in call position is parsed as a
+    %% *function* call, not a call of the fun variable bound above it.
+    HashesOf = fun(Wire) ->
+        {ok, Bytes} = eth_block:hex_data(Wire),
+        {ok, Tx} = eth_tx:from_rlp(Bytes),
+        eth_tx:blob_versioned_hashes(Tx)
+    end,
+    Expected = HashesOf(A) ++ HashesOf(B),
+    ?assertEqual(3, length(Expected)),
+    ?assertEqual(ok, eth_engine:blob_hashes_admission(P, Expected)),
+    %% The same set in the wrong order is a mismatch, which is what "respecting the
+    %% order of inclusion" is for.
+    ?assertMatch({invalid, _, _},
+                 eth_engine:blob_hashes_admission(P, lists:reverse(Expected))).
+
+%% "This validation MUST be instantly run in all cases even during active sync
+%% process" -- so it must not be reachable only from the path that executes. An
+%% actual array this node cannot compute is `unchecked', and in particular is NOT
+%% treated as `[]': "the payload has no blob transactions" and "this node could not
+%% read the transactions" are different claims, and conflating them would report
+%% INVALID against a payload whose blobs are fine.
+blob_hashes_that_cannot_be_computed_are_unchecked_not_invalid_test() ->
+    P = payload_with_transactions([<<"0xdeadbeef">>]),
+    %% The invariant is that it is `unchecked' and *not* a mismatch: an
+    %% undeterminable actual array must never be reported as a disagreement,
+    %% because a client cannot act on "this node could not read it".
+    ?assertMatch({unchecked, _}, eth_engine:blob_hashes_admission(P, [])),
+    ?assertMatch({unchecked, _},
+                 eth_engine:blob_hashes_admission(
+                   P, [hex(versioned_hash(1))])),
+    P2 = payload(),
+    ?assertMatch({unchecked, transactions_not_an_array},
+                 eth_engine:blob_hashes_admission(P2#{<<"transactions">> => null}, [])),
+    ?assertMatch({unchecked, expected_hashes_not_an_array},
+                 eth_engine:blob_hashes_admission(
+                   P2#{<<"transactions">> => []}, not_a_list)).
+
+%% A versioned hash is 0x01 followed by 31 bytes (EIP-4844: the first byte of the
+%% SHA-256 of the commitment, with the version in the top bit). An expected value
+%% whose first byte is not 0x01 is not a versioned hash, and admitting it would let
+%% a caller assert anything and be told the payload is fine.
+expected_hashes_must_be_versioned_hashes_test() ->
+    P = payload(),
+    Empty = P#{<<"transactions">> => []},
+    %% A well-formed hash passes the *shape* check, and then disagrees with the
+    %% payload -- which is the shape failure being absent, not a pass.
+    ?assertMatch({invalid, [<<1, _/binary>>], []},
+                 eth_engine:blob_hashes_admission(Empty, [versioned_hash(1)])),
+    ?assertMatch({invalid, [<<1, _/binary>>], []},
+                 eth_engine:blob_hashes_admission(Empty, [hex(versioned_hash(1))])),
+    %% Version 0x00, not 0x01.
+    ?assertMatch({unchecked, expected_hashes_not_an_array},
+                 eth_engine:blob_hashes_admission(
+                   Empty, [hex(<<0:248, 1>>)])),
+    %% Right length, wrong width.
+    ?assertMatch({unchecked, expected_hashes_not_an_array},
+                 eth_engine:blob_hashes_admission(Empty, [<<1, 2, 3>>])).
+
+%% ===========================================================================
+%% Over the wire
+%% ===========================================================================
+
+%% The whole reason this work exists: a post-Merge consensus client calls V3, and
+%% before this change every one of those calls was answered -32601 method not
+%% found, which is indistinguishable from a node that does not implement the Engine
+%% API at all.
+v3_methods_are_routed_rather_than_refused_test() ->
+    with_http(fun(Port) ->
+        Head = #{<<"headBlockHash">> => <<1:256>>,
+                 <<"safeBlockHash">> => <<0:256>>,
+                 <<"finalizedBlockHash">> => <<0:256>>},
+        %% forkchoiceUpdatedV3 with null attributes: a status, not an error.
+        ?assertMatch({ok, #{<<"result">> := #{<<"payloadStatus">> :=
+                                        #{<<"status">> := _}}}, _},
+                     call(Port, <<"engine_forkchoiceUpdatedV3">>, [Head, null])),
+        %% getPayloadV3 for an id this node never issued: -38001, the code the
+        %% specification names, and not -32601.
+        ?assertMatch({ok, #{<<"error">> := #{<<"code">> := -38001}}, _},
+                     call(Port, <<"engine_getPayloadV3">>, [<<0:64>>])),
+        ?assertMatch({ok, #{<<"error">> := #{<<"code">> := -38001}}, _},
+                     call(Port, <<"engine_getPayloadV2">>, [<<0:64>>]))
+    end).
+
+%% newPayloadV2 and V3 with a payload whose structure is wrong for the method
+%% answer -32602 over HTTP, not a payload status. A status here would be read by a
+%% client as a verdict on the block.
+new_payload_v2_answers_invalid_params_for_the_wrong_structure_test() ->
+    with_http(fun(Port) ->
+        V1 = v1_payload(shanghai_at(sepolia) - 1),
+        %% Post-Shanghai timestamp, so V2 wants the V2 structure.
+        Post = v2_payload(shanghai_at(sepolia)),
+        ?assertMatch({ok, #{<<"error">> := #{<<"code">> := -32602}}, _},
+                     call(Port, <<"engine_newPayloadV2">>,
+                          [Post#{<<"withdrawals">> => null}])),
+        %% Pre-Shanghai timestamp, so V2 wants the V1 structure, and this payload
+        %% carries `withdrawals'.
+        ?assertMatch({ok, #{<<"error">> := #{<<"code">> := -32602}}, _},
+                     call(Port, <<"engine_newPayloadV2">>,
+                          [V1#{<<"withdrawals">> => []}]))
+    end).
+
+%% newPayloadV3's third parameter is parentBeaconBlockRoot, DATA, 32 bytes. A null
+%% is "not provided" (cancun.md item 1) and so is -32602, not -38005: the frame
+%% check is about the payload's timestamp and says nothing about this parameter.
+new_payload_v3_requires_a_parent_beacon_block_root_test() ->
+    with_http(fun(Port) ->
+        P = payload(),
+        [?assertMatch({ok, #{<<"error">> := #{<<"code">> := -32602}}, _},
+                      call(Port, <<"engine_newPayloadV3">>, [P, [], Root]))
+         || Root <- [null, <<"0x00">>, <<"0xzz">>, 42]],
+        %% Present and well formed, and the blob hashes disagree, so the answer is
+        %% the INVALID *status* -- which is the check the other two gates do not do.
+        %% This is the real Cancun fixture, with its real transactions, so the
+        %% actual array is whatever those transactions commit to; a check that could
+        %% not read them would answer SYNCING here, and that is what the first
+        %% version of this did.
+        Hash = hex(versioned_hash(9)),
+        %% call/3 is {ok, Body, HttpStatus}; the status is not under test here.
+        {ok, #{<<"result">> := #{<<"status">> := <<"INVALID">>,
+                                 <<"latestValidHash">> := null,
+                                 <<"validationError">> := Reason}}, _} =
+            call(Port, <<"engine_newPayloadV3">>, [P, [Hash], <<0:256>>]),
+        %% The reason has to be readable, not a ~p dump of two lists of 32-byte
+        %% binaries: it names the disagreement, not the whole arrays.
+        ?assertNotEqual(nomatch, binary:match(Reason, <<"blob versioned hashes">>)),
+        ?assertNotEqual(nomatch, binary:match(Reason, <<"first disagreement at index">>)),
+        %% Nothing of the dump survives, so this would fail if message/1 were used.
+        ?assertEqual(nomatch, binary:match(Reason, <<"blob_hashes_mismatch">>))
+    end).
+
+%% newPayloadV3 with matching blob hashes falls through to the ordinary path, and
+%% the ordinary path's verdict is unchanged by the blob check having run. That is
+%% the invariant, and comparing against the same payload on V1 is what makes it
+%% checkable: asserting a hard-coded status would only pin whatever the ordinary
+%% path happens to return today, and would still pass with the blob check removed
+%% from the code -- which is the failure this test exists to catch, since the
+%% mismatch case above is its only other guard.
+%%
+%% The payload is the real fixture, with its real transaction list, and the
+%% expected array is therefore whatever its blob transactions commit to. It has no
+%% blob transactions, so `[]' is the correct expectation and not a convenient one.
+new_payload_v3_with_matching_hashes_reaches_the_ordinary_path_test() ->
+    with_http(fun(Port) ->
+        P = payload(),
+        ?assertEqual(ok, eth_engine:blob_hashes_admission(P, [])),
+        {ok, #{<<"result">> := V3}, _} =
+            call(Port, <<"engine_newPayloadV3">>, [P, [], <<0:256>>]),
+        {ok, #{<<"result">> := V1}, _} = call(Port, <<"engine_newPayloadV1">>, [P]),
+        ?assertEqual(maps:get(<<"status">>, V1), maps:get(<<"status">>, V3))
+    end).
+
+%% forkchoiceUpdatedV2 and V3 run the attributes checks; -38003 for a shape
+%% failure. The code is -38003 and not -32602 because the specification names
+%% -38003 for payloadAttributes specifically.
+forkchoice_updated_checks_payload_attributes_test() ->
+    with_http(fun(Port) ->
+        Head = #{<<"headBlockHash">> => <<1:256>>,
+                 <<"safeBlockHash">> => <<0:256>>,
+                 <<"finalizedBlockHash">> => <<0:256>>},
+        V2 = attributes(shanghai),
+        %% V3 demands parentBeaconBlockRoot as well.
+        ?assertMatch({ok, #{<<"error">> := #{<<"code">> := -38003}}, _},
+                     call(Port, <<"engine_forkchoiceUpdatedV3">>, [Head, V2])),
+        %% V2 refuses it for carrying the key at all.
+        ?assertMatch({ok, #{<<"error">> := #{<<"code">> := -38003}}, _},
+                     call(Port, <<"engine_forkchoiceUpdatedV2">>,
+                          [Head, attributes(cancun)])),
+        %% Well formed for V2, so this is a status and not an error.
+        ?assertMatch({ok, #{<<"result">> := #{<<"payloadStatus">> := _}}, _},
+                     call(Port, <<"engine_forkchoiceUpdatedV2">>, [Head, V2])),
+        %% A timestamp outside the Cancun frame is -38005, a different code from
+        %% the shape failure above.
+        Prague = after_cancun_at(sepolia),
+        ?assertMatch({ok, #{<<"error">> := #{<<"code">> := -38005}}, _},
+                     call(Port, <<"engine_forkchoiceUpdatedV3">>,
+                          [Head, (attributes(cancun))#{<<"timestamp">> => hexq(Prague)}]))
+    end).
+
+%% ===========================================================================
+%% Helpers
+%% ===========================================================================
+
+%% ETH_NETWORK is process-wide, so it is restored. The gate reads
+%% eth_fork_schedule:configured_network/0, and a test that left this set would
+%% silently redirect every later test's frame check.
+with_network(Network, Fun) ->
+    Previous = os:getenv("ETH_NETWORK"),
+    true = os:putenv("ETH_NETWORK", Network),
+    try Fun()
+    after
+        case Previous of
+            false -> os:unsetenv("ETH_NETWORK");
+            _ -> os:putenv("ETH_NETWORK", Previous)
+        end
+    end.
+
+%% The activation instants, read from the schedule rather than written here. The
+%% *values* are pinned by eth_fork_schedule_tests, which is the module that owns
+%% them; this module only states the behaviour at whatever they are, so a change to
+%% the schedule cannot make a test here quietly test the wrong boundary.
+shanghai_at(Network) ->
+    {ok, T, _To} = eth_fork_schedule:timestamp_frame(Network, shanghai), T.
+
+cancun_at(Network) ->
+    {ok, T, _To} = eth_fork_schedule:timestamp_frame(Network, cancun), T.
+
+%% The instant Cancun's frame closes, which is the next timestamped fork's
+%% activation. This is the boundary the half-open rule is about.
+after_cancun_at(Network) ->
+    {ok, _From, To} = eth_fork_schedule:timestamp_frame(Network, cancun), To.
+
+far_future() -> 1900000000.
+
+payload_with_timestamp(Timestamp) ->
+    (payload())#{<<"timestamp">> => Timestamp}.
+
+%% Genuine structures, not a Cancun payload with its timestamp moved. The gates
+%% compare the *set* of appended keys, so a test that only changed the timestamp
+%% would be testing "a Cancun payload at a Shanghai timestamp", which is refused
+%% for carrying the wrong keys rather than for being in the wrong frame.
+v1_payload(Timestamp) ->
+    lists:foldl(fun(K, Acc) -> maps:remove(K, Acc) end,
+                payload_with_timestamp(hexq(Timestamp)),
+                [<<"withdrawals">>, <<"blobGasUsed">>, <<"excessBlobGas">>]).
+
+v2_payload(Timestamp) ->
+    lists:foldl(fun(K, Acc) -> maps:remove(K, Acc) end,
+                payload_with_timestamp(hexq(Timestamp)),
+                [<<"blobGasUsed">>, <<"excessBlobGas">>]).
+
+payload_with_transactions(Txs) ->
+    (payload())#{<<"transactions">> => Txs}.
+
+%% A type-3 (blob) transaction carrying the given versioned hashes, keyed by
+%% position, encoded to the wire form a payload carries.
+blob_tx(HashesByIndex) ->
+    Hashes = [maps:get(I, HashesByIndex) || I <- lists:sort(maps:keys(HashesByIndex))],
+    {ok, Bin} = eth_tx:to_rlp(#{
+        <<"type">> => <<"0x3">>,
+        <<"chainId">> => <<"0x1">>,
+        <<"nonce">> => <<"0x0">>,
+        <<"maxPriorityFeePerGas">> => <<"0x1">>,
+        <<"maxFeePerGas">> => <<"0x2">>,
+        <<"gas">> => <<"0x5208">>,
+        <<"to">> => <<"0x0102030405060708090a0b0c0d0e0f1011121314">>,
+        <<"value">> => <<"0x0">>,
+        <<"input">> => <<"0x">>,
+        <<"accessList">> => [],
+        <<"maxFeePerBlobGas">> => <<"0x3b9aca00">>,
+        <<"blobVersionedHashes">> => [hex(H) || H <- Hashes],
+        <<"v">> => <<"0x0">>, <<"r">> => <<"0x1">>, <<"s">> => <<"0x1">>
+    }),
+    hex(Bin).
+
+%% EIP-4844 versioned hash: 0x01 in the first byte, then 31 arbitrary bytes.
+versioned_hash(N) -> <<1, N:248>>.
+
+attributes(shanghai) ->
+    #{<<"timestamp">> => hexq(shanghai_at(sepolia) + 12),
+      <<"prevRandao">> => <<0:256>>,
+      <<"suggestedFeeRecipient">> => <<0:160>>,
+      <<"withdrawals">> => []};
+%% The V3 attributes' timestamp has to be inside the Cancun frame, or the -38005
+%% check fires before the structure is reached. V2's does not matter for the same
+%% reason: V2 has no frame check.
+attributes(cancun) ->
+    (attributes(shanghai))#{<<"timestamp">> => hexq(cancun_at(sepolia) + 12),
+                            <<"parentBeaconBlockRoot">> => <<0:256>>}.
+
+hexq(Int) -> <<"0x", (binary:encode_hex(<<Int:64>>))/binary>>.
+
+
+%% ===========================================================================
 %% Fixtures
 %% ===========================================================================
 
@@ -583,21 +1360,14 @@ post(Port, Method, Params, Headers) ->
     {ok, Decoded} = thoas:decode(Resp),
     {ok, Decoded, Status}.
 
-payload() ->
-    #{<<"parentHash">> => hex(<<16#ab, 0:248>>),
-      <<"feeRecipient">> => <<"0x0000000000000000000000000000000000000000">>,
-      <<"stateRoot">> => hex(<<16#cd, 0:248>>),
-      <<"receiptsRoot">> => hex(<<16#ef, 0:248>>),
-      <<"logsBloom">> => hex(<<0:2048>>),
-      <<"prevRandao">> => hex(<<16#11, 0:248>>),
-      <<"blockNumber">> => <<"0x64">>,
-      <<"gasLimit">> => <<"0x1c9c380">>,
-      <<"gasUsed">> => <<"0x5208">>,
-      <<"timestamp">> => <<"0x64">>,
-      <<"extraData">> => <<"0x">>,
-      <<"baseFeePerGas">> => <<"0x7">>,
-      <<"blockHash">> => hex(<<16#77, 0:248>>),
-      <<"transactions">> => [<<"0xf8">>]}.
+%% A real Cancun payload from Sepolia, so the engine is exercised on data the
+%% network produced: a decodable body, a block hash that really is the hash of the
+%% header, and withdrawals. The hand-rolled payload this replaced had a
+%% transaction that was not a transaction, so every test using it was really only
+%% testing that the decoder complains.
+payload() -> real_payload().
+
+real_payload() -> maps:get(payload, eth_payload_fixture:cancun()).
 
 forkchoice(Head) -> forkchoice(Head, undefined).
 
@@ -625,7 +1395,17 @@ payload_id() -> hex(<<16#a1, 0:56>>).
 hash_value(undefined) -> undefined;
 hash_value(Hash) -> hex(Hash).
 
+%% The two forms a 32-byte hash arrives in: a 0x-prefixed string, which is what a
+%% decoded JSON object carries, and the raw bytes themselves.
 hex(Bin) -> <<"0x", (binary:encode_hex(Bin))/binary>>.
+
+unhex(<<"0x", Rest/binary>>) -> binary:decode_hex(Rest);
+unhex(Bin) -> Bin.
+
+%% The right *length* for a 32-byte hash and not hex, which is a different failure
+%% from being the wrong length and worth testing separately: a decoder that only
+%% counted bytes would take this for a hash.
+non_hex_data() -> iolist_to_binary(["0xZZ", binary:copy(<<"0">>, 62)]).
 
 triton_td() -> eth_hex:decode(<<"0xc70d815d562d3cfa955">>).
 
@@ -635,3 +1415,4 @@ recorded_head() ->
     %% file, and it is here because the discarded-write defect it guards was
     %% invisible from the public API once the statuses became honest.
     element(6, gen_server:call(eth_engine, get_state, infinity)).
+

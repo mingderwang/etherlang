@@ -28,7 +28,25 @@
 -export([start_link/1, start_link/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -export([new_payload/1, forkchoice_updated/1, get_payload/1,
-         exchange_transition_config/1, jwt_secret/0]).
+         exchange_transition_config/1, jwt_secret/0,
+         %% Exported so the status mapping can be tested against the finalize
+         %% results eth_finalize_tests produces, rather than only through a path
+         %% that needs the parent block's state held locally.
+         status_for_finalize/1, status_for_verification/1,
+         %% Exported, and pure, for the same reason: the version and fork gates
+         %% decide *whether* a payload is processed at all, so a test that can
+         %% only reach them over HTTP cannot distinguish "the gate refused it"
+         %% from "the gate was never consulted".
+         payload_admission/2, attributes_admission/2,
+         blob_hashes_admission/2, status_for_version/2,
+         version_fork/1, structure_for_version/2,
+         required_structure/1, required_attributes/1,
+         %% The module's one DATA reader, exported because the handler checks a DATA
+         %% parameter of its own (newPayloadV3's parentBeaconBlockRoot) and writing
+         %% a second decoder there was how that check came to reject every
+         %% well-formed value: eth_hex:decode/1 returns an integer, so the second
+         %% decoder could never produce the 32 bytes it was testing for.
+         data32/1 ]).
 
 %% Engine API constants
 -define(ENGINE_PORT, 8551).
@@ -39,6 +57,21 @@
 -define(VALIDATED, <<"VALIDATED">>).
 -define(INVALID_BLOCK_HASH, <<"INVALID_BLOCK_HASH">>).
 -define(SECURITY_ERROR, <<"SECURITY_ERROR">>).
+
+%% JSON-RPC error codes the engine API specifies. The three -380xx codes are from
+%% execution-apis src/engine/common.md, "Engine API error codes":
+%%
+%%   | -38001 | Unknown payload            |
+%%   | -38002 | Invalid forkchoice state  |
+%%   | -38003 | Invalid payload attributes|
+%%   | -38004 | Too large request         |
+%%   | -38005 | Unsupported fork          |
+%%
+%% -32602 is JSON-RPC's own "Invalid params", not an engine-specific code, and
+%% is the code the versioned methods use for a structure mismatch.
+-define(INVALID_PARAMS, -32602).
+-define(UNSUPPORTED_FORK, -38005).
+-define(INVALID_ATTRIBUTES, -38003).
 
 %% Engine state
 %% Every field carries a default, which none of them did.
@@ -179,8 +212,486 @@ code_change(_OldVsn, S, _Extra) -> {ok, S}.
 %% ---------------------------------------------------------------------------
 
 %% ---------------------------------------------------------------------------
+%% Versioned-method admission
+%% ---------------------------------------------------------------------------
+%%
+%% The engine API's methods are versioned, and the version is not decoration: a
+%% V2 method on a V2 payload and a V2 method on a V1 payload are different calls
+%% with different answers, and the specification gives the wrong pairing an error
+%% code rather than a payload status. Before Cancun this node implemented only the
+%% V1 methods, so a post-Merge consensus client -- which calls
+%% engine_forkchoiceUpdatedV3 and engine_getPayloadV3, and has since Osaka
+%% engine_forkchoiceUpdatedV4 -- was answered `-32601 method not found' for every
+%% call. That is a node no consensus layer can drive, whatever else it can do.
+%%
+%% Two gates, in the order the specification lists them. From
+%% execution-apis src/engine/cancun.md, engine_newPayloadV3:
+%%
+%%   1. "Client software MUST check that provided set of parameters and their
+%%      fields strictly matches the expected one and return `-32602: Invalid
+%%      params' error if this check fails. Any field having `null' value MUST be
+%%      considered as not provided."
+%%   2. "Client software MUST return `-38005: Unsupported fork' error if the
+%%      `timestamp' of the payload does not fall within the time frame of the
+%%      Cancun fork."
+%%
+%% Both are *errors* and not statuses, and that distinction is the whole point. A
+%% PayloadStatusV1 is a verdict on a payload; -32602 and -38005 say the request
+%% was malformed or aimed at the wrong fork, and the payload was never judged.
+%% Reporting either as SYNCING would tell a client "I will get to this later" about
+%% something this node has already decided it cannot accept, and the client would
+%% keep offering it.
+%%
+%% The structure check is on the *keys*, not the values: a V1 payload is a V2
+%% payload minus `withdrawals', a V2 is a V3 minus `blobGasUsed' and
+%% `excessBlobGas', and each fork only ever appended. So which of the appended keys
+%% are present identifies the structure, and `null' counts as absent per item 1.
+%% The value-level check is eth_block:from_payload/1's job and runs after
+%% admission, which is the order the specification gives: the parameter check
+%% precedes the blockHash check, which precedes execution.
+%%
+%% "Strictly matches" is taken literally: the set of fork-specific keys a payload
+%% carries must *equal* the set its version calls for, not merely contain it. The
+%% weaker reading has a concrete failure -- ExecutionPayloadV3 is a superset of
+%% V2, so a Prague payload would satisfy a V2 method's requirements and be
+%% accepted by a node that cannot execute Prague rules. Rejecting the extra keys
+%% is what makes "use the version that matches" enforceable rather than advisory.
+
+%% The keys each fork appended, in the order the forks appended them. Paris is the
+%% base set, which eth_block:from_payload/1 checks field by field; only the
+%% appended keys are listed here because only they distinguish one version's
+%% structure from another's.
+required_structure(paris) -> [];
+required_structure(shanghai) -> [<<"withdrawals">>];
+required_structure(cancun) -> [<<"withdrawals">>, <<"blobGasUsed">>,
+                              <<"excessBlobGas">>].
+
+%% Every key any version appends, so "the keys this payload carries" is a
+%% comparison over a fixed set rather than over the payload's own keys. A payload
+%% with a key not in this list cannot be versioned by it, and
+%% structure_admission/2 will not notice -- eth_block:from_payload/1 ignores
+%% unknown fields too, which is a separate, documented looseness.
+appended_keys() -> [<<"withdrawals">>, <<"blobGasUsed">>, <<"excessBlobGas">>].
+
+%% payloadAttributes has its own version line, and it is *not* the payload's.
+%% PayloadAttributesV1 is timestamp, prevRandao and suggestedFeeRecipient
+%% (src/engine/paris.md); V2 appends withdrawals (src/engine/shanghai.md,
+%% PayloadAttributesV2); V3 appends parentBeaconBlockRoot (src/engine/cancun.md,
+%% PayloadAttributesV3: "This structure has the syntax of PayloadAttributesV2 and
+%% appends a single field: parentBeaconBlockRoot").
+%%
+%% So V3 attributes carry parentBeaconBlockRoot and *not* blobGasUsed or
+%% excessBlobGas, which are header fields of the payload and not attributes at all.
+%% Reusing required_structure/1 for the attributes -- which is the obvious thing to
+%% write, since both are versioned -- checks for the wrong keys twice over: a
+%% correct V3 attributes object is refused for lacking blobGasUsed, and a payload's
+%% key set is demanded of an object that has none of them.
+required_attributes(paris) -> [];
+required_attributes(shanghai) -> [<<"withdrawals">>];
+required_attributes(cancun) -> [<<"withdrawals">>, <<"parentBeaconBlockRoot">>].
+
+appended_attribute_keys() -> [<<"withdrawals">>, <<"parentBeaconBlockRoot">>].
+
+%% The structure a method of the given version requires of a payload whose
+%% timestamp is Timestamp.
+%%
+%% V1 has exactly one structure. V2 selects between two by timestamp, from
+%% execution-apis src/engine/shanghai.md, engine_newPayloadV2:
+%%
+%%   "ExecutionPayloadV1 MUST be used if the `timestamp' value is lower than the
+%%    Shanghai timestamp, ExecutionPayloadV2 MUST be used if the `timestamp' value
+%%    is greater or equal to the Shanghai timestamp, Client software MUST return
+%%    `-32602: Invalid params' error if the wrong version of the structure is used
+%%    in the method call."
+%%
+%% V3 is Cancun only, so its structure is fixed and the timestamp is checked
+%% against the Cancun frame instead.
+%%
+%% Note that V2's rule is a *one-sided* comparison ("lower than", "greater or
+%% equal"), so this asks for the Shanghai activation instant and not for Shanghai's
+%% frame. Shanghai's frame closes when Cancun opens, and using it here would make
+%% every post-Cancun timestamp look pre-Shanghai and demand the V1 structure of a
+%% Cancun payload.
+-spec structure_for_version(integer(), integer()) -> atom().
+structure_for_version(1, _Timestamp) -> paris;
+structure_for_version(2, Timestamp) ->
+    case at_or_after(shanghai, Timestamp) of
+        true -> shanghai;
+        false -> paris
+    end;
+structure_for_version(3, _Timestamp) -> cancun.
+
+%% One-sided: has this fork activated yet?
+at_or_after(Fork, Timestamp) ->
+    case eth_fork_schedule:activated_at(
+           eth_fork_schedule:configured_network(), Fork) of
+        {ok, From} -> Timestamp >= From;
+        %% A network that does not timestamp this fork. Reporting "not yet
+        %% activated" would make V2 demand the V1 structure forever on it, so this
+        %% is answered as "already active", which is the reading that leaves the
+        %% V2 structure -- the one that carries withdrawals, and so the superset --
+        %% in place.
+        error -> true
+    end.
+
+%% The fork a method of the given version is the method *for*. This is the fork
+%% whose time frame bounds the method, which is not the same as the structure the
+%% method demands: V2's structure is chosen by the timestamp, and V2 has no upper
+%% bound of its own.
+-spec version_fork(integer()) -> atom().
+version_fork(1) -> paris;
+version_fork(2) -> shanghai;
+version_fork(3) -> cancun.
+
+%% ok | {error, Code, Message}
+-spec payload_admission(map() | term(), integer()) -> ok | {error, integer(), binary()}.
+payload_admission(Payload, 1) when is_map(Payload) ->
+    %% V1 has no parameter gate at all, and this is worth being explicit about
+    %% because it is the opposite of what the V3 clause says one clause earlier.
+    %% src/engine/paris.md, engine_newPayloadV1, lists six specification items and
+    %% not one of them is a structure check; the string `-32602' does not occur in
+    %% paris.md anywhere. The structure requirement arrives with V2
+    %% (src/engine/shanghai.md: "MUST return -32602: Invalid params error if the
+    %% wrong version of the structure is used") and is restated for V3
+    %% (src/engine/cancun.md item 1: "strictly matches the expected one").
+    %
+    %% So applying a structure check to V1 would refuse a Cancun payload sent to
+    %% newPayloadV1 with an error code the Paris method has no clause to produce.
+    %% A consensus layer client does not do that -- it calls the method matching
+    %% the fork -- so a V1 call carrying a later structure is a client that has
+    %% been told to use V3, not a request this node should refuse on a code the
+    %% specification does not define for it.
+    ok;
+payload_admission(Payload, Version) when is_map(Payload), is_integer(Version) ->
+    case strict_timestamp(Payload) of
+        {ok, Timestamp} ->
+            Structure = structure_for_version(Version, Timestamp),
+            case structure_admission(Payload, Structure) of
+                ok -> frame_admission(Version, Timestamp);
+                {error, _, _} = Error -> Error
+            end;
+        error ->
+            %% Item 1 is the structure check, and an unreadable timestamp means
+            %% the parameters do not match the expected structure. It is not a fork
+            %% error, because "does not fall within the time frame" cannot be
+            %% evaluated at all -- and V2's structure choice depends on it.
+            {error, ?INVALID_PARAMS, <<"invalid params">>}
+    end;
+payload_admission(_Payload, _Version) ->
+    {error, ?INVALID_PARAMS, <<"invalid params">>}.
+
+%% Only V3 carries the -38005 clause. V1 predates it, and V2's only timestamp
+%% rule is the structure choice already made above -- the specification puts no
+%% upper bound on V2, so imposing one here would refuse payloads the
+%% specification says to accept.
+frame_admission(1, _Timestamp) -> ok;
+frame_admission(2, _Timestamp) -> ok;
+frame_admission(3, Timestamp) ->
+    case in_fork_frame(cancun, Timestamp) of
+        true -> ok;
+        false -> {error, ?UNSUPPORTED_FORK, <<"unsupported fork">>}
+    end.
+
+in_fork_frame(Fork, Timestamp) ->
+    eth_fork_schedule:timestamp_in_frame(
+      eth_fork_schedule:configured_network(), Fork, Timestamp).
+
+%% The set of appended keys the payload carries, sorted, must equal the set its
+%% version requires, sorted. `null' counts as absent per item 1.
+structure_admission(Payload, Structure) ->
+    Expected = lists:sort(required_structure(Structure)),
+    case lists:sort([K || K <- appended_keys(), present(Payload, K)]) of
+        Expected -> ok;
+        Actual -> {error, ?INVALID_PARAMS, structure_message(Expected, Actual)}
+    end.
+
+%% "Any field having `null' value MUST be considered as not provided."
+present(Payload, Key) ->
+    case maps:find(Key, Payload) of
+        {ok, null} -> false;
+        {ok, undefined} -> false;
+        {ok, _Value} -> true;
+        error -> false
+    end.
+
+structure_message([], []) -> <<"invalid params">>;
+structure_message([], Actual) ->
+    iolist_to_binary(["invalid params: unexpected ",
+                      lists:join(", ", key_names(Actual))]);
+structure_message(Expected, []) ->
+    iolist_to_binary(["invalid params: missing ",
+                      lists:join(", ", key_names(Expected))]);
+structure_message(Expected, Actual) ->
+    iolist_to_binary(["invalid params: expected ",
+                      lists:join(", ", key_names(Expected)),
+                      " but got ", lists:join(", ", key_names(Actual))]).
+
+key_names(Keys) -> [binary_to_list(K) || K <- lists:sort(Keys)].
+
+%% A QUANTITY read strictly. This is deliberately not quantity/2, which answers
+%% its Default for an unparseable value: the -32602 gate has to be able to tell
+%% "the client sent 0x0" from "the client sent something I cannot read", and
+%% defaulting the second to the first would report a missing field for a payload
+%% that carries one.
+strict_timestamp(Payload) ->
+    case maps:find(<<"timestamp">>, Payload) of
+        {ok, null} -> error;
+        {ok, undefined} -> error;
+        {ok, Value} -> strict_quantity(Value);
+        error -> error
+    end.
+
+strict_quantity(Value) when is_integer(Value), Value >= 0 -> {ok, Value};
+strict_quantity(Value) when is_binary(Value) ->
+    try {ok, eth_hex:decode(Value)} catch _:_ -> error end;
+strict_quantity(_Value) -> error.
+
+%% ---------------------------------------------------------------------------
+%% payloadAttributes admission
+%% ---------------------------------------------------------------------------
+%%
+%% From execution-apis src/engine/cancun.md, engine_forkchoiceUpdatedV3 item 2,
+%% which "Extend[s] point (8) of the engine_forkchoiceUpdatedV1 specification by
+%% defining the following sequence of checks that MUST be run over
+%% payloadAttributes":
+%%
+%%   1. "payloadAttributes matches the PayloadAttributesV3 structure, return
+%%      -38003: Invalid payload attributes on failure."
+%%   2. "payloadAttributes.timestamp does not fall within the time frame of the
+%%      Cancun fork, return -38005: Unsupported fork on failure."
+%%
+%% Note the two different codes: a *malformed* attributes object is -38003, and
+%% a well-formed one aimed at the wrong fork is -38005. Collapsing them would
+%% leave a client unable to tell "you sent me the wrong shape" from "you sent me
+%% the right shape for the wrong time", and the second is retryable on a
+%% different method while the first is not.
+%%
+%% PayloadAttributesV1 is timestamp, prevRandao and suggestedFeeRecipient;
+%% V2 appends withdrawals (src/engine/shanghai.md, PayloadAttributesV2) and V3
+%% appends parentBeaconBlockRoot (src/engine/cancun.md, PayloadAttributesV3). So
+%% the keys that identify a version are the appended ones, and the same
+%% exact-set rule applies for the same reason.
+-spec attributes_admission(map() | null | term(), integer()) -> ok | {error, integer(), binary()}.
+attributes_admission(null, _Version) -> ok;
+attributes_admission(undefined, _Version) -> ok;
+attributes_admission(_Attributes, 1) ->
+    %% V1 has no structure check either, for the same reason the payload gate does
+    %% not: -32602 does not occur in paris.md. The one attributes rule Paris does
+    %% have is point (8).1 -- "Verify that payloadAttributes.timestamp is greater
+    %% than timestamp of a block referenced by forkchoiceState.headBlockHash and
+    %% return -38003 on failure" -- which needs the head's timestamp and so belongs
+    %% to the forkchoice path, not to a check on the attributes alone. This node
+    %% does not have the head's block, so that check is unwired rather than
+    %% approximated here; see the note in forkchoice_updated/1.
+    ok;
+attributes_admission(Attributes, Version) when is_map(Attributes), is_integer(Version) ->
+    Structure = version_fork(Version),
+    Expected = lists:sort(required_attributes(Structure)),
+    case lists:sort([K || K <- appended_attribute_keys(), present(Attributes, K)]) of
+        Expected -> attributes_frame_admission(Attributes, Version);
+        Actual -> {error, ?INVALID_ATTRIBUTES,
+                   attributes_message(Expected, Actual)}
+    end;
+attributes_admission(_Attributes, _Version) ->
+    {error, ?INVALID_ATTRIBUTES, <<"invalid payload attributes">>}.
+
+attributes_message(Expected, Actual) ->
+    case {Expected, Actual} of
+        {[], []} -> <<"invalid payload attributes">>;
+        {[], _} -> iolist_to_binary(["invalid payload attributes: unexpected ",
+                                     lists:join(", ", key_names(Actual))]);
+        {_, []} -> iolist_to_binary(["invalid payload attributes: missing ",
+                                     lists:join(", ", key_names(Expected))]);
+        _ -> iolist_to_binary(["invalid payload attributes: expected ",
+                               lists:join(", ", key_names(Expected)),
+                               " but got ", lists:join(", ", key_names(Actual))])
+    end.
+
+%% The attributes' own timestamp is the one that must be in frame, not the
+%% head's: it is the timestamp the *new* block would carry, so it is what decides
+%% the fork being built for.
+attributes_frame_admission(_Attributes, 1) -> ok;
+attributes_frame_admission(_Attributes, 2) -> ok;
+attributes_frame_admission(Attributes, 3) ->
+    case strict_quantity_field(Attributes, <<"timestamp">>) of
+        {ok, Timestamp} -> frame_admission(3, Timestamp);
+        error ->
+            %% A QUANTITY is checked as part of matching the structure, so an
+            %% unreadable one is a shape failure, and the code is -38003.
+            {error, ?INVALID_ATTRIBUTES,
+             <<"invalid payload attributes: timestamp">>}
+    end.
+
+strict_quantity_field(Map, Key) ->
+    case maps:find(Key, Map) of
+        {ok, Value} -> strict_quantity(Value);
+        error -> error
+    end.
+
+%% ---------------------------------------------------------------------------
+%% Blob versioned hashes (newPayloadV3)
+%% ---------------------------------------------------------------------------
+%%
+%% execution-apis src/engine/cancun.md, engine_newPayloadV3 item 3:
+%%
+%%   1. "Obtain the actual array by concatenating blob versioned hashes lists
+%%      (tx.blob_versioned_hashes) of each blob transaction included in the
+%%      payload, respecting the order of inclusion. If the payload has no blob
+%%      transactions the expected array MUST be []."
+%%   2. "Return {status: INVALID, latestValidHash: null, validationError:
+%%      errorMessage | null} if the expected and the actual arrays don't match."
+%%   3. "This validation MUST be instantly run in all cases even during active sync
+%%      process."
+%%
+%% Item 3 is the reason this is a separate function and not folded into
+%% new_payload/1. Everything else in this module answers SYNCING when it holds no
+%% prestate to execute against, and that is the correct answer for a root it
+%% cannot compute. It is the wrong answer here: a client that has just been told
+%% SYNCING will offer the same payload again, and a payload whose blob hashes
+%% disagree with the consensus layer's will disagree forever. So this check runs
+%% before the state-dependent path and its result does not depend on whether the
+%% node can execute.
+%%
+%% Note it is a *status* (INVALID), not an error code, unlike the -32602 and
+%% -38005 gates above. The payload is well formed and aimed at the right fork; it
+%% is the contents that are wrong, so the specification gives it a verdict.
+
+%% ok | {invalid, Expected, Actual} | {unchecked, Reason}
+-spec blob_hashes_admission(map() | term(), term()) ->
+          ok | {invalid, [binary()], [binary()]} | {unchecked, term()}.
+blob_hashes_admission(Payload, Expected) when is_map(Payload) ->
+    case expected_hashes(Expected) of
+        {ok, ExpectedHashes} ->
+            case actual_hashes(Payload) of
+                {ok, ActualHashes} ->
+                    case ActualHashes =:= ExpectedHashes of
+                        true -> ok;
+                        false -> {invalid, ExpectedHashes, ActualHashes}
+                    end;
+                {error, Reason} ->
+                    {unchecked, Reason}
+            end;
+        error ->
+            %% The specification calls the expected array a parameter of the
+            %% call, and item 1 requires a strict parameter match, so a value
+            %% that is not an array of 32-byte hashes has already failed the
+            %% -32602 gate. Reaching here means the caller skipped that gate.
+            {unchecked, expected_hashes_not_an_array}
+    end;
+blob_hashes_admission(_Payload, _Expected) ->
+    {unchecked, payload_not_an_object}.
+
+expected_hashes(Expected) when is_list(Expected) ->
+    Hashes = [expected_hash(H) || H <- Expected],
+    case lists:all(fun is_ok_1/1, Hashes) of
+        true -> {ok, [H || {ok, H} <- Hashes]};
+        false -> error
+    end;
+expected_hashes(_Expected) -> error.
+
+is_ok_1({ok, _}) -> true;
+is_ok_1(_) -> false.
+
+%% A versioned hash arrives as DATA, which on the wire is a 0x-prefixed hex string
+%% and in an in-process caller is the 32 raw bytes it denotes. Both are accepted, as
+%% eth_block:payload_data/2 accepts both, and a value that is neither -- or that is
+%% 32 bytes whose first byte is not 0x01 -- is not a versioned hash.
+%%
+%% The first byte check is EIP-4844's: the versioned hash is the first byte of the
+%% SHA-256 of the commitment, with the version in the top bit, so it is 0x01 for
+%% the only version defined. Without it a caller could assert any 32 bytes and be
+%% told the payload's blobs matched.
+%%
+%% The DATA decode is data32/1, which already existed below and already accepts the
+%% wire form and the raw form. It is worth saying why, because the first version of
+%% this wrote its own decoder on eth_hex:decode/1 -- which returns an *integer*,
+%% correct for a QUANTITY and never a 32-byte binary -- and so rejected every
+%% well-formed value it was shown, reporting `expected_hashes_not_an_array' for a
+%% perfectly good hash. eth_hex has no hex-to-bytes function at all; eth_block's
+%% hex_data/1 is now exported for callers that need one.
+expected_hash(Hash) when is_binary(Hash) ->
+    case data32(Hash) of
+        {ok, <<16#01, _/binary>> = Bytes} -> {ok, Bytes};
+        {ok, Other} -> {error, Other};
+        {error, _} -> {error, Hash}
+    end;
+expected_hash(_Hash) -> {error, not_data}.
+
+%% The hashes the payload's own blob transactions commit to, in order of
+%% inclusion. A transaction this node cannot decode leaves the actual array
+%% unknown, and that is reported as unknown rather than as empty: "the payload has
+%% no blob transactions" and "this node could not read the transactions" are
+%% different claims, and only the first makes the expected array [].
+actual_hashes(Payload) ->
+    case payload_transactions(Payload) of
+        {ok, Transactions} -> actual_hashes_of(Transactions, []);
+        error -> {error, transactions_not_an_array}
+    end.
+
+payload_transactions(Payload) ->
+    case maps:find(<<"transactions">>, Payload) of
+        {ok, null} -> error;
+        {ok, undefined} -> error;
+        {ok, Transactions} when is_list(Transactions) -> {ok, Transactions};
+        {ok, _Other} -> error;
+        error -> error
+    end.
+
+actual_hashes_of([], Acc) -> {ok, lists:reverse(Acc)};
+actual_hashes_of([Item | Rest], Acc) ->
+    case tx_bytes(Item) of
+        {ok, Bytes} ->
+            case eth_tx:from_rlp(Bytes) of
+                {ok, Tx} ->
+                    actual_hashes_of(
+                      Rest, lists:reverse(eth_tx:blob_versioned_hashes(Tx)) ++ Acc);
+                {error, Reason} ->
+                    {error, {undecodable_transaction, Reason}}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% A payload's transactions are DATA of whatever length the transaction is, so this
+%% cannot be data32/1 and is not length-checked against a constant. The hex decode
+%% is eth_block:hex_data/1; the first version used eth_hex:decode/1, which returns
+%% an *integer*, so every real transaction in every real payload failed the
+%% `is_binary' test below and was reported as {bad_transaction, <an integer>}. The
+%% consequence was that actual_hashes/1 could never read a real payload, so
+%% newPayloadV3 answered SYNCING for a payload whose blob hashes disagree with the
+%% consensus layer's -- the exact case the check exists to catch, silently missed
+%% on every payload that carried a transaction.
+%%
+%% Raw bytes are accepted as well, since that is what an in-process caller holds;
+%% `eth_block:payload_data/2' accepts both for the same reason.
+tx_bytes(Item) when is_binary(Item) ->
+    case eth_block:hex_data(Item) of
+        {ok, <<>>} -> {error, empty_transaction};
+        {ok, Bytes} -> {ok, Bytes};
+        error -> {ok, Item}
+    end;
+tx_bytes(Item) -> {error, {bad_transaction, Item}}.
+
+%% ---------------------------------------------------------------------------
 %% Statuses
 %% ---------------------------------------------------------------------------
+%%
+%% One status is version-dependent. From execution-apis src/engine/shanghai.md,
+%% engine_newPayloadV2, Response:
+%%
+%%   "result: PayloadStatusV1, values of the `status' field are restricted in the
+%%    following way: `INVALID_BLOCK_HASH' status value is supplanted by `INVALID'."
+%%
+%% So from V2 onwards a block whose hash does not match its own contents is
+%% reported as INVALID, and INVALID_BLOCK_HASH is reserved for V1. This is not a
+%% cosmetic rename: INVALID_BLOCK_HASH is the status that tells a client "this is
+%% a corrupt payload, not a valid block I chose to reject", and a client that
+%% receives it on a V2 method is reading a value the specification withdrew from
+%% that method.
+-spec status_for_version(binary(), integer()) -> binary().
+status_for_version(?INVALID_BLOCK_HASH, 1) -> ?INVALID_BLOCK_HASH;
+status_for_version(?INVALID_BLOCK_HASH, _Version) -> ?INVALID;
+status_for_version(Status, _Version) -> Status.
 %%
 %% The status strings and which method may return which of them are taken from
 %% the engine API specification (execution-apis, src/engine/paris.md):
@@ -216,65 +727,169 @@ new_payload(Payload) when is_map(Payload) ->
         Pid ->
             try
                 State = gen_server:call(Pid, get_state, infinity),
-                case payload_shape(Payload) of
-                    ok ->
-                        note_parent(State, Payload),
-                        ?SYNCING;
-                    {error, ShapeReason} ->
-                        {?INVALID, ShapeReason}
+                case validate_payload(Payload, State) of
+                    {ok, Block} ->
+                        execute_and_verdict(Block);
+                    {error, Status, Why} ->
+                        {Status, Why}
                 end
             catch
                 Class:Reason:Stack ->
                     logger:warning("etherlang: engine new_payload error ~p:~p~n~p",
                                    [Class, Reason, Stack]),
-                    {?INVALID, {Reason}}
+                    {?INVALID, Reason}
             end
     end;
 new_payload(_Payload) ->
     {?INVALID, payload_not_an_object}.
 
-%% The only thing decidable without a decoder. A payload with no parent hash
-%% cannot be placed on any chain, so no status derived from execution could
-%% describe it; the specification's INVALID cases are about the payload's
-%% contents, and a missing parent hash is a malformed request.
+%% Everything decidable before execution, in the order the specification lists it.
 %%
-%% This deliberately does *not* compare the parent hash against the recorded
-%% head. That used to be the whole of validate_payload/2, and it could only
-%% produce INVALID -- but a payload whose parent is not the head is not invalid,
-%% it is a side branch or a block this node has not imported, and the
-%% specification answers SYNCING to both. So the check could not decide anything
-%% and is not repeated here. The comparison is made in note_parent/2 for the log
-%% only.
-payload_shape(Payload) ->
-    case field(Payload, "parentHash", undefined) of
-        undefined ->
-            {error, missing_parent_hash};
-        Hash ->
-            case data32(Hash) of
-                {ok, _Bytes} -> ok;
-                {error, Why} -> {error, {malformed_parent_hash, Why}}
+%% 1. The payload must decode. A payload that does not is INVALID, and there is
+%%    nothing to execute.
+%% 2. `blockHash' must be the hash of the header the payload's own fields imply.
+%%    The specification requires this "in all cases ... even if this branch or any
+%%    other branches of the block tree are in an active sync process", and it
+%%    comes before execution for the same reason: a payload whose hash does not
+%%    match its own contents is not a block, whatever its state root turns out to
+%%    be. Its own status for this is INVALID_BLOCK_HASH, which is distinct from
+%%    INVALID precisely so a client can tell a corrupt payload from a valid one
+%%    this node rejected.
+%%
+%% The parent hash is deliberately *not* compared against the recorded head as a
+%% gate. A payload whose parent is not the head is not invalid -- it is a side
+%% branch, or a block this node has not imported -- and the specification answers
+%% SYNCING to both. Comparing it could only ever produce a wrong INVALID. It is
+%% logged instead, because a client proposing a block on a different parent is
+%% worth noticing.
+validate_payload(Payload, State) ->
+    case eth_block:from_payload(Payload) of
+        {error, Reason} ->
+            {error, ?INVALID, Reason};
+        {ok, Block} ->
+            case check_block_hash(Payload) of
+                ok ->
+                    note_parent(State, Payload),
+                    {ok, Block};
+                {error, Reason2} ->
+                    {error, ?INVALID_BLOCK_HASH, Reason2}
             end
     end.
 
-%% The recorded head is consulted for the log line only. Until a payload decoder
-%% exists there is nothing to compare a parent hash against that could change a
-%% status, so this is the single place the field is read.
+check_block_hash(Payload) ->
+    case data32(field(Payload, "blockHash", undefined)) of
+        {error, _} ->
+            {error, missing_or_malformed_block_hash};
+        {ok, Declared} ->
+            case eth_block:payload_block_hash(Payload) of
+                {error, Reason} ->
+                    {error, Reason};
+                {ok, Declared} ->
+                    ok;
+                {ok, Computed} ->
+                    {error, {block_hash_mismatch, Declared, Computed}}
+            end
+    end.
+
+%% The recorded head is read for the log line only, for the reason given above:
+%% a parent that is not the head is not a reason to reject a payload.
 note_parent(State, Payload) ->
     Parent = case data32(field(Payload, "parentHash", undefined)) of
         {ok, Bytes} -> Bytes;
         {error, _} -> undefined
     end,
     case {State#st.head, Parent} of
-        {undefined, _} ->
-            ok;
-        {_Head, undefined} ->
-            ok;
-        {Head, Parent} when Head =:= Parent ->
-            ok;
+        {undefined, _} -> ok;
+        {_Head, undefined} -> ok;
+        {Head, Parent} when Head =:= Parent -> ok;
         {Head, Parent} ->
             logger:info("etherlang: engine payload parent ~s is not the recorded head ~s",
                         [fmt(Parent), fmt(Head)])
     end.
+
+%% ---------------------------------------------------------------------------
+%% Execution and the verdict
+%% ---------------------------------------------------------------------------
+%%
+%% eth_block:finalize/1 executes the block and reports each of the three roots as
+%% a `{verified, Root} | {unverified, Reason}' verdict. This maps those onto the
+%% statuses, and the mapping is the whole point: a root this node checked and
+%% found wrong is INVALID, and a root it could not check is SYNCING. Reporting
+%% both as the same thing -- or reporting SYNCING for a mismatch -- would leave a
+%% client unable to tell a block this node has found bad from one it has not
+%% finished looking at.
+%%
+%% The return shape follows the specification's `validationError' rule: a bare
+%% status when there is nothing to report, and `{Status, Reason}' only for the
+%% statuses the specification allows a reason with, which are INVALID and
+%% INVALID_BLOCK_HASH. A reason attached to SYNCING describes this node's
+%% position, not a verdict on the payload, and the specification has no field for
+%% it -- so it is logged here rather than shown to the client as an error for a
+%% block it did nothing wrong.
+%%
+%% Note that finalize/1 commits the post-state, and is not idempotent. That is
+%% correct for this method, which is the one place a payload is meant to be
+%% executed, and it is why nothing else in this module calls it.
+execute_and_verdict(Block) ->
+    status_for_finalize(eth_block:finalize(Block)).
+
+%% The whole mapping from what finalizing produced to what the client is told,
+%% as a pure function of that result.
+%%
+%% It is split out because it is the part with the judgement in it, and the part
+%% that is hardest to reach through the module's public API: every path that
+%% produces a *checked* verdict needs the parent block's state to be held
+%% locally, which is not something a unit test sets up. The other half -- that
+%% finalizing produces these verdicts -- is checked where it happens, in
+%% eth_finalize_tests, against blocks that execute. Between them the path is
+%% covered, and each test says which half it is pinning rather than pretending to
+%% have executed a block.
+status_for_finalize({error, {unknown_parent, _} = Reason}) ->
+    %% The specification's SYNCING: the head references a payload this node does
+    %% not have, so it cannot be validated yet.
+    unsynced(Reason);
+status_for_finalize({error, {invalid_transaction, _Index, _Why} = Reason}) ->
+    %% A block whose body contains an invalid transaction is not a block. Not
+    %% SYNCING: there is nothing to wait for, the answer will not change.
+    {?INVALID, Reason};
+status_for_finalize({error, Reason}) ->
+    {?INVALID, Reason};
+status_for_finalize({ok, _Final, Verification}) ->
+    status_for_verification(Verification).
+
+status_for_verification(Verification) ->
+    case [V || V <- root_verdicts(Verification),
+               eth_block:is_mismatch_verdict(V)] of
+        [First | _] ->
+            %% Checked, and wrong.
+            {?INVALID, First};
+        [] ->
+            case [V || V <- root_verdicts(Verification), not is_checked(V)] of
+                [] ->
+                    ?VALID;
+                Unchecked ->
+                    unsynced({not_verified, Unchecked})
+            end
+    end.
+
+unsynced(Reason) ->
+    logger:info("etherlang: engine new_payload cannot validate yet: ~p", [Reason]),
+    ?SYNCING.
+
+root_verdicts(#{state_root := S, transactions_root := T, receipts_root := R}) ->
+    [S, T, R].
+
+%% A commitment that was not checked, so the block is not known to be valid.
+%%
+%% Only this half of the verdict is matched here, and it is matched on the tag
+%% rather than on a reason: `{verified, _}' vs `{unverified, _}' is the published
+%% shape of a verdict, so it is this module's business. Whether an `unverified'
+%% verdict means *wrong* or *absent* is eth_block's -- its reasons are five
+%% different terms in three shapes, and matching them from here got the state
+%% root's 3-tuple `{mismatch, _, _}' wrong, so a wrong state root was answered
+%% SYNCING. See eth_block:is_mismatch_verdict/1.
+is_checked({verified, _}) -> true;
+is_checked(_) -> false.
 
 %% engine_forkchoiceUpdatedV1(Params) -> Status() | {error, Reason}
 %%
@@ -447,7 +1062,7 @@ exchange_transition_config(_Config) ->
 
 %% The terminal total difficulty was decoded with binary_to_integer/1, which is
 %% base 10, so every real value -- "0xc70d815d562d3cfa955" for mainnet, and the
-%% 2^256-1 sentinel the specification mandates for an undecided value -- raised
+%% sentinel the specification mandates for an undecided value -- raised
 %% badarg and the catch turned it into SECURITY_ERROR. The transition
 %% configuration could therefore never be exchanged for any network. It is a hex
 %% quantity by specification, so it is decoded as one.
@@ -458,13 +1073,29 @@ exchange_transition_config(_Config) ->
 %% from this call, so the staleness was visible to the consensus client.
 %%
 
-%% The specification: in the absence of a TERMINAL_TOTAL_DIFFICULTY value both
-%% layers must use 2^256-1. Quoted from src/engine/paris.md clause 7:
-%% "Considering the absence of the `TERMINAL_TOTAL_DIFFICULTY` value ... Client
-%% software **MUST** use
-%% 1157920892373161954235709850086879078532699846656405640394575840079131296"
+%% The sentinel for an undecided TERMINAL_TOTAL_DIFFICULTY.
+%%
+%% This was 2^256-1 (16#ffff...ff, 64 f's). The specification mandates
+%% 2^256-2^10, which is 1023 smaller, and the comment above it purported to quote
+%% the clause while quoting a *truncated prefix* of the number -- the final
+%% "38912" was missing, so the quoted string was both the wrong value and a
+%% misquotation. The clause is execution-apis src/engine/paris.md item 7, which
+%% reads in full:
+%%
+%%   7. Considering the absence of the `TERMINAL_TOTAL_DIFFICULTY` value (i.e.
+%%      when a value has not been decided), Consensus Layer and Execution Layer
+%%      client software **MUST** use
+%%      `115792089237316195423570985008687907853269984665640564039457584007913129638912`
+%%      value (equal to `2**256-2**10`) for the `terminalTotalDifficulty` input
+%%      parameter of this call.
+%%
+%% The CL compares this value to decide the fork is undecided, so a node that
+%% reports 2^256-1 here disagrees with the CL about a consensus parameter and the
+%% two can reach different conclusions about when the Merge happened. It is
+%% written as 2^256-1024 rather than as the literal decimal so the intent is
+%% checkable by reading it, and eth_engine_tests pins the exact decimal string.
 -define(NO_TERMINAL_TOTAL_DIFFICULTY,
-        16#ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff).
+        ((1 bsl 256) - 1024)).
 
 terminal_total_difficulty(State) ->
     case State#st.terminal_total_difficulty of

@@ -115,6 +115,74 @@ fork_selection_sepolia_test() ->
     ?assertEqual(amsterdam, fork(sepolia, 11779968, 1791294816)).
 
 %% ---------------------------------------------------------------------------
+%% Fork time frames: the `-38005: Unsupported fork' input
+%% ---------------------------------------------------------------------------
+
+%% The engine API's versioned methods are gated on the payload's timestamp
+%% falling in the time frame of the fork that method serves. Cancun's frame on
+%% mainnet is [1710338135, 1746612311): half open, so the Prague activation
+%% instant belongs to Prague. A closed upper bound would accept a Prague payload
+%% on newPayloadV3 and a Cancun payload on newPayloadV4 at the same timestamp.
+cancun_frame_on_mainnet_is_half_open_test() ->
+    F = fun eth_fork_schedule:timestamp_in_frame/3,
+    ?assertEqual(false, F(mainnet, cancun, 1710338134)),
+    ?assertEqual(true,  F(mainnet, cancun, 1710338135)),
+    ?assertEqual(true,  F(mainnet, cancun, 1746612310)),
+    ?assertEqual(false, F(mainnet, cancun, 1746612311)),
+    ?assertEqual(false, F(mainnet, cancun, 1900000000)).
+
+%% Both neighbours must agree at the boundary, or one method's frame overlaps the
+%% other's and a timestamp is valid for two forks at once.
+neighbouring_frames_do_not_overlap_test() ->
+    F = fun eth_fork_schedule:timestamp_in_frame/3,
+    %% The Prague activation instant is not Cancun's and is Prague's.
+    ?assertEqual(false, F(mainnet, cancun, 1746612311)),
+    ?assertEqual(true,  F(mainnet, prague, 1746612311)),
+    %% One second earlier is still Cancun and not Prague.
+    ?assertEqual(true,  F(mainnet, cancun, 1746612310)),
+    ?assertEqual(false, F(mainnet, prague, 1746612310)),
+    %% The same at the Osaka boundary.
+    ?assertEqual(false, F(mainnet, prague, 1764798551)),
+    ?assertEqual(true,  F(mainnet, osaka, 1764798551)),
+    %% The last timestamped fork has no successor, so its frame runs to the end of
+    %% time rather than being empty.
+    ?assertEqual(true, F(sepolia, amsterdam, 1791294816)),
+    ?assertEqual(true, F(sepolia, amsterdam, 99999999999)).
+
+%% A fork this network does not timestamp has no frame. Reporting "out of frame"
+%% for it would refuse every payload on a network that predates the fork, which
+%% is the opposite of what a CL needs: a pre-Cancun CL calling V1 is fine, and
+%% the node must not answer it -38005.
+a_fork_the_network_does_not_timestamp_has_no_frame_test() ->
+    F = fun eth_fork_schedule:timestamp_in_frame/3,
+    ?assertEqual(false, F(sepolia, cancun, 1706655071)),
+    %% Cancun *is* timestamped on mainnet, so this is the same question with the
+    %% other answer -- the check reads the network's schedule, not a constant.
+    ?assertEqual(true, F(mainnet, cancun, 1710338135)),
+    %% Block-activated forks have no time frame at all.
+    ?assertEqual(false, F(mainnet, berlin, 1000000000)),
+    %% An unknown network has no schedule, hence no frames.
+    ?assertEqual(false, F(nonesuch, cancun, 1710338135)).
+
+%% The frame must be derived from the schedule current_fork/4 reads, not a second
+%% table. If these two ever disagree, a payload can be both "in the Cancun frame"
+%% and "not Cancun", and the node would answer -38005 to a block it would
+%% otherwise execute under Cancun rules.
+frame_agrees_with_current_fork_test() ->
+    Schedule = eth_fork_schedule:fork_schedule(mainnet),
+    Timestamped = [F || {time, _, F} <- Schedule],
+    Timestamps = [0, 1681338454, 1681338455, 1710338135, 1746612310, 1746612311,
+                  1764798551, 1799999999],
+    [begin
+         {ok, Fork} = eth_fork_schedule:current_fork(mainnet, 19000000, T),
+         InAnyFrame = lists:any(
+                        fun(F) -> eth_fork_schedule:timestamp_in_frame(mainnet, F, T)
+                        end, Timestamped),
+         ?assertEqual(InAnyFrame,
+                      eth_fork_schedule:timestamp_in_frame(mainnet, Fork, T))
+     end || T <- Timestamps].
+
+%% ---------------------------------------------------------------------------
 %% EIP-3675: the Merge is gated on total difficulty
 %% ---------------------------------------------------------------------------
 

@@ -66,8 +66,8 @@ beacon, validators, or block production).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**418 tests, green**).
-* **Status** — v0.7.0; eunit green (418 tests) and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**500 tests, green**).
+* **Status** — v0.7.0; eunit green (500 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -168,27 +168,57 @@ This is the full plan to make etherlang a **production-grade, consensus-layer-co
 
 ### Phase 1: Engine API — Consensus Layer Interface (partial)
 
-The Engine API (EIP-3675 / Cancun) is what lets a consensus client (Lighthouse, Prysm, etc.) delegate block execution to etherlang. All four V1 methods are served over real HTTP, with the response shapes the specification defines and a JWT check on every request. What they cannot do is validate a payload, and without a payload decoder they no longer imply that they can.
+The Engine API (EIP-3675 / Cancun) is what lets a consensus client (Lighthouse, Prysm, etc.) delegate block execution to etherlang. Ten methods are served over real HTTP with the response shapes the specification defines and a JWT check on every request: the V1, V2 and V3 variants of `newPayload`, `forkchoiceUpdated` and `getPayload`, plus `exchangeTransitionConfigurationV1`. `newPayload` decodes the payload, checks its `blockHash`, executes it, and maps the verdict — and in practice answers **`SYNCING`**, because this node holds no state for an arbitrary payload's parent.
+
+The V2/V3 methods were the difference between a node a consensus client can drive and one it cannot. Until this pass the node answered `-32601 method not found` to `engine_forkchoiceUpdatedV3` and `engine_getPayloadV3`, which is what a post-Merge Lighthouse calls on every slot; a CL could not get a single answer out of it. They are now routed, and each version's differences are implemented separately because the versions differ along four independent axes — the parameter check, the structure the payload must carry, the statuses the response may carry, and the shape of the result. Getting the four right is most of the work; see the item below.
 
 This section previously said the phase was complete and passing all tests, and that the declared state root was compared against the recomputed one. All three were false: there was no test file for the engine at all, and the root checks — real and tested — live in `eth_block:finalize/1`, which the engine never called. This is the node's only interface to the consensus layer, so it is worth being exact.
 
 - [ ] **Engine API server** — `engine_newPayloadV1`, `engine_forkchoiceUpdatedV1`, `engine_getPayloadV1`, `engine_exchangeTransitionConfigurationV1` (`eth_engine`)
-  - `engine_newPayloadV1` checks only that `parentHash` is present and is 32 bytes of DATA, then answers **`SYNCING`** — the specification's status for a payload whose requisite data for acceptance or validation is missing, which is this node exactly. It does not decode the header, execute the transactions, or check the state root, the transactions root, the receipts root, `gasUsed`, the blob-gas fields, or that `blockHash` is `Keccak256(RLP(header))`
+  - `engine_newPayloadV1` **decodes** the payload (`eth_block:from_payload/1`), checks `blockHash` against the header the payload's own fields imply, calls `eth_block:finalize/1`, and maps the resulting verdicts. It answers `INVALID_BLOCK_HASH` for a payload whose `blockHash` is not `Keccak256(RLP(header))`, `INVALID` for a payload that will not decode or whose transactions `eth_tx:validate/1` rejects, and **`SYNCING`** for a well-formed payload whose parent state this node does not hold — which, for an arbitrary payload, is always
+  - That `SYNCING` is the specification's status for a payload whose "requisite data for the payload's acceptance or validation is missing", and it is the honest answer rather than a fallback. The three commitments *are* checked where they can be: a block whose parent's state is not held still gets its transactions root verified, because that root covers only the block's own transaction list
   - It does not answer `ACCEPTED` either, which is a deliberate change. `ACCEPTED` is in the enum and so looks like the right answer for a received-but-unvalidated payload, but the specification makes it a claim with preconditions — non-empty transactions, a valid `blockHash`, a non-canonical payload, known and well-formed ancestors. None is checked here, so `ACCEPTED` is as unsupported as `VALID`
   - `engine_forkchoiceUpdatedV1` records the client's `headBlockHash`, `safeBlockHash` and `finalizedBlockHash`, and answers **`SYNCING`** for any head it has not itself validated. Per the specification that method's `VALID` *is* the verdict on executing the block, so the previous unconditional `VALID` was the claim this node actually made: a block reported valid without executing it, decoding it, or checking one of its three roots. `VALID` is still returned for the one case with nothing to judge — no head claimed and no payload to build on
+  - It does **not** compare `parentHash` against the head, deliberately. A payload whose parent is not the head is not invalid — it is a side branch, or a block this node has not imported — and the specification answers `SYNCING` to both, so the comparison could only ever produce a wrong `INVALID`. It survives as a log line in `note_parent/2`
   - Ancestry, existence and checkpoint checks against the local chain are **not** performed; the hashes are recorded as the block hashes the specification defines them to be, which is what they used to lose by being resolved to block numbers
   - `engine_getPayloadV1` takes the specification's `payloadId` and answers `-38001 Unknown payload` for all of them, because the builder that would issue one (`eth_block_builder`) is not started (see Phase 3). It used to take no argument and return the last payload the client had itself submitted — not a block this node built, and not necessarily one it believes is valid, which is a block a consensus client would have broadcast
   - `engine_exchangeTransitionConfigurationV1` returns the `TransitionConfigurationV1` object, which is the entire purpose of the method. It used to return a bare `VALID`, so the client received no configuration from the one call that exists to hand it over
-  - `eth_engine` never calls `eth_block`, `eth_mpt` or `eth_tx` and never compares a root. That was checked by grep rather than assumed
-  - **Missing methods**: no V2/V3 variants, which Cancun and Prague both require and a Lighthouse client on either fork will call; no `engine_getPayloadBodiesByHashV1` or `engine_getPayloadBodiesByRangeV1`, which Lighthouse requires; no `engine_notifyHeaders`; no `payloadAttributes` handling, so the node can never return a `payloadId` and cannot author a block at all
+  - The sentinel for an undecided `TERMINAL_TOTAL_DIFFICULTY` is `2^256-2^10` (`115792089237316195423570985008687907853269984665640564039457584007913129638912`), per `src/engine/paris.md` item 7. **This was `2^256-1`, 1023 higher, and the comment above it purported to quote the clause while quoting a truncated prefix of the number** — the final `38912` was missing, so the quoted string was both the wrong value and a misquotation. Both layers compare this number, so a node reporting a different one fails every transition-configuration exchange against a client that read the specification
+  - `eth_engine` calls `eth_block` and `eth_tx` and compares roots. It does not call `eth_mpt` directly, and that is by design: the state comes from `eth_block:finalize/1`, which is the only code allowed to switch `eth_state` to the local trie
+  - **V2/V3 variants are served**, and each version's differences are implemented rather than assumed. They were the single largest compatibility gap in this node:
+    - **The structure gate.** Shanghai's clause (`src/engine/shanghai.md`) makes `newPayloadV2`'s required structure a *function of the payload's timestamp* — V1's structure below the Shanghai activation, V2's at or above it — and Cancun's (`src/engine/cancun.md` item 1) requires the parameters to "strictly match the expected one", with `null` counting as not provided. "Strictly" is implemented as an *exact key set*, not a containment check: `ExecutionPayloadV3` is a superset of V2, so a presence-only test would admit a Prague payload to a V2 method — a node that cannot execute Prague rules agreeing to process one
+    - **The fork gate.** `-38005: Unsupported fork` when a timestamp is outside the fork the method serves, which needs the fork's time frame. That is new in `eth_fork_schedule`: `timestamp_in_frame/3` and `timestamp_frame/2`, derived from the same schedule `current_fork/4` reads so the two cannot disagree, half-open at the upper bound so the fork that supersedes one owns its own activation instant
+    - **V1 has no structure gate, deliberately.** `paris.md` never mentions `-32602`; that clause arrives with V2. Applying it to V1 would refuse a Cancun payload on a method whose specification has no clause to produce that error. The first version of this work *did* apply it, and the existing V1 tests caught it
+    - **`payloadAttributes` has its own version line**, and it is not the payload's. `PayloadAttributesV3` is V2 plus `parentBeaconBlockRoot`, not plus the blob gas fields, so the attribute keys are a separate table from the payload keys. Reusing one table checks for the wrong keys twice over
+    - **Two different codes, deliberately.** A malformed attributes object is `-38003 Invalid payload attributes`; a well-formed one aimed at the wrong fork is `-38005`. Collapsing them leaves a client unable to tell "wrong shape" from "right shape, wrong time", and only the second is retryable on a different method
+    - **`INVALID_BLOCK_HASH` is supplanted by `INVALID` from V2 on**, per `shanghai.md`, so a V2/V3 response can never carry a value the specification withdrew from that method
+    - **`getPayload`'s result changes shape with the version**: V1 an `ExecutionPayloadV1`, V2 `{executionPayload, blockValue}`, V3 adds `blobsBundle` and `shouldOverrideBuilder`. Returning V1's bare payload from a V2 method is not a shape the client can read
+    - **Blob versioned hashes are checked on `newPayloadV3`**, before the state-dependent path and independently of it, because `cancun.md` item 3 requires the check "in all cases even during active sync process". A mismatch is an `INVALID` *status*, not an error code: the payload is well formed and the contents are wrong. An actual array this node cannot compute is reported `unchecked` and deliberately *not* treated as `[]` — "the payload has no blob transactions" and "this node could not read the transactions" are different claims, and conflating them would report `INVALID` against a payload whose blobs are fine
+  - **Still missing, with the specific reason for each**:
+    - `engine_getPayloadBodiesByHashV1` / `engine_getPayloadBodiesByRangeV1` — **not implemented, and the blocker is data, not code.** `ExecutionPayloadBodyV1` requires each transaction as its EIP-2718 wire bytes. This node's `eth_chain` stores the `eth_getBlockByNumber` response verbatim (`eth_sync:fetch_block/2`), whose `transactions` are *decoded* RPC objects; the raw bytes are never retained, and re-encoding a decoded object is not a substitute — the RPC object has no `blobVersionedHashes` field at all, so a type-3 transaction cannot be reconstructed from it. Serving these methods needs `eth_getRawTransactionByHash` per transaction at sync time and storage of the result. An implementation that projected the stored maps would return `null` for every block, and one that matched `#block{}` records would never match anything, since nothing on the read path ever builds a record (`eth_block:from_json/1` has no caller in `src/`)
+    - `engine_notifyHeaders` — not implemented. The clause does not appear in any of the specification's per-fork files; only the V2 `getPayloadBodiesBy*` methods are found under those names, so the method's shape would have to be guessed
+    - `payloadAttributes` is now **validated** but not **acted on**: the `-38003` and `-38005` checks run, and no `payloadId` is ever issued, so the node still cannot author a block. `eth_block_builder` is not started (see Phase 3)
 - [x] **Engine API HTTP endpoint** — `eth_engine_handler.erl` serves `POST /engine` on port 8551, reads its arguments positionally as the specification defines them, and shapes every response as the specification does
 - [x] **Engine API authentication** — `eth_jwt` implements HS256 against `src/engine/authentication.md`: `alg: none` rejected, `iat` required and bounded to ±60 seconds, unrecognized claims ignored, a hex-encoded 256-bit secret read from `DATA_DIR/jwt.hex` and generated on first start. A node with no secret refuses the port rather than serving it open
-- [x] **Engine API test coverage** — `eth_engine_tests.erl`, 38 tests: the status each method may honestly return, the key and hex forms a real request carries, the state actually being kept, the response shapes, the authentication rules, and the HTTP surface end to end through a real listener
-- [ ] **Payload validation** — the root checks exist in `eth_block:finalize/1` and the engine does not use them:
-  - The declared state root is compared against the root recomputed after execution (Phase 4), and the receipts and transactions roots against the ones derived from the block's own body (Phase 5) — real, and in `eth_block:finalize/1`
+- [x] **Engine API test coverage** — `eth_engine_tests.erl`, 78 tests: the status each method may honestly return, the key and hex forms a real request carries, the state actually being kept, the response shapes, the authentication rules, and the HTTP surface end to end through a real listener. Rewritten against real payload fixtures rather than a hand-rolled mock map (was 38)
+- [x] **Payload validation** — the engine is now wired to the verification that already existed:
+  - The declared state root is compared against the root recomputed after execution (Phase 4), and the receipts and transactions roots against the ones derived from the block's own body (Phase 5) — in `eth_block:finalize/1`, now reached from `eth_engine`
   - All three are reported as `{verified, Root} | {unverified, Reason}` verdicts in the `Verification` map. None of them is reported as a bare root: a recomputed value under a key named after a header field is indistinguishable from a confirmed one, and that is how a wrong receipts root passed unchecked until Phase 5
-  - A block whose parent's state this node does not hold locally still gets its transactions root checked, since that root covers only the block's own transaction list. Its receipts root is reported `{unverified, not_executed}`
-  - **But `eth_engine` never calls `finalize/1`**, and no payload-to-`#block{}` decoder exists, so none of this is reachable from the engine's entry point. The verification is implemented; the engine is not wired to it
+  - A checked-and-wrong root is `INVALID`; an *unchecked* root is `SYNCING`. A mismatch outranks an unchecked root, so a payload that is wrong in any way this node can decide is never reported as merely syncing
+  - The return shape follows the specification's `validationError` rule: a bare status binary for `VALID`/`SYNCING`, and `{Status, Reason}` only for `INVALID` and `INVALID_BLOCK_HASH`. A reason on `SYNCING` is logged, never returned to the client
+  - The mapping lives in `status_for_finalize/1` and `status_for_verification/1`, exported and pure, so it is tested against the `finalize/1` results directly rather than only through a path that needs the parent block's state held locally
+  - **Still not done**: this node holds no prestate for an arbitrary payload's parent, so the state root and receipts root come back `{unverified, …}` in practice and the answer is `SYNCING`. The plumbing is real; the state is not there. Snap sync (Phase 4) is what would change that
+- [x] **Payload decoding** — `eth_block:from_payload/1` and `eth_block:payload_block_hash/1`, with the contract stated rather than assumed:
+  - The V1 field set is **required**; only V2/V3 additions are optional. A missing required field is `{error, {missing_field, Key}}` and is never defaulted, because a defaulted field would be hashed into a block hash this node then certified
+  - The post-Merge header is 16/17/20 fields (Paris / Shanghai / Cancun). `parentBeaconBlockRoot` **is** a header field (EIP-4788, checked against the EIP text); `requestsHash` is not
+  - `from_payload/1` assumes post-Merge (difficulty 0, 8-byte nonce). A pre-Merge block cannot be expressed as a payload, so there is no fallback path to write
+  - The transactions root is computed from the payload's **wire bytes**, not by re-encoding decoded transactions. The decoder separately verifies that each transaction re-encodes exactly, returning `{error, {transaction_not_re_encodable, Index}}` if not
+  - The transactions root and the withdrawals root are recomputed from the payload's own lists for the `blockHash` check, so the hash is tied to the body rather than to the header fields alone
+  - An unparseable quantity is `{error, {bad_quantity, Key}}`, never 0
+- [x] **Two header-construction constants were wrong** — both found by building the header RLP independently in Python and diffing it byte-for-byte against the Erlang output, and both now pinned by tests asserting the real block hashes of three Sepolia blocks (Paris 1450507, Shanghai 3001655, Cancun 6985356):
+  - `eth_block:new/2` used `?EMPTY_ROOT` (`56e81f…`, the empty **trie** root) for `sha3Uncles`. It must be `Keccak256(RLP([]))` = `1dcc4de8…`. Both constants live in the same module and one had been standing in for the other
+  - `eth_block:new/2` set the nonce to `<<0:192>>` — 192 **bits**, 24 bytes, where the nonce is 8. RLP prefixes strings by length, so every header it built was 16 bytes too long. `from_json/1` had the same default
+  - Both were live in `eth_block:new/2`, the constructor the builder and the block tests use. They did not affect `newPayload` validation, which decodes rather than constructs — which is why three real block hashes, and not a unit test of the constructor, is what caught them
 - [x] **Transition configuration** — the configuration is parsed as what the specification says it is (a hex `QUANTITY`, decoded as hex) and returned to the client. An absent total difficulty is reported as `2^256-1`, the value the specification mandates for an undecided one. It was decoded as base 10, so every real value raised `badarg` and became `SECURITY_ERROR`; no network with a non-trivial terminal total difficulty could exchange its configuration at all. `TERMINAL_TOTAL_DIFFICULTY` is also *interpreted*: fork selection activates Paris at it (see EIP-3675 in Phase 5). `TERMINAL_BLOCK_HASH` is still only passed through.
 - [x] **Engine API server startup** — `eth_rpc_server` starts a separate cowboy listener on port 8551, and `eth_engine` is a supervised child started before it. `eth_engine` was declared in `etherlang.app.src`'s `registered` list — which asserts a process is running — but nothing started it, so every engine method in a real node was answering from a gen_server that did not exist
 
@@ -201,6 +231,8 @@ This section previously said the phase was complete and passing all tests, and t
 - **The handler could not match its own module**: two handlers matched the *strings* `"VALID"`/`"SYNCING"` against *binary* return values, so neither matched a clause and both raised `case_clause`
 - **Every method read the wrong parameter shape.** All four take their arguments positionally as `params[n]`; three read them as named-key objects, so every well-formed request was answered `invalid params`. That is why the engine could be visibly broken without a payload decoder being the cause: it never got as far as needing one
 - **Responses were not the specification's shapes**, and **the port was unauthenticated**
+
+**What was added after that pass.** `eth_engine` now calls `eth_block:finalize/1` and maps its verdicts, and `eth_block:from_payload/1` decodes a payload into a `#block{}`, so there is finally a path from the engine's JSON to code that can verify it. `eth_engine_tests` was rewritten against real fixtures: **78 tests, up from 50.** The chain is `newPayload` → `validate_payload/2` → `check_block_hash/1` → `status_for_finalize/1` → `status_for_verification/1`, and the last two are exported and pure precisely so the verdict mapping can be tested without holding a parent state.
 
 ### Phase 2: Full State Trie — Replace Bounded Snap Store ✅ COMPLETE
 
@@ -478,8 +510,9 @@ Where the work actually stands:
 | Change | State |
 |---|---|
 | Bounded DETS snap store → full MPT state trie | done |
-| Engine API server for CL communication | **served, authenticated, tested, and unable to validate** — all four V1 methods answer with the specification's response shapes and a JWT is required, but `newPayload` checks only `parentHash` and answers `SYNCING`, `forkchoiceUpdated` answers `SYNCING` for any head this node has not itself validated, and `getPayload` reports every `payloadId` unknown because the builder is not started. No `payloadAttributes` handling, so the node cannot author a block. No V2/V3, no `getPayloadBodiesBy*`, no `notifyHeaders` |
-| Engine API test coverage | 36 tests in `eth_engine_tests.erl`; there were none before, and `newPayload` crashed on every payload while the documentation reported it as passing |
+| Engine API server for CL communication | **served, authenticated, and wired to real validation** — ten methods (V1/V2/V3 of `newPayload`, `forkchoiceUpdated`, `getPayload`, plus `exchangeTransitionConfigurationV1`) answer with the specification's response shapes and a JWT is required. V2/V3 exist because a post-Merge consensus client calls `forkchoiceUpdatedV3` and `getPayloadV3` on every slot, and this node was answering `-32601 method not found` to both. `newPayload` decodes the payload, checks `blockHash`, executes it and maps the verdicts: `INVALID_BLOCK_HASH` for a payload that contradicts its own header, `INVALID` for one that will not decode or whose transactions `eth_tx:validate/1` rejects, `SYNCING` for a well-formed payload whose parent state this node does not hold — which, for an arbitrary payload, is always. `forkchoiceUpdated` answers `SYNCING` for any head this node has not itself validated, and `getPayload` reports every `payloadId` unknown because the builder is not started. `payloadAttributes` is validated (`-38003`/`-38005`) but not acted on, so the node cannot author a block and never issues a `payloadId`. No `getPayloadBodiesBy*` (blocked on raw transaction bytes, which the chain store does not retain) and no `notifyHeaders` (no specification text found) |
+| **Specification conformance** | **Nothing here has been checked against the execution-spec tests (EEST) or `eips.ethereum.org` at scale.** `grep -rn 'execution-specs\|eips.ethereum\|EELS' apps/etherlang` returns nothing. Every specification claim in this file was checked against the *text* of the `execution-apis` repository's per-fork files and against the EIP text, by reading it, and the field sets, error codes and version rules are pinned by unit tests — but no fixture from the conformance suite has been run, so "conforms to the Engine API specification" is not a claim this project can make. The unwired per-fork gas table (Phase 5) is a precondition for any such result: a node executing Cancun rules with a flat schedule diverges on the state root however correctly the API surface answers |
+| Engine API test coverage | 78 tests in `eth_engine_tests.erl`, plus 23 in `eth_block_payload_tests.erl` against real Sepolia payloads. There were **none** before, and `newPayload` crashed on every payload while the documentation reported it as passing. This row said 36 while the Phase 1 item above it said 38, and the file had 38 test functions — a stale number that was never re-derived |
 | RPC method coverage | 20 methods dispatched. `eth_estimateGas`, `eth_feeHistory`, `eth_getTransactionByHash`, `eth_maxPriorityFeePerGas`, `eth_createAccessList`, `eth_getBlockReceipts`, `eth_getProof` and `eth_accounts` are absent entirely |
 | Block execution: receipts, logs, bloom, state root, EIP-4788, EIP-4895, EIP-2935 | done, and the two system-contract EIPs verified against live Sepolia data |
 | Block authoring (proposer duties) | **not done** — the node builds and executes blocks but is never selected to author one |
@@ -708,7 +741,8 @@ compat), receipts store + filters, txpool (validation/ordering/gossip/RPC),
 peer-first sync with verified
 bodies/receipts, snap state heal, shift/dispatch EVM regressions, and the
 local `eth_call`
-override path — **418 tests, all green**.
+override path — **467 tests, all green** (418 at `d623f6a`, measured in a clean
+worktree, not copied from this file).
 
 ```bash
 make docker-test        # builds a test image and runs `rebar3 eunit`
@@ -723,6 +757,43 @@ pid-scoped. If a run ever goes red, `rm -rf /tmp/etherlang_test_*` isolates
 stale-state contamination before blaming the code. Live behaviour is covered
 separately by `tools/live_sepolia_smoke_test.sh` (read-only, needs a running
 node) and the foundry/hardhat harnesses above.
+
+Flake note (closed, a different bug): `eth_sync_tests_peer` also failed
+intermittently with `eaddrinuse`, and EUnit reported it as a **cancelled** test
+with no failure and no assertion — which reads like the runner gave up and is
+not that. `eth_test_util:free_port/0` listens on port 0, reads back the number
+the OS chose, and closes the socket, so between the close and the caller's own
+bind the number is unowned. That test needs *two* binds on the one number (a
+UDP discv4 socket and a TCP peer listener — legal, different protocols) drawn
+from a `free_port/0` call, and a full suite binds dozens of listeners, so the
+window was being lost.
+
+The port has to stay a number — discv4 and the peer listener both advertise it
+in an enode URL — so the socket cannot simply be held open across the handover.
+`eth_test_util:with_port/1` closes the gap by retrying: draw a fresh port, let
+the caller bind, and on a lost bind draw another, bounded at five attempts so a
+port that is never free produces `{port_exhausted, …}` rather than a hang.
+
+**The retry was dead when first written, and the second half of the bug is the
+interesting one.** `gen_tcp:listen/2` and `gen_udp:open/2` do not raise — they
+return `{error, eaddrinuse}`; `eth_discv4`/`eth_peer`/`eth_rpc_server` turn that
+into `{stop, eaddrinuse}` from `init/1`, which `gen_server:start_link/3` reports
+as `{error, eaddrinuse}`; and every caller writes `{ok, _} =
+Mod:start_link(...)`. What actually reached the helper's `catch` was therefore
+
+```erlang
+error:{badmatch, {error, eaddrinuse}}
+```
+
+A matcher written for a bare `eaddrinuse` does not recognise that term, so the
+first collision re-raised and the retry never ran — a "flaky" test that was in
+fact a dead code path. The fix is the `{badmatch, …}` clause, and it is pinned
+by `eth_test_util_tests`, which produces the failure from a **real bind on a
+real occupied port** rather than by raising a term that looks like one. An
+earlier version of that test raised a literal `{badmatch, {error, eaddrinuse}}`
+and passed against the broken matcher, because the *shape* the matcher was
+written against and the shape that arrives are the same shape — until they
+were not. 7 tests, and the suite is green on three consecutive full runs.
 
 ## Benchmarking (`eth_call`)
 

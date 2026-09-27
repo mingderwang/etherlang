@@ -21,7 +21,15 @@
           add_transaction/2,
           declare_state_root/2,
           finalize/1,
+          %% Exported because the reason vocabulary of an `unverified' verdict is
+          %% this module's private vocabulary, and eth_engine has to decide
+          %% whether a verdict means "checked, and wrong" or "could not check".
+          %% See is_mismatch_verdict/1 for why that decision cannot be made by
+          %% pattern-matching those reasons from outside.
+          is_mismatch_verdict/1,
           from_json/1,
+          from_payload/1,
+          payload_block_hash/1,
           to_json/1,
           tx_root/1,
           receipts_root/1,
@@ -36,7 +44,17 @@
           %% rather than a test convenience.
           receipts/1,
           logs/1,
-          fork/1 ]).
+          fork/1,
+          %% Exported because hex DATA -> bytes is not a block concern, and
+          %% eth_hex:decode/1 cannot do it: it decodes to an *integer*, which is
+          %% the right answer for a QUANTITY and never a 32-byte binary or a
+          %% transaction. So a caller outside this module that needs the bytes of
+          %% a DATA value has to write its own decoder, and eth_engine wrote two.
+          %% Both were wrong in the same way -- they used eth_hex:decode/1 and so
+          %% could never produce the bytes they were testing for, which made
+          %% newPayloadV3 report every real transaction as unreadable and answer
+          %% SYNCING where it should have answered INVALID.
+          hex_data/1 ]).
 
 -include_lib("etherlang/include/eth_block.hrl").
 
@@ -46,6 +64,23 @@
                        16#ff, 16#83, 16#45, 16#e6, 16#92, 16#c0, 16#f8, 16#6e,
                        16#5b, 16#48, 16#e0, 16#1b, 16#99, 16#6c, 16#ad, 16#c0,
                        16#01, 16#62, 16#2f, 16#b5, 16#e3, 16#63, 16#b4, 16#21>>).
+
+%% Keccak256(RLP([])) -- the hash of an empty ommers list, which every
+%% post-Merge block carries in its `sha3Uncles' field because the ommers list is
+%% always empty after the Merge.
+%%
+%% This was ?EMPTY_ROOT, which is Keccak256(RLP(<<>>)) -- the *empty trie* root --
+%% so every block this node built carried the trie root in its ommers field, and
+%% every block hash it computed was wrong. The two constants differ in all 32
+%% bytes, which is what makes this the kind of mistake that survives: the value
+%% looks exactly like a hash, is the right length, and is a perfectly good root of
+%% something. It was found by decoding a real Paris block and asking why the
+%% header it produced did not hash to the hash 6.5 million blocks ago.
+-define(EMPTY_UNCLE_HASH, <<16#1d, 16#cc, 16#4d, 16#e8, 16#de, 16#c7, 16#5d,
+                            16#7a, 16#ab, 16#85, 16#b5, 16#67, 16#b6, 16#cc,
+                            16#d4, 16#1a, 16#d3, 16#12, 16#45, 16#1b, 16#94,
+                            16#8a, 16#74, 16#13, 16#f0, 16#a1, 16#42, 16#fd,
+                            16#40, 16#d4, 16#93, 16#47>>).
 
 %% ---------------------------------------------------------------------------
 %% Block construction
@@ -74,9 +109,16 @@ new(ParentHash, Number) ->
         withdrawals_root = ?EMPTY_ROOT,
         parent_beacon_block_root = undefined,
         extra_data = <<>>,
-        nonce = <<0:192>>,
+        %% 8 bytes. This was <<0:192>>, which is 192 *bits* -- 24 bytes -- and
+        %% the nonce is 8. RLP prefixes a string by its length, so a 24-byte
+        %% nonce makes the header 16 bytes longer than the header the network
+        %% hashed, and every block hash this node computes is wrong. Found by
+        %% decoding a real post-Merge block and asking why a header that decoded
+        %% field for field to the block's own values did not hash to the block's
+        %% own hash.
+        nonce = <<0:64>>,
         mix_hash = <<0:256>>,
-        sha3_uncles = ?EMPTY_ROOT
+        sha3_uncles = ?EMPTY_UNCLE_HASH
     }.
 
 %% new/3 attaches a base fee, which new/2 cannot know on its own.
@@ -415,6 +457,41 @@ check_commitment(Which, Declared, Computed) when is_binary(Declared) ->
 check_commitment(Which, _Declared, _Computed) ->
     {unverified, {invalid_declared, Which}}.
 
+%% Does this verdict mean "checked, and the value is wrong", as opposed to
+%% "could not be checked"?
+%%
+%% It has to be asked here rather than by the caller, because the two verdicts are
+%% not distinguishable from the `unverified' tag alone -- both are
+%% `{unverified, Reason}' -- and the reasons are not one shape. There are five,
+%% and they were written at three different places in this module:
+%%
+%%   {unverified, state_not_local}              -- checked nothing (finalize/1)
+%%   {unverified, not_executed}                 -- checked nothing (finalize/1)
+%%   {unverified, {commit_failed, _}}           -- checked nothing (commit path)
+%%   {unverified, {mismatch, Declared, Computed}}          -- WRONG (3-tuple)
+%%   {unverified, {mismatch, Which, Decl, Comp}}          -- WRONG (4-tuple)
+%%   {unverified, invalid_declared_root}                  -- WRONG (bare atom)
+%%   {unverified, {invalid_declared, Which}}              -- WRONG (2-tuple)
+%%
+%% The state root's mismatch is a 3-tuple while the content roots' is a 4-tuple,
+%% because check_state_root/2 predates check_commitment/3 and neither was changed
+%% to match the other. eth_engine pattern-matched only the 4-tuple and the
+%% `{invalid_declared, _}' pair, so a payload declaring a wrong *state root* -- the
+%% commitment the node is most entitled to have an opinion about -- fell through
+%% to the unchecked branch and was answered SYNCING. That is the specific
+%% inversion this function exists to make impossible: a client told SYNCING for a
+%% block this node had already found bad will keep retrying it forever.
+%%
+%% A new `{unverified, ...}' reason must be added here explicitly. Silence means
+%% SYNCING, which is the safe direction to fail in -- but a wrong value reported
+%% as unchecked is still a wrong answer.
+is_mismatch_verdict({unverified, {mismatch, _, _}}) -> true;
+is_mismatch_verdict({unverified, {mismatch, _, _, _}}) -> true;
+is_mismatch_verdict({unverified, invalid_declared_root}) -> true;
+is_mismatch_verdict({unverified, {invalid_declared, _}}) -> true;
+is_mismatch_verdict({unverified, _}) -> false;
+is_mismatch_verdict(_) -> false.
+
 %% Recompute the content-derived commitments. The block's own state_root field is
 %% left alone here; it is only set by commitments/2, and only once a root has
 %% been justified.
@@ -715,6 +792,408 @@ make_receipt(Tx, Result, GasUsed, Cumulative, Logs, Index) ->
         <<"transactionHash">> => maps:get(<<"hash">>, Tx, <<>>),
         <<"transactionIndex">> => Index
     }.
+
+%% ---------------------------------------------------------------------------
+%% Engine API payloads
+%% ---------------------------------------------------------------------------
+%%
+%% from_json/1 above decodes a JSON-RPC *block*, which is a different object from
+%% an ExecutionPayload. The payload names the height `blockNumber', the fee
+%% recipient `feeRecipient' and the mix hash `prevRandao', and it carries its
+%% transactions as wire bytes rather than as decoded objects. It also carries no
+%% nonce, no sha3Uncles and no difficulty, because after the Merge the first two
+%% are fixed constants and the third is zero -- so those come from new/2, where
+%% they are the right values rather than placeholders.
+%%
+%% Unlike from_json/1 this does not default a missing field to something
+%% plausible. A payload is a complete object: a consensus client has no reason to
+%% omit a field from it, and a field invented here would be hashed into a block
+%% hash this node then checked as correct -- a plausible value, silently wrong,
+%% which is the failure mode this codebase keeps refusing to ship. So the V1 field
+%% set is required, and only the later V2/V3 additions are optional.
+from_payload(Payload) ->
+    case decode_payload(Payload) of
+        {ok, Block, _Wire} -> {ok, Block};
+        {error, Reason} -> {error, Reason}
+    end.
+
+%% The payload's own `blockHash' is a commitment to its header, and the
+%% specification requires it to be validated -- in all cases, including while
+%% syncing. That check needs the two roots the payload asserts but does not
+%% carry: the transactions root is a trie over the transaction list the payload
+%% *does* carry, and the withdrawals root likewise. Both are recomputed here from
+%% those lists rather than read from anywhere, so the hash check also ties the
+%% block hash to the body.
+%%
+%% Which header fields are in the encoding depends on which the payload carries,
+%% and the answer is not a guess:
+%%
+%%   Paris     16 fields
+%%   Shanghai  17 -- EIP-4895 appended withdrawalsRoot
+%%   Cancun    20 -- EIP-4844 appended blobGasUsed and excessBlobGas, and
+%%                    EIP-4788 appended parentBeaconBlockRoot
+%%
+%% EIP-4788 is the one that is easy to get wrong: `parentBeaconBlockRoot' reads
+%% like a system-call input rather than a header field, and it is both. The EIP
+%% says "execution clients MUST extend the header schema with an additional
+%% field: the `parent_beacon_block_root'", and then gives the resulting header
+%% RLP with it last. Omitting it produces a header that is 33 bytes short and a
+%% block hash no client reproduces.
+%%
+%% `requestsHash' (EIP-7685) is *not* a header field: it is committed through the
+%% beacon-roots contract by EIP-7251, so a Prague header still has 20 fields.
+payload_block_hash(Payload) ->
+    case decode_payload(Payload) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Block, Wire} ->
+            case payload_header_fork(Payload) of
+                {error, Reason} ->
+                    {error, Reason};
+                {ok, Fork} ->
+                    case payload_roots(Payload, Wire) of
+                        {error, Reason} -> {error, Reason};
+                        {ok, Roots} ->
+                            case payload_header_rlp(Block, Roots, Fork) of
+                                {error, Reason2} -> {error, Reason2};
+                                Encoded -> {ok, eth_keccak:hash(Encoded)}
+                            end
+                    end
+            end
+    end.
+
+%% The forks this encoder distinguishes, which is not the same list as the
+%% schedule's: it needs only the header shape, and only the three shapes the
+%% specification has ever described.
+payload_header_fork(Payload) ->
+    BlobUsed = pget(Payload, <<"blobGasUsed">>),
+    BlobExcess = pget(Payload, <<"excessBlobGas">>),
+    Withdrawals = pget(Payload, <<"withdrawals">>),
+    case {BlobUsed, BlobExcess, Withdrawals} of
+        {undefined, undefined, undefined} ->
+            {ok, paris};
+        {undefined, undefined, _} ->
+            {ok, shanghai};
+        %% EIP-4844 appends both blob fields together, so one without the other
+        %% is not a header this node knows how to spell. Guessing which half is
+        %% missing would produce a block hash that looks computable and is not.
+        {Used, Excess, _} when Used =/= undefined, Excess =/= undefined ->
+            case pget(Payload, <<"parentBeaconBlockRoot">>) of
+                undefined -> {error, missing_parent_beacon_block_root};
+                _ -> {ok, cancun}
+            end;
+        {Used, Excess, _} ->
+            {error, {partial_blob_fields, Used, Excess}}
+    end.
+
+payload_roots(Payload, Wire) ->
+    case blob_quantities(Payload) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, BlobGasUsed, ExcessBlobGas} ->
+            {ok, #{transactions_root => tx_root_of_wire(Wire),
+                   withdrawals_root => withdrawals_root_of(Payload),
+                   blob_gas_used => BlobGasUsed,
+                   excess_blob_gas => ExcessBlobGas}}
+    end.
+
+withdrawals_root_of(Payload) ->
+    case pget(Payload, <<"withdrawals">>) of
+        undefined -> undefined;
+        {ok, Ws} -> eth_fork_schedule:withdrawals_root(withdrawals_from_json(Ws))
+    end.
+
+%% These are quantities, and they have to be *decoded*.
+%%
+%% This used to pass the JSON value straight through, so `"0x0"' reached the RLP
+%% encoder as a three-byte string and was encoded as three bytes of ASCII where a
+%% single 0x80 belongs. The header was then 6 bytes longer than the header the
+%% network hashed, and the block hash was wrong for every Cancun block. It is the
+%% same mistake the optional-field setter made, which is what made it worth
+%% fixing in both places at once: the hash path and the block path had to agree,
+%% and they did not.
+%%
+%% An unparseable quantity is an error rather than a zero. Defaulting a quantity
+%% this node could not read to 0 would move a gas boundary, which is precisely the
+%% kind of plausible-but-wrong value this module exists to avoid producing.
+blob_quantities(Payload) ->
+    case decoded_quantity(Payload, <<"blobGasUsed">>, 0) of
+        {error, Reason} -> {error, Reason};
+        {ok, BlobGasUsed} ->
+            case decoded_quantity(Payload, <<"excessBlobGas">>, 0) of
+                {error, Reason2} -> {error, Reason2};
+                {ok, ExcessBlobGas} -> {ok, BlobGasUsed, ExcessBlobGas}
+            end
+    end.
+
+decoded_quantity(Payload, Key, Default) ->
+    case pget(Payload, Key) of
+        undefined ->
+            {ok, Default};
+        {ok, Value} ->
+            case payload_quantity(Value) of
+                {ok, Decoded} -> {ok, Decoded};
+                {error, _} -> {error, {bad_quantity, Key}}
+            end
+    end.
+
+%% The 16 fields of Paris, then the two Shanghai and Cancun each appended.
+payload_header_rlp(#block{parent_hash = PH, miner = Miner, sha3_uncles = SU,
+                          state_root = SR, receipts_root = RR,
+                          logs_bloom = Bloom, difficulty = Diff, number = N,
+                          gas_limit = GL, gas_used = GU, timestamp = Ts,
+                          extra_data = Extra, mix_hash = Mix, nonce = Nonce,
+                          base_fee_per_gas = BF} = Block, Roots, Fork) ->
+    Base = [PH, SU, Miner, SR, maps:get(transactions_root, Roots), RR, Bloom,
+            Diff, N, GL, GU, Ts, Extra, Mix, Nonce,
+            case BF of undefined -> 0; B -> B end],
+    case Fork of
+        paris ->
+            eth_rlp:encode(Base);
+        shanghai ->
+            eth_rlp:encode(Base ++ [maps:get(withdrawals_root, Roots)]);
+        cancun ->
+            eth_rlp:encode(Base ++ [maps:get(withdrawals_root, Roots),
+                                   maps:get(blob_gas_used, Roots),
+                                   maps:get(excess_blob_gas, Roots),
+                                   %% EIP-4788's header field, which is also the
+                                   %% value handed to the system call. It has to
+                                   %% be the same 32 bytes in both places: a
+                                   %% header that commits to one root while the
+                                   %% contract records another is a block whose
+                                   %% state root nobody can reproduce.
+                                   parent_beacon_root(Roots, Block)])
+    end.
+
+parent_beacon_root(Roots, #block{parent_beacon_block_root = undefined}) ->
+    _ = Roots,
+    {error, missing_parent_beacon_block_root};
+parent_beacon_root(_Roots, #block{parent_beacon_block_root = Root}) ->
+    Root.
+
+%% The transaction trie over wire bytes: key RLP(index) from 0, value the
+%% transaction exactly as the payload carried it.
+%%
+%% Computed from the payload's own bytes rather than by re-encoding the decoded
+%% transactions. Re-encoding is a round trip through the codec, and a codec that
+%% does not round-trip exactly would produce a transactions root that is wrong
+%% without being obviously wrong -- and then the block hash built on top of it
+%% would be wrong in the same invisible way. The decode path checks the round trip
+%% separately, so a codec that cannot reproduce a transaction is reported rather
+%% than papered over.
+tx_root_of_wire([]) ->
+    eth_trie:root([]);
+tx_root_of_wire(Wire) ->
+    Pairs = [{eth_rlp:encode(I), Bytes}
+             || {Bytes, I} <- lists:zip(Wire, lists:seq(0, length(Wire) - 1))],
+    eth_trie:root(Pairs).
+
+decode_payload(Payload) when is_map(Payload) ->
+    case payload_fields(Payload) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Pairs} ->
+            case payload_transactions(Payload) of
+                {error, Reason} ->
+                    {error, Reason};
+                {ok, Txs, Wire} ->
+                    Block0 = lists:foldl(fun({Field, Value}, Acc) ->
+                                                 put_field(Acc, Field, Value)
+                                         end, new(<<0:256>>, 0), Pairs),
+                    Block1 = put_optional_fields(Block0, Payload),
+                    {ok, Block1#block{transactions = Txs}, Wire}
+            end
+    end;
+decode_payload(_Payload) ->
+    {error, payload_not_an_object}.
+
+%% The V1 field set, all required.
+payload_fields(Payload) ->
+    Specs = [{<<"parentHash">>, {data, 32}, parent_hash},
+             {<<"feeRecipient">>, {data, 20}, miner},
+             {<<"stateRoot">>, {data, 32}, state_root},
+             {<<"receiptsRoot">>, {data, 32}, receipts_root},
+             {<<"logsBloom">>, {data, 256}, logs_bloom},
+             {<<"prevRandao">>, {data, 32}, mix_hash},
+             {<<"blockNumber">>, quantity, number},
+             {<<"gasLimit">>, quantity, gas_limit},
+             {<<"gasUsed">>, quantity, gas_used},
+             {<<"timestamp">>, quantity, timestamp},
+             {<<"extraData">>, {data, extra}, extra_data},
+             {<<"baseFeePerGas">>, quantity, base_fee_per_gas}],
+    decode_specs(Payload, Specs, []).
+
+decode_specs(_Payload, [], Acc) ->
+    {ok, lists:reverse(Acc)};
+decode_specs(Payload, [{Key, Kind, Field} | Rest], Acc) ->
+    case pget(Payload, Key) of
+        undefined ->
+            {error, {missing_field, Key}};
+        {ok, Value} ->
+            case payload_value(Kind, Value) of
+                {ok, Decoded} -> decode_specs(Payload, Rest, [{Field, Decoded} | Acc]);
+                {error, Reason} -> {error, {bad_field, Key, Reason}}
+            end
+    end.
+
+payload_value(quantity, Value) -> payload_quantity(Value);
+payload_value({data, Size}, Value) -> payload_data(Value, Size).
+
+%% QUANTITY: a hex string, or an integer for an in-process caller.
+payload_quantity(Value) when is_integer(Value), Value >= 0 ->
+    {ok, Value};
+payload_quantity(Value) when is_binary(Value) ->
+    try {ok, eth_hex:decode(Value)} catch _:_ -> {error, not_a_quantity} end;
+payload_quantity(_Value) ->
+    {error, not_a_quantity}.
+
+%% DATA: a 0x-prefixed hex string, or raw bytes of the required width. The
+%% prefixed form is tried first because that is what a decoded JSON object
+%% carries; the two are genuinely ambiguous only for a raw 32-byte value that
+%% happens to begin with the two bytes "0x", and preferring the wire form is the
+%% right way to break that tie.
+payload_data(Value, Size) when is_binary(Value) ->
+    case hex_data(Value) of
+        {ok, Bytes} when Size =:= extra -> {ok, Bytes};
+        {ok, Bytes} when byte_size(Bytes) =:= Size -> {ok, Bytes};
+        {ok, Bytes} -> {error, {wrong_size, byte_size(Bytes), Size}};
+        error when Size =:= extra andalso byte_size(Value) =:= 0 -> {ok, <<>>};
+        error when byte_size(Value) =:= Size -> {ok, Value};
+        error -> {error, not_data}
+    end;
+payload_data(_Value, _Size) ->
+    {error, not_data}.
+
+%% DATA on the wire: a 0x-prefixed hex string, which is the only form the engine API
+%% carries. Exported -- see the note in the export list.
+hex_data(<<"0x">>) -> {ok, <<>>};
+hex_data(<<"0X", Rest/binary>>) -> from_hex(Rest);
+hex_data(<<"0x", Rest/binary>>) -> from_hex(Rest);
+hex_data(_) -> error.
+
+from_hex(Hex) ->
+    case byte_size(Hex) rem 2 of
+        0 ->
+            case eth_hex:is_hex(Hex) of
+                true -> {ok, binary:decode_hex(Hex)};
+                false -> error
+            end;
+        _ ->
+            error
+    end.
+
+%% The specification requires every transaction to be at least one byte, in all
+%% cases, and a zero-length entry is a malformed payload rather than a
+%% transaction. The round-trip check is this node's own addition: it is what
+%% stops finalize/1 from recomputing the transactions root from a decode that
+%% cannot be reproduced, which would report a spurious mismatch and, worse, make
+%% the transactions-root verdict meaningless for that block.
+payload_transactions(Payload) ->
+    case pget(Payload, <<"transactions">>) of
+        undefined ->
+            {error, {missing_field, <<"transactions">>}};
+        {ok, List} when is_list(List) ->
+            decode_transactions(List, 0, [], []);
+        {ok, _Other} ->
+            {error, {bad_field, <<"transactions">>, not_a_list}}
+    end.
+
+decode_transactions([], _Index, Acc, Wire) ->
+    {ok, lists:reverse(Acc), lists:reverse(Wire)};
+decode_transactions([Item | Rest], Index, Acc, Wire) ->
+    case hex_data(Item) of
+        {ok, <<>>} ->
+            {error, {zero_length_transaction, Index}};
+        {ok, Bytes} ->
+            case eth_tx:from_rlp(Bytes) of
+                {ok, Tx} ->
+                    case re_encodes(Tx, Bytes) of
+                        true ->
+                            decode_transactions(Rest, Index + 1, [Tx | Acc],
+                                                [Bytes | Wire]);
+                        false ->
+                            {error, {transaction_not_re_encodable, Index}}
+                    end;
+                {error, Reason} ->
+                    {error, {invalid_transaction, Index, Reason}}
+            end;
+        error ->
+            {error, {malformed_transaction, Index, not_data}}
+    end.
+
+re_encodes(Tx, Bytes) ->
+    case eth_tx:to_rlp(Tx) of
+        {ok, Bytes} -> true;
+        {ok, _Other} -> false;
+        {error, _} -> false
+    end.
+
+%% The V2/V3 additions, absent on a Paris payload.
+put_optional_fields(Block, Payload) ->
+    Block1 = case pget(Payload, <<"withdrawals">>) of
+        undefined -> Block;
+        {ok, Ws} when is_list(Ws) ->
+            Block#block{withdrawals = withdrawals_from_json(Ws)};
+        {ok, _Other} ->
+            Block
+    end,
+    Block2 = set_quantity_field(blob_gas_used, pget(Payload, <<"blobGasUsed">>), Block1),
+    Block3 = set_quantity_field(excess_blob_gas, pget(Payload, <<"excessBlobGas">>), Block2),
+    case pget(Payload, <<"parentBeaconBlockRoot">>) of
+        undefined -> Block3;
+        {ok, Root} ->
+            case maybe_word(Root) of
+                undefined -> Block3;
+                Word -> Block3#block{parent_beacon_block_root = Word}
+            end
+    end.
+
+%% The value has to be decoded. Storing the raw `"0x0"' leaves a JSON string in a
+%% field the header encodes as a number, and RLP encodes a 3-byte binary as a
+%% 3-byte string -- so the header would carry three bytes of ASCII where a single
+%% 0x80 belongs, and the block hash would not match. `quantity_or_zero/1' in the
+%% hash path decodes correctly, so the two paths disagreed, which is the worst
+%% way for them to disagree: the hash was right and the block was wrong.
+set_quantity_field(_Field, undefined, Block) -> Block;
+set_quantity_field(Field, {ok, Value}, Block) ->
+    case payload_quantity(Value) of
+        {ok, Decoded} when Field =:= blob_gas_used ->
+            Block#block{blob_gas_used = Decoded};
+        {ok, Decoded} when Field =:= excess_blob_gas ->
+            Block#block{excess_blob_gas = Decoded};
+        {error, _} ->
+            Block
+    end.
+
+put_field(B, parent_hash, V) -> B#block{parent_hash = V};
+put_field(B, miner, V) -> B#block{miner = V};
+put_field(B, state_root, V) -> B#block{state_root = V};
+put_field(B, receipts_root, V) -> B#block{receipts_root = V};
+put_field(B, logs_bloom, V) -> B#block{logs_bloom = V};
+put_field(B, mix_hash, V) -> B#block{mix_hash = V};
+put_field(B, number, V) -> B#block{number = V};
+put_field(B, gas_limit, V) -> B#block{gas_limit = V};
+put_field(B, gas_used, V) -> B#block{gas_used = V};
+put_field(B, timestamp, V) -> B#block{timestamp = V};
+put_field(B, extra_data, V) -> B#block{extra_data = V};
+put_field(B, base_fee_per_gas, V) -> B#block{base_fee_per_gas = V}.
+
+%% Both key forms, for the same reason eth_engine accepts both: a decoded JSON
+%% object has binary keys and an in-process caller has no reason to know that.
+%% from_json/1 reads binary keys only because its only callers are the upstream
+%% sync path and its own tests, both of which hand it a decoded object.
+pget(Map, Key) -> pget(Map, Key, undefined).
+pget(Map, Key, Default) when is_map(Map), is_binary(Key) ->
+    case maps:find(Key, Map) of
+        {ok, Value} -> {ok, Value};
+        error ->
+            case maps:find(binary_to_list(Key), Map) of
+                {ok, Value2} -> {ok, Value2};
+                error -> Default
+            end
+    end;
+pget(_Map, _Key, Default) ->
+    Default.
 
 %% ---------------------------------------------------------------------------
 %% Header construction

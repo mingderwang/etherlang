@@ -48,7 +48,10 @@
           process_history/4,
           apply_withdrawals_to_state/2,
           gas_cost/3,
-          gas_cost/4 ]).
+          gas_cost/4,
+          timestamp_in_frame/3,
+          timestamp_frame/2,
+          activated_at/2 ]).
 
 -define(BASE_FEE_MAX_CHANGE_DENOMINATOR, 8).
 -define(BASE_FEE_INITIAL, 1000000000).
@@ -254,6 +257,81 @@ reached(ttd, _Point, _BlockNumber, _BlockTimestamp, undefined) -> false;
 reached(ttd, Point, _BlockNumber, _BlockTimestamp, TotalDifficulty)
   when is_integer(TotalDifficulty) ->
     TotalDifficulty >= Point.
+
+%% ---------------------------------------------------------------------------
+%% Fork time frames
+%% ---------------------------------------------------------------------------
+%%
+%% The engine API requires `-38005: Unsupported fork' when a payload's timestamp
+%% "does not fall within the time frame" of the fork the method serves
+%% (execution-apis src/engine/cancun.md, engine_newPayloadV3 item 2,
+%% engine_forkchoiceUpdatedV3 item 2.2, engine_getPayloadV3 item 1). This is the
+%% whole reason a versioned method exists: newPayloadV3 is the Cancun method, so
+%% a Prague timestamp arriving on it means the client sent the wrong version and
+%% the answer is an error, not a status.
+%%
+%% The frame of a timestamped fork F is [activation(F), activation(next)), half
+%% open, so the fork that supersedes F owns its own activation instant. Without
+%% the half-open upper bound a Cancun payload at exactly the Prague activation
+%% time would be accepted by two methods at once.
+%%
+%% This reads the same schedule as current_fork/4 rather than a second table, so
+%% the two cannot disagree about when a fork starts. It is deliberately *not*
+%% current_fork/4 with a number supplied: a payload's timestamp can be checked
+%% without knowing its block number or its total difficulty, and the -38005 check
+%% runs before the payload is decoded far enough to have either.
+
+%% timestamp_frame/2 is exported alongside timestamp_in_frame/3 because the
+%% activation instants are what a test needs in order to state the *boundary*
+%% cases -- "the last instant in frame", "the first instant out of it" -- and a
+%% test that hard-codes those numbers will silently disagree with the schedule
+%% when the schedule changes. Reading them from here means eth_fork_schedule_tests
+%% pins the *values* and eth_engine_tests pins the *behaviour at* the values, and
+%% neither can drift without the other noticing.
+
+-spec timestamp_in_frame(atom(), atom(), integer()) -> boolean().
+timestamp_in_frame(Network, Fork, Timestamp) when is_integer(Timestamp) ->
+    case timestamp_frame(Network, Fork) of
+        {ok, From, infinity} -> Timestamp >= From;
+        {ok, From, To} -> Timestamp >= From andalso Timestamp < To;
+        error -> false
+    end;
+timestamp_in_frame(_Network, _Fork, _Timestamp) -> false.
+
+-spec timestamp_frame(atom(), atom()) -> {ok, integer(), integer() | infinity} | error.
+timestamp_frame(Network, Fork) ->
+    Times = [{Point, Name} || {time, Point, Name} <- fork_schedule(Network)],
+    case lists:keyfind(Fork, 2, Times) of
+        {From, Fork} ->
+            {ok, From, next_time_after(Times, From)};
+        false ->
+            %% The fork is not timestamp-activated on this network. It may be
+            %% block-activated, or absent from the schedule entirely. Either way
+            %% there is no time frame to check a timestamp against, and reporting
+            %% -38005 for a fork this network does not timestamp would refuse
+            %% every payload on a network that predates the fork.
+            error
+    end.
+
+%% The instant a fork becomes active, or `error' if this network does not
+%% timestamp it. This is the *lower* bound only, and it is deliberately not
+%% timestamp_in_frame/3: "is the timestamp at or after Shanghai" is a one-sided
+%% question, and answering it with a frame makes a post-Cancun timestamp fail it --
+%% Shanghai's frame closes when Cancun opens, so every timestamp from Cancun
+%% onwards would be reported as "before Shanghai", and newPayloadV2 would then
+%% demand the V1 structure of a Cancun payload.
+-spec activated_at(atom(), atom()) -> {ok, integer()} | error.
+activated_at(Network, Fork) ->
+    case timestamp_frame(Network, Fork) of
+        {ok, From, _To} -> {ok, From};
+        error -> error
+    end.
+
+next_time_after(Times, From) ->
+    case lists:sort([Point || {Point, _} <- Times, Point > From]) of
+        [Next | _] -> Next;
+        [] -> infinity
+    end.
 
 %% Pick the highest-ranked active fork. Ties are broken towards the fork that
 %% appears earliest in the schedule, and the choice is made by explicit filter

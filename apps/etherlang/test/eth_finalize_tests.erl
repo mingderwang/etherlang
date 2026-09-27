@@ -40,43 +40,18 @@ finalize_test_() ->
      {"confirms a correct receipts root", fun confirms_correct_receipts_root/0},
      {"the transactions root needs no state", fun tx_root_needs_no_state/0},
      {"content roots are reported as verdicts",
-      fun content_roots_are_verdicts/0}].
+      fun content_roots_are_verdicts/0},
+     {"every unverified reason is classified",
+      fun every_unverified_reason_is_classified/0}].
 
 %% Each case gets a fresh MPT and a fresh chain store, and leaves the global
 %% base-source setting as it found it: it is process-wide, so a leaked change
-%% would silently redirect another module's reads.
+%% would silently redirect another module's reads. The implementation lives in
+%% eth_test_util now, because a second module needing a real verdict out of
+%% finalize/1 has to be able to get one -- see the note there on why a test that
+%% hand-writes the verdict term instead cannot fail.
 with_ctx(Fun) ->
-    ensure_started(eth_mpt),
-    ok = eth_mpt:clear(),
-    ensure_started(eth_chain, eth_test_util:tmp_dir()),
-    Previous = eth_state:base_source(),
-    try Fun()
-    after
-        _ = eth_state:set_base_source(Previous),
-        _ = clear_mpt(),
-        _ = stop_chain()
-    end.
-
-%% start_link/1 links to the calling process, and a process that is already
-%% registered is not an error here -- another test module in the same VM may
-%% have started it and left it up.
-ensure_started(Mod) ->
-    case whereis(Mod) of
-        undefined -> {ok, Pid} = Mod:start_link(), Pid;
-        Pid -> Pid
-    end.
-
-ensure_started(eth_chain, Dir) ->
-    case whereis(eth_chain) of
-        undefined -> {ok, Pid} = eth_chain:start_link(eth_chain, Dir), Pid;
-        Pid -> Pid
-    end.
-
-clear_mpt() ->
-    try eth_mpt:clear() catch _:_ -> ok end.
-
-stop_chain() ->
-    try gen_server:stop(eth_chain) catch _:_ -> ok end.
+    eth_test_util:finalize_ctx(Fun).
 
 %% ---------------------------------------------------------------------------
 %% The parent is the anchor for execution
@@ -309,12 +284,60 @@ content_roots_are_verdicts() ->
 %% header map. Constructing one through the record instead would bypass exactly
 %% the path where a peer's declared roots get read, which is the path under test.
 inbound(ParentHash, Overrides) ->
-    Base = #{<<"parentHash">> => hex(ParentHash),
-             <<"number">> => <<"0x1">>,
-             <<"timestamp">> => <<"0x64">>,
-             <<"gasLimit">> => <<"0x1c9c380">>,
-             <<"baseFeePerGas">> => <<"0x3b9aca00">>},
-    eth_block:from_json(maps:merge(Base, Overrides)).
+    eth_test_util:inbound_block(hex(ParentHash), Overrides).
+
+%% ---------------------------------------------------------------------------
+%% The verdict vocabulary
+%% ---------------------------------------------------------------------------
+
+%% Every `{unverified, Reason}' this module can produce, and whether it means
+%% "checked, and wrong" or "could not check". eth_engine needs that distinction to
+%% choose between INVALID and SYNCING, and it used to guess it by pattern-matching
+%% the reasons from outside -- guessing wrong for the state root, whose mismatch is
+%% a 3-tuple while the content roots' is a 4-tuple. A wrong state root was
+%% therefore reported as SYNCING.
+%%
+%% This list is the spec for is_mismatch_verdict/1. It is written out by hand
+%% rather than harvested, because harvesting it would need every production path to
+%% be reachable; the point of the test is that a reader can see the whole vocabulary
+%% and check each answer against the line that produces it. A new `{unverified, _}'
+%% reason added anywhere above is a decision this test forces into the open: it
+%% lands in one of the two lists, or it does not compile.
+%%
+%% NOT a mismatch -- nothing is known against the block:
+%%   finalize/1: state_not_local     (the parent's state is not held)
+%%   finalize/1: not_executed        (the body was never run, so no receipts)
+%%   commit path: {commit_failed, _} (the write did not land)
+%%
+%% A mismatch -- this node checked and the value is wrong:
+%%   check_state_root/2:  {mismatch, Declared, Computed}      (3-tuple)
+%%   check_commitment/3:  {mismatch, Which, Declared, Computed} (4-tuple)
+%%   check_state_root/2:  invalid_declared_root               (bare atom)
+%%   check_commitment/3:  {invalid_declared, Which}           (2-tuple)
+%%
+%% The last two are the unreadable-declaration cases. A payload claiming a root
+%% this node cannot interpret is making a claim, and a claim that cannot be read
+%% is not an absence of information -- there is nothing to wait for, and the
+%% declared value is certainly not what execution produced.
+every_unverified_reason_is_classified() ->
+    Unchecked = [{unverified, state_not_local},
+                 {unverified, not_executed},
+                 {unverified, {commit_failed, io_error}}],
+    Wrong = [{unverified, {mismatch, <<1:256>>, <<2:256>>}},
+             {unverified, {mismatch, receipts_root, <<1:256>>, <<2:256>>}},
+             {unverified, {mismatch, transactions_root, <<1:256>>, <<2:256>>}},
+             {unverified, invalid_declared_root},
+             {unverified, {invalid_declared, receipts_root}},
+             {unverified, {invalid_declared, state_root}}],
+    lists:foreach(fun(V) -> ?assertNot(eth_block:is_mismatch_verdict(V))
+                end, Unchecked),
+    lists:foreach(fun(V) -> ?assert(eth_block:is_mismatch_verdict(V))
+                end, Wrong),
+    %% A verified verdict is not a mismatch however its root looks.
+    ?assertNot(eth_block:is_mismatch_verdict({verified, <<1:256>>})),
+    %% And a malformed verdict does not become INVALID by being unrecognised.
+    ?assertNot(eth_block:is_mismatch_verdict({unverified, something_new})),
+    ?assertNot(eth_block:is_mismatch_verdict(garbage)).
 
 %% ---------------------------------------------------------------------------
 %% Inbound payloads
@@ -366,15 +389,7 @@ sample_block_json() ->
 %% eth_test_util because the chain store recomputes and verifies the hash on
 %% append, so the state root has to be substituted before the hash is taken.
 store_parent(ParentRoot) ->
-    Base = eth_test_util:header(0, hex(<<0:256>>), 0),
-    Block = Base#{
-              <<"totalDifficulty">> => eth_hex:encode_int(0),
-              <<"size">> => eth_hex:encode_int(600),
-              <<"stateRoot">> => hex(ParentRoot)
-             },
-    {ok, HashHex} = eth_header:verify(Block),
-    ok = eth_chain:append([{0, Block#{<<"hash">> => HashHex}, true}]),
-    hex_to_bin(HashHex).
+    eth_test_util:store_parent(ParentRoot).
 
 state_root_of(Block) ->
     hex_to_bin(maps:get(<<"stateRoot">>, eth_block:to_json(Block))).
