@@ -118,7 +118,33 @@ behavioural change per commit, and each step says what it now does.
 6. ~~**An isolated state base for the conformance runner.**~~  **Done**, as
    `eth_state:with_base_source/2` and its new `empty` source. See item 5. The tally
    is now assertable and is asserted, exactly and as a bound.
-7. **Block-level conformance**  *(next)*. The corpus above is state transitions.
+7. **The divergence fingerprints**  *(next, and these are concrete)*. The tally says
+   `state_mismatch` 249 times, which is not a work list. `eest_report`'s gas-delta
+   histogram is: a delta of a few thousand gas repeats because it is one missing
+   schedule term, and a delta in the millions means a frame consumed its whole
+   allowance where the fixture's did not. Of 229 comparable deltas:
+   - **`+550` gas, 6 fixtures, `byzantium/eip196_ec_add_mul`, all forks Berlin →
+     Prague, one contract.** Identical at every fork, so it is not a schedule term
+     and not fork-dependent. The contract is `PUSH1 0` ×5, `PUSH1 6`, `PUSH1 150`,
+     `CALL`, `PUSH1 0`, `SSTORE` — it forwards 150 gas to ECADD and stores the
+     success flag. The fixture expects the slot at **1**; this node leaves it at
+     **0**, and spends 26,824 gas where 26,274 is expected. So the call **fails
+     where it must succeed**. `eth_evm_precompiles:precompile(6, <<>>)` does return
+     `{ok, 64 zero bytes, 150}` when called directly, so the precompile handles the
+     point at infinity correctly and the fault is in the CALL path around it — not
+     in the curve arithmetic. **Unresolved.**
+   - **`-1` gas, 3 fixtures, `prague/eip7623_increase_calldata_cost`, the
+     `exact_gas` cases.** A one-gas shortfall, on tests whose whole subject is
+     hitting an exact gas figure. **Unresolved.**
+   - **`+56668` and `+56665`, 12 fixtures each.** The largest systematic bucket and
+     the one most likely to be a single cause. **Unresolved.**
+   - **`-1208` gas, 1 fixture, `homestead/coverage` at Homestead.** **Unresolved.**
+   Separately: `eth_evm_precompiles:precompile/2` takes **no fork**, so the EIP-1108
+   repricing cannot be applied at all — ECADD is charged 150 at every fork where
+   Byzantium's EIP-196 figure is 500 and Istanbul's is 15000, so it is wrong
+   everywhere and cannot be made right without a fork parameter. That is a known
+   structural gap, not a finding from the corpus.
+8. **Block-level conformance**  *(next after that)*. The corpus above is state transitions.
    EEST's `blockchain_tests` and the Ethereum Foundation's own `ethereum/tests`
    exercise what a state test cannot: state roots, receipts roots, logs blooms and
    block headers, over multi-block forks and transitions. Two thirds of the current
