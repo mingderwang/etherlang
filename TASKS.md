@@ -1,13 +1,22 @@
 # etherlang v1.0 — Execution Client Task List
 
 > **Specification conformance is unverified.** Nothing in this repository has been
-> checked against the execution-spec tests (EEST) or `eips.ethereum.org` at scale:
-> `grep -rn 'execution-specs\|eips.ethereum\|EELS' apps/etherlang` returns nothing.
-> Every specification claim below was checked against the *text* of the
-> `execution-apis` repository's per-fork files and against the EIP text, by reading
-> it, and the rules are pinned by unit tests — but no conformance fixture has been
-> run, so nothing here should be read as a conformance claim. The unwired per-fork
-> gas table (Phase 5) is a precondition for any such result.
+> checked against the execution-spec tests (EEST) or `eips.ethereum.org` at scale.
+> There is no EEST fixture directory and no fixture runner: `test/vectors/` holds
+> three committed Sepolia blocks and nothing else. Every specification claim below
+> was checked against the *text* of the `execution-apis` repository's per-fork
+> files and against the EIP text, by reading it, and the rules are pinned by unit
+> tests — but no conformance fixture has been run, so nothing here should be read
+> as a conformance claim. The unwired per-fork gas *pricing* (Phase 5) is a
+> precondition for any such result.
+>
+> The grep that used to be offered as evidence here —
+> `grep -rn 'execution-specs\|eips.ethereum\|EELS' apps/etherlang`, asserted to
+> return nothing — **no longer returns nothing**, and has been retired rather than
+> left in place. `eth_fork_schedule` and its tests now cite execution-specs and
+> go-ethereum as the provenance of the per-fork opcode table, so it returns six
+> comment hits. A handle that has gone stale reads as a clean result, which is
+> worse than having none.
 
 **86 tasks across 9 phases** — Phase 1-5 partially complete (**41 done, 45 remaining**).
 
@@ -39,11 +48,14 @@ behavioural change per commit, and each step says what it now does.
    answered from this node's own state and each says what it is derived from, and
    `eth_getTransactionByBlockHashAndIndex` came along because it shares the
    projection. `eth_createAccessList` is still absent; the blocker is named in Phase 6.
-3. **Wire the per-fork gas table into the EVM**  *(next)*. `eth_evm:base_cost/1` takes
-   no fork and `eth_fork_schedule:gas_cost/3,4` has no caller in the execution path.
-   This is a refactor, not a substitution, and it is a precondition for every
-   state-root claim this project could make — including the one above, about the
-   blocks this node builds.
+3. **Wire the per-fork gas table into the EVM**  *(in progress — the first half is
+   done, the second is not)*. The **availability** half is done: an instruction the
+   executing fork does not have is now an exceptional halt rather than a cheap one,
+   and the fork reaches the interpreter through the Env. The **price** half is not
+   done: `eth_evm:base_cost/1` still takes no fork and `eth_fork_schedule:gas_cost/3,4`
+   still has no caller in the execution path. See the Phase 5 item for both halves
+   and for why the second is a refactor of the charging path rather than a
+   substitution.
 4. **EEST conformance work**: run the execution-specs fixtures and record what fails.
    Nothing in this repository has been checked against them (see the note in Phase 8).
 
@@ -209,13 +221,32 @@ Recorded because the documentation claimed otherwise, and because each of these 
 
 ## Phase 5: Protocol Compliance (13 tasks)
 - [ ] **Per-fork exact gas schedule** — give the gas schedule the per-fork branching it lacks
-  - Fork *selection* is done and driven by real network activation points, including the Merge's total-difficulty activation (`current_fork/4`; see EIP-3675 below). What is not done is the per-fork *gas table*: `eth_evm` still carries one fork-unaware schedule. Within Cancun-era rules that schedule is now bit-exact — and the process of checking it turned up a live 3-gas overcharge on three of the four `CALL` opcodes — but it is applied unchanged to forks where EIP-150, EIP-2929 and EIP-3860 did not yet exist.
+  - This item is two questions and only the first has been answered.
+  - **Availability: done.** An instruction the executing fork does not have is an
+    exceptional halt that consumes the frame's whole allowance, and the interpreter
+    now says so. Before this, every clause in `eth_evm:do_op/3` was unconditional, so
+    PUSH0 executed in a Paris block, TSTORE executed anywhere before Cancun, and each
+    pushed a value and returned successfully — a post-state no other client can
+    reproduce, produced without one error and recorded as a result. `eth_fork_schedule:
+    opcode_exists/2` is the new predicate; `eth_evm:run/5` requires a `fork` key in the
+    Env and every Env builder sets it.
+  - **Price: not done.** `eth_evm:base_cost/1` still takes no fork, so one Cancun-era
+    schedule is applied to every block. See the sub-points below for what that costs.
+  - Fork *selection* is done and driven by real network activation points, including the Merge's total-difficulty activation (`current_fork/4`; see EIP-3675 below).
   - **There is a fork-parameterized table, it is dead code, and it was also wrong.** `eth_fork_schedule:gas_cost/3,4` (over `base_gas_cost/3` and `dynamic_gas_cost/4`) takes a fork atom, is exported, and has its own unit tests — and nothing in the execution path calls it. The EVM charges `eth_evm:base_cost/1`, which takes no fork, so the fork table passing its tests proved nothing about execution.
   - Checking what that dead table actually said, rather than assuming it was a better version of the live one, found it wrong for **19 of the 256 opcodes** (measured by evaluating both tables across the whole range, cold and warm) while its tests stayed green. With a non-zero length argument it is 21, the two extra being `CREATE` and `CREATE2`, which had no init-code term at all. `SELFBALANCE` was 32000 (it shared a clause with `CREATE`/`CREATE2`, the other two opcodes that read the caller's account); `RETURNDATASIZE` was 2600 (routed through `access_cost/3`); `TLOAD`, `TSTORE`, `MCOPY` and `PUSH0` were **0** (no clause at all, so they fell to a catch-all that prices an unassigned opcode at 0); `SLOAD` was 2; `JUMP`/`JUMPI` were 2; `MLOAD`/`MSTORE`/`MSTORE8` were 2; `SSTORE` was 2 rather than 0; `CALLDATASIZE`/`CODESIZE`/`GASPRICE` were 3; `JUMPDEST` was 2; `INVALID` was 5000. The per-word terms were transposed: `RETURNDATASIZE` carried the 3-per-word copy cost and `RETURNDATACOPY` carried none, so reading the size of a return buffer was billed per byte of it and copying it was free. `CREATE`/`CREATE2` also had no EIP-3860 init-code term, and `CREATE2` no hashing term, so deploying a large contract cost nothing for the code about to run.
   - The tests missed all of it because they sampled nine opcodes the table already had right (`ADD`, `MUL`, `SUB`, `DIV`, `MOD`, `ADDM`, `EXP`, `KECCAK256`, `CREATE`) and none it had wrong. So the earlier claim that wiring the table up "is the start of this task, not the end" was too generous: wiring it up as it stood would have made execution worse. The table is now corrected and pinned by a **whole-table** assertion — the priced set exactly, plus every value — so a missing clause shows up as a missing entry rather than as a silent zero. That test is what would have caught all nineteen.
   - Comparing the two tables also found a **live** bug the fork table did not have. `eth_evm:base_cost/1` has no clause for `CALL`, `CALLCODE` or `STATICCALL`, so all three fell to its `base_cost(_) -> 3` catch-all and were charged 3 gas more than EIP-2929 specifies; `DELEGATECALL`, the one member that *was* listed, was correct. Three gas changes no execution outcome, so no test failed and no contract behaved differently — but `gasUsed` is a receipt field, the receipts root is in the block header, and the header is hashed. Fixed, with the whole family pinned at 2600 cold and 100 warm.
   - **Wiring it up is not a substitution, and the two tables are not interchangeable.** They agree on the *total* for every opcode but not on how it is composed. `eth_evm:base_cost/1` prices a warm access at 100 and its handler adds the cold surcharge separately (2500 for an account, 2000 for a storage slot); `eth_fork_schedule:access_cost/3` returns the **total**, 2600 or 2100, in one figure. Substituting the fork table for the EVM's base would charge a cold `BALANCE` 5100 instead of 2600 (2x), a cold `SLOAD` 4100 instead of 2100, and a cold `CALL` 5200 instead of 2600, because the handlers would add their surcharges on top of a figure that already includes them. So the wiring has to pick one owner of the composition and change the other side to match -- it is a refactor of the charging path, not a one-line change, and it cannot be done by swapping a function name.
   - What is still missing is the part neither table covers: `eth_evm` has no EIP-150 pre-Berlin access costs, and no per-fork branching at all, so its prices are a Cancun-era schedule applied to every fork. `eth_fork_schedule` also has no EIP-3529 refund logic and its `SSTORE` is a bare 0, so the table is not yet a complete per-fork schedule either.
+  - `fork_rank/1` used to collapse Frontier through Petersburg into a single rank 0.
+    That was invisible while the only gates were Berlin, London, Shanghai and Cancun,
+    and it made the availability question above inexpressible: with `byzantium` and
+    `constantinople` both at 0, `at_least(frontier, byzantium)` was *true*, so nothing
+    could refuse an instruction a fork did not have. Every fork now has its own rank,
+    except Muir Glacier, which deliberately shares Istanbul's — it delays the
+    difficulty bomb and changes no execution rule, and giving it its own rank made
+    `highest_ranked/1` report `muir_glacier` for every mainnet block from 12,244,000 on.
   - Istanbul, Berlin, London, Arrow Glacier, Gray Glacier, Merge, Bellatrix, Paris, Shanghai, Cancun, Deneb
   - Each fork's exact gas costs for all opcodes
   - Dynamic base fee calculation (EIP-1559), Blob gas accounting (EIP-4844)

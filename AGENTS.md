@@ -20,15 +20,16 @@ Lighthouse-compatible execution client with a working Engine API.
 It is **not** yet a production execution client. It does not author blocks, it
 has no consensus layer, and its per-fork gas schedule is not wired in. `README.md`
 §"Current Status" and `TASKS.md` are the authority on what is and is not done;
-`docs/YELLOW_PAPER.md` describes the target architecture.
+`docs/YELLOW_PAPER.md` describes the system model, the trust assumptions, and
+the boundary between what the node does and what it is becoming.
 
 ### Read these before claiming anything works
 
 | File | What it is |
 |------|------------|
-| `README.md` | Feature status, honesty notes, config, layout. ~930 lines. |
-| `TASKS.md` | The 81-task / 9-phase list. Every unchecked box is a real gap. |
-| `docs/YELLOW_PAPER.md` | The design document for the v1.0 target. |
+| `README.md` | Feature status, honesty notes, config, layout. |
+| `TASKS.md` | The 86-task / 9-phase list. Every unchecked box is a real gap. |
+| `docs/YELLOW_PAPER.md` | The design document: system model, trust assumptions, and the boundary between what the node does and what it is becoming. §1.3 is the list of things it deliberately does *not* claim. |
 
 Documentation in this repo is deliberately adversarial: it names specific gaps
 rather than softening them. **Keep it that way.** A README that says "partial"
@@ -132,10 +133,18 @@ nothing is committed.
 
 ### Fork awareness
 
-`eth_fork_schedule:current_fork/3,4` selects the fork. The gas *table*
-(`gas_cost/3,4`) is fork-parameterized and unit-tested, but **nothing in the
-execution path calls it** — the EVM applies one flat Cancun-era table. Wiring it
-in is a refactor, not a substitution. It is a known, documented, unticked item.
+`eth_fork_schedule:current_fork/3,4` selects the fork, and it now reaches the
+interpreter: `eth_evm:run/5` **requires** a `fork` key in the Env and refuses an
+instruction the fork does not have (`eth_fork_schedule:opcode_exists/2`). Do not
+give that key a default. A default is a fork this node chose rather than one the
+chain chose, and the only symptom is a plausible answer.
+
+The gas *table* (`gas_cost/3,4`) is a different question and is still
+disconnected: it is fork-parameterized and unit-tested, but **nothing in the
+execution path calls it** — `eth_evm:base_cost/1` applies one flat Cancun-era
+schedule. Wiring it in is a refactor, not a substitution, because the two tables
+agree on every total but not on how it is composed. A known, documented, unticked
+item.
 
 ---
 
@@ -364,8 +373,9 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
 | `eth_kzg:blob_to_kzg_commitment/1` | Needs the `g1_lin` derivation; no local blob fixture, and the EIP-4844 vector fetch 404'd. |
 | EIP-7685 `requestsHash` | Hashing rule sourced, but the EIP does not fix the header field position, and without EIP-7251 there are no requests. |
 | `TERMINAL_BLOCK_HASH` (EIP-3675) | Chain-config data, not in the EIP. Carried and echoed, never checked against a post-Merge block's difficulty. |
-| Per-fork gas table wiring | A refactor, not a substitution. |
+| Per-fork gas *price* wiring | A refactor, not a substitution. Availability is done; pricing is not. |
 | `eth_block:to_rlp/1` fork-awareness | It unconditionally includes the Cancun trailing fields, so it is only correct for Cancun-or-later headers. Pre-existing, documented, unfixed. |
+| `eth_tx:initcode_gas/1` fork-awareness | Charges EIP-3860 init-code gas at every fork, so a pre-Shanghai creation transaction is overcharged at admission. A transaction has no block context to resolve a fork from, and the pool has none. |
 
 ## 11. Known dead code
 
@@ -388,12 +398,22 @@ The authoritative version of this list is the "What to do next, in order" sectio
 the top of `TASKS.md`, which also records the Engine API work that is deliberately
 **later** and why. Kept here only as a pointer, because this file is read more often.
 
-1. Wire the per-fork gas table into the EVM — a refactor, and a precondition for
-   any state-root claim, and for a block this node builds being proposable.
+1. Wire the per-fork gas **prices** into the EVM — a refactor, and a precondition
+   for any state-root claim, and for a block this node builds being proposable.
+   The *availability* half is already done; see §3 "Fork awareness".
 2. Run the EEST fixtures and record what fails.
 
 Done, and no longer listed:
 
+- Per-fork opcode *availability*. `eth_fork_schedule:opcode_exists/2` answers
+  whether a fork has an instruction, and `eth_evm` halts on one it does not. Every
+  clause in `do_op/3` used to be unconditional, so PUSH0 ran in a Paris block and
+  TSTORE ran anywhere before Cancun, each returning successfully. The fork reaches
+  the interpreter through a **required** `fork` key in the Env; do not give it a
+  default. `fork_rank/1` also had to stop collapsing Frontier-through-Petersburg
+  into one rank, because with `byzantium` at rank 0 `at_least(frontier,
+  byzantium)` was true and the gate was inexpressible. Muir Glacier still shares
+  Istanbul's rank on purpose.
 - Payload-decoder work, committed and tagged `v1.10-versioned-engine`.
 - `eth_block_builder` started and `payloadAttributes` acted on, so `forkchoiceUpdated`
   returns a `payloadId` and `getPayload` returns a real block. Its state root will not

@@ -1,459 +1,473 @@
-# etherlang — a yellow-paper style description
+# etherlang — design and current state
 
-**Version**: v1.0-DEV (planning).
+**Status**: v1.0 in progress. 583 eunit tests, green.
 
-**v0.7.4 status**: read-mostly relay (see README). This document describes the v1.0 target architecture. This document describes what the node *is*,
-its system model, trust assumptions, data structures, protocol, and the
-properties that fall out of the design. It is not a re-derivation of the
-Ethereum Yellow Paper; it is the design document for an approximately-30k-line
-Erlang JSON-RPC node with an opportunistic embedded EVM.
+This document describes what the node *is* and what it is *becoming*: the system
+model, the trust assumptions, the data structures, and — at least as important —
+the boundary between the two. It is not a re-derivation of the Ethereum Yellow
+Paper, and it is not a conformance claim. See §1.3 for what "not a conformance
+claim" means here, precisely.
 
-Status: implementation described below is verified live on Sepolia; the EVM
-fidelity caveats are listed in README's TODO and repeated here in §9.
+Where this document and the code disagree, the code is wrong. Fix one or fix
+this file in the same change; never leave them disagreeing. `README.md` carries
+the feature-status table, `TASKS.md` the ordered task list, and `AGENTS.md` the
+rules this repository has had to learn the hard way.
 
 ---
 
-## 1. Executive summary
+## 1. What this node is
 
-etherlang is an Erlang/OTP application that speaks the Ethereum JSON-RPC
-interface. It is **v0.7.4 is a read-mostly relay** — a low-footprint
-dependency-light endpoint whose workload is proportional to *reads*, not to state.
+### 1.1 The short version
 
-This document describes the **v1.0 target architecture**: a complete Ethereum
-execution client that is compatible with Lighthouse, Prysm, Nimbus, Teku, and
-Lodestar. To achieve this, etherlang must become:
+An Ethereum execution-layer node in pure Erlang/OTP. It syncs the canonical chain
+over devp2p/RLPx with a JSON-RPC fallback, keeps state in a Merkle-Patricia trie,
+runs a pending-transaction pool, serves JSON-RPC, and speaks the Engine API well
+enough for a consensus client to drive it.
 
-- a **full consensus-layer-compatible** node via the Engine API (EIP-3675),
-- a **full state trie** (Merkle-Patricia Trie, not a bounded snap store),
-- a **block producer** (author execution payloads when selected as proposer),
-- **geth-compatible** in all JSON-RPC methods and devp2p sub-protocols,
-- **per-fork exact** in gas scheduling and protocol behavior.
+It is **not yet a production execution client**. It does not author blocks that
+would survive submission, it has no consensus layer of its own, and its per-fork
+*gas pricing* is not wired in. Each of those is a named item in `TASKS.md`, not a
+vague future.
 
-See the README for the full v1.0 work plan.
+### 1.2 What it does today
+
+- **Engine API** — `newPayload`, `forkchoiceUpdated` and `getPayload` at V1, V2
+  and V3, plus `engine_exchangeTransitionConfigurationV1`. JWT-authenticated; a
+  node with no secret refuses the port rather than serving it open.
+- **Block building** — `eth_block_builder` is a supervised child.
+  `forkchoiceUpdated` issues a `payloadId` from a `payloadAttributes`, and
+  `getPayload` returns a real block with a computed `blockValue`.
+- **Local JSON-RPC** — 28 `eth_*` methods are answered from this node's own
+  state, each saying what it derives from. The rest proxy.
+- **Execution** — a full EVM interpreter with EIP-2929 warm/cold access tracking,
+  EIP-1153 transient storage, EIP-4844 point evaluation, and system calls for
+  EIP-4788 and EIP-2935 that run the *deployed contract's code* rather than
+  writing the slots directly.
+
+### 1.3 What this document does not claim
+
+**No conformance claim of any kind.** Nothing in this repository has been run
+against the Ethereum Foundation's execution-spec tests. There is no EEST fixture
+directory and no fixture runner; `apps/etherlang/test/vectors/` holds three
+committed Sepolia blocks and nothing else. Every specification claim here was
+checked against the *text* of the `execution-apis` repository's per-fork files
+and against the EIP text, by reading it, and is pinned by unit tests — but a test
+that encodes a reading of a specification is not the same as a test that executes
+one.
+
+> The obvious grep for this used to be `grep -rn 'execution-specs\|eips.ethereum\|
+> EELS' apps/etherlang`, asserted to return nothing. **It no longer does**, and the
+> handle had to be retired rather than left in place: `eth_fork_schedule` and its
+> tests now *cite* execution-specs and go-ethereum as the provenance of the opcode
+> table, so the grep returns six comment hits. A verification handle that has gone
+> stale is worse than none, because it reads as a clean result. Cite the fixture
+> directory, which is checkable.
+
+Two specific non-claims, because both are easy to overstate:
+
+- **The opcode availability table was cross-checked against other
+  implementations, not against a specification test.** The per-fork sets in
+  `eth_fork_schedule:opcode_exists/2` reproduce the instruction counts of
+  go-ethereum's `newFrontierInstructionSet()` and execution-specs' per-fork
+  `Ops` enums exactly. That is a strong provenance check and it is still not
+  EEST.
+- **"The gas schedule is the single reason state roots diverge" is unverified
+  and must not be restated as fact.** It cannot be checked end to end without real
+  prestate, which this node does not hold for arbitrary blocks.
+
+### 1.4 An unverified claim, flagged where it appears
+
+`README.md` and `TASKS.md` both say the unwired gas table is why a built block's
+state root will not match the network's. That is a *reasonable expectation*, not
+a measurement. The correct statement is narrower: the root is **not known** to
+match, and the gas table is one identified reason it might not. See §7.
+
+---
 
 ## 2. System model and trust assumptions
 
-The node is a **read-mostly relay with local cache and local verification**.
+### 2.1 The three sources of truth, and which one counts
 
-Trust boundary (all explicit, all configurable or documented):
+`eth_state:base_source/0` is process-wide and has two values:
 
-1. **Canonicality** — v0.7.4: the upstream node is the source of truth.
-   **v1.0 target**: the node independently verifies canonicality via the
-   consensus layer (Engine API forkchoice updates) and local block execution.
-   The consensus client (Lighthouse, etc.) provides the canonical chain;
-   etherlang verifies and executes blocks locally.
-2. **Finality** — the `finalized` checkpoint (like `safe`) is *learned from
-   the upstream node* rather than derived. It is only **accepted** when it
-   satisfies a local guard: it must be at or below the local head **and** must
-   match the locally recomputed canonical hash at that height (eth_sync
-   `track_finalized/1`). A checkpoint that would otherwise brick the store —
-   ahead of head or on a fork — is logged and ignored.
-3. **Hash integrity** — except under `VERIFY_HEADERS=false`, every block's
-   header is RLP-encoded and keccak-256 hashed locally (eth_header/eth_rlp/
-   eth_keccak) before storage. The stored `hash` and the parentHash linkage are
-   therefore recomputed, not copied from the wire (`eth_chain:verify_blocks/2`).
-4. **State reads** — v0.7.4: account state is fetched lazily from upstream
-   per read and cached. **v1.0 target**: state is maintained in a full
-   Merkle-Patricia Trie, enabling local verification of all state reads,
-   state proofs, and storage access.
+| Value | Meaning | May a commitment come from it? |
+|---|---|---|
+| `upstream` | read-only, lazily fetched over JSON-RPC | **No** |
+| `mpt` | the local Merkle-Patricia trie | **Yes — the only one** |
 
-Non-goals, stated so nobody re-opens them: staking,
-validators, beacon chain consensus, WebSocket transport.
+Only a write under `mpt` is a real commitment. `eth_block:finalize/1` switches to
+`mpt`, executes, and restores it in a `finally`. **Any path that computes or
+reports a root must set `mpt` first.** A root computed over the upstream view, or
+over an empty trie, is not a result; it is a fabrication.
 
-**Block production and consensus-layer integration are now goals** (see Phase 1-3 below).
+This is the single most load-bearing rule in the codebase and the easiest to
+violate by accident, because the global silently redirects every other module's
+reads for the rest of the VM's life. Tests that touch it must restore it —
+`eth_test_util:finalize_ctx/1` is the reference pattern.
+
+### 2.2 Trust boundary
+
+1. **Canonicality** — the consensus client supplies the canonical chain through
+   the Engine API; this node executes what it is given. Where the chain arrives by
+   RPC instead, canonicality is *assumed*, and header hashes are recomputed rather
+   than copied (`eth_header`, `eth_chain:verify_blocks/2`).
+2. **Finality** — the `finalized` checkpoint is *learned*, not derived, and is
+   only **accepted** when it is at or below the local head **and** matches the
+   locally recomputed canonical hash at that height. A checkpoint that would
+   otherwise brick the store is logged and ignored.
+3. **Hash integrity** — except under `VERIFY_HEADERS=false`, every header is
+   RLP-encoded and keccak-256 hashed locally before storage.
+4. **State reads** — served from the local trie, or fetched and cached, depending
+   on `base_source`. `eth_getProof` answers from the local trie **only**; a peer
+   sends balances, not RLP nodes, so a proof it cannot produce locally is
+   `{error, {state_not_local, _}}` and the handler proxies.
+
+### 2.3 Non-goals, stated so nobody re-opens them
+
+Staking, validators, beacon-chain consensus, WebSocket transport.
+
+### 2.4 Block production and consensus integration are goals, not current state
+
+`forkchoiceUpdated` returns a `payloadId` and `getPayload` returns a block. That
+is the *plumbing*. Whether the block would be accepted on the network is a
+separate question with a known answer today: **no**, for the reason in §7.
+
+---
 
 ## 3. OTP kernel
 
 ```
 etherlang_app (application)
 └─ etherlang_sup (one_for_one, 5 restarts / 10 s per child)
-   ├─ eth_state       (gen_server)  — owns eth_state_cache ETS table
-   ├─ eth_chain       (gen_server)  — canonical chain store (DETS)
-   ├─ eth_rpc_server  (gen_server)  — cowboy HTTP listener + rate-limit table
-   └─ eth_sync        (gen_server)  — chain synchroniser (poll loop)
+   ├─ eth_mpt            (gen_server) — the one stateful trie
+   ├─ eth_state          (gen_server) — delegate; reads/writes via base_source/0
+   ├─ eth_chain          (gen_server) — canonical chain store (DETS)
+   ├─ eth_sync           (gen_server) — peer-first sync, gap fill, follow
+   ├─ eth_txpool         (gen_server) — pending/queued tiers, eviction, gossip
+   ├─ eth_engine         (gen_server) — Engine API state; started *before* its listener
+   ├─ eth_block_builder  (gen_server) — issues payloadIds
+   └─ eth_rpc_server     (gen_server) — cowboy on :8545, plus :8551 for Engine
 ```
 
-Start-up order in `etherlang_app:start/2`: ensure `crypto`, `inets`, `ssl`,
-`cowboy` are running, initialise the upstream JSON-RPC client
-(`eth_rpc_client`, 3 retries / 1 s backoff / 20 s timeout), then start the
-supervisor.
+48 modules in `apps/etherlang/src`, 46 test modules alongside. Every stateful
+module is a `gen_server` registered under its own name. The rest are pure or
+stateless — `eth_rlp`, `eth_keccak`, `eth_hex`, `eth_word`, `eth_trie`,
+`eth_fork_schedule`, `eth_evm`, and the rest of that list.
 
-The supervisor deliberately owns `eth_state` as a named, permanent process:
-the ETS cache table lives and dies with it. (This was a fix: when the table
-was created lazily inside short-lived request handlers, the owning handler's
-exit killed concurrent readers mid-request and crash-looped the EthStats
-agents downstream — `etherlang_sup.erl:19-23`.)
+**Keep new logic out of the `gen_server`s where it can be pure.** That is what
+makes it testable without holding state, and several of the mistakes this project
+has had to unpick were a rule living inside a process where it could not be
+reached by a test.
 
-## 4. Configuration (eth_config)
+`eth_engine` is started before the listener that serves it. It used to be declared
+in `registered` — a claim that a process is running — while nothing started it,
+so every engine method in a real node was answering from a `gen_server` that did
+not exist.
 
-Every runtime knob is an environment variable first, application env second,
-default last (see eth_config.erl for the full table). Representative defaults:
+---
 
-| Variable            | Default    | Meaning                                   |
-|---------------------|-----------|-------------------------------------------|
-| `UPSTREAM_RPC_URL`  | publicnode | upstream Sepolia JSON-RPC endpoint         |
-| `RPC_LISTEN_IP`     | 127.0.0.1  | bind address (0.0.0.0 = expose)           |
-| `RPC_LISTEN_PORT`   | 8545       | local HTTP port                           |
-| `RPC_MAX_BATCH`     | 30         | max JSON-RPC batch size (else -32600)     |
-| `RPC_RATE_LIMIT`    | 30         | per-source req/s (0 disables)             |
-| `RPC_RATE_BURST`    | 100        | token-bucket burst (else HTTP 429)        |
-| `CHAIN_RETENTION`   | 2048       | recent blocks kept locally                |
-| `BODY_WINDOW`       | 2048       | most-recent blocks stored full-body       |
-| `MAX_REORG_DEPTH`   | 256        | ancestor-walk cap                         |
-| `SYNC_CONCURRENCY`  | 8          | parallel block fetches per tick           |
-| `SYNC_BUDGET`       | 2048       | max blocks per sync tick                  |
-| `POLL_INTERVAL_MS`  | 5000       | follow-mode poll interval                 |
-| `VERIFY_HEADERS`    | true       | recompute + verify header hashes          |
-| `EVM_ETH_CALL`      | true       | serve eth_call from the built-in EVM      |
-| `DATA_DIR`          | ./data     | DETS persistence directory                |
-| `ETH_START_BLOCK`   | latest     | head-offset sync, or a specific block     |
+## 4. Configuration
 
-Two invariants are enforced structurally rather than by config: retention is
-clamped `≥ max_reorg_depth` (`eth_chain:init/1`), so a rewind target can never
-be pruned; the finalized checkpoint is never pruned and rewinds never go below
-it.
+Every runtime knob is an environment variable first (`eth_config`). Frequently
+touched: `UPSTREAM_RPC_URL`, `ETH_NETWORK`, `ETH_FORK`, `DATA_DIR`,
+`RPC_LISTEN_PORT`/`RPC_LISTEN_IP`, `ENGINE_PORT`, `RPC_API_KEY`, `CHAIN_RETENTION`
+(2048), `BODY_WINDOW`, `ETH_START_BLOCK`, `DISCV4_ENABLED`, `RLPX_ENABLED`,
+`STATE_SYNC_ENABLED`, `EVM_ETH_CALL`, `VERIFY_HEADERS`.
 
-## 5. The chain store (eth_chain)
+`config/sys.config` is **empty on purpose**. Do not add a default to it.
 
-Storage is three DETS "set" tables under `DATA_DIR`:
+Two invariants are structural rather than configurable: retention is clamped
+`≥ max_reorg_depth`, so a rewind target can never be pruned; the finalized
+checkpoint is never pruned and rewinds never go below it.
 
-```
-chain.num.dets   {{Num}}          -> {Hash, Block, Full}
-chain.hash.dets  {{Hash}}         -> Num
-chain.meta.dets  head | finalized | low
-```
+---
 
-- `Block` is the JSON-RPC block map (header + consensus fields + some
-  server-normalisation). `Full=true` means `transactions` holds full
-  transaction objects; `Full=false` means it holds transaction *hashes* only
-  (header-only sync).
-- Only **canonical** blocks are kept. The canonical hash at Num is the locally
-  recomputed one (`eth_header:verify/1` exchanges the claimed hash for the
-  recomputed hex hash before `verify_blocks/2` folds it into the block).
-- `head` is `{Num, Hash}`; on the empty store the first block becomes the
-  anchor (genesis, or the `ETH_START_BLOCK` snapshot offset — anchors are
-  trusted as configured, which is why header verification matters most in
-  follow mode).
-- `finalized` is the accepted checkpoint (monotonic; `set_finalized/2` never
-  moves it backwards).
-- `low` is the lowest block number still retained, a persisted watermark.
+## 5. The chain store
 
-### 5.1 Append protocol
+Three DETS "set" tables under `DATA_DIR`: `chain.num.dets`, `chain.hash.dets`,
+`chain.meta.dets`. Only canonical blocks are kept. `head` is `{Num, Hash}`;
+`finalized` is monotonic and never moves backwards; `low` is a persisted
+pruning watermark.
 
-`append/1` takes an ascending batch. For each entry the head must be the
-parent:
+DETS has a hard 2 GiB per-file ceiling and the open crashes on overflow, which is
+what the bounded-retention design exists to avoid. After each append, a bounded
+batch of blocks below the retention window is deleted, retiring each deleted
+number's hash-index row as it goes, and the finalized block itself is skipped so a
+rewind to the checkpoint always remains possible.
 
-- `Num = HN + 1 ∧ parentHash = headHash` → insert, advance head.
-- `parentHash` already stored at a height `< HN` → a reorg:
-  `do_append/2` rewinds to the common ancestor (refusing to go below
-  `finalized`), then continues the batch from `CA + 1`. Returns `{reorg, CA}`.
-- parent unknown → `{missing_parent, Parent}`; the sync layer then walks
-  ancestors to find the common ancestor (`ancestor_walk`, capped at
-  `MAX_REORG_DEPTH`).
+### 5.1 The read path's silent trap
 
-`rewind/1` discards blocks above N (deleting both hash and number entries),
-re-derives the new head from the store, and refuses any rewind below
-`finalized` (`{error, {below_finality, F}}`).
+`eth_chain` is keyed by the `hash` field of the stored map — the **0x-hex
+string**, not 32 raw bytes. `eth_header` reads `parentHash` via `hex_to_bin/1`,
+which has no binary clause, so a raw hash dies in `hexval(N)`. Three modules
+disagree about this and the disagreement is silent until a block is stored by one
+path and read by another.
 
-### 5.2 Bounded growth and pruning
+### 5.2 Pruned and absent are not an error surface
 
-DETS has a hard 2 GiB per-file ceiling; on Overflow-on-file the open crashes.
-This drove the retention design. After each successful append:
+`get_by_number/1` and `get_by_hash/1` return `not_found`, and the RPC layer falls
+back to the upstream proxy. A header-only block requested full also proxies rather
+than fabricating a body. "Garbage-collected historical data" is therefore
+invisible to callers, which is the intended behaviour and also the reason the
+local-serving gaps in `TASKS.md` are so easy to miss.
 
-```
-below = max(head − retention + 1, 0)
-delete_range(low, min(below, low + PRUNE_BATCH))     # PRUNE_BATCH = 4096
-```
+---
 
-Each deleted Num also retires its hash-index row (`hash.dets`). `low` advances
-incrementally so a store that pre-dates the watermark (or grew unbounded on old
-code) is caught up a bounded number of deletions per append rather than in one
-giant pass. The finalized block itself is skipped by `delete_range` (parameter
-`Skip`) so `rewind` to the checkpoint always remains possible. `low = 0` is the
-hard floor; blocks above `low` but below `fn + 1` cannot exist because
-`retention ≥ max_reorg_depth` and pruning never crosses `finalized`.
+## 6. Synchronisation
 
-Observed behaviour on Sepolia, Sept 2026: blob-heavy blocks ≈ 330 KB
-full-bodied; at retention 2048 the live `num.dets` plateaus at ≈ 830 MB
-(verified flat across minutes). Pre-fix (unbounded) growth hit the 2 GiB
-ceiling in days.
+Peer-first, RPC second. Each tick tries eth-capable peers before the upstream
+endpoint.
 
-### 5.3 Reads and the proxy fallback
+- **Peer sync** — backward walk from a peer's best hash to a local anchor, then
+  forward fill: bodies fetched per header and `transactionsRoot`-verified,
+  receipts fetched and `receiptsRoot`-verified, assembled and appended through the
+  normal chain path so reorg logic is reused.
+- **RPC fallback** — `eth_blockNumber` from upstream, the finalized checkpoint
+  tracked under the guard in §2.2, then three branches: empty store (gap fill from
+  the anchor), head below upstream (`sync_range`), head above upstream (reconcile
+  against the canonical hash of the upstream head).
 
-`get_by_number/1` and `get_by_hash/1` return `{ok, Block, Full}` or
-`not_found`. Pruned/unknown blocks are **not an error surface**: the RPC layer
-falls back to the upstream proxy, so "garbage-collected historical data" is
-invisible to callers (see §7). For a stored block requested **full** but only
-kept header-only, the handler also proxies rather than fabricating bodies.
+`sync_range` works in **windows**: `min(concurrency, span)` blocks fetched in
+parallel under a deadline and re-sorted into number order before append.
+Per-tick progress is bounded by `SYNC_BUDGET`.
 
-## 6. Synchronisation (eth_sync)
+Error handling is deliberately graceful: window failures count and retry next
+tick; a rewind refused below the finalized floor triggers a backoff rather than
+hot-looping; a deep reorg is given up on with an error and a backoff.
 
-The synchroniser is a poll loop (`tick` → `run_once` → `send_after`). Each
-tick tries **eth-ready peers first**, RPC second:
+---
 
-* **Peer sync** — backward walk (192-header reverse batches) from a peer's
-  best hash to a local anchor, then forward fill: bodies fetched per header
-  and `transactionsRoot`-verified, receipts fetched and `receiptsRoot`-
-  verified, everything assembled and appended through the normal chain path
-  (reorg logic reused). Empty stores advertise genesis `Status`.
-* **RPC fallback** — `eth_blockNumber` from upstream → target `HeadU`,
-  `finalized` tracked with the guarded accept (§2), then three branches on
-  local head:
-   - **empty store** → gap fill from `anchor` (`latest` → `max(HeadU, 0)`;
-     a number → that block) up to `HeadU`.
-   - **head below upstream** → `sync_range(head+1, HeadU)`.
-   - **head above upstream** → upstream reorged or a stale fork tip was
-     fetched; reconcile against the canonical hash of `HeadU` (rewind, or walk
-     to the ancestor and rewind).
+## 7. Execution: what is right, and what is not
 
-`sync_range` works in **windows**: `min(concurrency, span)` blocks are fetched
-in parallel with a 120 s deadline and re-sorted into number order before
-append. Per-tick progress is bounded by `SYNC_BUDGET`; `body_window` decides
-which blocks in the run are fetched `Full=true` vs header-only. `mode` toggles
-`gap`/`follow`; `synced=true` flips once `From > To`.
+This is the section to read before trusting any state root this node reports.
 
-Error handling is deliberately graceful:
+### 7.1 The commitment rule
 
-- window fetch failures and append `bad_block`/`below_finality` errors count
-  `failed` and retry on the next tick;
-- a rewind refused below the finalized floor triggers a 60 s backoff
-  (`FLOOR_BACKOFF_MS`), re-armed on every refusal, stopping log spam and
-  upstream churn while the node is pinned;
-- a deep reorg (`ancestor_walk` exceeding `max_reorg` or reaching below
-  finality) is given up with an error and backoff.
+`eth_block:finalize/1` returns `{ok, Block, Verification}` where every commitment
+in `Verification` is a **verdict**:
 
-`eth_syncing` returns `false` once `synced ∧ head ≥ target`, else the
-`{startingBlock, currentBlock, highestBlock}` object.
-
-## 7. The RPC layer (eth_rpc_server / eth_rpc_handler)
-
-Transport is HTTP/1.1 JSON-RPC 2.0 over cowboy (`POST /`). Security, all
-default-on:
-
-- binding confined to loopback by default (`RPC_LISTEN_IP` to open);
-- per-source **token bucket** rate limit (`eth_rate_limit`, keyed on peer IP,
-  `{ipv4, ...}`/`{ipv6, ...}`/`unknown`) → HTTP 429 + `-32005 too many
-  requests`;
-- batch cap `RPC_MAX_BATCH` → single `-32600 batch too large` error;
-- parser errors → `-32700`; malformed requests → `-32600`; non-POST → 405.
-
-Dispatch is two-tier:
-
-1. **local ambitions** (served from the store or computed):
-   - `eth_blockNumber` — local head,
-   - `eth_syncing` — sync status,
-   - `web3_clientVersion` / `eth_getVersion` — `etherlang/…`,
-   - `eth_coinbase` (zero address), `eth_mining` (false), `eth_hashrate` (0),
-   - `eth_getBlockByNumber` / `eth_getBlockByHash` (+ `Full` upgrade through
-     the proxy when the local copy is header-only or absent),
-   - block transaction counts (`…ByNumber`, `…ByHash`),
-   - `eth_getTransactionByBlockNumberAndIndex` (full-body blocks only),
-   - `eth_call` — §8.
-   Tags are resolved for the local store: `latest`/`pending`→local head,
-   `finalized`/`safe`→the tracked checkpoint, `earliest`→0; pruned or
-   non-local targets are passed to the proxy verbatim.
-2. **everything else** → verbatim upstream pass-through, including upstream
-   error objects (codes and messages preserved).
-
-A serving-time **compatibility shim** injects `totalDifficulty` into post-merge
-Sepolia blocks (`eth_rpc_handler:with_td_compat/1`): since The Merge the value
-is frozen at the terminal total difficulty (TTD = 17,000,000,000,000,000), so
-re-adding it is state a protocol fact, not fabricated data. Gated to
-`chain_id = 11155111 ∧ number ≥ 1450409`; storage is never touched and other
-chains pass through.
-
-### 7.1 Rate limiter (eth_rate_limit)
-
-A per-source token bucket: `Rate` tokens refill per second up to a `Burst`
-cap; `Rate ≤ 0` disables. The table is created in `eth_rpc_server:init/1`,
-passed to every handler in `limits` (tests may pass none → unlimited), and
-owned for the lifetime of the listener.
-
-## 8. Local EVM execution (eth_call → eth_evm)
-
-`eth_call` is the one reading/writing-experiment method implemented locally.
-Design (eth_call.erl + eth_state.erl + eth_evm.erl ~900 lines + precompiles):
-
-- **State model — lazy fetch + immutable overlay + snap state store.**
-  The node maintains a bounded snap state leaf store (accounts/storage/codes
-  fetched via snap sync) plus the `eth_state` cache. Reads go:
-  overlay → ETS cache → local snap store → upstream JSON-RPC
-  (`eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`,
-  `eth_getStorageAt`). Cache TTL: **3 s** for tags
-  (`latest`/`pending`/`safe`/`finalized`), **unbounded** for concrete
-  block numbers (immutable).
-  Writes (SSTORE, value transfers, CREATE'd code) only ever land in the
-  **overlay** map of the in-flight call and are discarded on revert — upstream
-  state can never be mutated through `eth_call`.
-- **State overrides** (the 3rd `eth_call` parameter) are parsed into the same
-  overlay, with per-account `balance`, `nonce`, `code`, `state`, `stateDiff`.
-  EIP-6780 `created`/`destroyed` markers cannot arrive via JSON overrides
-  (only the fields above are parsed), so a client cannot forge them.
-- **Environment** is built from the resolved block header (chain id cached in
-  `persistent_term`, coinbase, base fee, gas limit, timestamp, block number);
-  the gas limit defaults to 30,000,000 when the request omits `gas`.
-- **Precompiles** at their canonical addresses are handled natively
-  (`eth_evm_precompiles`, incl. the BN254 pairing via `eth_pairing_bn128`).
-  `0x0A` (KZG point evaluation) is **not** implemented; those requests alone
-  fall back to the upstream proxy.
-- **Opportunistic semantics.** The EVM is honest about its own limits: on an
-  unsupported opcode, an internal crash, or an unverifiable out-of-gas it
-  returns `fallback` and `eth_rpc_handler` proxies the original request
-  upstream. Correctness holes therefore degrade to *round-trip*, never to
-  wrong answers. Known fidelity gaps (revert-value semantics, gas-accounting
-  edge cases, dropped child-frame logs, missing warm/cold accesses) are
-  tracked in README TODO items 1–5.
-
-## 9. Known limitations (v0.7.0)
-
-1. EVM fidelity gaps (see §8) — these can return *correct-looking-but-wrong*
-   data on exotic code paths, hence the proxy fallback is the safety net.
-2. No consensus participation, no block production.
-3. devp2p is opt-in and young: discovery/RLPx/`eth`+snap sync, tx gossip,
-   auto-dial and strict ForkID are implemented and loopback-tested, but
-   live-peering breadth (against diverse real clients) is not yet
-   demonstrated — upstream RPC remains the dependable fallback by design
-   (all configurable).
-4. Blobs are not stored/extended; KZG `0x0A` is proxied.
-5. Header-only blocks proxy `Full=true` requests rather than serving bodies.
-6. `eth_getLogs` serves ranges capped at 1024 blocks from the receipts store;
-   wider ranges proxy upstream. Receipt/state serving needs the respective
-   stores populated (peer/snap sync paths); pure-RPC syncs keep proxying.
-7. Snap serving carries no proofs (leaf store only): strict requesters
-   reject our ranges; full proof serving needs inner-node retention.
-8. The state cache TTL for tags is a freshness/size trade-off; concurrent
-   readers share it safely behind the `eth_state` owner.
-
-## 10. Testing and the live harness
-
-- 185 eunit tests in `apps/etherlang/test/`, exercised with
-  `rebar3 eunit` (compiles to `_build/{default,node2}`).
-- Two local nodes (node A `:8545`, node B `:8546`) + a Docker deployment
-  (`Dockerfile`, `docker-compose` with ethstats agents) all run the same
-  release; verified live against Sepolia: gas-level tx through the node,
-  MetaMask send, `forge create` deploy, pruned-block proxying, retention
-  plateau, rate-limit behaviour.
-- `tools/etherlangctl` encodes the whole topology as one launcher.
-
-## 11. Roadmap direction
-
-Close remaining EVM fidelity gaps (precise gas accounting, better
-revert value/error reporting) → already resolved as of v0.7.4.
-
-**v1.0 target: complete execution client.** See README for the full
-9-phase plan:
-
-1. **Engine API** — `engine_newPayloadV1`, `engine_forkchoiceUpdatedV1`,
-   `engine_getPayloadV1`, `engine_exchangeTransitionConfigurationV1`
-   (JWT-authenticated, for Lighthouse/Prysm/Nimbus/Teku/Lodestar)
-2. **Full MPT state trie** — replace bounded snap store with
-   Merkle-Patricia Trie supporting state proofs, local verification,
-   and `eth_getProof`
-3. **Block production** — construct execution payloads, process
-   withdrawals (EIP-4895), compute receipts/blooms, produce blocks
-   when selected as proposer
-4. **State management** — pruning (archive/recent modes), state
-   expiration (EIP-4444), full state sync (snap code EIP-1189),
-   state root verification (EIP-4788)
-5. **Protocol compliance** — per-fork exact gas schedule, EIP-1559
-   base fee + burning, EIP-4844 blobs, EIP-4788 beacon roots,
-   EIP-3675 PoS merge, geth-compatible devp2p
-6. **JSON-RPC completeness** — debug/trace/miner/personal/admin
-   APIs, typed transactions (EIP-2718), EIP-712 signing, all `eth_*`
-   methods
-7. **Consensus integration** — tested with Lighthouse, Prysm, Nimbus,
-   Teku, Lodestar on Sepolia and mainnet
-8. **Testing** — Foundry tests, geth test vectors, differential testing
-   against geth, conformance tests, fuzz testing
-9. **Infrastructure** — Docker, monitoring, health checks, release process
-
-## 12. v1.0 Architecture — Complete Execution Client
-
-### Design goal
-
-etherlang v1.0 is a **complete Ethereum execution client** that is
-compatible with **any consensus client** that implements the Engine API
-(EIP-3675): Lighthouse, Prysm, Nimbus, Teku, Lodestar.
-
-### Architecture (v1.0)
-
-```
-ethlang (execution layer)
-├── Engine API server (JWT-authenticated)
-│   ├── engine_newPayloadV1     — receive blocks from CL
-│   ├── engine_forkchoiceUpdatedV1 — safe/finalized updates
-│   ├── engine_getPayloadV1     — return payload for CL
-│   └── engine_exchangeTransitionConfigurationV1 — negotiate
-│
-├── Block producer
-│   ├── Transaction pool → block builder
-│   ├── Block header constructor
-│   ├── State execution (MPT)
-│   ├── Receipt/log/bloom generation
-│   └── Withdrawal processing (EIP-4895)
-│
-├── Full state trie (Merkle-Patricia)
-│   ├── Account trie (balance, nonce, codeHash, storageRoot)
-│   ├── Storage trie (per-account)
-│   ├── Code storage (by keccak hash)
-│   ├── State proof generation
-│   └── State pruning (archive/recent modes)
-│
-├── Consensus interface (Engine API client)
-│   ├── Lighthouse / Prysm / Nimbus / Teku / Lodestar
-│   ├── JWT authentication
-│   └── Forkchoice sync
-│
-├── JSON-RPC server (complete API)
-│   ├── eth_* (all methods)
-│   ├── debug_* (trace APIs)
-│   ├── miner_* (no-op in PoS)
-│   ├── personal_* (key management)
-│   ├── admin_* (node management)
-│   ├── net_* (network info)
-│   └── web3_* (compatibility)
-│
-├── devp2p stack (full protocol)
-│   ├── discv5 (UDP v5 discovery)
-│   ├── rlpx (EIP-8 handshake + framing)
-│   ├── eth/68 + all sub-protocols
-│   ├── snap/1 (full snap sync)
-│   └── eth/69 (history, if needed)
-│
-└── Verification layer
-    ├── State root verification (every block)
-    ├── Receipt verification
-    ├── Per-fork exact gas schedule
-    └── Transaction validation (all fields)
+```erlang
+{verified, Root} | {unverified, Reason}
 ```
 
-### Trust model (v1.0)
+**There is no way to get a bare root out of it, on purpose.** A recomputed value
+stored under a key named after a header field is indistinguishable from a
+confirmed one, and that is exactly how a wrong receipts root once passed
+unchecked through this project.
 
-1. **Consensus client** (Lighthouse, etc.) provides the canonical chain
-   via the Engine API. etherlang validates and executes every block.
-2. **State** is maintained in a full MPT. State root is verified after
-   every block execution.
-3. **State proofs** are locally verifiable. No trust in upstream
-   for state reads.
-4. **Canonicality** is determined by the consensus layer, not upstream
-   RPC.
-5. **Block production** occurs when etherlang is selected as proposer
-   by the consensus layer.
+- An absent context key means the rule is **unchecked**, not passed.
+- `{unverified, state_not_local}` is a correct, complete answer when the node
+  holds no prestate. Do not paper over it.
+- "It should be fine" is not a reason. If you cannot check it, report it unchecked.
 
-### Testing matrix (v1.0)
+### 7.2 Fork selection is done; fork *pricing* is not
 
-| Consensus client | Engine API | eth/68 | forkid | Testing |
-|---|---|---|---|---|
-| Lighthouse | Required | Required | Required | Phase 7 |
-| Prysm | Required | Required | Required | Phase 7 |
-| Nimbus | Required | Required | Required | Phase 7 |
-| Teku | Required | Required | Required | Phase 7 |
-| Lodestar | Required | Required | Required | Phase 7 |
+`eth_fork_schedule:current_fork/3,4` selects the fork from real network
+activation points, including a `{ttd, N, Fork}` activation kind so the Merge turns
+on total difficulty rather than a guessed block number. An **unknown** total
+difficulty reports the *pre*-Merge fork, on purpose: a caller that guessed
+"merged" would apply PoS rules to a block it has not established is post-Merge,
+and would not know it had.
 
-### Dependencies
+Two halves of "per-fork exact" must not be confused:
 
-- Pure Erlang/OTP — no external consensus libraries needed
-- No Rust, Go, or Java dependencies
-- Pure Erlang crypto (secp256k1, ECIES, keccak)
-- Pure Erlang MPT implementation
-- DETS/ETS for state storage (with snapshot files for persistence)
+| | Status |
+|---|---|
+| **Availability** — may this fork run this instruction at all? | **Done.** An instruction the fork lacks is an exceptional halt consuming the frame's whole allowance. |
+| **Price** — what does it cost? | **Not done.** `eth_evm:base_cost/1` takes no fork; one Cancun-era schedule is applied to every block. |
+
+The availability half was the more dangerous of the two, because every clause in
+`do_op/3` was unconditional: PUSH0 executed in a Paris block and TSTORE executed
+anywhere before Cancun, each pushing a value and each returning *successfully*. A
+frame that succeeds where the chain's must halt is a different post-state, and
+nothing in the result says so.
+
+The price half is still open, and specifically:
+
+- no EIP-150 pre-Berlin access costs — `SLOAD` is 200, `BALANCE`/`EXTCODESIZE`/
+  `EXTCODEHASH` 700, the `CALL` family 700, where the Berlin+ figures are
+  2100/2600/100;
+- no EIP-3529 refund cap — the interpreter caps refunds at `gasUsed div 2` (the
+  EIP-2200 figure) while applying EIP-3529's 4800 clear refund, so the cap and
+  the refund it caps come from different forks;
+- no EIP-6780 gating on SELFDESTRUCT — the same-transaction rule is applied at
+  every fork, where before Cancun storage was always deleted;
+- EIP-3860's init-code cost is charged at every fork, and the Shanghai condition
+  belongs with the per-fork branching.
+
+**Wiring the price half is a refactor, not a substitution.** The two tables agree
+on every opcode's *total* but not on how it is composed: `eth_evm:base_cost/1`
+prices a warm access at 100 and its handler adds the cold surcharge separately
+(2500 account, 2000 slot), while `eth_fork_schedule:access_cost/3` returns the
+**total** (2600 or 2100) in one figure. Swapping the fork table in for the EVM's
+base would charge a cold `BALANCE` 5100 instead of 2600, a cold `SLOAD` 4100
+instead of 2100, and a cold `CALL` 5200 instead of 2600. One owner of the
+composition has to be chosen and the other side changed to match.
+
+### 7.3 The engine's status mapping
+
+`newPayload` decodes the payload, checks `blockHash`, calls `finalize/1`, and maps
+the verdicts:
+
+| Condition | Status |
+|---|---|
+| A root was **checked** and is wrong | `INVALID` |
+| A root is **unchecked** (no prestate held) | `SYNCING` |
+| A mismatch outranks an unchecked root | `INVALID` |
+| Unknown parent | `SYNCING` |
+| Invalid transaction | `INVALID` |
+| Other `finalize/1` error | `INVALID` |
+| `blockHash` ≠ `Keccak256(RLP(header))` | `INVALID_BLOCK_HASH` |
+
+Return shape follows the specification's `validationError` rule: a bare status
+binary for `VALID`/`SYNCING`; `{Status, Reason}` only for `INVALID` and
+`INVALID_BLOCK_HASH`. Reasons on `SYNCING` are logged, never returned.
+
+`ACCEPTED` is deliberately **not** returned. It is in the status enum, so
+returning it looks right, but the specification makes it a claim with
+preconditions — every transaction non-empty, `blockHash` correct, the payload not
+extending the canonical chain, not fully validated, ancestors known — and none is
+checked here.
+
+`forkchoiceUpdated` deliberately does **not** compare `parentHash` to the head. A
+non-matching parent is a side branch or an unimported block, and the
+specification answers `SYNCING` to both, so the comparison could only ever produce
+a wrong `INVALID`. It survives as a log line.
+
+`status_for_finalize/1` and `status_for_verification/1` are exported and pure so
+the mapping is testable without holding the parent state locally.
+
+### 7.4 The interpreter is honest about its own limits
+
+`eth_call` is the one method that executes locally and can therefore be wrong.
+It degrades rather than lying: on an unsupported opcode, an internal crash, or an
+unverifiable condition it returns `fallback` and the handler proxies the original
+request upstream. A correctness hole becomes a round trip, not a wrong answer.
+
+Two distinctions inside that are load-bearing:
+
+- `unsupported` means "this node cannot run this, ask someone else" and is
+  answered with a proxy. A precompile that *ran and failed* is not that: the
+  input is invalid, the answer is a hard failure that consumes the frame, and
+  proxying would substitute another node's verdict for this one's. A failed
+  `0x0A` halts with `{error, {kzg, point_evaluation_failed}}` and refunds its
+  caller nothing.
+- `invalid_opcode` is 0xFE, a specified instruction at every fork.
+  `{undefined_opcode, Op}` is a byte the fork has never had. Both halt the frame
+  and consume its allowance, so they agree on every state root and differ only in
+  the label; they are kept apart so a caller can tell them.
+
+`eth_evm:run/5` **requires** a `fork` in the Env and has no default. A default
+would be a fork this node chose rather than one the chain chose: run against a
+Paris block with Cancun's instructions available and the frame succeeds where the
+chain says it must halt. A `badkey` is the loud version of that, and every Env
+builder in `src/` sets it — `eth_call:env_from_block/2`,
+`eth_block:block_env/2`, `eth_fork_schedule:run_system_call/6`.
+
+### 7.5 Constants are derived and pinned, or documented as gaps
+
+Every consensus constant is one or the other. Never both, never neither.
+
+- **Derived and pinned:** `?EMPTY_UNCLE_HASH` = `Keccak256(RLP([]))`, previously
+  `?EMPTY_ROOT` — the empty *trie* root, a completely different constant that was
+  standing in for it in the same module. Now pinned by asserting the three real
+  Sepolia block hashes. The 2 GiB DETS ceiling, the undecided-TTD sentinel
+  `2^256-2^10`, the per-fork opcode counts.
+- **Documented as a gap:** `eth_kzg:blob_to_kzg_commitment/1` is *deliberately*
+  unimplemented — it needs the `g1_lin` derivation and the EIP-4844 vector could
+  not be fetched, so it is not in the repository. Do not "finish" it with an
+  approximation. EIP-7685's `requestsHash` (the EIP does not fix the header field
+  position, and without EIP-7251 there are no requests). `TERMINAL_BLOCK_HASH`
+  (chain-config data, not in the EIP; carried and echoed, never checked).
+
+Never tune a constant until a test passes. That is fitting the test.
+
+---
+
+## 8. Testing
+
+- **No network.** Every test runs against `eth_mock_node` (in-process JSON-RPC)
+  or a loopback devp2p stack on real sockets. **A unit test must never perform a
+  lazy upstream fetch** — it hangs when the node is offline rather than failing.
+  Two of this document's own findings came from that: `SELFBALANCE` reaches
+  `eth_state`, which falls through to its upstream reader unless the account is in
+  the state's overlay, and `eth_rpc_client` is process-wide and points at a public
+  Sepolia node by default, so any test whose *failure* path proxies makes a live
+  network call.
+- **Real chain data is committed, not fetched** — `test/vectors/*.json`,
+  `eth_payload_fixture.erl` (real Sepolia payloads: Paris 1450507, Shanghai
+  3001655, Cancun 6985356), `eth_test_util.erl`.
+- **Fixtures must be independent of the code under test.** A payload whose
+  transactions were re-encoded with this repo's own codec makes the transactions
+  root and block hash checks circular.
+- **Give every fork variant a fixture, including a non-degenerate one.** The small
+  real Cancun block has `blobGasUsed = "0x0"`, so a decoder that passed the string
+  through undecoded agreed with a correct one.
+- **Test names are the specification.** If a name had to be softened to make it
+  pass, the test is wrong.
+- **A test that has never failed has never been tested.** Inject a defect into the
+  live path and watch the test catch it, restoring from a pristine copy in a
+  `finally` and `touch`ing afterwards. Pick an injection that still compiles: an
+  injection that orphans a helper is a warning, warnings are errors, and the
+  *build* catches it — which proves nothing about the test.
+- **After a timeout, verify the tree against the pristine copy** before trusting
+  any result. A killed injection script has left a dirty tree before, and the next
+  run then tested injected code and reported it as the baseline.
+- **Never restore a snapshot taken before the change it is meant to protect.** It
+  silently reverts work. Use `git diff` to confirm the tree is what you intended.
+
+EUnit truncates assertion values; write diagnostics to a file from a temporary
+probe and read it with the shell. Delete probe files before committing — two
+leftovers were once silently compiled and inflated the test count by 2.
+
+---
+
+## 9. Where the work is
+
+`TASKS.md` holds the authoritative ordered list. In order:
+
+1. **Finish the per-fork gas *pricing*** — the refactor described in §7.2. A
+   precondition for any state-root claim, and for a block this node builds being
+   proposable.
+2. **EEST conformance work** — run the execution-specs fixtures and record what
+   fails. Nothing here has been checked against them (§1.3).
+
+Deliberately later, with reasons recorded in `TASKS.md`: the rest of the Engine
+API (`getPayloadBodiesBy*V1` — blocked on **data**, since EIP-2718 wire bytes are
+not retained; `notifyHeaders` — no clause in any per-fork `execution-apis` file,
+so implementing it would mean inventing its shape; V4/V5; `getBlobsV1`),
+`eth_createAccessList` (needs access recording on the EVM's hot path), and
+`debug_*`/`trace_*`/`miner_*`/`admin_*`/`personal_*`.
+
+---
+
+## 10. Deliberately not done
+
+Do not "fix" these by guessing. Each is in `TASKS.md`.
+
+| Item | Why |
+|---|---|
+| `eth_kzg:blob_to_kzg_commitment/1` | Needs the `g1_lin` derivation; no local blob fixture, and the EIP-4844 vector fetch 404'd. |
+| EIP-7685 `requestsHash` | Hashing rule sourced, but the EIP does not fix the header field position, and without EIP-7251 there are no requests. |
+| `TERMINAL_BLOCK_HASH` (EIP-3675) | Chain-config data, not in the EIP. Carried and echoed, never checked against a post-Merge block's difficulty. |
+| Per-fork gas *pricing* | A refactor of the charging path, not a substitution. See §7.2. |
+| `eth_block:to_rlp/1` fork-awareness | Unconditionally includes the Cancun trailing fields, so it is only correct for Cancun-or-later headers. Pre-existing, documented, unfixed. |
+| Snap proof serving | Leaf store only; strict requesters reject our ranges. Needs inner-node retention. |
+
+---
+
+## 11. Known dead and unwired code
+
+Named so it is not mistaken for working code:
+
+- `eth_block:hash/1`, `eth_block:header/1`, `eth_block:to_rlp/1` — unused in
+  `src/`, tests only.
+- `eth_header:header_fields/0` lists `requestsHash`, which is not a header field.
+  Inert, because upstream block JSONs do not carry it.
+- `eth_rpc_server:start_engine_api/2` swallows a listener failure
+  (`{error, Reason} -> logger:error(...), ok`).
+- `eth_tx:intrinsic_gas/1` charges EIP-3860 init-code gas unconditionally, because
+  a transaction has no block context to resolve a fork from. A pre-Shanghai
+  creation transaction is therefore overcharged at admission. Named rather than
+  fixed, because fixing it means giving the validator a fork argument it cannot
+  honestly obtain on the pool path.
