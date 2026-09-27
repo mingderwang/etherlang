@@ -973,3 +973,135 @@ initcode_gas_agrees_with_the_opcode_term_test() ->
          ?assertEqual(eth_fork_schedule:initcode_word_cost(F) * Words,
                       eth_fork_schedule:gas_cost(16#F0, F, Len) - Base)
      end || F <- [frontier, berlin, london, shanghai, cancun, prague]].
+
+%% ---------------------------------------------------------------------------
+%% One owner of a price's composition
+%% ---------------------------------------------------------------------------
+%%
+%% Two tables used to answer "what does this opcode cost": eth_evm:base_cost/1,
+%% fork-free, and this module's base_gas_cost/3. They agreed on most totals and
+%% decomposed four groups differently, and the interpreter's copy has been
+%% deleted. These tests pin the shape of the split, so a second decomposition
+%% cannot appear beside the first.
+
+%% An access-sensitive opcode has no constant part, because "is this target warm"
+%% is not knowable before the handler looks. If one of them ever gained a
+%% non-zero constant, the machine loop would charge it and the handler would
+%% charge the whole price again -- the cold BALANCE would cost 5100, which is
+%% exactly the bug the two-table arrangement made possible.
+access_sensitive_opcodes_have_no_constant_cost_test() ->
+    Sensitive = [Op || Op <- lists:seq(0, 255),
+                       eth_fork_schedule:access_sensitive(Op)],
+    ?assertEqual([16#31, 16#3B, 16#3C, 16#3F, 16#54, 16#F1, 16#F2, 16#F4, 16#FA],
+                 Sensitive),
+    [?assertEqual(0, eth_fork_schedule:constant_cost(Op, F))
+     || Op <- Sensitive,
+        F <- [frontier, byzantium, istanbul, berlin, london, shanghai, cancun]],
+    %% And the only opcodes whose constant is zero are the ones that are free on
+    %% purpose, so the list above is a statement about these nine and not a way
+    %% of making the first assertion pass. SSTORE is here for a different reason
+    %% than the four beside it: its *entire* cost is the EIP-2200 net-metering
+    %% term, which is charged in the interpreter and is not implemented -- so it is
+    %% not access-sensitive, because that would promise this table a price it does
+    %% not hold. Asserted as a list rather than as "everything else is non-zero"
+    %% because "non-zero" is false: these five are zero, four of them deliberately.
+    ?assertEqual([16#00, 16#55, 16#F3, 16#FD, 16#FE],
+                 [Op || Op <- lists:seq(0, 255),
+                       eth_fork_schedule:opcode_exists(Op, cancun),
+                       not eth_fork_schedule:access_sensitive(Op),
+                       eth_fork_schedule:constant_cost(Op, cancun) =:= 0]).
+
+%% The constant the machine loop charges is the table's own base, for every
+%% opcode and every fork. `gas_cost/3' at length 0 is base + dynamic, and dynamic
+%% is 0 at length 0 for all of them, so the two must agree exactly. This is the
+%% whole-space check that the two tables could not both pass -- and the reason
+%% deleting eth_evm's copy was safe is that this pins the survivor.
+constant_cost_is_the_tables_own_base_everywhere_test() ->
+    Forks = [frontier, byzantium, constantinople, istanbul, berlin, london,
+             shanghai, cancun, prague],
+    [begin
+         ?assertEqual(eth_fork_schedule:gas_cost(Op, F, 0),
+                      eth_fork_schedule:constant_cost(Op, F))
+     end || F <- Forks,
+            Op <- lists:seq(0, 255),
+            eth_fork_schedule:opcode_exists(Op, F),
+            not eth_fork_schedule:access_sensitive(Op)].
+
+%% EIP-150's pre-Berlin figures, which existed in this table and in *no* part of
+%% execution until eth_evm asked for them. Before that a Frontier BALANCE cost
+%% 2600, because the interpreter charged a warm base of 100 plus a hardcoded 2500
+%% cold surcharge at every fork.
+pre_berlin_access_costs_are_eip_150s_test() ->
+    Pre = [frontier, homestead, dao, tangerine, spurious_dragon, byzantium,
+           constantinople, petersburg, istanbul, muir_glacier],
+    %% EIP-150 set BALANCE and EXTCODEHASH to 400, and left EXTCODESIZE,
+    %% EXTCODECOPY and the CALL family at 700.
+    [?assertEqual(400, eth_fork_schedule:access_cost(16#31, F, #{})) || F <- Pre],
+    [?assertEqual(400, eth_fork_schedule:access_cost(16#3F, F, #{})) || F <- Pre],
+    [?assertEqual(700, eth_fork_schedule:access_cost(16#3B, F, #{})) || F <- Pre],
+    [?assertEqual(700, eth_fork_schedule:access_cost(16#3C, F, #{})) || F <- Pre],
+    [?assertEqual(700, eth_fork_schedule:access_cost(Op, F, #{}))
+     || F <- Pre, Op <- [16#F1, 16#F2, 16#F4, 16#FA]],
+    %% SLOAD is COLD_SLOAD_COST's own legacy figure, 200, and not an account's
+    %% 400. The two were separate functions before and are one table now.
+    [?assertEqual(200, eth_fork_schedule:access_cost(16#54, F, #{})) || F <- Pre],
+    %% Warmth is not observable before Berlin, so the argument makes no
+    %% difference: there is one pre-Berlin price per opcode.
+    [?assertEqual(eth_fork_schedule:access_cost(Op, F, #{}),
+                  eth_fork_schedule:access_cost(Op, F, #{warm => true}))
+     || F <- Pre,
+        Op <- [16#31, 16#3B, 16#3C, 16#3F, 16#54, 16#F1, 16#F2, 16#F4, 16#FA]].
+
+%% EIP-2929 from Berlin: 100 warm, and cold at the opcode's own figure. SLOAD's
+%% cold cost is 2100 and an account's is 2600 -- different constants, which is
+%% why they share a table with two numbers each rather than one regime.
+berlin_access_costs_are_warm_100_and_cold_per_opcode_test() ->
+    Post = [berlin, london, shanghai, cancun, prague, osaka, amsterdam],
+    Accounts = [16#31, 16#3B, 16#3C, 16#3F, 16#F1, 16#F2, 16#F4, 16#FA],
+    [begin
+         ?assertEqual(100, eth_fork_schedule:access_cost(Op, F, #{warm => true})),
+         ?assertEqual(2600, eth_fork_schedule:access_cost(Op, F, #{})),
+         %% Absent means cold, because that is the common case: an access the
+         %% frame has not touched yet. Defaulting to warm would undercharge every
+         %% first access in a frame.
+         ?assertEqual(2600, eth_fork_schedule:access_cost(Op, F, #{warm => false}))
+     end || F <- Post, Op <- Accounts],
+    [begin
+         ?assertEqual(100, eth_fork_schedule:access_cost(16#54, F, #{warm => true})),
+         ?assertEqual(2100, eth_fork_schedule:access_cost(16#54, F, #{}))
+     end || F <- Post].
+
+%% EIP-161's two optional terms are Spurious Dragon's, and this function gated
+%% them on Berlin -- two forks later. So a Spurious-Dragon-to-Byzantium CALL
+%% carrying value paid neither the 9000 nor the 25000 while still being charged
+%% the access cost, and a Homestead-to-Tangerine one paid neither at all.
+call_optional_terms_start_at_spurious_dragon_not_berlin_test() ->
+    Full = #{warm => false, value_transfer => true, new_account => true},
+    NoValue = #{warm => false, value_transfer => false, new_account => false},
+    Before = [frontier, homestead, dao, tangerine],
+    AtOrAfter = [spurious_dragon, byzantium, constantinople, petersburg, istanbul,
+                 berlin, london, shanghai, cancun],
+    %% Before Spurious Dragon: the access term alone, 700.
+    [?assertEqual(700, eth_fork_schedule:call_cost(Op, F, Full))
+     || F <- Before, Op <- [16#F1, 16#F2, 16#F4, 16#FA]],
+    %% From Spurious Dragon: 700 + 9000 + 25000. The two boundaries are separate
+    %% assertions because the gap between them -- Spurious Dragon through
+    %% Istanbul -- is exactly the span that was wrong.
+    [?assertEqual(700 + 9000 + 25000, eth_fork_schedule:call_cost(Op, F, Full))
+     || F <- [spurious_dragon, byzantium, constantinople, petersburg, istanbul],
+        Op <- [16#F1, 16#F2, 16#F4, 16#FA]],
+    [?assertEqual(2600 + 9000 + 25000, eth_fork_schedule:call_cost(Op, F, Full))
+     || F <- [berlin, london, shanghai, cancun],
+        Op <- [16#F1, 16#F2, 16#F4, 16#FA]],
+    %% A call that moves no value and creates no account pays the access term and
+    %% nothing else, at every fork. Charging 25000 on a zero-value call would make
+    %% every read-only call cost 25000 more than it should.
+    [?assertEqual(eth_fork_schedule:access_cost(Op, F, #{}),
+                  eth_fork_schedule:call_cost(Op, F, NoValue))
+     || F <- Before ++ AtOrAfter, Op <- [16#F1, 16#F2, 16#F4, 16#FA]],
+    %% DELEGATECALL and STATICCALL are priced as CALL and CALLCODE: the same access
+    %% term, and the caller decides the optional ones by whether value is moving,
+    %% which it never is for either.
+    [?assertEqual(eth_fork_schedule:call_cost(16#F1, F, Full),
+                  eth_fork_schedule:call_cost(Op, F, Full))
+     || F <- AtOrAfter, Op <- [16#F2, 16#F4, 16#FA]].

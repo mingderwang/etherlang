@@ -39,24 +39,33 @@ behavioural change per commit, and each step says what it now does.
    defects the dead version would have shipped the moment it was started.
    `eth_block:to_payload/1` was added as the inverse of `from_payload/1` and
    round-trips all three real Sepolia payloads hash-identically. The honest limit
-   stands: a block this node builds has a state root that will not match the
-   network's while the gas table is unwired, so the node can serve a CL's requests
-   but is not yet safe to propose from.
+   stands, though the reason has narrowed: a block this node builds has a state
+   root that is **not known** to match the network's. The gas table is wired now,
+   and what remains is SSTORE net metering -- a known 2700-gas-per-no-op-write
+   overcharge -- plus the standing caveat that no state-root divergence has been
+   checked end to end. The node can serve a CL's requests but is not yet safe to
+   propose from.
 2. ~~**Add the missing JSON-RPC methods**~~  **Done**, and the framing was wrong:
    they were not missing so much as unexamined. A catch-all clause proxied every
    unknown method, so all eight *answered* — with another node's view. Seven are now
    answered from this node's own state and each says what it is derived from, and
    `eth_getTransactionByBlockHashAndIndex` came along because it shares the
    projection. `eth_createAccessList` is still absent; the blocker is named in Phase 6.
-3. **Wire the per-fork gas table into the EVM**  *(in progress — the first half is
-   done, the second is not)*. The **availability** half is done: an instruction the
-   executing fork does not have is now an exceptional halt rather than a cheap one,
-   and the fork reaches the interpreter through the Env. The **price** half is not
-   done: `eth_evm:base_cost/1` still takes no fork and `eth_fork_schedule:gas_cost/3,4`
-   still has no caller in the execution path. See the Phase 5 item for both halves
-   and for why the second is a refactor of the charging path rather than a
-   substitution.
-4. **EEST conformance work**: run the execution-specs fixtures and record what fails.
+3. ~~**Wire the per-fork gas table into the EVM.**~~  **Done, with one exception.**
+   *Availability* — an instruction the executing fork does not have is an
+   exceptional halt rather than a cheap one, and the fork reaches the interpreter
+   through the Env. *Pricing* — `eth_fork_schedule` now owns every price the
+   interpreter charges and `eth_evm:base_cost/1`, a second fork-free copy of the
+   schedule, is deleted. What remains is **SSTORE net metering**, which is a live
+   bug rather than a gap: a no-op write is overcharged by 2700 gas net at every
+   fork, because the interpreter uses the slot's *current* value where EIP-2200
+   wants the value it held at the start of the transaction. See the Phase 5 item.
+4. **SSTORE net metering**  *(next)*. Needs the transaction-start value of each
+   slot. The EVM tracks no such thing, and the transient map cannot hold it: that
+   map is transaction-scoped but is discarded on a child revert, whereas the
+   original value must survive one. This is its own change with its own revert
+   semantics, not a table edit.
+5. **EEST conformance work**: run the execution-specs fixtures and record what fails.
    Nothing in this repository has been checked against them (see the note in Phase 8).
 
 ### Deliberately later: the rest of the Engine API
@@ -230,12 +239,10 @@ Recorded because the documentation claimed otherwise, and because each of these 
     reproduce, produced without one error and recorded as a result. `eth_fork_schedule:
     opcode_exists/2` is the new predicate; `eth_evm:run/5` requires a `fork` key in the
     Env and every Env builder sets it.
-  - **Price: partly done.** Four rules are now fork-selected, each derived from the EIP
-    text and pinned by a test: the **refund cap**, **EIP-6780** on SELFDESTRUCT, the
-    **EIP-3860** init-code term, and the fork's reach into `eth_tx`'s intrinsic check.
-    What remains is the **access costs** — `eth_evm:base_cost/1` still takes no fork, so
-    a warm access costs 100 and a cold one 2600/2100 at every fork, where EIP-150's
-    pre-Berlin 700/200 apply. The sub-points below give the detail.
+  - **Price: done, except SSTORE.** `eth_fork_schedule` is the execution path's only
+    source of prices and `eth_evm:base_cost/1` -- a second, fork-free copy of the
+    schedule -- is deleted. The sub-points below record what that took, and what
+    comparing the two tables turned up on the way.
   - **The refund cap was Berlin's divisor with London's refund amounts.** EIP-3529 (London)
     sets `MAX_REFUND_QUOTIENT` to 5, so a transaction may refund `gas_used // 5`; before it
     EIP-2200 (Berlin) allowed `gas_used // 2`. The interpreter used `GasUsed div 2` while
@@ -285,11 +292,16 @@ Recorded because the documentation claimed otherwise, and because each of these 
     schedule with the current value in place of the original would be inventing a rule no
     fork specifies, which is the thing this repository has to avoid.
   - Fork *selection* is done and driven by real network activation points, including the Merge's total-difficulty activation (`current_fork/4`; see EIP-3675 below).
-  - **There is a fork-parameterized table, it is dead code, and it was also wrong.** `eth_fork_schedule:gas_cost/3,4` (over `base_gas_cost/3` and `dynamic_gas_cost/4`) takes a fork atom, is exported, and has its own unit tests — and nothing in the execution path calls it. The EVM charges `eth_evm:base_cost/1`, which takes no fork, so the fork table passing its tests proved nothing about execution.
+  - **The fork-parameterized table was dead code, and it was also wrong.** `eth_fork_schedule:gas_cost/3,4` (over `base_gas_cost/3` and `dynamic_gas_cost/4`) took a fork atom, was exported, and had its own unit tests — and nothing in the execution path called it, because the EVM charged `eth_evm:base_cost/1`, which took no fork. So the fork table passing its tests proved nothing about execution.
+    - **It is *still* not called from `src/`, deliberately.** The interpreter now charges `constant_cost/2` before the opcode runs and the access term afterwards, because warmth is not knowable before then; `gas_cost/3,4` is the *aggregate* of those two, and an aggregate is the wrong shape for an interpreter that charges at two different moments with two different sets of facts. What is wired in is the table's components, and `gas_cost/3,4` remains the query API that answers "what does this opcode cost at this fork" in one figure — used by its own tests. Anyone reading this as "the table is still disconnected" should check what calls it: nothing in `src/` calls the aggregate, and that is the design.
   - Checking what that dead table actually said, rather than assuming it was a better version of the live one, found it wrong for **19 of the 256 opcodes** (measured by evaluating both tables across the whole range, cold and warm) while its tests stayed green. With a non-zero length argument it is 21, the two extra being `CREATE` and `CREATE2`, which had no init-code term at all. `SELFBALANCE` was 32000 (it shared a clause with `CREATE`/`CREATE2`, the other two opcodes that read the caller's account); `RETURNDATASIZE` was 2600 (routed through `access_cost/3`); `TLOAD`, `TSTORE`, `MCOPY` and `PUSH0` were **0** (no clause at all, so they fell to a catch-all that prices an unassigned opcode at 0); `SLOAD` was 2; `JUMP`/`JUMPI` were 2; `MLOAD`/`MSTORE`/`MSTORE8` were 2; `SSTORE` was 2 rather than 0; `CALLDATASIZE`/`CODESIZE`/`GASPRICE` were 3; `JUMPDEST` was 2; `INVALID` was 5000. The per-word terms were transposed: `RETURNDATASIZE` carried the 3-per-word copy cost and `RETURNDATACOPY` carried none, so reading the size of a return buffer was billed per byte of it and copying it was free. `CREATE`/`CREATE2` also had no EIP-3860 init-code term, and `CREATE2` no hashing term, so deploying a large contract cost nothing for the code about to run.
   - The tests missed all of it because they sampled nine opcodes the table already had right (`ADD`, `MUL`, `SUB`, `DIV`, `MOD`, `ADDM`, `EXP`, `KECCAK256`, `CREATE`) and none it had wrong. So the earlier claim that wiring the table up "is the start of this task, not the end" was too generous: wiring it up as it stood would have made execution worse. The table is now corrected and pinned by a **whole-table** assertion — the priced set exactly, plus every value — so a missing clause shows up as a missing entry rather than as a silent zero. That test is what would have caught all nineteen.
   - Comparing the two tables also found a **live** bug the fork table did not have. `eth_evm:base_cost/1` has no clause for `CALL`, `CALLCODE` or `STATICCALL`, so all three fell to its `base_cost(_) -> 3` catch-all and were charged 3 gas more than EIP-2929 specifies; `DELEGATECALL`, the one member that *was* listed, was correct. Three gas changes no execution outcome, so no test failed and no contract behaved differently — but `gasUsed` is a receipt field, the receipts root is in the block header, and the header is hashed. Fixed, with the whole family pinned at 2600 cold and 100 warm.
-  - **Wiring it up is not a substitution, and the two tables are not interchangeable.** They agree on the *total* for every opcode but not on how it is composed. `eth_evm:base_cost/1` prices a warm access at 100 and its handler adds the cold surcharge separately (2500 for an account, 2000 for a storage slot); `eth_fork_schedule:access_cost/3` returns the **total**, 2600 or 2100, in one figure. Substituting the fork table for the EVM's base would charge a cold `BALANCE` 5100 instead of 2600 (2x), a cold `SLOAD` 4100 instead of 2100, and a cold `CALL` 5200 instead of 2600, because the handlers would add their surcharges on top of a figure that already includes them. So the wiring has to pick one owner of the composition and change the other side to match -- it is a refactor of the charging path, not a one-line change, and it cannot be done by swapping a function name.
+  - **The wiring was not a substitution, and the two tables were not interchangeable.** They agreed on the *total* for every opcode but not on how it was composed: `eth_evm:base_cost/1` priced a warm access at 100 and its handler added the cold surcharge separately (2500 for an account, 2000 for a storage slot), while `eth_fork_schedule:access_cost/3` returned the **total**, 2600 or 2100, in one figure. Substituting the fork table for the EVM's base would have charged a cold `BALANCE` 5100 instead of 2600, a cold `SLOAD` 4100 instead of 2100, and a cold `CALL` 5200 instead of 2600. The resolution was one owner: the machine loop charges `constant_cost/2`, which is **zero** for the access-sensitive opcodes because warmth is not knowable before the handler looks, and each handler asks for its whole price supplying only the facts. `base_cost/1` is deleted.
+  - **Measuring the two tables against each other, rather than reading either, found two more live bugs.**
+    - **`ADDRESS` cost 3, not 2.** It had no clause in `base_cost/1` and fell to the `base_cost(_) -> 3` catch-all -- the same trap that had once mispriced three of the four `CALL` opcodes, which is what "a trap that has now fired twice" in Phase 5 refers to. One gas on every `ADDRESS` in every block, and `gasUsed` is a receipt field. The fork table has 2, so deleting the copy fixed it.
+    - **EIP-161's two terms were gated on Berlin.** The 9000 for a value transfer and the 25000 for a new account are Spurious Dragon's, two forks earlier, so a Spurious-Dragon-through-Istanbul `CALL` carrying value paid neither while still being charged the access cost. The gate had never been exercised, because nothing called that function before this change.
+  - **EIP-150's pre-Berlin figures existed only in the table and nowhere in execution.** A Frontier `BALANCE` cost 2600, because the interpreter had no path to the pre-Berlin price at all: 400 for `BALANCE` and `EXTCODEHASH`, 700 for `EXTCODESIZE`/`EXTCODECOPY`/the `CALL` family, 200 for `SLOAD`. They are applied now, from one table keyed by opcode rather than taking it as an argument -- the figures differ by opcode and an argument invites the caller to pass the wrong one for its own opcode. `SLOAD` had been a separate function differing in two numbers (200 and 2100 against 400/700 and 2600), which is a second place for the two to drift.
   - What is still missing is the part neither table covers: `eth_evm` has no EIP-150 pre-Berlin access costs and no per-fork branching for them, so a warm access costs 100 and a cold one 2600/2100 at every fork. `eth_fork_schedule` is no longer missing EIP-3529's refund logic — that is `refund_cap/2` — but its `SSTORE` is still a bare 0, so the table is not yet a complete per-fork schedule either. One thing is named as a gap rather than implemented: **EIP-150's 63/64 gas-retention rule and the 2300 stipend** are applied at every fork. The EIP states the rule it introduced, not the one it replaced, and no client consulted still supports a pre-Whistle block — so the pre-EIP-150 behaviour would have to be invented, and it is not.
   - `fork_rank/1` used to collapse Frontier through Petersburg into a single rank 0.
     That was invisible while the only gates were Berlin, London, Shanghai and Cancun,

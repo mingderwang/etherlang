@@ -139,13 +139,17 @@ instruction the fork does not have (`eth_fork_schedule:opcode_exists/2`). Do not
 give that key a default. A default is a fork this node chose rather than one the
 chain chose, and the only symptom is a plausible answer.
 
-The gas *table* (`gas_cost/3,4`) is a different question and is still
-disconnected: it is fork-parameterized and unit-tested, but **nothing in the
-execution path calls it** — `eth_evm:base_cost/1` applies one flat Cancun-era
-schedule for the *access* costs. Four other rules are now fork-selected (the
-refund cap, EIP-6780, EIP-3860, and `eth_tx`'s intrinsic floor). Wiring the
-access costs in is a refactor, not a substitution, because the two tables agree on
-every total but not on how it is composed.
+The gas *table* is now the execution path's only source of prices.
+`eth_fork_schedule:constant_cost/2` is what the machine loop charges, and the
+handlers whose price depends on the frame ask for the whole figure via
+`access_cost/3` or `call_cost/3`. `eth_evm:base_cost/1` — a second, fork-free copy
+of the schedule — **is deleted**; do not add it back. Two copies of a consensus
+constant is one too many, and they had drifted in how they decomposed four groups
+rather than in their values, which is why neither could be substituted for the
+other. The rules now fork-selected are every opcode's constant price, EIP-150's
+pre-Berlin access costs, EIP-2929's warm/cold split, EIP-161's 9000/25000 (which
+are Spurious Dragon's, not Berlin's), the refund cap, EIP-6780, EIP-3860, and
+`eth_tx`'s intrinsic floor.
 
 **SSTORE net metering is not implemented, and a no-op write is mispriced.** A
 no-op is charged 2900 with a 100 refund where EIP-2200 clause (1) says
@@ -382,7 +386,7 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
 | `eth_kzg:blob_to_kzg_commitment/1` | Needs the `g1_lin` derivation; no local blob fixture, and the EIP-4844 vector fetch 404'd. |
 | EIP-7685 `requestsHash` | Hashing rule sourced, but the EIP does not fix the header field position, and without EIP-7251 there are no requests. |
 | `TERMINAL_BLOCK_HASH` (EIP-3675) | Chain-config data, not in the EIP. Carried and echoed, never checked against a post-Merge block's difficulty. |
-| Per-fork gas *price* wiring | A refactor, not a substitution. Availability is done; pricing is not. |
+| Per-fork gas *price* wiring | Done. One owner of every price; the interpreter's duplicate table is deleted. SSTORE is the exception — see below. |
 | `eth_block:to_rlp/1` fork-awareness | It unconditionally includes the Cancun trailing fields, so it is only correct for Cancun-or-later headers. Pre-existing, documented, unfixed. |
 | `eth_tx:intrinsic_gas/1` fork-awareness | Takes no fork and falls back to the operator's `ETH_FORK` pin. Correct for pool admission, where no block exists; wrong for `eth_call`/`eth_estimateGas` and block execution, which pass the block's own fork through `intrinsic_gas/2`. Do not use the one-argument form where a block is in hand. |
 | EIP-150's 63/64 rule and 2300 stipend | Applied at every fork. The EIP states the rule it introduced, not the one it replaced, and no consulted client still supports a pre-Whistle block — so the earlier behaviour would have to be invented. |

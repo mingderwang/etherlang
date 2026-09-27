@@ -1,6 +1,6 @@
 # etherlang — design and current state
 
-**Status**: v1.0 in progress. 597 eunit tests, green.
+**Status**: v1.0 in progress. 608 eunit tests, green.
 
 This document describes what the node *is* and what it is *becoming*: the system
 model, the trust assumptions, the data structures, and — at least as important —
@@ -274,7 +274,7 @@ Two halves of "per-fork exact" must not be confused:
 | | Status |
 |---|---|
 | **Availability** — may this fork run this instruction at all? | **Done.** An instruction the fork lacks is an exceptional halt consuming the frame's whole allowance. |
-| **Price** — what does it cost? | **Partly done.** Four rules are fork-selected; the access costs are not. |
+| **Price** — what does it cost? | **Done, except SSTORE.** `eth_fork_schedule` owns every price; the interpreter's duplicate table is deleted. |
 
 The availability half was the more dangerous of the two, because every clause in
 `do_op/3` was unconditional: PUSH0 executed in a Paris block and TSTORE executed
@@ -282,58 +282,56 @@ anywhere before Cancun, each pushing a value and each returning *successfully*. 
 frame that succeeds where the chain's must halt is a different post-state, and
 nothing in the result says so.
 
-### 7.2.1 What per-fork pricing now selects
+### 7.2.1 One owner of a price's composition
 
-Four rules, each read off the EIP's own text rather than recalled, each pinned by
-a test that fails if the gate is removed:
+`eth_evm` used to carry its own copy of the base schedule, `base_cost/1`, taking
+no fork, alongside `eth_fork_schedule`'s fork-parameterized one. Two copies of a
+consensus constant is one too many, and they had already drifted — not in most
+values, but in how four groups were *built*:
 
-- **The refund cap.** EIP-2200 (Berlin) allowed `gas_used // 2`; EIP-3529 (London)
-  sets `MAX_REFUND_QUOTIENT` to 5 and allows `gas_used // 5`. The interpreter was
-  applying Berlin's divisor to London's refund *amounts*, so cap and refund came
-  from different forks — and a frame refunding the maximum got 40% more gas back
-  than London allows.
-- **EIP-6780 (Cancun) on SELFDESTRUCT.** The balance always moves; code and
-  storage are deleted only for an account created in the same transaction, where
-  before Cancun they were always deleted. A *question* rather than a price,
-  because the cost is 5000 at every fork and only what it destroys changes.
-- **EIP-3860's init-code term**, Shanghai-gated, in the CREATE and CREATE2
-  opcodes *and* in a creation transaction's intrinsic gas — which had been
-  charging it at every fork, overcharging a pre-Shanghai creation by 2 gas a
-  word. Enough to refuse a transaction minted exactly at the pre-Shanghai floor.
-  CREATE2's hashing term is Constantinople's and stays ungated.
-- **The fork's reach into `eth_tx`.** The validator's intrinsic check had no fork
-  to consult at all. It does now, from the block's own, supplied by
-  `eth_block:validation_ctx/4`. Where no block exists — pool admission — the
-  operator's `ETH_FORK` pin is used instead, which is a stated weakening rather
-  than a resolution.
+| | `eth_evm:base_cost/1` | the fork table |
+|---|---|---|
+| `BALANCE`, `EXTCODESIZE`, `EXTCODECOPY`, `EXTCODEHASH`, `SLOAD` | warm base 100, plus a hardcoded 2500/2000 in the handler | the whole figure, 2600 or 2100 |
+| the `CALL` family | 0, with `do_call/3` charging the access cost itself | the whole figure |
+| `LOG0`–`LOG4` | flat 375, plus 375 a topic in the handler | `375 * (topics + 1)` |
 
-### 7.2.2 What is still missing
+Both were internally consistent, which is why neither was wrong on its own and why
+neither could be substituted for the other: a cold `BALANCE` would have cost 5100.
+The resolution is one owner. The machine loop charges
+`eth_fork_schedule:constant_cost/2`, which is **zero** for the access-sensitive
+opcodes — whether a target is warm is not knowable before the handler looks — and
+each of those handlers asks the table for its whole price, supplying only the
+facts: is the target warm, is value moving, does the account exist.
 
-- **The access costs.** `eth_evm:base_cost/1` takes no fork, so a warm access
-  costs 100 and a cold one 2600/2100 at every fork. EIP-150's pre-Berlin figures
-  — `SLOAD` 200, `BALANCE`/`EXTCODEHASH` 400, `EXTCODESIZE`/`EXTCODECOPY` 700, the
-  `CALL` family 700 — are not applied anywhere. **Wiring these is a refactor, not
-  a substitution**: the two tables agree on every opcode's *total* but not on how
-  it is composed. `base_cost/1` prices a warm access at 100 and its handler adds
-  the cold surcharge separately (2500 account, 2000 slot), while
-  `eth_fork_schedule:access_cost/3` returns the **total** (2600 or 2100) in one
-  figure. Swapping the fork table in for the EVM's base would charge a cold
-  `BALANCE` 5100 instead of 2600, a cold `SLOAD` 4100 instead of 2100, and a cold
-  `CALL` 5200 instead of 2600. One owner of the composition has to be chosen and
-  the other side changed to match.
-- **EIP-150's 63/64 gas-retention rule and the 2300 stipend**, applied at every
-  fork. Named as a gap rather than implemented: the EIP states the rule it
-  introduced and not the one it replaced, and no client consulted still supports a
-  pre-Whistle block, so the earlier behaviour would have to be invented.
-- **SSTORE net metering** — see below; this one is a live bug, not a gap.
+### 7.2.2 What the comparison found
+
+Measuring the two tables against each other across the whole `0x00-0xFF` space,
+rather than reading either, is what turned up the rest:
+
+- **`ADDRESS` cost 3, not 2.** It had no clause in `base_cost/1` and fell to the
+  `base_cost(_) -> 3` catch-all — the same trap that had once mispriced three of
+  the four `CALL` opcodes. One gas on every `ADDRESS` in every block, and
+  `gasUsed` is a receipt field. The fork table has 2, so deleting the copy fixed
+  it.
+- **EIP-150's figures existed only in the table.** A Frontier `BALANCE` cost 2600,
+  because execution had no path to the pre-Berlin price at all. `BALANCE` and
+  `EXTCODEHASH` are 400, `EXTCODESIZE`/`EXTCODECOPY`/the `CALL` family 700, `SLOAD`
+  200 — and `SLOAD` is not an account, which is why its cold cost is 2100 where an
+  account's is 2600.
+- **EIP-161's two terms were gated on Berlin.** The 9000 for a value transfer and
+  the 25000 for a new account are Spurious Dragon's, two forks earlier, so a
+  Spurious-Dragon-through-Istanbul `CALL` with value paid neither while still
+  being charged the access cost. The gate had never been exercised, because
+  nothing called the function.
 
 ### 7.2.3 A live SSTORE bug, named rather than fixed
+
+The one thing still wrong is SSTORE, and it is wrong at every fork.
 
 A no-op write — storing a slot's existing value back to itself — is charged **2900
 with a 100 refund**, netting 2800. EIP-2200 clause (1) says a no-op costs
 `SLOAD_GAS` and nothing else: 800 at Berlin, 100 from EIP-2929. The interpreter
-therefore overcharges **2700 gas net on every no-op write at every fork, London
-included**.
+therefore overcharges **2700 gas net on every no-op write, London included**.
 
 The `20000` / `2900` / `4800` cases beside it are correct, which is why this sat
 undetected next to a schedule that had just been described as exact within
@@ -345,6 +343,13 @@ tracks no such thing, and the transient map cannot hold it: that map is
 transaction-scoped but is discarded on a child revert, whereas the original value
 must survive one. Substituting the current value for the original would be
 inventing a schedule no fork specifies.
+
+### 7.2.4 Still not implemented
+
+- **EIP-150's 63/64 gas-retention rule and the 2300 stipend**, applied at every
+  fork. Named as a gap rather than implemented: the EIP states the rule it
+  introduced and not the one it replaced, and no client consulted still supports a
+  pre-Whistle block, so the earlier behaviour would have to be invented.
 
 ### 7.3 The engine's status mapping
 

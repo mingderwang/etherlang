@@ -1072,3 +1072,163 @@ selfdestruct_destroys_only_from_cancun_test() ->
 run_gas(Code, State, Env, Gas) ->
     {ok, _Out, Left, _St, _Logs} = eth_evm:run(Code, ?MSG0, State, Env, Gas),
     Left.
+
+%% ---------------------------------------------------------------------------
+%% Access costs, measured through execution
+%% ---------------------------------------------------------------------------
+%%
+%% eth_evm carried its own fork-free copy of the base schedule and added a
+%% hardcoded cold surcharge afterwards, so EIP-150's figures existed only in
+%% eth_fork_schedule and nowhere in execution: a Frontier BALANCE cost 2600.
+%% These run the opcodes and measure, because a table test cannot show that the
+%% interpreter asked the table.
+
+%% The pre-Berlin account accessors, one opcode per frame.
+%%
+%% PUSH1 and POP are charged in every case and so are the same in all of them;
+%% each figure below is written as a total rather than as "cost plus these two
+%% instructions", so that a change to the pushes shows up here instead of being
+%% cancelled out. The state is seeded the way `balance_cold_then_warm_test'
+%% seeds it, so `exists/2' answers from the overlay and nothing reaches upstream.
+account_accessors_cost_eip_150_prices_before_berlin_test() ->
+    Tgt = <<0:152, 16#0E:8>>,
+    State = eth_state:new(0, #{{balance, Tgt} => 123,
+                               {nonce, Tgt} => 0,
+                               {code, Tgt} => <<>>}),
+    Push = 3 + 2,                          %% PUSH1 0x0e, then POP
+    At = fun(Op, Fork) ->
+        spent(<<16#60,16#0E, Op, 16#50, 16#00>>, State, Fork) - Push
+    end,
+    %% BALANCE and EXTCODESIZE exist at every fork and differ in their legacy
+    %% figure: 400 and 700. EIP-150 raised BALANCE and left EXTCODESIZE alone.
+    ?assertEqual(400, At(16#31, frontier)),
+    ?assertEqual(700, At(16#3B, frontier)),
+    %% EXTCODEHASH is the other 400, but it arrived with Constantinople (EIP-1052)
+    %% and is an undefined opcode before that -- so it is priced at the earliest
+    %% fork it can be run at, and asking for it at Frontier is answered with
+    %% `undefined_opcode' rather than a price. Asserted here because that is the
+    %% answer, and a price for it at Frontier would mean the availability gate had
+    %% been bypassed.
+    ?assertEqual(400, At(16#3F, constantinople)),
+    ?assertMatch({error, {undefined_opcode, 16#3F}, _, _},
+                 eth_evm:run(<<16#60,16#0E, 16#3F, 16#50, 16#00>>, ?MSG0, State,
+                             #{fork => frontier}, ?GAS)),
+    %% Istanbul, the last fork before Berlin, so the figure is not a Frontier
+    %% accident.
+    ?assertEqual(400, At(16#31, istanbul)),
+    %% From Berlin the same opcode is COLD_ACCOUNT_ACCESS_COST. Asserting the
+    %% boundary from both sides is what makes this a fork test rather than a
+    %% constant test: 400 and 2600 are 2200 apart, and only one of them is right
+    %% for any given block.
+    ?assertEqual(2600, At(16#31, berlin)).
+
+%% SLOAD before Berlin is 200: neither an account's 400 nor its own Berlin figure
+%% of 2100. Asserted alone because it is the number most likely to be confused
+%% with a neighbour's -- which is exactly what it was, in a function of its own.
+sload_costs_200_before_berlin_test() ->
+    State = eth_state:new(0, #{{store, ?CALLER, 5} => 77}),
+    Code = <<16#60, 5, 16#54, 16#50, 16#00>>,
+    Push = 3 + 2,
+    [?assertEqual({F, 200}, {F, spent(Code, State, F) - Push})
+     || F <- [frontier, byzantium, petersburg, istanbul]],
+    %% Berlin and later: COLD_SLOAD_COST, which is 2100 and not 2600.
+    ?assertEqual(2100, spent(Code, State, berlin) - Push),
+    ?assertEqual(2100, spent(Code, State, cancun) - Push).
+
+%% The CALL family before Spurious Dragon pays the EIP-150 access term and
+%% nothing else: no 9000 for a value transfer, no 25000 for a new account, both of
+%% which are EIP-161's. A zero-value call to a funded account is used so the
+%% optional terms are not merely absent by accident -- if `new_account' were being
+%% asked about a non-existent address the 25000 would show up and the figure would
+%% not match.
+%%
+%% Reads go through with_local_reads/1 because the second half of this asks about
+%% a destination that is *deliberately* absent from the state, and there is
+%% nothing to seed: an absent account is the whole point. Read without that,
+%% `new_account/3' would fall through to eth_state's upstream reader and block in
+%% httpc against a public Sepolia node -- a cancelled test, not a failure.
+call_costs_only_the_access_term_before_spurious_dragon_test() ->
+    eth_test_util:with_local_reads(fun() ->
+        State = call_state(1000, <<16#00>>),
+        Args = call_args(16#0D, 0),
+        Code = <<Args/binary, 16#F1, 16#50, 16#00>>,
+        Pushes = spent(<<Args/binary, 16#00>>, State, frontier),
+        [?assertEqual({F, 700 + 2}, {F, spent(Code, State, F) - Pushes})
+         || F <- [frontier, homestead]],
+        %% Spurious Dragon adds the two terms, and a call with value to a new
+        %% account carries all three. The account is absent from the overlay,
+        %% which is what `new_account' asks about.
+        Absent = eth_state:new(0, #{{balance, ?CALLER} => 1000}),
+        WithValue = <<(call_args(16#0E, 40))/binary, 16#F1, 16#50, 16#00>>,
+        Pushes2 = spent(<<(call_args(16#0E, 40))/binary, 16#00>>, Absent, byzantium),
+        ?assertEqual(700 + 9000 + 25000 + 2,
+                     spent(WithValue, Absent, byzantium) - Pushes2)
+    end).
+
+%% ADDRESS costs 2, where it cost 3.
+%%
+%% `eth_evm:base_cost/1' had no clause for 0x30, so it fell to the
+%% `base_cost(_) -> 3' catch-all -- the same trap that once mispriced three of the
+%% four CALL opcodes, and the reason the catch-all was called "a trap that has now
+%% fired twice". One gas, on every ADDRESS in every block, and `gasUsed' is a
+%% receipt field. Deleting the interpreter's copy fixed it, because the fork table
+%% has 2; this test is here so a catch-all cannot come back.
+address_costs_two_not_three_test() ->
+    ?assertEqual(?GAS - 2, ?GAS - spent(<<16#30, 16#00>>, ?STATE, cancun)),
+    ?assertEqual(2, eth_fork_schedule:constant_cost(16#30, cancun)).
+
+spent(Code, State, Fork) ->
+    {ok, _, Left, _, _} = eth_evm:run(Code, ?MSG0, State, #{fork => Fork}, ?GAS),
+    ?GAS - Left.
+
+%% LOG's total, which nothing observed.
+%%
+%% The 375 * (topics + 1) is charged by the machine loop as the fork table's
+%% constant for LOG_n, and do_log/3 charges only the per-byte term. That split is
+%% the same total the handler used to produce alone -- `375 * N + 8 * Len' there
+%% on top of a flat 375 in the loop -- which is exactly why nothing failed when the
+%% handler changed: the two decompositions agree.
+%%
+%% So the total is pinned here directly, at three different topic counts, because a
+%% test at one count cannot tell 375 * (n + 1) from 375 + 375 * n, and the error
+%% this guards is 375 per topic. That is a receipts-root difference on every event
+%% a contract emits.
+log_costs_375_per_topic_plus_one_test() ->
+    %% PUSH1 0 is 3 gas; STOP is free. With no data there is no memory expansion
+    %% and no per-byte term, so the whole cost is the constant.
+    %% do_log/3 pops offset, then length, then the topics -- so the topics go
+    %% deepest and the length on top. Getting that order wrong still costs the
+    %% same, because the price does not read the stack, which is why this half
+    %% would pass either way; the per-byte half below is the one that notices.
+    At = fun(N) ->
+        Code = list_to_binary([<<16#60, 0>> || _ <- lists:seq(1, N)]
+                              ++ [<<16#60, 0>>, <<16#60, 0>>,
+                                  <<(16#A0 + N)>>, <<16#00>>]),
+        spent(Code, ?STATE, cancun) - 3 * (2 + N)
+    end,
+    ?assertEqual({0, 375}, {0, At(0)}),
+    ?assertEqual({1, 750}, {1, At(1)}),
+    ?assertEqual({2, 1125}, {2, At(2)}),
+    ?assertEqual({3, 1500}, {3, At(3)}),
+    ?assertEqual({4, 1875}, {4, At(4)}).
+
+%% The per-byte term, and the memory expansion it rides on. 32 bytes of data at
+%% offset 0 is one word, so LOG1 costs 750 + 256 + 3.
+log_charges_eight_a_byte_plus_memory_test() ->
+    %% topic, then length, then offset -- the reverse of the order do_log/3 pops
+    %% them in, which is Off, then Len, then the topics. The offset is on top, so
+    %% it is pushed last; pushing it first silently makes the *offset* 32 and the
+    %% length 0, and the frame then costs 3 gas of memory and no data term.
+    At = fun(Len, Fork) ->
+        Code = <<16#60, 0, 16#60, Len, 16#60, 0, 16#A1, 16#00>>,
+        spent(Code, ?STATE, Fork) - 3 * 3
+    end,
+    %% 32 bytes at offset 0 is one word: 750 + 256 + 3.
+    ?assertEqual(750 + 8 * 32 + 3, At(32, cancun)),
+    %% 64 bytes is two words: 6 gas of memory, not 3.
+    ?assertEqual(750 + 8 * 64 + 6, At(64, cancun)),
+    %% 33 bytes is still two words, because memory is charged per word.
+    ?assertEqual(750 + 8 * 33 + 6, At(33, cancun)),
+    %% And the term is fork-invariant: it is EIP-150's log data price and was never
+    %% changed, so a pre-Berlin frame pays the same 8 a byte.
+    ?assertEqual(750 + 8 * 32 + 3, At(32, istanbul)).

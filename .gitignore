@@ -2,7 +2,7 @@ _build/
 data/
 erl_crash.dump
 rebar3.crashdump
-session-*.md
+session*.md
 *.beam
 .rebar3/
 doc/

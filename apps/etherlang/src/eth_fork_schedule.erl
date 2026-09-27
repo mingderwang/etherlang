@@ -50,6 +50,10 @@
           apply_withdrawals_to_state/2,
           gas_cost/3,
           gas_cost/4,
+          constant_cost/2,
+          access_sensitive/1,
+          access_cost/3,
+          call_cost/3,
           refund_cap/2,
           selfdestruct_deletes/1,
           initcode_word_cost/1,
@@ -1180,7 +1184,7 @@ base_gas_cost(16#0B, _, _) -> 5;                                   % SIGNEXTEND
 base_gas_cost(Op, _, _) when Op >= 16#10, Op =< 16#1D -> 3;
 base_gas_cost(16#20, _, _) -> 30;                                  % KECCAK256
 base_gas_cost(16#30, _, _) -> 2;                                   % ADDRESS
-base_gas_cost(16#31, Fork, Args) -> access_cost(Fork, 400, Args);  % BALANCE
+base_gas_cost(16#31, Fork, Args) -> access_cost(16#31, Fork, Args);  % BALANCE
 base_gas_cost(16#32, _, _) -> 2;                                   % ORIGIN
 base_gas_cost(16#33, _, _) -> 2;                                   % CALLER
 base_gas_cost(16#34, _, _) -> 2;                                   % CALLVALUE
@@ -1194,15 +1198,15 @@ base_gas_cost(16#37, _, _) -> 3;                                   % CALLDATACOP
 base_gas_cost(16#38, _, _) -> 2;                                   % CODESIZE
 base_gas_cost(16#39, _, _) -> 3;                                   % CODECOPY
 base_gas_cost(16#3A, _, _) -> 2;                                   % GASPRICE
-base_gas_cost(16#3B, Fork, Args) -> access_cost(Fork, 700, Args);  % EXTCODESIZE
-base_gas_cost(16#3C, Fork, Args) -> access_cost(Fork, 700, Args);  % EXTCODECOPY
+base_gas_cost(16#3B, Fork, Args) -> access_cost(16#3B, Fork, Args);  % EXTCODESIZE
+base_gas_cost(16#3C, Fork, Args) -> access_cost(16#3C, Fork, Args);  % EXTCODECOPY
 %% RETURNDATASIZE is 2. It was routed through access_cost/3, so a Cancun read
 %% cost 2600 -- a thousand times the real price, and enough to out-of-gas a loop
 %% that loops over return data. RETURNDATACOPY is the one with a per-word cost,
 %% and it is 3.
 base_gas_cost(16#3D, _, _) -> 2;
 base_gas_cost(16#3E, _, _) -> 3;
-base_gas_cost(16#3F, Fork, Args) -> access_cost(Fork, 400, Args);  % EXTCODEHASH
+base_gas_cost(16#3F, Fork, Args) -> access_cost(16#3F, Fork, Args);  % EXTCODEHASH
 base_gas_cost(16#40, _, _) -> 20;                                  % BLOCKHASH
 base_gas_cost(Op, _, _) when Op >= 16#41, Op =< 16#46 -> 2;
 %% SELFBALANCE is 5. It shared a clause with CREATE and CREATE2 -- the three
@@ -1219,7 +1223,7 @@ base_gas_cost(16#53, _, _) -> 3;                                   % MSTORE8
 %% SLOAD is EIP-2929 warm/cold, and its cold cost is 2100 rather than the 2600
 %% an account access costs. It was inside a 0x50-0x5B range priced at 2, so a
 %% storage read was 1050x too cheap.
-base_gas_cost(16#54, Fork, Args) -> sload_cost(Fork, Args);
+base_gas_cost(16#54, Fork, Args) -> access_cost(16#54, Fork, Args);
 base_gas_cost(16#55, _, _) -> 0;                                   % SSTORE, all dynamic
 %% JUMP and JUMPI are 8 and 10. Like the CALLDATASIZE group above they were
 %% swept into a range that priced them at 2.
@@ -1244,12 +1248,12 @@ base_gas_cost(Op, _, _) when Op >= 16#80, Op =< 16#8F -> 3;        % DUP1..DUP16
 base_gas_cost(Op, _, _) when Op >= 16#90, Op =< 16#9F -> 3;        % SWAP1..SWAP16
 base_gas_cost(Op, _, _) when Op >= 16#A0, Op =< 16#A4 -> 375 * (Op - 16#A0 + 1);
 base_gas_cost(16#F0, Fork, _) -> account_creation_cost(Fork);       % CREATE
-base_gas_cost(16#F1, Fork, Args) -> call_cost(Fork, Args);         % CALL
-base_gas_cost(16#F2, Fork, Args) -> call_cost(Fork, Args);         % CALLCODE
+base_gas_cost(16#F1, Fork, Args) -> call_cost(16#F1, Fork, Args);  % CALL
+base_gas_cost(16#F2, Fork, Args) -> call_cost(16#F2, Fork, Args);  % CALLCODE
 base_gas_cost(16#F3, _, _) -> 0;                                   % RETURN
-base_gas_cost(16#F4, Fork, Args) -> call_cost(Fork, Args);         % DELEGATECALL
+base_gas_cost(16#F4, Fork, Args) -> call_cost(16#F4, Fork, Args);  % DELEGATECALL
 base_gas_cost(16#F5, Fork, _) -> account_creation_cost(Fork);       % CREATE2
-base_gas_cost(16#FA, Fork, Args) -> call_cost(Fork, Args);         % STATICCALL
+base_gas_cost(16#FA, Fork, Args) -> call_cost(16#FA, Fork, Args);  % STATICCALL
 base_gas_cost(16#FD, _, _) -> 0;                                   % REVERT
 %% INVALID is priced 0, like RETURN and REVERT, because what it costs is not a
 %% number: it is an exceptional halt that consumes the frame's whole allowance.
@@ -1265,34 +1269,121 @@ base_gas_cost(_, _, _) -> 0.
 
 %% SLOAD (EIP-2929). A cold slot costs 2100 and a warm one 100, from Berlin.
 %% Pre-Berlin it was a flat 200, raised by E-150.
-sload_cost(Fork, Args) ->
-    case at_least(Fork, berlin) of
-        false -> 200;
-        true ->
-            case maps:get(warm, Args, false) of
-                true -> 100;
-                false -> 2100
-            end
-    end.
+%% ---------------------------------------------------------------------------
+%% Access costs, and the one owner of how a price is composed
+%% ---------------------------------------------------------------------------
+%% ---------------------------------------------------------------------------
+%% An access-sensitive opcode has no constant part at all: BALANCE costs 2600
+%% cold and 100 warm, and there is nothing left over that a machine loop could
+%% charge before running it, because "cold" is not knowable until the opcode has
+%% looked at what the frame has already touched. So `constant_cost/2' charges
+%% **zero** for these, and the handler asks for the whole price here.
+%%
+%% That is the whole reason this is one function and not two. The interpreter used
+%% to price a warm access at 100 and add a cold surcharge afterwards -- 2500 for
+%% an account, 2000 for a slot -- while this table returned the *total* in one
+%% figure. Both were internally consistent and they disagreed, so neither could be
+%% substituted for the other: a cold BALANCE would have cost 5100. The surcharge
+%% is gone, and the fork is in the figure.
+%%
+%% Keyed by opcode rather than taking the legacy cost as an argument, because the
+%% pre-Berlin figure differs by opcode -- EIP-150 set BALANCE and EXTCODEHASH to
+%% 400 while leaving EXTCODESIZE, EXTCODECOPY and the CALL family at 700 -- and an
+%% argument invites the caller to pass the wrong one for its own opcode. Measured
+%% across both tables, the legacy figures are the only per-opcode difference.
 
-%% EIP-2929 (Berlin): a cold account access costs 2600 and a warm one costs
-%% 100. Before Berlin the flat legacy cost applies. EIP-150 raised the
-%% pre-Berlin BALANCE cost to 400, so the pre-Berlin value is passed in.
-access_cost(Fork, LegacyCost, Args) ->
+%% Both price figures for each access-sensitive opcode, as
+%% {pre-Berlin (EIP-150), post-Berlin cold}. Warm is 100 from Berlin for all of
+%% them, so it is not a per-opcode number and is not here.
+%%
+%% One table rather than an opcode-argument and a separate `sload_cost/2',
+%% because that is what it was: SLOAD differed only in these two figures -- 200 and
+%% 2100 against 400/700 and 2600 -- so it had its own function, and the two could
+%% drift without anything noticing. SLOAD's cold cost is COLD_SLOAD_COST (2100) and
+%% an account access is COLD_ACCOUNT_ACCESS_COST (2600); they are different
+%% constants, not different regimes.
+access_prices(16#31) -> {400, 2600};   % BALANCE
+access_prices(16#3B) -> {700, 2600};   % EXTCODESIZE
+access_prices(16#3C) -> {700, 2600};   % EXTCODECOPY
+access_prices(16#3F) -> {400, 2600};   % EXTCODEHASH
+access_prices(16#54) -> {200, 2100};   % SLOAD
+access_prices(Op) when Op >= 16#F1, Op =< 16#F4 -> {700, 2600};  % the CALL family
+access_prices(16#FA) -> {700, 2600};   % STATICCALL
+access_prices(_Op) -> {0, 0}.
+
+%% Does this opcode's price depend on what this frame has already touched?
+%%
+%% True for the account and slot accessors and for the CALL family. False for
+%% everything else, including SSTORE: SSTORE's price is entirely variable too, but
+%% it is not in this table at all (its base is a bare 0), so calling it
+%% "access-sensitive" here would promise a price that does not exist. SSTORE is
+%% net-metered in the interpreter and is documented as not implemented.
+-spec access_sensitive(integer()) -> boolean().
+access_sensitive(16#31) -> true;   % BALANCE
+access_sensitive(16#3B) -> true;   % EXTCODESIZE
+access_sensitive(16#3C) -> true;   % EXTCODECOPY
+access_sensitive(16#3F) -> true;   % EXTCODEHASH
+access_sensitive(16#54) -> true;   % SLOAD
+access_sensitive(16#F1) -> true;   % CALL
+access_sensitive(16#F2) -> true;   % CALLCODE
+access_sensitive(16#F4) -> true;   % DELEGATECALL
+access_sensitive(16#FA) -> true;   % STATICCALL
+access_sensitive(_Op) -> false.
+
+%% The part of an opcode's price that does not depend on what this frame has
+%% already touched, and which the machine loop can therefore charge before the
+%% opcode runs.
+%%
+%% Zero for the access-sensitive opcodes, and `base_gas_cost/3' for the rest --
+%% which is the whole of it, since the table already carries every opcode's
+%% constant price and the interpreter's own copy of that table is gone.
+-spec constant_cost(integer(), atom()) -> non_neg_integer().
+constant_cost(Op, Fork) when is_integer(Op), is_atom(Fork) ->
+    case access_sensitive(Op) of
+        true -> 0;
+        false -> base_gas_cost(Op, Fork, #{})
+    end;
+constant_cost(_Op, _Fork) ->
+    0.
+
+%% The whole price of an access-sensitive opcode, warm or cold.
+%%
+%% `Args' carries the facts only the caller knows: `warm => boolean', whether this
+%% frame has already touched the target. The fork decides which price regime
+%% applies; the opcode supplies both figures within the chosen regime.
+-spec access_cost(integer(), atom(), map()) -> non_neg_integer().
+access_cost(Op, Fork, Args) when is_map(Args) ->
+    {Legacy, Cold} = access_prices(Op),
     case at_least(Fork, berlin) of
-        false -> LegacyCost;
+        false ->
+            Legacy;
         true ->
             case maps:get(warm, Args, false) of
                 true -> 100;
-                false -> 2600
+                false -> Cold
             end
-    end.
+    end;
+access_cost(_Op, _Fork, _Args) ->
+    0.
 
 %% The CALL family: cold/warm access cost plus, for a value-bearing call, the
 %% 9000 gas stipend (EIP-161) and the 25000 new-account cost (EIP-161).
-call_cost(Fork, Args) ->
-    Access = access_cost(Fork, 700, Args),
-    case at_least(Fork, berlin) of
+%% The CALL family's whole price: the access term plus EIP-161's two optional ones.
+%%
+%% Keyed by opcode so DELEGATECALL and STATICCALL get the same access figure as CALL
+%% and CALLCODE without the caller having to say which family it is in.
+%%
+%% The two optional terms are gated on **Spurious Dragon**, not Berlin. They are
+%% EIP-161's -- the 9000 for a value transfer and the 25000 for an account that did
+%% not exist -- and Berlin is two forks later. This gated them on Berlin, so a
+%% Spurious-Dragon-to-Byzantium CALL with value paid no 9000 and no 25000, and a
+%% Homestead-to-Tangerine one paid neither while still being charged the EIP-150
+%% access cost the same function computes. The gate was never exercised, because
+%% nothing called this function before now.
+-spec call_cost(integer(), atom(), map()) -> non_neg_integer().
+call_cost(Op, Fork, Args) when is_map(Args) ->
+    Access = access_cost(Op, Fork, Args),
+    case at_least(Fork, spurious_dragon) of
         false ->
             Access;
         true ->
@@ -1305,7 +1396,9 @@ call_cost(Fork, Args) ->
                 false -> 0
             end,
             Access + ValueGas + NewAccountGas
-    end.
+    end;
+call_cost(_Op, _Fork, _Args) ->
+    0.
 
 account_creation_cost(_Fork) -> 32000.
 selfdestruct_cost(_Fork) -> 5000.

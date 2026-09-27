@@ -129,8 +129,23 @@ exec(E, Ctx) ->
 undefined_opcode(Op, E, Ctx) ->
     {E#e{halt = {error, {undefined_opcode, Op}}}, Ctx}.
 
+%% The price charged before the opcode runs: the part of it that does not depend
+%% on what this frame has already touched, taken from eth_fork_schedule.
+%%
+%% This used to be eth_evm's own table, `base_cost/1', which took no fork and was
+%% a second copy of the fork schedule's `base_gas_cost/3'. The two agreed on every
+%% opcode's total except four groups, and disagreed on how each total was built:
+%% the access opcodes were a warm base here plus a cold surcharge in the handler,
+%% while the table returned the whole figure; LOG was a flat 375 here plus 375 a
+%% topic in the handler, while the table returned 375 * (topics + 1). Both were
+%% internally consistent, which is why neither was wrong on its own and why neither
+%% could be substituted for the other. One owner now: the fork table.
+%%
+%% `constant_cost/2' charges **zero** for the access-sensitive opcodes, because
+%% whether a target is warm is not knowable until the handler has looked. Those
+%% handlers ask for their whole price instead.
 charge_and_run(Op, E, Ctx) ->
-    case charge(E, base_cost(Op)) of
+    case charge(E, eth_fork_schedule:constant_cost(Op, Ctx#ctx.fork)) of
         {ok, E1} -> do_op(Op, E1, Ctx);
         oog -> oog(E, Ctx)
     end.
@@ -204,107 +219,29 @@ s_env(Key, Ctx, Default) -> maps:get(Key, Ctx#ctx.env, Default).
 s_msg(Key, Ctx, Default) -> maps:get(Key, Ctx#ctx.msg, Default).
 
 %% ---------------------------------------------------------------------------
-%% Base gas schedule (approximate)
 %% ---------------------------------------------------------------------------
-
-base_cost(16#00) -> 0;
-base_cost(16#02) -> 5;
-base_cost(16#04) -> 5;
-base_cost(16#05) -> 5;
-base_cost(16#06) -> 5;
-base_cost(16#07) -> 5;
-base_cost(16#08) -> 8;
-base_cost(16#09) -> 8;
-base_cost(16#0A) -> 10;
-base_cost(16#0B) -> 5;
-base_cost(Op) when Op >= 16#01, Op =< 16#1D -> 3;
-base_cost(16#20) -> 30;
-base_cost(16#31) -> 100;
-base_cost(16#32) -> 2;
-base_cost(16#33) -> 2;
-base_cost(16#34) -> 2;
-base_cost(16#35) -> 3;
-base_cost(16#36) -> 2;
-base_cost(16#37) -> 3;
-base_cost(16#38) -> 2;
-base_cost(16#39) -> 3;
-base_cost(16#3A) -> 2;
-base_cost(16#3B) -> 100;
-base_cost(16#3C) -> 100;
-base_cost(16#3D) -> 2;
-base_cost(16#3E) -> 3;
-base_cost(16#3F) -> 100;
-base_cost(16#40) -> 20;
-base_cost(Op) when Op >= 16#41, Op =< 16#46 -> 2;
-base_cost(16#47) -> 5;
-%% BASEFEE, BLOBHASH and BLOBBASEFEE are 20 each. These were 2, 3 and 2, which
-%% is the price of ADDRESS-family opcodes; the three were grouped with the
-%% 0x41-0x46 block by range, and that block is 2. The error is not a rounding
-%% difference: a contract that reads the base fee in a loop was being charged a
-%% twelfth of the real price, which is the difference between a block that
-%% out-of-gas at the intended depth and one that runs.
-base_cost(16#48) -> 20;
-base_cost(16#49) -> 20;
-base_cost(16#4A) -> 20;
-base_cost(16#50) -> 2;
-base_cost(16#51) -> 3;
-base_cost(16#52) -> 3;
-base_cost(16#53) -> 3;
-base_cost(16#54) -> 100;
-base_cost(16#55) -> 0;
-base_cost(16#56) -> 8;
-base_cost(16#57) -> 10;
-base_cost(16#58) -> 2;
-base_cost(16#59) -> 2;
-base_cost(16#5A) -> 2;
-base_cost(16#5B) -> 1;
-base_cost(16#5C) -> 100;
-base_cost(16#5D) -> 100;
-base_cost(16#5E) -> 3;
-base_cost(16#5F) -> 2;
-base_cost(Op) when Op >= 16#60, Op =< 16#7F -> 3;
-base_cost(Op) when Op >= 16#80, Op =< 16#8F -> 3;
-base_cost(Op) when Op >= 16#90, Op =< 16#9F -> 3;
-%% LOG is a flat 375 here; do_log/3 adds 375 per topic and 8 per byte of data,
-%% so the total is 375*(topics+1) + 8*len as the specification has it. The
-%% per-opcode figures are deliberately NOT spelled out in this table: doing so
-%% would charge the topic term twice.
-base_cost(Op) when Op >= 16#A0, Op =< 16#A4 -> 375;
-base_cost(16#F0) -> 32000;
-base_cost(16#F5) -> 32000;
-base_cost(16#FF) -> 5000;
-%% Halting opcodes cost nothing beyond the work they actually do (memory
-%% expansion, or the refund). RETURN and REVERT in particular are *not* 3 gas
-%% each: they neither read nor write state, so pricing them charges every
-%% function that returns -- which is every function -- for its own return. The
-%% catch-all below is the last resort for an opcode this schedule has not been
-%% given a cost for, which is exactly why these four are named explicitly.
-base_cost(16#F3) -> 0;
-base_cost(16#FD) -> 0;
-base_cost(16#FE) -> 0;
-%% The whole CALL family is priced by do_call/3, which charges EIP-2929's access
-%% cost plus the 9000 value transfer and the 25000 new-account term, and memory
-%% expansion for the arguments and the return region. There is no base term to
-%% add on top, so it is 0 for all four.
+%% Gas prices live in eth_fork_schedule
+%% ---------------------------------------------------------------------------
 %%
-%% DELEGATECALL said 0 here and the other three said nothing, so they fell to the
-%% catch-all below and were charged 3 each. Every CALL, CALLCODE and STATICCALL
-%% in every block was therefore charged 3 gas more than the specification says,
-%% while DELEGATECALL was right -- and the discrepancy is invisible in execution
-%% (3 gas does not change any outcome) while being exactly the kind of
-%% difference that moves a gasUsed field and so a receipts root.
-base_cost(16#F1) -> 0;
-base_cost(16#F2) -> 0;
-base_cost(16#F4) -> 0;
-base_cost(16#FA) -> 0;
-%% The last resort for an opcode this schedule has not been given a cost for.
-%% It is 3 because 3 is the price of most arithmetic, which is the least-bad
-%% guess available -- but a guess is exactly the problem, and this catch-all is
-%% what hid three missing CALL entries for as long as it was here. An opcode
-%% with no cost should be conspicuous, not plausible: do_op/3 has no catch-all
-%% either, so an opcode that reaches here with no price crashes into
-%% run_t/6's handler and becomes an evm_crash rather than quietly costing 3.
-base_cost(_) -> 3.
+%% This module used to carry its own copy of the base schedule, `base_cost/1',
+%% taking no fork. It is gone, and the fork table now owns every price, because
+%% two copies of a consensus constant is one too many and they had already drifted.
+%%
+%% What the drift cost, measured by evaluating both tables across the whole
+%% 0x00-0xFF space at Cancun rather than by reading either:
+%%
+%%   * The four account accessors and SLOAD returned a warm base of 100 plus a
+%%     hardcoded surcharge in the handler -- 2500 for an account, 2000 for a slot
+%%     -- so the *pre-Berlin* figures did not exist anywhere in execution. A
+%%     Frontier BALANCE cost 2600, where EIP-150 says 400.
+%%   * ADDRESS (0x30) had no clause at all and fell to the catch-all, so it cost 3
+%%     where it is 2. One gas, on every ADDRESS in every block, and `gasUsed' is a
+%%     receipt field. The fork table has 2, so deleting the copy fixed it.
+%%   * The CALL family returned 0 here and the whole figure there, because
+%%     do_call/3 charged the EIP-2929 access cost itself.
+%%   * LOG returned a flat 375 here and 375 * (topics + 1) there, with do_log/3
+%%     adding 375 a topic on top of the flat 375. The same total in two
+%%     decompositions, and only one of them could be charged by the machine loop.
 
 %% ---------------------------------------------------------------------------
 %% Opcode dispatch
@@ -377,8 +314,8 @@ do_op(16#30, E, Ctx) -> next(push(E, eth_word:from_bytes(s_msg(address, Ctx, <<0
 do_op(16#31, E, Ctx) ->
     {A, E1} = pop(E),
     Addr = eth_state:address(eth_word:to_bytes(A, 20)),
-    {Extra, Ctx1} = cold_account_extra(Ctx, Addr),
-    case charge(E1, Extra) of
+    {Cost, Ctx1} = access_price(Ctx, 16#31, Addr),
+    case charge(E1, Cost) of
         oog -> oog(E1, Ctx1);
         {ok, E2} -> next(push(E2, eth_state:balance(Ctx1#ctx.state, Addr)), Ctx1)
     end;
@@ -417,8 +354,8 @@ do_op(16#3A, E, Ctx) -> next(push(E, s_msg(gas_price, Ctx, 0)), Ctx);
 do_op(16#3B, E, Ctx) ->
     {A, E1} = pop(E),
     Addr = eth_state:address(eth_word:to_bytes(A, 20)),
-    {Extra, Ctx1} = cold_account_extra(Ctx, Addr),
-    case charge(E1, Extra) of
+    {Cost, Ctx1} = access_price(Ctx, 16#3B, Addr),
+    case charge(E1, Cost) of
         oog -> oog(E1, Ctx1);
         {ok, E2} ->
             Code = eth_state:code(Ctx1#ctx.state, Addr),
@@ -427,8 +364,8 @@ do_op(16#3B, E, Ctx) ->
 do_op(16#3C, E, Ctx) ->
     {A, E1} = pop(E), {Dst, E2} = pop(E1), {Off, E3} = pop(E2), {Len, E4} = pop(E3),
     Addr = eth_state:address(eth_word:to_bytes(A, 20)),
-    {Extra, Ctx1} = cold_account_extra(Ctx, Addr),
-    case charge(E4, Extra) of
+    {Cost, Ctx1} = access_price(Ctx, 16#3C, Addr),
+    case charge(E4, Cost) of
         oog -> oog(E4, Ctx1);
         {ok, E5} ->
             case charge_mem(E5, Dst + Len) of
@@ -463,8 +400,8 @@ do_op(16#3E, E, Ctx) ->
 do_op(16#3F, E, Ctx) ->
     {A, E1} = pop(E),
     Addr = eth_state:address(eth_word:to_bytes(A, 20)),
-    {Extra, Ctx1} = cold_account_extra(Ctx, Addr),
-    case charge(E1, Extra) of
+    {Cost, Ctx1} = access_price(Ctx, 16#3F, Addr),
+    case charge(E1, Cost) of
         oog -> oog(E1, Ctx1);
         {ok, E2} ->
             Hash = case eth_state:exists(Ctx1#ctx.state, Addr) of
@@ -528,8 +465,8 @@ do_op(16#53, E, Ctx) ->
 do_op(16#54, E, Ctx) ->
     {Slot, E1} = pop(E),
     Addr = s_msg(address, Ctx, <<0:160>>),
-    {Extra, Ctx1} = cold_store_extra(Ctx, Addr, Slot),
-    case charge(E1, Extra) of
+    {Cost, Ctx1} = store_access_price(Ctx, Addr, Slot),
+    case charge(E1, Cost) of
         oog -> oog(E1, Ctx1);
         {ok, E2} -> next(push(E2, eth_state:storage(Ctx1#ctx.state, Addr, Slot)), Ctx1)
     end;
@@ -614,10 +551,10 @@ do_op(16#FD, E, Ctx) ->
         {ok, E3} -> {E3#e{halt = {revert, read(E3, Off, Len)}}, Ctx}
     end;
 do_op(16#FE, E, Ctx) -> {E#e{halt = {error, invalid_opcode}}, Ctx};
-do_op(16#F1, E, Ctx) -> do_call(call, E, Ctx);
-do_op(16#F2, E, Ctx) -> do_call(callcode, E, Ctx);
-do_op(16#F4, E, Ctx) -> do_call(delegatecall, E, Ctx);
-do_op(16#FA, E, Ctx) -> do_call(staticcall, E, Ctx);
+do_op(16#F1, E, Ctx) -> do_call(call, 16#F1, E, Ctx);
+do_op(16#F2, E, Ctx) -> do_call(callcode, 16#F2, E, Ctx);
+do_op(16#F4, E, Ctx) -> do_call(delegatecall, 16#F4, E, Ctx);
+do_op(16#FA, E, Ctx) -> do_call(staticcall, 16#FA, E, Ctx);
 do_op(16#F0, E, Ctx) -> do_create(create, E, Ctx);
 do_op(16#F5, E, Ctx) -> do_create(create2, E, Ctx);
 do_op(16#FF, E, Ctx) ->
@@ -671,27 +608,35 @@ tri_op(Fun, E, Ctx) ->
 %% EIP-2929 warm tracking shares the transaction-global transient map under
 %% reserved 3-tuple keys (never colliding with {Addr,Slot} TSTORE slots, and
 %% inheriting tx scope + revert-discard semantics automatically).
-%% Each returns {ExtraColdCost, Ctx1} on top of the warm base price, with the
-%% account/slot marked warmed.
-cold_account_extra(Ctx, Addr) ->
+%%
+%% Each helper returns the opcode's **whole** price and a context with the
+%% account or slot marked warm. Peeking before charging is what makes that
+%% possible: the price depends on the answer, and the answer changes as a side
+%% effect of asking. Marking first and charging after would charge the cold price
+%% to the frame that warmed it, which is the one gas figure EIP-2929 exists to
+%% get right.
+access_price(Ctx, Op, Addr) ->
+    {Warm, Ctx1} = warm_account(Ctx, Addr),
+    {eth_fork_schedule:access_cost(Op, Ctx#ctx.fork, #{warm => Warm}), Ctx1}.
+
+store_access_price(Ctx, Addr, Slot) ->
+    {Warm, Ctx1} = warm_store(Ctx, Addr, Slot),
+    {eth_fork_schedule:access_cost(16#54, Ctx#ctx.fork, #{warm => Warm}), Ctx1}.
+
+warm_account(Ctx, Addr) ->
     case maps:is_key({warm_account, Addr}, Ctx#ctx.transient) of
-        true -> {0, Ctx};
-        false -> {2500, Ctx#ctx{transient = maps:put({warm_account, Addr},
-                                                    true, Ctx#ctx.transient)}}
-    end.
-cold_store_extra(Ctx, Addr, Slot) ->
-    case maps:is_key({warm_store, Addr, Slot}, Ctx#ctx.transient) of
-        true -> {0, Ctx};
-        false -> {2000, Ctx#ctx{transient = maps:put({warm_store, Addr, Slot},
-                                                    true, Ctx#ctx.transient)}}
+        true -> {true, Ctx};
+        false -> {false, mark({warm_account, Addr}, Ctx)}
     end.
 
-%% Full EIP-2929 access cost for a CALL target: 100 warm, 2600 cold.
-call_access_cost(Ctx, To) ->
-    case cold_account_extra(Ctx, To) of
-        {0, Ctx1} -> {100, Ctx1};
-        {2500, Ctx1} -> {2600, Ctx1}
+warm_store(Ctx, Addr, Slot) ->
+    case maps:is_key({warm_store, Addr, Slot}, Ctx#ctx.transient) of
+        true -> {true, Ctx};
+        false -> {false, mark({warm_store, Addr, Slot}, Ctx)}
     end.
+
+mark(Key, Ctx) ->
+    Ctx#ctx{transient = maps:put(Key, true, Ctx#ctx.transient)}.
 
 push_n(N, E = #e{code = Code, pc = Pc}, Ctx) ->
     Available = max(byte_size(Code) - (Pc + 1), 0),
@@ -725,7 +670,13 @@ do_log(N, E, Ctx) ->
             case charge_mem(E3, Off + Len) of
                 oog -> oog(E3, Ctx);
                 {ok, E4} ->
-                    Cost = 375 * N + 8 * Len,
+                    %% The 375 * (topics + 1) is charged by the machine loop, as
+                    %% the fork table's constant for LOG_n, so only the per-byte
+                    %% term is left. It used to be `375 * N + 8 * Len' here on top
+                    %% of a flat 375 in the loop, which is the same total and a
+                    %% second decomposition of it -- the reason the loop could not
+                    %% simply take the table's figure without this changing too.
+                    Cost = 8 * Len,
                     case charge(E4, Cost) of
                         {ok, E5} ->
                             Topics = [eth_word:to_bytes(T, 32) || T <- TopicWords],
@@ -741,7 +692,12 @@ do_log(N, E, Ctx) ->
 %% CALL family
 %% ---------------------------------------------------------------------------
 
-do_call(Kind, E, Ctx) ->
+%% `Kind' says what the call *does* -- whether it moves value, whose storage it
+%% runs against -- and `Op' is the opcode, which is what the price is keyed on.
+%% Both are needed and they are not the same: DELEGATECALL and STATICCALL are
+%% priced as CALL and CALLCODE, and passing a kind-derived guess instead of the
+%% byte would put the figure one lookup away from the table that owns it.
+do_call(Kind, Op, E, Ctx) ->
     {GasReq, E1} = pop(E),
     {ToW, E2} = pop(E1),
     {Value, E3} = case Kind of
@@ -758,10 +714,20 @@ do_call(Kind, E, Ctx) ->
     case Static andalso Value =/= 0 of
         true -> {E7#e{halt = {error, write_protection}}, Ctx};
         false ->
-            %% EIP-2929: cold target costs 2600, warm costs 100. The target
-            %% is warmed by the call itself (all CALL kinds).
-            {AccessCost, CtxA} = call_access_cost(Ctx, To),
-            Base = AccessCost + value_cost(Value) + new_account_cost(CtxA, To, Value),
+            %% The whole CALL price in one figure from the fork table: the
+            %% EIP-2929 warm/cold access term, plus EIP-161's 9000 for a value
+            %% transfer and 25000 for an account that did not exist. The EVM
+            %% supplies only the facts -- is the target warm, is value moving,
+            %% does the account exist -- and the table supplies the prices,
+            %% because the two optional terms are Spurious Dragon's while the
+            %% access term is EIP-150's and EIP-2929's.
+            %%
+            %% The target is warmed by the call itself, for all four kinds.
+            {Warm, CtxA} = warm_account(Ctx, To),
+            Base = eth_fork_schedule:call_cost(Op, Ctx#ctx.fork,
+                                              #{warm => Warm,
+                                                value_transfer => Value =/= 0,
+                                                new_account => new_account(CtxA, To, Value)}),
             case charge(E7, Base) of
                 oog -> oog(E7, CtxA);
                 {ok, E8} ->
@@ -887,15 +853,14 @@ finish_call(E, Ctx, State, Out, RetOff, RetLen, Success, _Left) ->
          end,
     next(push(E1, Success), Ctx#ctx{state = State}).
 
-value_cost(0) -> 0;
-value_cost(_) -> 9000.
-
-new_account_cost(Ctx, To, Value) when Value > 0 ->
-    case eth_state:exists(Ctx#ctx.state, To) of
-        true -> 0;
-        false -> 25000
-    end;
-new_account_cost(_Ctx, _To, _Value) -> 0.
+%% EIP-161's 25000 applies to a value-bearing call whose destination does not
+%% exist, and to nothing else. The *price* is the fork table's; this is only the
+%% fact, and a zero-value call answers false without reading the account at all --
+%% which is both correct and the reason a read-only call cannot be charged for
+%% creating something it cannot create.
+new_account(_Ctx, _To, 0) -> false;
+new_account(Ctx, To, _Value) ->
+    not eth_state:exists(Ctx#ctx.state, To).
 
 transfer(State, _From, _To, 0) -> State;
 transfer(State, From, To, Value) ->
