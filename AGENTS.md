@@ -436,7 +436,7 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
 | Per-fork gas *price* wiring | Done. One owner of every price; the interpreter's duplicate table is deleted. SSTORE included (EIP-2200, Berlin and later). |
 | `eth_tx:intrinsic_gas/1` fork-awareness | Takes no fork and falls back to the operator's `ETH_FORK` pin. Correct for pool admission, where no block exists; wrong for `eth_call`/`eth_estimateGas` and block execution, which pass the block's own fork through `intrinsic_gas/2`. Do not use the one-argument form where a block is in hand. |
 | EIP-150's 63/64 rule and 2300 stipend | **Both are now fork-gated** (Tangerine Whistle and later; zero before), and the pre-Whistle rule is derived rather than invented because EIP-150's own `substitute` block is the code it replaced. That gained a corpus fixture: 11 -> 12 matches. What is **still open** is where the stipend sits relative to the cap — the EIP's pseudocode adds it after the clamp, this module adds it before, and the reading that follows the EIP makes a child's allowance exceed the caller's remaining. Not changed on a reading; see TASKS.md. |
-| Pre-Berlin SSTORE | Refused, not priced, and the refusal is now **safe**: `eth_block:run_transaction/5` answers `{error, {unpriced, What}}` rather than executing into a wrong state root, which was 55 of 266 committed fixtures. Pricing it is still open — three schedules before Berlin (the flat rule, EIP-1283 at Constantinople, Petersburg's revert of it) plus two `SLOAD_GAS` changes, and only EIP-2200's text is implemented. `eth_call` falls back upstream. See §3 "Fork awareness" and TASKS.md. |
+| Pre-Berlin SSTORE | **Priced, except at Constantinople.** The flat rule (the yellow paper's, which Petersburg restored) with EIP-2200's own inherited figures, and `SLOAD_GAS` fork-selected 50/200/800 by EIP-150 and EIP-1884. Constantinople is the *only* fork still refused, because EIP-1283 replaced the rule and Petersburg reverted it — and it is unreachable by block number on mainnet anyway, since it and Petersburg share block 7,280,000. `SLOAD` itself was also a flat 200 at every fork, right for one span of three. See §3 "Fork awareness" and TASKS.md. |
 
 ## 11. Known dead code
 
@@ -480,6 +480,15 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
   against real data — and the point is that the pin already existed and I read past
   it. `requestsHash` was never "inert because upstream JSONs do not carry it": upstream
   JSONs **do** carry it, from Prague on.
+- **`unsupported` is not one thing.** `eth_evm_precompiles:precompile/3` has three
+  answers: `{ok, Output, GasCost}`, `{failed, Why}` (the EVM's answer is that the call
+  fails — nothing returned, forwarded gas consumed, caller carries on), and
+  `unsupported` (this node cannot run this at all, and `eth_block:run_transaction/5`
+  refuses the block). It had two, and they were conflated in both directions: blake2f
+  and the pairing check reported *rejected input* as `unsupported`, which the block
+  layer reads as a missing implementation, so seven `eip152_blake2` fixtures — whose
+  DELEGATECALLs carry zero-length calldata, where the call should simply fail —
+  refused the whole block. `ECADD` and `ECMUL` still conflate them; named in TASKS.md.
 - `eth_rpc_server:start_engine_api/2` **no longer** swallows a listener failure. It
   logged the error, returned `ok`, and `init/1` ignored the answer anyway, so a node
   whose Engine API port was taken came up reporting success with the Engine API
