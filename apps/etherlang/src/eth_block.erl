@@ -608,7 +608,11 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     GasLimitTx = uint(maps:get(<<"gas">>, Tx, GL)),
     Value = uint(maps:get(<<"value">>, Tx, 0)),
     To = to_address(maps:get(<<"to">>, Tx, <<>>)),
-    Data = to_bytes(maps:get(<<"input">>, Tx, <<>>)),
+    %% Through `eth_tx:calldata/1' and not a local read of `input'. This read
+    %% `input' alone, while the JSON-RPC field is `data' and `eth_tx:from_rlp/1' emits
+    %% `input' -- so a transaction carrying `data' was executed with no calldata
+    %% while `eth_tx:intrinsic_gas/5' charged for the calldata. See that function.
+    Data = eth_tx:calldata(Tx),
     MaxPriorityFee = uint(maps:get(<<"maxPriorityFeePerGas">>, Tx, 0)),
     MaxFee = uint(maps:get(<<"maxFeePerGas">>, Tx, 0)),
     GasPrice = uint(maps:get(<<"gasPrice">>, Tx, 0)),

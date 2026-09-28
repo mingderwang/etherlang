@@ -684,6 +684,31 @@ merge_base_fee(Base, none) -> Base;
 merge_base_fee(_Base, Derived) -> Derived.
 
 %% Recover the base fee from the expected post-state, or `none'.
+%% **The fixture states the base fee in `env.currentBaseFee' and this ignores it.**
+%%
+%% Recorded because it cost an hour, and because the reason it is *not* fixed is the
+%% interesting part. The derivation answers `none' for a type-2 transaction --
+%% `effective_price/2' is `min(maxFeePerGas, maxPriorityFeePerGas)' = `min(7, 1)' = 1,
+%% not the 7 the sender actually pays, because the base fee is the very term being
+%% derived and cannot appear in the price that derives it -- so the block came out with
+%% `base_fee_per_gas = undefined', `run_transaction/5' computed `EffectiveGasPrice = 0',
+%% `buy_gas/4' charged the sender nothing and `settle_gas/8' refunded nothing. The
+%% corpus reported that as a **gas** divergence of **+517,958**, which is
+%% `(gasLimit - gasUsed) * price' and looks exactly like a pricing bug.
+%%
+%% It is not. An instrumented run of `test_eip1559_tx_validity` reports
+%% `result=ok charged0=26006', and 26,006 is the chain's own figure for that
+%% transaction -- so the gas and the storage write were both right, and the whole of
+%% `+517,958` was the comparison.
+%%
+%% Preferring the stated figure is the obvious fix and it is **not applied**: an
+%% injection that removed it left every test green, so with `overlay_key/1' in place
+%% the tally is 46 either way and the change cannot be shown to do anything. It is a
+%% real divergence between what the fixture says and what the block is built with, and
+%% it is named here rather than shipped -- a change to a *measurement* that cannot be
+%% shown to change a number is a change to the ruler, not to the node, and this
+%% repository does not ship those without the number to show for it.
+
 derived_base_fee(Entry, Post, Tx) ->
     State = maps:get(<<"state">>, Post, #{}),
     Sender = maps:get(<<"sender">>, maps:get(<<"transaction">>, Entry, #{}), <<"0x">>),
@@ -913,7 +938,40 @@ account_diff(A, F, State) ->
 %% and of what the node did: absent means absent, which for a state test is zero,
 %% because EIP-161 says an account that did not survive has nothing in it.
 overlay(State, Key, Default) ->
-    maps:get(Key, maps:get(overlay, State, #{}), Default).
+    maps:get(overlay_key(Key), maps:get(overlay, State, #{}), Default).
+
+%% `eth_state:new/2' rewrites every `{store, A, S}' key of the overrides it is given
+%% through `eth_state:slot_key/1', so a slot written to the overlay is under the
+%% **32-byte word** whatever the caller passed. This read path did not, so a slot the
+%% fixture wrote as `<<"0x00">>' was seeded under the integer `0' and read back under
+%% the integer `0' -- while the node's own write went under `<<0:256>>'.
+%%
+%% The consequence is that **the comparison could not see a storage write the node
+%% had made**: every slot read as zero. `london/eip1559_fee_market_change/
+%% test_eip1559_tx_validity` is the clearest witness, and it looked like a node defect
+%% for a long time -- the node was reported as not storing `1` into slot 0, when an
+%% instrumented run of the same fixture has the frame finishing `result=ok` with
+%% `charged0=26006`, which is the chain's own figure. The gas was right and the write
+%% was right; the runner was looking in the wrong place.
+%%
+%% Only the `{store, ...}' key needs this. `account/2' already normalises the address
+%% for `balance', `nonce' and `code', so those keys match as written.
+overlay_key({store, A, S}) -> {store, A, slot_word(S)};
+overlay_key(Key) -> Key.
+
+%% The same normalisation `eth_state:slot_key/1' performs: a short binary is padded on
+%% the left, a long one is truncated to its last 32 bytes, and an integer is widened.
+%% Re-derived here rather than called, because `slot_key/1' is not exported and
+%% duplicating five lines is cheaper than exporting a function whose only other
+%% caller is a gen_server's internals.
+slot_word(S) when is_binary(S) ->
+    Pad = 32 - byte_size(S),
+    case Pad >= 0 of
+        true -> <<0:(Pad * 8), S/binary>>;
+        false -> binary:part(S, byte_size(S) - 32, 32)
+    end;
+slot_word(S) when is_integer(S) -> <<S:256>>;
+slot_word(_) -> <<0:256>>.
 
 %% One field, and only if it differs. Reporting every field unconditionally --
 %% which the first version did -- makes every account a diff, so a genuine

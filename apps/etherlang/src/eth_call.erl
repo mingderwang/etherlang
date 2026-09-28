@@ -358,10 +358,10 @@ msg_code(Tx, State) ->
 %% TransactionCall carries calldata under `input` (newer) or `data` (legacy);
 %% clients use either interchangeably, so accept both.
 tx_data(Tx) ->
-    case maps:get(<<"input">>, Tx, undefined) of
-        undefined -> hex_to_bin(maps:get(<<"data">>, Tx, <<"0x">>));
-        Input -> hex_to_bin(Input)
-    end.
+    %% Through `eth_tx:calldata/1'. This was a second, separately-written copy of the
+    %% same rule and it happened to agree -- which is the good case, and still a second
+    %% place for it to stop agreeing.
+    eth_tx:calldata(Tx).
 
 msg_from_tx(Tx, BlockNumber) ->
     From = case maps:get(<<"from">>, Tx, undefined) of
@@ -441,7 +441,6 @@ fork_at(Number, Timestamp) ->
 
 param_hex(N) when is_integer(N) -> eth_hex:encode_int(N);
 param_hex(Tag) when is_binary(Tag) -> Tag.
-hex_to_bin(BinHex) -> try eth_state:hex_to_bin(BinHex) catch _:_ -> <<>> end.
 bin32(nil) -> <<0:256>>;
 bin32(Hex) when is_binary(Hex) ->
     case byte_size(eth_state:hex_to_bin(Hex)) of

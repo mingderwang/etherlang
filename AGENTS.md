@@ -442,6 +442,25 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
 | A `CALL` the caller cannot afford | The spec's `call`: on `sender_balance < value` it pushes 0, **empties the return data**, and adds `sub_call` back. This module consumed the forwarded allowance instead, and `check_call_value/5` had no `callcode` clause at all, so `CALLCODE` moved no value and read no balance. `+45,247` on six corpus fixtures. The stipend's *field* — `cost` vs `sub_call` — is still open; see TASKS.md. |
 | Pre-Berlin SSTORE | **Priced, except at Constantinople.** The flat rule (the yellow paper's, which Petersburg restored) with EIP-2200's own inherited figures, and `SLOAD_GAS` fork-selected 50/200/800 by EIP-150 and EIP-1884. Constantinople is the *only* fork still refused, because EIP-1283 replaced the rule and Petersburg reverted it — and it is unreachable by block number on mainnet anyway, since it and Petersburg share block 7,280,000. `SLOAD` itself was also a flat 200 at every fork, right for one span of three. See §3 "Fork awareness" and TASKS.md. |
 
+## 10a. Three traps this repository has now paid for
+
+- **A key is written through one normaliser and read through another.** `eth_state:new/2`
+  rewrites every `{store, A, S}` key of an overlay through `eth_state:slot_key/1`; a
+  read path that does not go through the same normaliser sees nothing. It cost 21 of
+  266 fixtures, and it presented as a *node* defect — `test_eip1559_tx_validity` was
+  read as "this node does not execute a valid EIP-1559 transaction" when the node
+  finished it at `charged0=26006`, the chain's own figure. **When a write and a read of
+  the same map disagree, suspect the key before the value.**
+- **A gas figure read off a balance difference can be a fee bug.** `+517,958` is
+  `(gasLimit - gasUsed) * price`. It looks like a pricing bug and is arithmetic about
+  the *price*, and an instrumented run is what separated them: `charged0` was already
+  exactly the chain's number. Print the receipt before believing a delta.
+- **A map carrying both `data` and `input` is ambiguous, and the precedence is part of
+  the contract.** `data` is JSON-RPC's spelling and `input` is this node's internal one;
+  a caller supplying `data` means it. `eth_tx:calldata/1` states the rule because getting
+  it wrong makes a test that *adds* `data` to a map already carrying an empty `input`
+  fail for a reason that is not the one under test.
+
 ## 11. Known dead code
 
 - `eth_block_builder` **is now started** and issues `payloadId`s. It was rewritten

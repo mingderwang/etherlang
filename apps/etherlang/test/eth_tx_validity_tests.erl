@@ -157,6 +157,16 @@ committed_balance(Addr) ->
         A -> maps:get(balance, A, 0)
     end.
 
+%% Read through the MPT, not through `eth_state`. `committed/1' answers an *account*
+%% map -- balance, nonce, code hash -- and has no overlay, so `eth_state:storage/3'
+%% cannot be called on it; it wants a state.
+%%
+%% The value comes back as the **stored encoding**, a binary, not an integer -- the
+%% trie holds words. I asserted the integer `1' first and got `<<1>>', which is a
+%% correct answer to a question I had not finished asking.
+committed_storage(Addr, Slot) ->
+    eth_mpt:get_storage(Addr, eth_word:to_bytes(Slot, 32)).
+
 committed_nonce(Addr) ->
     case committed(Addr) of
         undefined -> undefined;
@@ -535,6 +545,63 @@ untouched_coinbase_is_not_created_test() ->
         ?assertEqual(undefined, committed(?COINBASE))
     end).
 
+
+%% **A transaction carrying JSON-RPC's `data` is executed with its calldata.**
+%%
+%% `run_transaction/5` read `<<"input">>` alone. `input` is the spelling
+%% `eth_tx:from_rlp/1' produces, so a transaction this node decoded itself was fine --
+%% and a transaction handed in as a JSON-RPC object, which spells the field `data`,
+%% ran with **no calldata at all**, while `eth_tx:intrinsic_gas/5` -- which reads
+%% through `eth_tx:calldata/1'` and accepts either spelling -- charged the intrinsic
+%% cost of calldata that was never executed. The node billed for input it did not run.
+%%
+%% The committed corpus **cannot** see this: every fixture's transaction is decoded
+%% from `txbytes' and so arrives carrying `input'. An injection that restored the
+%% `input`-only read left all 722 tests green, which is why this test exists and why the
+%% fix's commit says the corpus did not find it rather than implying that it did.
+%%
+%% The contract is `PUSH1 0; CALLDATASIZE; SSTORE; STOP`, so the stored value *is* the
+%% calldata length: 1 for one byte, 0 for none, and no other reading of the state can
+%% stand in for it.
+run_transaction_executes_calldata_spelled_data_test() ->
+    with_ctx(fun() -> calldata_under("data") end).
+
+%% The same assertion for the spelling `eth_tx:from_rlp/1' emits, which is the one the
+%% whole committed corpus arrives with. A separate test rather than a second half of
+%% the one above, because `store_parent/1' appends a block and the second call in one
+%% context fails on the chain's shape -- so the two spellings were being tested in a
+%% place where only one of them could run.
+run_transaction_executes_calldata_spelled_input_test() ->
+    with_ctx(fun() -> calldata_under("input") end).
+
+calldata_under(Key) ->
+    %% `CALLDATASIZE; PUSH1 0; SSTORE` -- and the operand order is the whole point:
+    %% `SSTORE' pops the **key** from the top, so the value has to be pushed first. I
+    %% wrote `PUSH1 0; CALLDATASIZE; SSTORE', which stores into `storage[calldatasize]'
+    %% and leaves slot 0 unset, and the test then read `undefined' and looked like a
+    %% node that had not executed the calldata at all.
+    Code = <<16#36, 16#60, 0, 16#55, 16#00>>,
+    ok = eth_mpt:put_code(eth_keccak:hash(Code), Code),
+    ok = eth_mpt:put_account(?PROBE, 0, 0, eth_keccak:hash(Code)),
+    {Priv, Sender} = new_key(),
+    fund(Sender, 1000 * ?WEI, 0),
+    %% One zero byte, under the one spelling named. `signed/2' always emits `input',
+    %% so the other case has to **remove** it: a map carrying both is the ambiguous one
+    %% and `data' wins it, so a test that only overwrote would pass without the reader
+    %% ever consulting `input'.
+    Tx0 = signed(Priv, #{to => ?PROBE, gas => 100000, gas_price => 1}),
+    Tx = case Key of
+             "data" -> Tx0#{<<"data">> => <<0>>};
+             "input" ->
+                 %% The parentheses are required: a map update cannot chain
+                 %% directly onto a call. Written without them the parse error is
+                 %% reported on the `#', two functions later, and the real message --
+                 %% `calldata_under/1 undefined' -- is a cascade.
+                 (maps:remove(<<"data">>, Tx0))#{<<"input">> => <<0>>}
+         end,
+    Parent = store_parent(eth_mpt:state_root()),
+    _ = finalize(Parent, 1, [Tx]),
+    ?assertEqual(<<1>>, committed_storage(?PROBE, 0)).
 
 %% A transaction that reverts still consumed its nonce and still paid for its
 %% gas. Only the contract's own state changes are undone. This is the difference

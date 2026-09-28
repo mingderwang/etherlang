@@ -12,7 +12,8 @@
 %% Two rules that disagree about intrinsic gas charge different fees for the
 %% same transaction, so this has to be one function called from one place.
 
--export([to_rlp/1, from_rlp/1, tx_root/1, sender/1,
+-export([
+           calldata/1,to_rlp/1, from_rlp/1, tx_root/1, sender/1,
          blob_versioned_hashes/1, valid_versioned_hashes/1,
          validate/1, validate/2, intrinsic_gas/1, intrinsic_gas/2, tx_type/1]).
 
@@ -419,7 +420,7 @@ validate(Tx, Ctx) when is_map(Tx), is_map(Ctx) ->
         ensure(Nonce >= 0, {error, negative_nonce}),
         {To, IsCreate} = to_field(Tx),
         ensure(valid_to(To), {error, invalid_to}),
-        Data = data_field(Tx),
+        Data = calldata(Tx),
         AccessList = access_list_field(Tx),
         ensure(fee_fields_ok(Tx, GasPrice, MaxFee, MaxPriority),
                {error, invalid_fee}),
@@ -548,8 +549,45 @@ valid_to(<<>>) -> true;
 valid_to(B) when is_binary(B), byte_size(B) =:= 20 -> true;
 valid_to(_) -> false.
 
-data_field(Tx) ->
-    case maps:get(<<"input">>, Tx, maps:get(<<"data">>, Tx, <<>>)) of
+%% The transaction's calldata, as bytes.
+%%
+%% **One reader, because this had three and they disagreed.** JSON-RPC spells the
+%% field `data`; `eth_tx:from_rlp/1` and the wire shape spell it `input`; clients send
+%% either. This function took `input` in preference to `data` and decoded a hex string
+%% either way. `eth_call:tx_data/1` did the same thing separately and identically.
+%% `eth_block:run_transaction/5` did **not** -- it read `input` alone --
+%%
+%%     Data = to_bytes(maps:get(<<"input">>, Tx, <<>>)),
+%%
+%% so every transaction the node executed without an `input` key ran with **no
+%% calldata at all**, while `eth_tx:intrinsic_gas/5` -- which reads through *this*
+%% function -- charged the intrinsic cost of the calldata that was never executed. The
+%% node billed for input it did not run, and produced a state root no other client
+%% could reproduce.
+%%
+%% The corpus found it, and the shape of the finding is the part worth keeping: the
+%% divergence is a *gas* figure of +517,958 on five fixtures, which looks like a
+ %% pricing bug and is not one. Every one of the 266 committed fixtures carries `data`
+ %% and none carries `input`, so the whole committed corpus was being run with empty
+ %% calldata. `test_eip1559_tx_validity` is the clearest single witness: its
+ %% transaction is `PUSH1 1; PUSH1 0; SSTORE` reached through `CALLDATASIZE`-free
+ %% direct code, so the storage write the fixture expects never happened and the sender
+ %% was charged its whole 100,000 allowance -- 700,000 wei at `maxFeePerGas` 7 -- with
+ %% no refund, because the frame that failed had nothing to return.
+-spec calldata(map()) -> binary().
+calldata(Tx) ->
+    %% **`data` first, then `input`.** A map carrying both is ambiguous and the
+    %% precedence has to be stated, because the two spellings are not
+    %% interchangeable: `data` is what JSON-RPC calls the field and `input` is what
+    %% `from_rlp/1' emits internally, so a map with both is one this node did not build
+    %% and a caller supplied. When a caller supplies `data` it means it, and the
+    %% internal `input` -- which may be present and empty, as it is for every map
+    %% `eth_tx_validity_tests:signed/2' builds -- must not shadow it.
+    %%
+    %% I had it the other way round and wrote a test that put one byte under `data` on
+    %% a map that already carried an empty `input`. It failed, and the failure was the
+    %% precedence rather than the reader.
+    case maps:get(<<"data">>, Tx, maps:get(<<"input">>, Tx, <<>>)) of
         B when is_binary(B) -> data_bytes(B);
         _ -> throw({error, bad_data})
     end.
@@ -763,7 +801,7 @@ intrinsic_gas(Tx) ->
 %% uses this form is silently getting the pin.
 intrinsic_gas(Tx, Fork) when is_atom(Fork) ->
     {_To, IsCreate} = to_field(Tx),
-    intrinsic_gas(data_field(Tx), IsCreate, access_list_field(Tx), Fork,
+    intrinsic_gas(calldata(Tx), IsCreate, access_list_field(Tx), Fork,
                   authorization_list_field(Tx)).
 
 intrinsic_gas(Data, IsCreate, AccessList, Fork, AuthList)

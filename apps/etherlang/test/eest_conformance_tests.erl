@@ -157,8 +157,24 @@
 %% fork from Berlin and at none before it, which is what identifies it as a precompile
 %% rather than anything else. The `test_gas.py` contracts behind those fixtures each
 %% call one precompile and do nothing else.
--define(EXPECTED, #{match => 25,
-                    state_mismatch => 238,
+%%
+%% `match` 25 -> **46** and `state_mismatch` 238 -> 217, and neither number moved because
+%% the node got better at executing anything. The runner could not **see** a storage
+%% write the node had made: `eth_state:new/2` rewrites every `{store, A, S}' key of the
+%% overlay it is given through `eth_state:slot_key/1', so a slot seeded from a
+%% fixture's `<<"0x00">>' went in under the 32-byte word, and this module's read path --
+%% `overlay/3' -- looked it up under the *integer* `0'. Every slot therefore read as
+%% zero on the way back, and a node that stored `1' was reported as having stored
+%% nothing.
+%%
+%% Twenty-one fixtures were being scored on a comparison that could not see storage.
+%% `london/eip1559_fee_market_change/test_eip1559_tx_validity` is the clearest witness
+%% and it had been read as a node defect for a long time: an instrumented run of it has
+%% the frame finishing `result=ok charged0=26006`, and 26,006 is the chain's own figure
+%% for that transaction, so both the gas and the write were right and only the
+%% comparison was wrong. See `overlay_key/1'.
+-define(EXPECTED, #{match => 46,
+                    state_mismatch => 217,
                     unpriced => 0,
                     tx_decode_failed => 0,
                     tx_roundtrip_mismatch => 0,
@@ -230,7 +246,31 @@ conformance_tally_is_reported() ->
 %% headroom that still cannot be reached by a runner which has stopped comparing.
 assert_not_mostly_matching(Results) ->
     Matched = length([1 || {_, O, _, _} <- Results, O =:= match]),
-    ?assert(Matched < length(Results) div 10).
+    %% **This used to be `Matched < length(Results) div 10', and it is worth saying
+    %% what happened to it, because it is a threshold change and not a neutral edit.**
+    %%
+    %% That bound was calibrated when a run observed "between 2 and 7 matches out of
+    %% 266", and its stated purpose was to catch a runner that has stopped comparing --
+    %% the failure where every entry is classified `match' and the tally reads as total
+    %% conformance while every other assertion here still passes.
+    %%
+    %% It expresses that purpose as a *ratio*, and the ratio is the problem: it fails as
+    %% the node gets better. At 25 of 266 it had one fixture of headroom. At 46 of 266
+    %% -- 17% -- a node that had just fixed twenty-one fixtures tripped it, and a node
+    %% that was fully conformant would trip it harder. **A check that punishes the thing
+    %% it is meant to encourage is not a check; it is a ceiling on the work.** So the
+    %% bound is gone and the intent is stated directly, in the two directions it can
+    %% fail:
+    %%
+    %%   * `Matched > 0' -- the runner reached a verdict rather than dropping every
+    %%     entry, which is what a fixture whose fork is unreachable would do;
+    %%   * `Matched < length(Results)' -- the runner still reports differences.
+    %%
+    %% Both failure modes the original was written for are covered, neither of them
+    %% moves when the node improves, and the "fully conformant" case is now the thing
+    %% `?EXPECTED' is for rather than something this bound objects to.
+    ?assert(Matched > 0),
+    ?assert(Matched < length(Results)).
 
 %% Frontier has no activation point in this node's schedule -- the earliest is
 %% Homestead at 1,150,000, so no number or timestamp selects `frontier', and a

@@ -379,7 +379,30 @@ behavioural change per commit, and each step says what it now does.
        sender's balance no longer implies a whole number of gas. That is a symptom of
        the node's balance now differing from the fixture's in a way the derivation
        cannot express, and it is **not yet explained**. Named, not chased.
-     - **Remaining fingerprints**, largest first: `+517958` ×5, `+152536` ×2
+     - **The runner could not see storage at all** (`v1.39`). Not a node defect, and it
+     was worth twenty-one fixtures. `eth_state:new/2` rewrites every `{store, A, S}` key
+     of the overlay it is handed through `eth_state:slot_key/1`, so a slot seeded from
+     a fixture's `<<"0x00">>` went in under the 32-byte word; the comparison's read path
+     looked it up under the **integer** `0`. Every slot therefore read as zero coming
+     back. `london/eip1559_fee_market_change/test_eip1559_tx_validity` had been read as
+     a node defect for a long time — an instrumented run of it reports `result=ok
+     charged0=26006`, and 26,006 is the chain's own figure, so the gas and the write
+     were both right. **25 → 46 matches, `state_mismatch` 238 → 217.**
+   - **`eth_block:run_transaction/5` read `input` alone** (`v1.39`). `input` is what
+     `eth_tx:from_rlp/1` emits; the JSON-RPC field is `data`. A transaction handed in as
+     a JSON-RPC object ran with **no calldata** while `eth_tx:intrinsic_gas/5` charged the
+     intrinsic cost of calldata that was never executed. `eth_tx:calldata/1` is now the
+     one reader, preferring `data` and falling back to `input`, and `eth_call` uses it
+     too. **The committed corpus cannot see this** — every fixture arrives carrying
+     `input` — so it is pinned by two unit tests and the commit says the corpus did not
+     find it.
+   - **The conformance runner's `derived_base_fee/3` ignores `env.currentBaseFee`** and
+     derives a figure that comes out `none` for a type-2 transaction, leaving the block
+     with no base fee and the sender charged nothing for gas. **Named, not fixed**: an
+     injection that preferred the stated figure left every test green once
+     `overlay_key/1` was in place, so it cannot be shown to change a number, and this
+     repository does not ship a change to a measurement that has no number to show.
+   - **Remaining fingerprints**, largest first: `+517958` ×5, `+152536` ×2
        (`test_coverage`), `−19900` ×24, `−19912` ×6, `−3` ×36, `+10500` ×6,
        `+2576`/`+3746`/`+3776` ×5 each, `+4000` ×6 (`test_acl`), `+2300` ×7,
        `+9139`, `+9439`, `+20176` (BLS12-381 G1MSM), `+2100`, `−23000` ×2,
