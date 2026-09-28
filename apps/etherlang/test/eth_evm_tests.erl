@@ -196,6 +196,131 @@ call_insufficient_balance_fails_cleanly_test() ->
     ?assertEqual(10, eth_state:balance(St, ?CALLER)),
     ?assertEqual(0, eth_state:balance(St, ?CALLEE)).
 
+%% The state half of an unaffordable call was already right; the **gas** half was not,
+%% and that is why a test could sit here for the whole life of this module passing
+%% against a node that over-charged 45,247 gas on six corpus fixtures.
+%%
+%% The spec, in `forks/berlin/vm/instructions/system.py', `call':
+%%
+%%     sender_balance = get_account(evm.message.tx_env.state,
+%%                                 evm.message.current_target).balance
+%%     if sender_balance < value:
+%%         push(evm.stack, U256(0))
+%%         evm.return_data = b""
+%%         evm.gas_left += message_call_gas.sub_call
+%%
+%% The first line was in this module and the third was not, and the third is the one
+%% that is worth 45,247 gas. A call that **consumed** its forwarded allowance instead
+%% of returning it is a different *answer*, not a different number, and a balance
+%% assertion cannot see it at all.
+a_call_the_caller_cannot_afford_returns_its_forwarded_gas_test() ->
+    %% The target is given a balance so that it *exists*, which keeps EIP-161's 25,000
+    %% out of the comparison. It is charged on a value-bearing call to an account with
+    %% no balance, no nonce and no code -- which is what `call_state/2` leaves -- and
+    %% leaving it in made the difference 34,000 rather than 9,000 and sent me looking
+    %% for a sign error that was not there.
+    %% The same program twice, once sending 40 the caller cannot cover and once
+    %% sending nothing. What is left after the two cancel is EIP-161's 9,000 for the
+    %% value transfer and nothing else -- **provided** the failed call handed its
+    %% forwarded gas back. A version that consumed it differs by most of a million,
+    %% because `call_args/2' forwards 0xFFFF.
+    %% Under `with_local_reads/1' because the target's account is only partly seeded
+    %% and an unseeded read does not answer zero -- it falls through `eth_state' to the
+    %% configured base source, which in the default `upstream' mode is an RPC call, and
+    %% in a unit test that is a *crash* rather than a failure. The same trap the note on
+    %% `both_slots/3' describes.
+    eth_test_util:with_local_reads(fun() ->
+        [?assertEqual({F, 9000},
+                      {F, unaffordable_call_cost(F) - affordable_call_cost(F)})
+         || F <- [istanbul, berlin, cancun]],
+        %% And the absolute figures, so the difference above cannot be satisfied by two
+        %% wrong numbers that happen to differ by 9,000. They are the access price and
+        %% the access price plus EIP-161's 9,000, and nothing else -- no part of the
+        %% 0xFFFF the call forwards. The two forks are listed separately because
+        %% EIP-2929's `COLD_ACCOUNT_ACCESS_COST` is 2,600 and not 700, and a single
+        %% bound written against Istanbul's 721 is off by a factor at every fork after
+        %% it.
+        [?assertEqual({F, {A, A + 9000}},
+                      {F, {affordable_call_cost(F), unaffordable_call_cost(F)}})
+         || {F, A} <- [{istanbul, 721}, {berlin, 2621}, {cancun, 2621}]]
+    end).
+
+%% `spent/3' is already the spend -- `?GAS - Left' -- so these are `spent/3' and not
+%% `?GAS - spent/3'. Writing the second form gave `Left` rather than the cost, the
+%% difference came out as -9,000 instead of +9,000, and I spent a while looking for a
+%% sign error in the EVM.
+unaffordable_call_cost(Fork) ->
+    spent(<<(call_seq(16#0D, 40, 16#F1))/binary, 16#00>>, broke_state(), Fork).
+
+affordable_call_cost(Fork) ->
+    spent(<<(call_seq(16#0D, 0, 16#F1))/binary, 16#00>>, broke_state(), Fork).
+
+broke_state() -> eth_state:set_balance(call_state(10, <<>>), ?CALLEE, 5).
+
+%% The spec's other two lines, which the same fix brought: the call pushes 0 and
+%% **empties the return data**. A `RETURNDATASIZE` after a call that did not happen
+%% must read zero, and it used to read whatever the previous call left behind.
+%% Under `with_local_reads/1' like its sibling, for the same reason: the two slots
+%% written here are not in the overlay, and an unseeded read goes to the configured
+%% base source, which is a *hang* in a unit test rather than a zero.
+a_call_the_caller_cannot_afford_empties_the_return_data_test() ->
+    eth_test_util:with_local_reads(fun() ->
+        %% **A successful call first, so there is something to clear.** The first
+        %% version of this program was a lone failing call, and it asserted
+        %% `RETURNDATASIZE == 0` -- which passed with the `evm.return_data = b""' line
+        %% deleted, because nothing had ever set the return data. A test that asserts a
+        %% value is zero proves nothing unless something else could have made it
+        %% non-zero, and the injection that showed this (delete the reset, every test
+        %% still green) is the reason it is stated here.
+        %%
+        %% The callee is `PUSH1 1; PUSH1 0; RETURN` -- one byte back -- so the first
+        %% call leaves a return data of size 1 and the second must clear it.
+        Callee = <<16#60, 1, 16#60, 0, 16#F3>>,
+        Code = <<(call_seq(16#0D, 0, 16#F1))/binary,
+                 (call_seq(16#0D, 40, 16#F1))/binary,
+                 16#3D, 16#60, 5, 16#55, 16#00>>,
+        {ok, _, _, St, _} = eth_evm:run(Code, ?MSG0, call_state(10, Callee),
+                                        #{fork => cancun}, ?GAS),
+        ?assertEqual(0, eth_state:storage(St, ?CALLER, 5)),
+        %% And the control: with only the *successful* call, the size is 1. Without this
+        %% the assertion above is a statement about a return-data register that was
+        %% never written, which is what made it vacuous in the first place.
+        Only = <<(call_seq(16#0D, 0, 16#F1))/binary,
+                  16#3D, 16#60, 5, 16#55, 16#00>>,
+        {ok, _, _, St0, _} = eth_evm:run(Only, ?MSG0, call_state(10, Callee),
+                                         #{fork => cancun}, ?GAS),
+        ?assertEqual(1, eth_state:storage(St0, ?CALLER, 5)),
+        %% And the success flag the failing CALL pushed is 0, not 1.
+        {ok, _, _, St2, _} =
+            eth_evm:run(<<(call_seq(16#0D, 40, 16#F1))/binary, 16#60, 6, 16#55, 16#00>>,
+                        ?MSG0, call_state(10, Callee), #{fork => cancun}, ?GAS),
+        ?assertEqual(0, eth_state:storage(St2, ?CALLER, 6))
+    end).
+
+%% `CALLCODE` is the same block in the spec -- the same `sender_balance` check, the
+%% same `evm.gas_left += message_call_gas.sub_call`, and `should_transfer_value=True` --
+%% and `check_call_value/5` had only a `call` clause, so `CALLCODE` moved no value and
+%% consulted no balance. `delegatecall` and `staticcall` correctly have neither.
+callcode_transfers_the_value_and_checks_the_balance_like_call_test() ->
+  eth_test_util:with_local_reads(fun() ->
+    Funded = call_state(1000, <<16#00>>),
+    [begin
+         {ok, _, _, St, _} =
+             eth_evm:run(<<(call_seq(16#0D, 40, 16#F2))/binary, 16#00>>,
+                         ?MSG0, Funded, #{fork => F}, ?GAS),
+         ?assertEqual({F, 960}, {F, eth_state:balance(St, ?CALLER)}),
+         ?assertEqual({F, 40}, {F, eth_state:balance(St, ?CALLEE)})
+     end || F <- [istanbul, berlin, cancun]],
+    %% And when the caller cannot cover it, `CALLCODE` fails exactly as `CALL` does --
+    %% no value moves. This is the half that was missing; the first half above would
+    %% have passed before the fix too, since nothing moved in either direction.
+    {ok, _, _, Broke, _} =
+        eth_evm:run(<<(call_seq(16#0D, 40, 16#F2))/binary, 16#00>>,
+                    ?MSG0, call_state(10, <<16#00>>), #{fork => cancun}, ?GAS),
+    ?assertEqual(10, eth_state:balance(Broke, ?CALLER)),
+    ?assertEqual(0, eth_state:balance(Broke, ?CALLEE))
+  end).
+
 create_revert_keeps_nonce_drops_value_test() ->
     %% Init code reverts: value returns, nonce stays consumed, nothing deployed.
     Init = <<16#60,0, 16#60,0, 16#FD>>,

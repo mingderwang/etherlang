@@ -901,27 +901,50 @@ do_call(Kind, Op, E, Ctx) ->
 %% version of this change charged the pre-stipend figure and refunded the
 %% post-stipend one, and two existing tests caught it at 9300 against 11600.
 %%
-%% **The one thing this does not settle is where the stipend sits relative to the cap.**
-%% EIP-150 writes:
+%% **One figure where the specification has two. Recorded, not shipped.**
+%%
+%% EIP-150 writes two lines:
 %%
 %%     gas = min(gas, max_call_gas(compustate.gas - extra_gas))
 %%     submsg_gas = gas + opcodes.GSTIPEND * (value > 0)
 %%
-%% which reads as the stipend being added *after* the clamp. Implementing it that way
-%% makes the child's allowance `cap + 2300` while the caller is only asked for
-%% `cap + 2300` too -- and with a callee that spends everything it is given, the
-%% child's allowance then exceeds what the caller had left, and the CALL's own charge
-%% raises. That is a second-order accounting question I could not settle from the text
-%% alone, and a change to a CALL's gas is not something to ship on a reading.
+%% and the spec names both:
 %%
-%% So the stipend stays **inside** the clamp, which is what this module always did and
-%% which is symmetric with the charge. The clause this replaces applied the 63/64
-%% cap and the 2300 stipend at **every** fork, including the four before Tangerine
-%% Whistle; that much is derived from the EIP's own `substitute' block and is fixed
-%% here. The ordering within Tangerine-and-later is recorded in TASKS.md as open,
-%% with the reason, rather than guessed at.
+%%     call_stipend = Uint(0) if value == 0 else call_stipend
+%%     gas = min(gas, max_message_call_gas(gas_left - memory_cost - extra_gas))
+%%     return MessageCallGas(gas + extra_gas, gas + call_stipend)
+%%
+%% so `cost` is the clamped gas **plus `extra_gas`** and `sub_call` is the clamped gas
+%% **plus the stipend**. The stipend is in the child's allowance and **not** in the
+%% caller's charge. This module returns one number for both, `min(gas + stipend, cap)`,
+%% which is the same figure in the other field.
+%%
+%% Three separate wrong readings of that, all caught, which is why the shape is written
+%% down rather than left implicit:
+%%
+%%   * A `CALL` whose value the caller cannot cover **consumed** its forwarded
+%%     allowance. The spec returns it -- `evm.gas_left += message_call_gas.sub_call` --
+%%     and the corpus named that as a uniform **+45,247** across the six forks of
+%%     `eip2929_gas_cost_increases/test_call_insufficient_balance`. **Fixed**, because
+%%     the spec says so in one line and the corpus agrees.
+%%   * With the refund in place, the same six fixtures sat at **+2,300**, which is the
+%%     stipend exactly -- the consequence of the one-figure model above, and not
+%%     independently fixable.
+%%   * The first attempt at the split put the stipend in `cost`
+%%     (`{Sub + Stipend, Sub}`) rather than in `sub_call`, and the same six fixtures
+%%     then charged their **whole 100,000 allowance**: `Sub + 2300` can exceed the gas
+%%     remaining and `charge/2' answers `oog'. The error was not a wrong total but a
+%%     **halt**, which is much louder than a total and which is the only reason the
+%%     mistake is recorded at this length.
+%%
+%% So the split is not shipped. The residual +2,300 is one gas figure on six fixtures
+%% and the fix is a change to **every** value-bearing `CALL`'s accounting, which is not
+%% something to ship on the strength of a transcription when the corpus neither
+%% confirms nor refutes it. It is named in TASKS.md with the spec text quoted, so the
+%% next person does not have to rediscover that the two figures are different.
 %%
 %% Before Tangerine Whistle there is no cap and no stipend at all. The EIP gives the
+%% code it replaced:%% Before Tangerine Whistle there is no cap and no stipend at all. The EIP gives the
 %% code it replaced:
 %%
 %%     if compustate.gas < gas + extra_gas:
@@ -992,9 +1015,11 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
                     From = s_msg(address, Ctx, <<0:160>>),
                     case check_call_value(Kind, Ctx#ctx.state, From, To, Value) of
                         {error, insufficient_balance} ->
-                            %% The call cannot happen. The forwarded allowance is
-                            %% still spent: the CALL opcode has already paid for it.
-                            finish_call(E, Ctx, Ctx#ctx.state, <<>>, RetOff, RetLen, 0);
+                            %% The call cannot happen, and the gas it could not use
+                            %% comes **back**. See the note on
+                            %% `insufficient_balance_refunds_the_forwarded_gas/0'.
+                            finish_call(add_gas(E#e{retdata = <<>>}, CallGas), Ctx,
+                                        Ctx#ctx.state, <<>>, RetOff, RetLen, 0);
                         {ok, St0} ->
                             case eth_evm_precompiles:precompile(ToW, Args,
                                                               Ctx#ctx.fork) of
@@ -1040,9 +1065,13 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
                         end,
                     case check_call_value(Kind, Ctx#ctx.state, CurAddr, To, Value) of
                         {error, insufficient_balance} ->
-                            %% Caller cannot cover Value: fail with no state
-                            %% change (same shape as the depth-limit failure).
-                            finish_call(E, Ctx, Ctx#ctx.state, <<>>, RetOff, RetLen, 0);
+                            %% Caller cannot cover Value: fail with no state change,
+                            %% and hand the forwarded allowance back. The second half is
+                            %% the part that was wrong, and it is worth a whole fixture
+                            %% file -- see
+                            %% `insufficient_balance_refunds_the_forwarded_gas/0'.
+                            finish_call(add_gas(E#e{retdata = <<>>}, CallGas), Ctx,
+                                        Ctx#ctx.state, <<>>, RetOff, RetLen, 0);
                         {ok, StateIn} ->
                             ChildStatic = Kind =:= staticcall orelse s_msg(static, Ctx, false),
                             ChildMsg = #{address => ChildAddr, caller => ChildCaller,
@@ -1148,17 +1177,50 @@ transfer(State, From, To, Value) ->
 %% not move value out of the caller (callcode's net effect is zero, so doing
 %% nothing matches). A caller that cannot cover Value fails the call with no
 %% state change (mirrors the depth-limit failure shape).
-check_call_value(call, State, _From, _To, 0) ->
+check_call_value(Kind, State, _From, _To, 0) when Kind =:= call; Kind =:= callcode ->
     %% Zero value moves nothing: skip the balance read entirely (also keeps
     %% view-only calls free of upstream fetches).
     {ok, State};
-check_call_value(call, State, From, To, Value) ->
+check_call_value(Kind, State, From, To, Value) when Kind =:= call; Kind =:= callcode ->
     case can_transfer(State, From, Value) of
         true -> {ok, transfer(State, From, To, Value)};
         false -> {error, insufficient_balance}
     end;
 check_call_value(_Kind, State, _From, _To, _Value) ->
     {ok, State}.
+
+%% **A `CALL` whose value the caller cannot cover returns its forwarded gas.**
+%%
+%% The spec's own `call`, in `forks/berlin/vm/instructions/system.py`:
+%%
+%%     sender_balance = get_account(evm.message.tx_env.state,
+%%                                 evm.message.current_target).balance
+%%     if sender_balance < value:
+%%         push(evm.stack, U256(0))
+%%         evm.return_data = b""
+%%         evm.gas_left += message_call_gas.sub_call
+%%     else:
+%%         generic_call(...)
+%%
+%% Three things, and the node had the first and none of the others: the call fails
+%% (pushing 0), the return data is emptied, and `sub_call` is added back. This module
+%% pushed 0 and **consumed** the forwarded allowance, on the reasoning -- recorded in a
+%% comment here until now -- that "the CALL opcode has already paid for it". The
+%% opcode has paid for `sub_call`; it is `sub_call` that is being refunded, which is a
+%% different direction of travel and not a consequence of the same fact.
+%%
+%% The corpus named it as a uniform **+45,247** across six forks of
+%% `eip2929_gas_cost_increases/test_call_insufficient_balance`, whose contract forwards
+%% `GAS` with a value of 1 from an account holding 0, so `sub_call` is essentially the
+%% whole allowance. Positive delta, node charges more -- consistent with consuming a
+%% refund the chain makes.
+%%
+%% `callcode` is here for the same reason and was **not** before: the spec's `callcode`
+%% is byte-for-byte the same block, with the same `sender_balance` check and the same
+%% `evm.gas_left += message_call_gas.sub_call`, and this module's `check_call_value/5`
+%% only had a `call` clause. So `CALLCODE` transferred no value and consulted no
+%% balance. `delegatecall` and `staticcall` correctly have neither, the spec passing
+%% `should_transfer_value=False` and `value=U256(0)` for them.
 
 can_transfer(_State, _From, 0) -> true;
 can_transfer(State, From, Value) ->

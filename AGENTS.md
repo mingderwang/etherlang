@@ -439,6 +439,7 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
 | The code-deposit cost | `G_codedeposit` = 200 per byte of returned code, at every fork, from `eth_fork_schedule:code_deposit_cost/1`; a create that cannot pay it fails and its whole forwarded allowance goes (EIP-2 item 3). It was charged **nowhere**, and the EIP-170 cap was a bare guard rather than a price. `max_code_size/1` answers `infinity` below Spurious Dragon. See TASKS.md. |
 | EIP-2929's cold `SSTORE` term | `sstore_cost/4` is only half of EIP-2929's SSTORE clause. The other half — "charge an **additional** `COLD_SLOAD_COST`" for a pair not in `accessed_storage_keys` — is `sstore_cold_cost/2`, and omitting it under-charges the *first* touch of a slot by 2,100 while leaving every second touch right. That asymmetry is invisible to any test that writes a slot twice. |
 | EIP-2929's transaction-start warm set | `eth_evm:initial_access/2`, gated on Berlin, seeds `accessed_addresses` with `tx.sender`, `tx.to` (or the address being created) and `eth_fork_schedule:precompile_addresses/1` — which **asks** `precompile_at/2` rather than keeping a second list, bounded by a pin that keeps the bound and the layout's catch-all clause the same statement. It was absent, so every precompile and both of those addresses cost `COLD_ACCOUNT_ACCESS_COST` on first touch. |
+| A `CALL` the caller cannot afford | The spec's `call`: on `sender_balance < value` it pushes 0, **empties the return data**, and adds `sub_call` back. This module consumed the forwarded allowance instead, and `check_call_value/5` had no `callcode` clause at all, so `CALLCODE` moved no value and read no balance. `+45,247` on six corpus fixtures. The stipend's *field* — `cost` vs `sub_call` — is still open; see TASKS.md. |
 | Pre-Berlin SSTORE | **Priced, except at Constantinople.** The flat rule (the yellow paper's, which Petersburg restored) with EIP-2200's own inherited figures, and `SLOAD_GAS` fork-selected 50/200/800 by EIP-150 and EIP-1884. Constantinople is the *only* fork still refused, because EIP-1283 replaced the rule and Petersburg reverted it — and it is unreachable by block number on mainnet anyway, since it and Petersburg share block 7,280,000. `SLOAD` itself was also a flat 200 at every fork, right for one span of three. See §3 "Fork awareness" and TASKS.md. |
 
 ## 11. Known dead code
@@ -495,6 +496,15 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
   the additional `COLD_SLOAD_COST` for a cold slot is a *separate* term. Implementing
   the first and not the second is a coherent-looking table that is wrong on every first
   access, and it is wrong in a way a test repeating an access cannot see.
+- **A gas assertion needs a control that could have been different.** The first version
+  of the return-data test ran one failing `CALL` and asserted `RETURNDATASIZE == 0`. It
+  passed with the `evm.return_data = b""` line **deleted**, because nothing had ever
+  set the register. The injection was the only thing that found it. Put the successful
+  call in front of the failing one, and assert the control's value too.
+- **`f([A, B]) -> ...` is `f/1`.** Not `f/2`. Every probe in this repository's history
+  that exported `main/2` for a `main([Dir, Needle])` head failed with "function main/2
+  undefined, did you mean main/1?" and it cost real time twice, because the error reads
+  like the compiler being wrong about the arity of its own export. It is not.
 - **A seeded set is not a seeded set until the key matches.** `precompile_addresses/1`
   first built one-byte binaries, because `precompile_at/2` is keyed on the address's last
   byte. Every seed was then a key no 160-bit address could equal, and the corpus did

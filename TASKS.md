@@ -360,18 +360,52 @@ behavioural change per commit, and each step says what it now does.
        by *asking* `precompile_at/2` rather than keeping a second list, and
        `no_precompile_above_ten_is_the_highest_address_test` is the pin that keeps the
        enumeration's bound and the layout's catch-all clause the same statement.
-     - **What the four fixes did to the histogram.** The `−9xxxxx` cluster (18 fixtures,
+     - **A `CALL` whose value the caller cannot cover now returns its forwarded gas**
+       (`v1.38`). The spec's own `call`, in `forks/berlin/vm/instructions/system.py`:
+       `if sender_balance < value: push(evm.stack, U256(0)); evm.return_data = b"";`
+       `evm.gas_left += message_call_gas.sub_call`. This module pushed 0 and
+       **consumed** the allowance, on a comment's reasoning that "the CALL opcode has
+       already paid for it" — and the opcode *has* paid for `sub_call`; `sub_call` is
+       what is being refunded, which is the other direction of travel. The corpus named
+       it as a uniform **+45,247** across the six forks of
+       `eip2929_gas_cost_increases/test_call_insufficient_balance`; it is now **+2,300**.
+       `callcode` is in the same fix: the spec's `callcode` is the same block with the
+       same check and `should_transfer_value=True`, and `check_call_value/5` had only a
+       `call` clause, so `CALLCODE` moved no value and consulted no balance.
+     - **What the five fixes did to the histogram.** The `−9xxxxx` cluster (18 fixtures,
        ~928,000 gas each) is gone entirely, as are `+2500` ×24 and `+2497` ×24.
        Comparable gas figures fell from 217 to 136, which is a *change* and not an
        improvement in itself: 81 fixtures no longer yield a figure at all, because the
        sender's balance no longer implies a whole number of gas. That is a symptom of
        the node's balance now differing from the fixture's in a way the derivation
        cannot express, and it is **not yet explained**. Named, not chased.
-     - **Remaining fingerprints**, largest first: `+517958` ×5, `+45247` ×6
-       (`test_call.py::test_call_insufficient_balance`), `+314626` ×2, `+152536` ×2
-       (`test_coverage`), `−19900` ×24, `−19912` ×6, `−3` ×36, `+10500` ×6, `+2576`/`+3746`/
-       `+3776` ×5 each, `+4000` ×6 (`test_acl`), `+9139`, `+9439`, `+20176` (BLS12-381
-       G1MSM), `+2100`, `+2300`, `−23000` ×2, `−48300` ×2, `−19800` ×4, `−19200` ×2.
+     - **Remaining fingerprints**, largest first: `+517958` ×5, `+152536` ×2
+       (`test_coverage`), `−19900` ×24, `−19912` ×6, `−3` ×36, `+10500` ×6,
+       `+2576`/`+3746`/`+3776` ×5 each, `+4000` ×6 (`test_acl`), `+2300` ×7,
+       `+9139`, `+9439`, `+20176` (BLS12-381 G1MSM), `+2100`, `−23000` ×2,
+       `−48300` ×2, `−20700` ×2, `−19800` ×4, `−19200` ×2.
+       `+45247` ×6 and `+314626` ×2 are **gone**.
+     - **`+2300` ×7 is the EIP-150 stipend, and the fix is known and not shipped.**
+       The spec has **two** figures where this module has one: `cost` is the clamped
+       gas **plus `extra_gas`** and `sub_call` is the clamped gas **plus the stipend**,
+       so the stipend is in the child's allowance and not in the caller's charge, and a
+       call that does not happen refunds `sub_call`. `child_gas/4` returns
+       `min(gas + stipend, cap)` for both.
+       I attempted the split **twice and reverted it both times.** The first attempt
+       put the stipend in `cost`, and the same six fixtures then charged their whole
+       100,000 allowance -- `Sub + 2300` can exceed the gas remaining, so the error was
+       a **halt** and not a wrong total. The second attempt had the right field and the
+       fixtures went to a state mismatch I could not explain. A change to every
+       value-bearing `CALL`'s accounting is not something to ship on a transcription the
+       corpus neither confirms nor refutes, so it stays open with the spec's text
+       quoted in the code.
+     - **`−3` ×36** (`test_identity_return_overwrite`, four call opcodes × nine forks).
+       Every opcode constant in that program is correct -- `MSTORE8` 3, `MSIZE` 2,
+       `RETURNDATASIZE` 2, `RETURNDATACOPY` 3, `SHA3` 30, `GAS` 2, all checked against
+       the table -- so it is not a price in `access_prices/1` or the opcode table. It
+       is the same 3 at every fork, which rules out anything fork-gated. Diagnosing it
+       needs a per-opcode gas trace the interpreter does not emit, and building one was
+       not a good use of the remaining time against `+517958`, which is larger.
        `−17412`/`−17400` are **gone**; they were `test_modexp_thresholds` at 6 × 2,952,
        and 2,952 is not a number this node's table contains, so the ModExp complexity
        formula was wrong somewhere rather than a constant being off by a little. The
