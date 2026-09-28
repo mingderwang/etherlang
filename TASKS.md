@@ -406,19 +406,47 @@ behavioural change per commit, and each step says what it now does.
      `test_tx_gas_limit` x3. **`+517,958` is `(gasLimit - gasUsed) * price`**: the gas
      is right -- an instrumented run reports `charged0=26006`, the chain's own figure --
      and the price is wrong.
-     The runner builds the block with `base_fee_per_gas = merge_base_fee(base_fee_for(Fork),
-     Derived)`, and `base_fee_for/1` answers **0** for every fork at London and later.
-     So the sender is charged `maxFeePerGas` against a base fee of 0, the tip is the
-     whole price, and the fee recipient's balance comes out wrong. `merge_base_fee/1`'s
-     first clause -- `merge_base_fee(undefined, _Derived) -> undefined` -- also discards
-     a derived value outright whenever the fork's own figure is `undefined`.
-     **Not fixed, and the fix is not yet isolated.** Preferring the
-     `env.currentBaseFee` the fixture states was tried and moved neither the tally nor
-     `+517958`, so the defect is in the fee path and not in the base fee's *source*. A
-     change to `base_fee_for/1` or `merge_base_fee/1` is the obvious next thing and is
-     deliberately not made on this reading: a wrong fee is a wrong balance for every
-     post-London block, and that is not a change to ship without a number to show for
-     it.
+     **Isolated, and it is one word.** The runner builds the block with
+     `base_fee_per_gas = merge_base_fee(base_fee_for(Fork), Derived)`, and
+     `base_fee_for/1` is:
+
+         base_fee_for(Fork) ->
+             case eth_fork_schedule:at_least(Fork, london) of
+                 true -> 0; false -> undefined
+             end.
+
+     **`Fork` is a binary.** It comes from `fork_of_key/1`, which does a binary capture
+     out of the entry's key, so it is `<<"London">>` and `<<"Paris">>` and not the atoms
+     `at_least/2` expects. An unrecognised fork ranks as ancient everywhere else in
+     `eth_fork_schedule`, so `at_least(<<"London">>, london)` is `false` --
+     verified, not inferred -- and `base_fee_for/1` answers `undefined` for **every**
+     fork, post-London included. Pre-London that is the correct answer and the bug is
+     invisible; from London it is not, so the block carries no base fee,
+     `effective_gas_price/4` takes its `undefined` branch, and a typed transaction --
+     which has no `gasPrice` -- is executed at an effective price of **0**. An
+     instrumented run of `test_eip1559_tx_validity` reports
+     `basefee=undefined eff=0 ceiling=7 charged=26006 sender_drop=0`: the sender is
+     debited 700,000 at `maxFeePerGas` and refunded nothing.
+
+     That also explains why preferring the fixture's `env.currentBaseFee` moved nothing
+     when tried: `merge_base_fee/1`'s first clause is
+     `merge_base_fee(undefined, _Derived) -> undefined`, so a derived value was
+     **discarded** -- the merge cannot reach it while the fork's own figure is
+     `undefined`, whatever it is.
+
+     Two harness defects, one of them a word. **Named, not fixed here**, because the
+     fix belongs with a measurement: the corpus is the only thing that can say whether
+     the eighteen flip, and the two candidates are `base_fee_for/1`'s argument and
+     `merge_base_fee/1`'s clause order, and picking between them on a reading is how the
+     tally ends up quoted for the wrong reason.
+
+     **What is *not* true, and was said before it was checked:** that this left the
+     node's EIP-1559 fee path "unmeasured". It does not.
+     `eth_tx_validity_tests` pins the fee recipient's tip and the sender's refund
+     against `min(MaxFee, BaseFee + MaxPriority)` at `BaseFee = 10`, and
+     `fee_below_base_fee_is_rejected_test` pins the `fee_too_low` refusal at 1,000.
+     What this bug removes is the **corpus's ability to corroborate** those unit tests,
+     which is a real loss and a much smaller claim.
      **The largest single cluster of what is left, and one cause rather than eighteen.**
    - **Remaining fingerprints**, largest first: `+517958` ×5, `+152536` ×2
        (`test_coverage`), `−19900` ×24, `−19912` ×6, `−3` ×36, `+10500` ×6,
