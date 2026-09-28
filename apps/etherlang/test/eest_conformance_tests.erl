@@ -144,8 +144,21 @@
 %%     a slot cost 2,100 too little and every second touch was right, which is why it
 %%     survived: a test that writes a slot twice cannot see it. The corpus gave it up
 %%     as a -2,100 delta on 40 fixtures, all at the same number.
--define(EXPECTED, #{match => 24,
-                    state_mismatch => 239,
+%%
+%% `match` 24 -> **25** again, from a third missing price: **EIP-2929's transaction-start
+%% warm set was never seeded.** Its own text: "When a transaction execution begins ...
+%% `accessed_addresses` is initialized to include the `tx.sender`, `tx.to` (or the
+%% address being created if it is a contract creation transaction) -- and the set of all
+%% precompiles." None of it was, so the transaction's own recipient, its own sender and
+%% every precompile were each charged `COLD_ACCOUNT_ACCESS_COST` on first touch.
+%%
+%% The corpus named it as a uniform **+2,500** on twenty-four fixtures, and 2,500 is
+%% `COLD_ACCOUNT_ACCESS_COST - WARM_STORAGE_READ_COST` exactly -- 2,600 - 100 -- at every
+%% fork from Berlin and at none before it, which is what identifies it as a precompile
+%% rather than anything else. The `test_gas.py` contracts behind those fixtures each
+%% call one precompile and do nothing else.
+-define(EXPECTED, #{match => 25,
+                    state_mismatch => 238,
                     unpriced => 0,
                     tx_decode_failed => 0,
                     tx_roundtrip_mismatch => 0,

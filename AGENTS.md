@@ -438,6 +438,7 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
 | EIP-150's 63/64 rule and 2300 stipend | **Both are now fork-gated** (Tangerine Whistle and later; zero before), and the pre-Whistle rule is derived rather than invented because EIP-150's own `substitute` block is the code it replaced. That gained a corpus fixture: 11 -> 12 matches. What is **still open** is where the stipend sits relative to the cap — the EIP's pseudocode adds it after the clamp, this module adds it before, and the reading that follows the EIP makes a child's allowance exceed the caller's remaining. Not changed on a reading; see TASKS.md. |
 | The code-deposit cost | `G_codedeposit` = 200 per byte of returned code, at every fork, from `eth_fork_schedule:code_deposit_cost/1`; a create that cannot pay it fails and its whole forwarded allowance goes (EIP-2 item 3). It was charged **nowhere**, and the EIP-170 cap was a bare guard rather than a price. `max_code_size/1` answers `infinity` below Spurious Dragon. See TASKS.md. |
 | EIP-2929's cold `SSTORE` term | `sstore_cost/4` is only half of EIP-2929's SSTORE clause. The other half — "charge an **additional** `COLD_SLOAD_COST`" for a pair not in `accessed_storage_keys` — is `sstore_cold_cost/2`, and omitting it under-charges the *first* touch of a slot by 2,100 while leaving every second touch right. That asymmetry is invisible to any test that writes a slot twice. |
+| EIP-2929's transaction-start warm set | `eth_evm:initial_access/2`, gated on Berlin, seeds `accessed_addresses` with `tx.sender`, `tx.to` (or the address being created) and `eth_fork_schedule:precompile_addresses/1` — which **asks** `precompile_at/2` rather than keeping a second list, bounded by a pin that keeps the bound and the layout's catch-all clause the same statement. It was absent, so every precompile and both of those addresses cost `COLD_ACCOUNT_ACCESS_COST` on first touch. |
 | Pre-Berlin SSTORE | **Priced, except at Constantinople.** The flat rule (the yellow paper's, which Petersburg restored) with EIP-2200's own inherited figures, and `SLOAD_GAS` fork-selected 50/200/800 by EIP-150 and EIP-1884. Constantinople is the *only* fork still refused, because EIP-1283 replaced the rule and Petersburg reverted it — and it is unreachable by block number on mainnet anyway, since it and Petersburg share block 7,280,000. `SLOAD` itself was also a flat 200 at every fork, right for one span of three. See §3 "Fork awareness" and TASKS.md. |
 
 ## 11. Known dead code
@@ -494,6 +495,16 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
   the additional `COLD_SLOAD_COST` for a cold slot is a *separate* term. Implementing
   the first and not the second is a coherent-looking table that is wrong on every first
   access, and it is wrong in a way a test repeating an access cannot see.
+- **A seeded set is not a seeded set until the key matches.** `precompile_addresses/1`
+  first built one-byte binaries, because `precompile_at/2` is keyed on the address's last
+  byte. Every seed was then a key no 160-bit address could equal, and the corpus did
+  not move at all — an access list that is present, correctly shaped, and inert is
+  indistinguishable from one that was never seeded. Twenty-byte is a length, and lengths
+  are where this goes wrong.
+- **Read a histogram in full.** Concluding that `+56665`/`+56668` had "dissolved" from
+  `head -30` of `h5`'s output, which cut them off, was an unsound observation that
+  happened to be right. The verification came later, untruncated, and by then the
+  conclusion had been in TASKS.md for a commit.
 - **`unsupported` is not one thing.** `eth_evm_precompiles:precompile/3` has three
   answers: `{ok, Output, GasCost}`, `{failed, Why}` (the EVM's answer is that the call
   fails — nothing returned, forwarded gas consumed, caller carries on), and

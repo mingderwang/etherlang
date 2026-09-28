@@ -1265,6 +1265,65 @@ sstore_sentry_is_2300_from_berlin_test() ->
 %% rule with net metering, and Petersburg reverted it. The flat rule is therefore right
 %% for the eight other pre-Berlin forks and wrong for exactly that one -- which is why
 %% `sstore_supported/1` is a single exception rather than a fork boundary.
+%% EIP-2929 seeds `accessed_addresses' with "the set of all precompiles", and the
+%% only way to answer that without a second copy of the layout is to ask the layout.
+%% `precompile_at/2' is keyed by the last byte, which is convenient; the *list* is a list
+%% of addresses, which are 160 bits.
+precompile_addresses_are_160_bit_and_fork_selected_test() ->
+    [?assert(lists:all(fun(A) -> byte_size(A) =:= 20 end, Addrs),
+            {F, byte_size(hd(Addrs))})
+     || F <- [frontier, byzantium, istanbul, cancun, prague],
+            Addrs <- [eth_fork_schedule:precompile_addresses(F)]],
+    %% Byzantium added 0x06, 0x07 **and 0x08** -- three, not two: EIP-196 brought
+    %% `ECADD` and `ECMUL` and EIP-197 the pairing check, and they arrived together.
+    %% Istanbul added 0x09, Cancun 0x0A. So the count moves with the fork, which is the
+    %% whole reason this is a function of the fork.
+    [?assertEqual({F, N}, {F, length(eth_fork_schedule:precompile_addresses(F))})
+     || {F, N} <- [{frontier, 5}, {homestead, 5}, {dao, 5}, {tangerine, 5},
+                   {spurious_dragon, 5}, {byzantium, 8}, {constantinople, 8},
+                   {petersburg, 8}, {istanbul, 9}, {muir_glacier, 9},
+                   {berlin, 9}, {london, 9}, {merge, 9}, {paris, 9},
+                   {shanghai, 9}, {cancun, 10}, {prague, 10}]],
+    %% An unrecognised fork ranks as ancient everywhere else in this module, and
+    %% ancient means Frontier, where 0x01 to 0x05 are precompiles and 0x06 onwards are
+    %% ordinary accounts. So an unknown fork gets **five**, not none and not ten. I
+    %% expected `[]' first, which would have meant refusing a precompile that exists at
+    %% every fork in the schedule -- the opposite of this module's direction, and a
+    %% refusal is the safe direction only for a *rule*, not for a contract that is
+    %% there.
+    ?assertEqual(5, length(eth_fork_schedule:precompile_addresses(no_such_fork))),
+    ?assertEqual(eth_fork_schedule:precompile_addresses(frontier),
+                 eth_fork_schedule:precompile_addresses(no_such_fork)).
+
+%% The bound `precompile_addresses/1' enumerates to is a fact about `precompile_at/2'
+%% having a catch-all clause, and this is what keeps the two statements the same
+%% statement: a precompile at 0x0B or above would make the bound wrong, and a bound
+%% that is wrong means the EIP-2929 warm set is silently short by one address -- which
+%% is a cold-charge bug that no other test in the module can see, because the wrong
+%% address is one nothing else here mentions.
+no_precompile_above_ten_is_the_highest_address_test() ->
+    [?assertEqual(undefined, eth_fork_schedule:precompile_at(F, N))
+     || F <- [frontier, homestead, tangerine, spurious_dragon, byzantium, istanbul,
+              berlin, london, cancun, prague],
+        N <- lists:seq(11, 64)],
+    %% And the list agrees with the predicate the interpreter actually asks, at every
+    %% fork: the list and `is_precompile/2' are two answers to one question and a table
+    %% can hold them apart by accident.
+    %%
+    %% **Through the word, not the address.** `is_precompile/2' takes the stack word and
+    %% `precompile_at/2' is keyed on it, while this list is of 160-bit addresses because
+    %% that is what the warm set needs. Asking the predicate about an address answers
+    %% `false' for all ten -- the clauses are `precompile_at(Fork, 6)', not
+    %% `precompile_at(Fork, <<0:152, 6>>)' -- and the first version of this line compared
+    %% the two that way and failed with an empty list against a full one.
+    [?assertEqual([A || A <- Addrs, eth_evm_precompiles:is_precompile(word_of(A), F)],
+                  Addrs)
+     || F <- [frontier, byzantium, istanbul, cancun],
+        Addrs <- [eth_fork_schedule:precompile_addresses(F)]].
+
+%% A 160-bit precompile address, as the word `precompile_at/2' is keyed on.
+word_of(<<0:152, N:8>>) -> N.
+
 code_deposit_cost_is_two_hundred_at_every_fork_test() ->
     %% The yellow paper's `G_codedeposit', and no EIP has ever changed it -- EIP-2
     %% introduced the *consequence* of not being able to pay it and left the figure

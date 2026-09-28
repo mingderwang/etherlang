@@ -345,32 +345,54 @@ behavioural change per commit, and each step says what it now does.
        The asymmetry is why it survived: a test that writes a slot twice cannot see it,
        and four existing tests did exactly that. The corpus gave it up as a −2,100
        delta on **40** fixtures, all at the same number.
-     - **What the two fixes did to the histogram.** The `−9xxxxx` cluster (18 fixtures,
-       ~928,000 gas each) is gone entirely. Comparable gas figures fell from 217 to
-       160, which is a *change* and not an improvement in itself: 79 fixtures no longer
-       yield a figure at all, because the sender's balance no longer implies a whole
-       number of gas. That is a symptom of the node's balance now differing from the
-       fixture's in a way the derivation cannot express, and it is **not yet explained**.
-       Named, not chased.
-     - **Remaining fingerprints**, largest first: `+2497` ×24 and `+2500` ×24
-       (`test_gas.py` ECADD/ECMUL/pairing), `−19900` ×12, `−17400` ×12, `−17412` ×6
-       (`test_modexp_thresholds`), `−3` ×12 (`test_identity` pre-Shanghai), `+4000` ×6
-       (`test_acl`), `+4576`/`+5746`/`+5776` ×5 each, `+9139`/`+10500`/`+10689`/`+11750`,
-       `+20176` (BLS12-381 G1MSM), `+2100`, `+2300`, `−23000`, `−48300`.
-       `−17412` is the clearest of them: 6 × 2,952, and 2,952 is not a number this
-       node's table contains, so the ModExp complexity formula is still wrong somewhere
-       rather than a constant being off by a little.
+     - **EIP-2929's transaction-start warm set was never seeded** (`v1.37`). Its own
+       text: "When a transaction execution begins ... `accessed_addresses` is
+       initialized to include the `tx.sender`, `tx.to` (or the address being created if
+       it is a contract creation transaction) -- and the set of all precompiles." None
+       of it was, so the transaction's own recipient, its own sender and every
+       precompile were each charged `COLD_ACCOUNT_ACCESS_COST` on first touch. The
+       corpus named it as a uniform **+2,500** on twenty-four fixtures, and 2,500 is
+       `COLD_ACCOUNT_ACCESS_COST - WARM_STORAGE_READ_COST` exactly -- 2,600 − 100 -- at
+       every fork from Berlin and at none before it, which is what identifies it as a
+       precompile rather than anything else: the `test_gas.py` contracts behind those
+       fixtures each call one precompile and do nothing else.
+       `eth_fork_schedule:precompile_addresses/1` answers the "set of all precompiles"
+       by *asking* `precompile_at/2` rather than keeping a second list, and
+       `no_precompile_above_ten_is_the_highest_address_test` is the pin that keeps the
+       enumeration's bound and the layout's catch-all clause the same statement.
+     - **What the four fixes did to the histogram.** The `−9xxxxx` cluster (18 fixtures,
+       ~928,000 gas each) is gone entirely, as are `+2500` ×24 and `+2497` ×24.
+       Comparable gas figures fell from 217 to 136, which is a *change* and not an
+       improvement in itself: 81 fixtures no longer yield a figure at all, because the
+       sender's balance no longer implies a whole number of gas. That is a symptom of
+       the node's balance now differing from the fixture's in a way the derivation
+       cannot express, and it is **not yet explained**. Named, not chased.
+     - **Remaining fingerprints**, largest first: `+517958` ×5, `+45247` ×6
+       (`test_call.py::test_call_insufficient_balance`), `+314626` ×2, `+152536` ×2
+       (`test_coverage`), `−19900` ×24, `−19912` ×6, `−3` ×36, `+10500` ×6, `+2576`/`+3746`/
+       `+3776` ×5 each, `+4000` ×6 (`test_acl`), `+9139`, `+9439`, `+20176` (BLS12-381
+       G1MSM), `+2100`, `+2300`, `−23000` ×2, `−48300` ×2, `−19800` ×4, `−19200` ×2.
+       `−17412`/`−17400` are **gone**; they were `test_modexp_thresholds` at 6 × 2,952,
+       and 2,952 is not a number this node's table contains, so the ModExp complexity
+       formula was wrong somewhere rather than a constant being off by a little. The
+       four fixes above moved them and the residue is elsewhere.
      - **ECADD and ECMUL still conflate the two and are named open.** `bn128_add/2`
        returns `unsupported` for an off-curve point where EIP-196 makes it a call
        failure. I stopped there because the `byzantium/eip196_ec_add_mul` fixtures pass
        with the present shape and a change there could move them in a direction I had
        not measured. Named, not done.
-   - **`+56668` and `+56665`.** **Unresolved, and gone from the histogram.** Neither
-     figure appears in a current run, so whatever produced them is fixed by one of the
-     three pricing fixes above — which is worth recording, because the entry spent
-     several revisions saying this fingerprint had to be "re-derived rather than
-     chased" when it was neither re-derived nor chased: it dissolved. The largest
-     positives now are the `test_gas.py` precompile prices.
+   - **`+56668` and `+56665`.** **Unresolved, and gone — verified on the full
+     histogram at `v1.36`, and the verification matters more than the fact.** The entry
+     spent several revisions insisting this fingerprint had to be "re-derived rather
+     than chased" when it was neither re-derived nor chased: it dissolved, on the
+     `create_deposit_oog` and EIP-2929 fixes above, without anything being done to it
+     by name.
+     It is recorded here rather than deleted because **I first concluded it had
+     dissolved from a truncated read** -- `h5`'s output piped through `head -30`, which
+     cut the list off below `+517958` and hid exactly the two entries I was looking
+     for. The conclusion happened to be right and the observation could not support it.
+     A histogram is read in full or not read; a partial one is a list of the entries
+     that happened to be near the top.
    - **Where the 2300 stipend sits relative to the 63/64 cap: open, and left open on
      purpose.** EIP-150's pseudocode reads
 %%

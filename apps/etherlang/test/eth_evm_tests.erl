@@ -146,6 +146,12 @@ selector_dispatch_wrong_selector_reverts_test() ->
 %% performs a lazy upstream fetch (unit tests run with no RPC client).
 -define(CALLER, <<0:160>>).
 -define(CALLEE, <<0:152, 16#0D:8>>).
+%% A precompile (0x04, the identity function) and an address no instruction in these
+%% tests mentions. Both are `PUSH20' so a program can name either, and they differ only
+%% in the low byte -- which is what lets a gas difference between two programs be read
+%% as a warm/cold term and nothing else.
+-define(PRECOMPILE, <<0:152, 16#04:8>>).
+-define(UNTOUCHED, <<0:152, 16#99:8>>).
 
 call_state(CallerBal, CalleeCode) ->
     eth_state:new(0, #{{balance, ?CALLER} => CallerBal,
@@ -1609,6 +1615,86 @@ sstore_at_or_below_the_stipend_fails_the_frame_test() ->
                  eth_evm:run(Code, ?MSG0, St, ?ENV, At)),
     ?assertMatch({ok, _, _, _, _},
                  eth_evm:run(Code, ?MSG0, St, ?ENV, At + 1)).
+
+%% ---------------------------------------------------------------------------
+%% EIP-2929's transaction-start warm set
+%% ---------------------------------------------------------------------------
+%%
+%% "When a transaction execution begins, `accessed_storage_keys' is initialized to
+%% empty, and `accessed_addresses' is initialized to include the `tx.sender',
+%% `tx.to' (or the address being created if it is a contract creation transaction) --
+%% and the set of all precompiles."
+%%
+%% None of it was seeded, so the transaction's own recipient, its own sender, and every
+%% precompile were each charged `COLD_ACCOUNT_ACCESS_COST' on first touch. The corpus
+%% named it as a uniform +2,500 on twenty-four fixtures, and 2,500 is
+%% `COLD_ACCOUNT_ACCESS_COST - WARM_STORAGE_READ_COST' exactly, at every fork from
+%% Berlin and at none before it.
+precompiles_are_warm_from_the_first_call_test() ->
+    [?assertEqual({F, 2500}, {F, precompile_warmth(F)})
+     || F <- [berlin, london, cancun, prague]],
+    %% And not below Berlin, where there is no access list at all. EIP-2929 introduces
+    %% the set as well as the rule, so charging the rule earlier would be a claim about
+    %% a schedule that has no such concept.
+    [?assertEqual({F, 0}, {F, precompile_warmth(F)})
+     || F <- [byzantium, petersburg, istanbul, muir_glacier]].
+
+%% `BALANCE' of an address nobody has touched, less `BALANCE' of a precompile.
+%% pushes are `PUSH20', so the only difference between the two programs is the low byte
+%% of the address, and the whole of the difference is the warm/cold term.
+%% of the address, and the whole of the difference is the warm/cold term -- and it is the
+%% **unseeded** address that is the minuend, because warm is the cheaper of the two. The
+%% first version had the subtraction the other way round and the test failed at -2,500,
+%% which is the same fact with the sign against me -- worth recording, because a sign
+%% error here reads exactly like a node charging the wrong way round.
+%% Zero gas is forwarded on purpose. With nothing forwarded the child cannot run, so
+%% the precompile's *own* price never enters the figure and what is left is exactly the
+%% access price EIP-2929 is about -- which is the term under test, and would otherwise
+%% be 2,485 off by the identity precompile's 15.
+precompile_warmth(Fork) ->
+    balance_cost(?UNTOUCHED, Fork) - balance_cost(?PRECOMPILE, Fork).
+
+%% The transaction's own `tx.to' and `tx.sender' are in the set before a single
+%% instruction runs. The same construction as above, with the address read out of the
+%% message: a `BALANCE' of the address the frame is *at* is warm, and one of an address
+%% nobody mentioned is cold.
+the_transaction_recipient_and_sender_are_warm_at_the_first_instruction_test() ->
+    [?assertEqual({F, 2500}, {F, msg_warmth(Key, F)})
+     || F <- [berlin, cancun], Key <- [address, origin]],
+    [?assertEqual({F, 0}, {F, msg_warmth(Key, F)})
+     || F <- [istanbul], Key <- [address, origin]].
+
+msg_warmth(Key, Fork) ->
+    A = <<0:152, 16#2A:8>>,
+    U = ?UNTOUCHED,
+    %% The message the frame runs under, with one of its two addresses replaced.
+    %% Written as an update on a *variable* rather than on the macro, because
+    %% `(?MSG0)#{Key => A}' is an expression that updates a literal and does not
+    %% compile -- the macro is not a variable.
+    Base = ?MSG0,
+    Msg = Base#{Key => A},
+    balance_cost_in(U, Msg, Fork) - balance_cost_in(A, Msg, Fork).
+
+balance_cost(Addr, Fork) -> balance_cost_in(Addr, ?MSG0, Fork).
+
+%% `?STATE' holds one account, `<<0:160>>', and reading the balance or the code of an
+%% address it does not hold falls through `eth_state' to the configured base source --
+%% which in the default `upstream' mode is an RPC call, and in a unit test is a *hang*
+%% that eunit reports as a cancelled test rather than a failure. Both addresses these
+%% tests name are therefore seeded here. This is the trap the note on `both_slots/3'
+%% describes, met from the other direction: seeding a slot does not help if the
+%% *account* is absent.
+warm_set_state() ->
+    lists:foldl(fun(A, Acc) ->
+                    eth_state:set_balance(eth_state:set_nonce(Acc, A, 0), A, 0)
+                end, ?STATE, [?PRECOMPILE, ?UNTOUCHED, <<0:152, 16#2A:8>>, ?CALLER]).
+
+%% `PUSH20 <addr>; BALANCE; STOP`.
+balance_cost_in(Addr, Msg, Fork) ->
+    Code = <<16#73, Addr/binary, 16#31, 16#00>>,
+    {ok, _, Left, _, _} = eth_evm:run(Code, Msg, warm_set_state(),
+                                      #{fork => Fork}, ?GAS),
+    ?GAS - Left.
 
 %% ---------------------------------------------------------------------------
 %% EIP-2929's additional cold-slot term on SSTORE

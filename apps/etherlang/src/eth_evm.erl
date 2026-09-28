@@ -31,7 +31,8 @@
 %% and the revert path, and no merge rule is needed.
 -record(ctx, {state, env, msg, transient = #{}, originals = #{}, fork}).
 
--export([run/5, valid_jumpdests/1]).
+-export([run/5,
+           initial_access/2, valid_jumpdests/1]).
 
 %% ---------------------------------------------------------------------------
 %% Public API
@@ -41,9 +42,58 @@
 %% | {revert, Output, GasLeft, State, Logs}
 %% | {error, Reason, State, Logs}
 run(Code, Msg, State, Env, Gas) when is_binary(Code) ->
+    Fork = fork_of(Env),
     {Res, _Transient, _Originals} =
-        run_t(Code, Msg, State, Env, Gas, #{}, #{}, fork_of(Env)),
+        run_t(Code, Msg, State, Env, Gas, initial_access(Msg, Fork), #{}, Fork),
     Res.
+
+%% EIP-2929, "When a transaction execution begins", in the EIP's own words:
+%%
+%%   - `accessed_storage_keys' is initialized to empty, and
+%%   - `accessed_addresses' is initialized to include
+%%     - the `tx.sender', `tx.to' (or the address being created if it is a contract
+%%       creation transaction)
+%%     - and the set of all precompiles.
+%%
+%% **None of it was seeded.** `run/5' began the transient map empty, so the first
+%% `BALANCE' of the transaction's own recipient, a `CALL' to any precompile, and
+%% anything touching the sender were each charged `COLD_ACCOUNT_ACCESS_COST'.
+%%
+%% The corpus named it as a uniform +2,500 across twenty-four fixtures, and 2,500 is
+%% `COLD_ACCOUNT_ACCESS_COST - WARM_STORAGE_READ_COST' exactly -- 2,600 - 100 -- at
+%% every fork from Berlin and at no fork before it. The "+2,500 at Berlin and later
+%% only" is what identifies it as a precompile rather than anything else: the
+%% `test_gas.py' contracts behind those fixtures call one precompile each and do
+%% nothing else, and their forwarded gas is one gas short of the precompile's price, so
+%% the call fails and the only thing left to price is the *access* to it.
+%%
+%% `accessed_storage_keys` is genuinely empty here, so there is nothing to seed on that
+%% side; the clause is noted rather than left implied, because a reader checking
+%% EIP-2929's list against this function will look for it.
+%%
+%% Berlin-gated because EIP-2929 introduces the access list as well as this rule, and
+%% because below Berlin `access_cost/3' ignores `warm' -- so seeding earlier would be
+%% harmless and would also be a claim about a fork whose schedule has no such concept.
+initial_access(Msg, Fork) ->
+    case eth_fork_schedule:at_least(Fork, berlin) of
+        false ->
+            #{};
+        true ->
+            %% The key is `{warm_account, Addr}' and not the bare address, because
+            %% that is the key `warm_account/2' looks up. Seeding under a different
+            %% key would produce a map that looks populated and prices every access
+            %% cold -- which is the bug, reproduced inside the fix for it.
+            %% `maps:get/3' on the message, not `s_msg/3' -- which takes a `#ctx{}' and
+            %% reads `Ctx#ctx.msg', and this function runs *before* a context exists. I
+            %% wrote `s_msg/3' first and every test in `eth_evm_tests' failed, because
+            %% `Msg#ctx.msg' on a plain map is a badrecord and the interpreter cannot
+            %% start a frame at all.
+            Addrs = [maps:get(origin, Msg, <<0:160>>),
+                     maps:get(address, Msg, <<0:160>>)]
+                    ++ eth_fork_schedule:precompile_addresses(Fork),
+            lists:foldl(fun(Addr, Acc) -> Acc#{{warm_account, Addr} => true} end,
+                        #{}, Addrs)
+    end.
 
 %% The fork this frame executes under, taken from the Env.
 %%

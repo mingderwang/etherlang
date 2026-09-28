@@ -70,6 +70,7 @@
           sstore_cold_cost/2,
           code_deposit_cost/1,
           max_code_size/1,
+          precompile_addresses/1,
           modexp_cost/1,
           modexp_complexity/2,
           precompile_at/2,
@@ -99,6 +100,10 @@
 %% EIP-170's MAX_CODE_SIZE, `0x6000` -- the EIP states the parameter in hex and
 %% `2**14 + 2**13` is 24576. See `max_code_size/1'.
 -define(MAX_CODE_SIZE, 24576).
+%% The highest address `precompile_at/2' names. It is a fact about the clauses above
+%% it rather than a guess about the protocol, and `precompile_addresses/1' enumerates
+%% up to it. See the note on the catch-all clause for why it cannot be exceeded.
+-define(HIGHEST_PRECOMPILE, 10).
 -define(SSTORE_RESET_GAS, 5000).
 %% EIP-150's GSTIPEND. The interpreter's comment called this EIP-2929's; it is not --
 %% EIP-2929 prices the callee's first access, and the stipend is what pays for it. The
@@ -1759,6 +1764,34 @@ introduced_at(Fork, At, What) ->
         true -> What;
         false -> undefined
     end.
+
+%% Every address this table recognises at `Fork', as a list of 20-byte addresses.
+%%
+%% EIP-2929 says `accessed_addresses' is initialised to include "the set of all
+%% precompiles", and the only way to answer that without a second copy of the layout
+%% is to ask the layout. Asking it as a *list* is what forces the question; the caller
+%% needs a set and the table has a function of one address.
+%%
+%% The bound is 10 because that is the last address named above and the last clause is
+%% a catch-all, so the table cannot recognise a higher one at any fork. The bound lives
+%% here, beside the layout it bounds, and not in the caller: a bound in a caller is the
+%% same list of addresses wearing a different hat, and it would still be right when
+%% the layout moved. `no_precompile_above_ten_is_the_highest_address_test' is the pin
+%% that makes the two statements stay the same statement.
+-spec precompile_addresses(atom()) -> [binary()].
+precompile_addresses(Fork) when is_atom(Fork) ->
+    %% **20 bytes, not one.** `precompile_at/2' is keyed by the address's last byte,
+    %% which is convenient, and the list it produces is a list of *addresses*, which
+    %% are 160 bits everywhere in the EVM. My first version built `<<N>>' -- one byte
+    %% -- and every seed was a key no 160-bit address could ever equal, so the
+    %% interpreter started with an access list that was present, correctly shaped, and
+    %% inert. The corpus did not move, which is the part worth keeping: a warm set that
+    %% is seeded under the wrong key looks exactly like one that is not seeded, and the
+    %% two are indistinguishable from the outside.
+    [<<0:152, N:8>> || N <- lists:seq(1, ?HIGHEST_PRECOMPILE),
+                      precompile_at(Fork, N) =/= undefined];
+precompile_addresses(_Fork) ->
+    [].
 
 %% The alt_bn128 arithmetic costs, as `{Base, PerUnit}'.
 %%
