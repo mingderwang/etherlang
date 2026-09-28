@@ -613,8 +613,29 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     %% `input' -- so a transaction carrying `data' was executed with no calldata
     %% while `eth_tx:intrinsic_gas/5' charged for the calldata. See that function.
     Data = eth_tx:calldata(Tx),
-    MaxPriorityFee = uint(maps:get(<<"maxPriorityFeePerGas">>, Tx, 0)),
-    MaxFee = uint(maps:get(<<"maxFeePerGas">>, Tx, 0)),
+    %% **`undefined`, not 0, when the field is absent.** These two were read with a
+    %% default of 0, which made a *legacy* transaction -- one that has no
+    %% `maxFeePerGas' and no `maxPriorityFeePerGas' at all -- indistinguishable from a
+    %% 1559 transaction that explicitly asks for a zero fee. `effective_gas_price/4'
+    %% then took its 1559 clause and answered `min(0, BaseFee + 0)' = **0**.
+    %%
+    %% The consequence is the whole gas limit, and it is why the conformance corpus
+    %% showed twenty fixtures at `spent_actual = 1000000` and nothing else:
+    %%
+    %%   * `gas_ceiling/1' charges the sender `gasLimit * gasPrice' -- 1,000,000 * 10;
+    %%   * `settle_gas/8' refunds `GasLeft * EffectiveGasPrice' -- `GasLeft * 0`;
+    %%   * so the sender is billed the entire allowance for gas it did not use.
+    %%
+    %% The boundary is London because that is the first fork with a base fee, and
+    %% `undefined' is the only value that says "this block has no base fee, so the
+    %% 1559 clause does not apply". Berlin and earlier were correct by accident: with
+    %% no base fee the function returned `gasPrice' before the guard was reached.
+    %%
+    %% A zero max fee is a real, valid thing for a 1559 transaction to say, and it is
+    %% handled as one below -- at the floor, and rejected by `fee_ceiling_ok/4' for
+    %% being below it. Collapsing "absent" into "zero" is what made it indistinguishable.
+    MaxPriorityFee = opt_uint(maps:get(<<"maxPriorityFeePerGas">>, Tx, undefined)),
+    MaxFee = opt_uint(maps:get(<<"maxFeePerGas">>, Tx, undefined)),
     GasPrice = uint(maps:get(<<"gasPrice">>, Tx, 0)),
     EffectiveGasPrice = effective_gas_price(GasPrice, MaxPriorityFee, MaxFee, BaseFee),
     %% The sender is the recovered signer, not the transaction's own `from'
@@ -1465,6 +1486,15 @@ uint(V) when is_binary(V) ->
 uint(_) ->
     0.
 
+%% `uint/1` with the distinction "this field is not on the transaction" preserved.
+%% A transaction that has no `maxFeePerGas' is a different thing from one that says
+%% `maxFeePerGas = 0x0`, and every caller that needs to tell them apart has to be able
+%% to; collapsing the two at the decode is what made a legacy transaction look like a
+%% 1559 transaction asking for a zero fee. See `effective_gas_price/4'.
+-spec opt_uint(binary() | integer() | undefined) -> integer() | undefined.
+opt_uint(undefined) -> undefined;
+opt_uint(V) -> uint(V).
+
 to_address(<<"0x", _/binary>> = H) -> hex_to_bin(H);
 to_address(A) when is_binary(A), byte_size(A) =:= 20 -> A;
 to_address(_) -> <<>>.
@@ -1481,11 +1511,26 @@ hex_to_bin(B) when is_binary(B) -> B.
 %% This is the price that is actually charged and that must be reported in the
 %% receipt; it is *not* the tip. Legacy transactions use gasPrice directly.
 effective_gas_price(GasPrice, MaxPriorityFee, MaxFee, BaseFee) ->
-    case BaseFee of
-        undefined -> GasPrice;
-        BF when is_integer(MaxFee), is_integer(MaxPriorityFee) ->
+    case {MaxFee, MaxPriorityFee, BaseFee} of
+        %% A transaction with neither 1559 field is legacy or 2930, and its price is
+        %% `gasPrice' whatever the block's base fee is. This clause is matched on
+        %% **absence**, not on a value, and that is the whole point: a 1559 transaction
+        %% that asks for a zero fee falls through to the clause below and is answered
+        %% `0' -- correctly, and visibly differently from a legacy transaction.
+        {undefined, undefined, _} ->
+            GasPrice;
+        %% A 1559 transaction in a block with no base fee. There is nothing to add, so
+        %% the price is the tip, capped by the ceiling. Pre-London this is the only
+        %% 1559 case that can arise, and it used to be answered by the `undefined'
+        %% clause above -- which returned `gasPrice', i.e. 0 for a typed transaction that
+        %% carries no `gasPrice' field at all.
+        {MaxFee, MaxPriorityFee, undefined} when is_integer(MaxFee),
+                                                 is_integer(MaxPriorityFee) ->
+            min(MaxFee, MaxPriorityFee);
+        {MaxFee, MaxPriorityFee, BF} when is_integer(MaxFee), is_integer(MaxPriorityFee) ->
             min(MaxFee, BF + MaxPriorityFee);
-        _ -> GasPrice
+        _ ->
+            GasPrice
     end.
 
 base_fee() ->

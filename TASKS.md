@@ -29,9 +29,13 @@
 
 ## The queue, re-derived
 
-**Re-measured after `v1.41`, from the committed corpus: 78 of 266 match, 3 are
-`fork_unreachable`, and 185 are `state_mismatch`. `crash`, `unpriced`,
+**Re-measured after `v1.42`, from the committed corpus: 189 of 266 match, 3 are
+`fork_unreachable`, and 74 are `state_mismatch`. `crash`, `unpriced`,
 `sender_mismatch` and `expected_rejection_not_raised` are all 0.**
+
+(The 78/185 figures below are the *pre-`v1.42`* measurement, kept because the two
+differs only in the fee path and the gas histogram below is the pre-`v1.42` one. Both
+were re-measured; neither is quoted from memory.)
 
 Two numbers decide what the work is, and neither is the tally:
 
@@ -56,7 +60,7 @@ implemented, so none of the 12/4/2/1 fixtures in those files is a missing opcode
 
 | n | file | what is likely, and what would settle it |
 |---|---|---|
-| 26 | `byzantium/eip196_ec_add_mul/test_gas.py` | The **named** open item: an off-curve point is reported `unsupported`, where EIP-196 makes it a **call failure**. `unsupported` makes `eth_block:run_transaction/5` refuse the whole block, so this is the same class as the blake2f defect `v1.35` fixed. Largest cluster. |
+| 26 | `byzantium/eip196_ec_add_mul/test_gas.py` | **Fixed by `v1.42`, and not by this row's guess.** These 26 were never the ECADD/ECMUL defect: the contract forwards 149 gas, ECADD costs 500 at Byzantium and 150 from Istanbul, and the fixture's own post-state is `storage = {}` -- so the chain's call fails on *affordability*. The real cause was `eth_block:effective_gas_price/4`. The ECADD/ECMUL defect is real and still open; see AGENTS.md §10. |
 | 24 | `shanghai/eip3651_warm_coinbase/test_warm_coinbase.py` | EIP-3651. `eth_evm:initial_access/2` (added in `v1.37`) already seeds `tx.to`, so the seeding is either incomplete for this shape or the runner is not applying it. Measure before touching either. |
 | 20 | `homestead/identity_precompile/test_identity.py` | 16 of this file's 28 entries were fixed by `v1.41`. Six remain, in the same code. |
 | 18 | `istanbul/eip1344_chainid/test_chainid.py` | `CHAINID` **is** implemented, so this is a value or a chain-id source defect. 18 fixtures with one wrong value is the cheapest thing on this list, if that is what it is. |
@@ -79,6 +83,21 @@ implemented, so none of the 12/4/2/1 fixtures in those files is a missing opcode
 
 **Then the structural items, which are not conformance and are not ordered by size:**
 
+- **`buy_gas/4` charges the sender at the ceiling, not the effective price**
+  (`v1.42` found it; the fix is not yet made). EIP-1559's reference implementation is
+  explicit:
+  `signer.balance -= transaction.gas_limit * effective_gas_price`, then
+  `signer.balance += gas_refund * effective_gas_price`. `buy_gas/4` charges
+  `gasLimit * max_fee_per_gas` and `settle_gas/8` refunds at the effective price, so an
+  overpaying sender is charged an extra
+
+      (gas_limit - gas_used) * (max_fee_per_gas - effective_gas_price)
+
+  which is **zero** whenever `max_fee == base_fee + max_priority` -- and every existing
+  test sets exactly that, which is why it has never been visible. The separating case,
+  `max_fee > base_fee + max_priority`, is the one nobody wrote. Validty is unaffected
+  and must not be: the EIP still asserts the sender can afford
+  `gas_limit * max_fee_per_gas` and that `max_fee >= base_fee_per_gas`.
 - **Block-level conformance is never run.** Every figure above comes from
   `eth_block:run_transaction/5`; nothing in this repository executes a whole block
   against a fixture. That is a different measurement and the one a block-producing node

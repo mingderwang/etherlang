@@ -452,6 +452,168 @@ base_fee_is_burned_and_the_tip_paid_test() ->
                      - committed_balance(Miner))
     end).
 
+%% ---------------------------------------------------------------------------
+%% A legacy transaction has no `maxFeePerGas' and no `maxPriorityFeePerGas'.
+%%
+%% `effective_gas_price/4' was handed both with a default of 0 and guarded on
+%% `is_integer/1', so a legacy transaction was indistinguishable from a 1559 one asking
+%% for a zero fee, and it was answered `min(0, baseFee + 0)' = **0**. The sender was
+%% then billed `gasLimit * gasPrice' with no refund at all: `GasLeft * 0'. The
+%% conformance corpus showed it as twenty fixtures at exactly `1000000` gas for gas
+%% that cost 2,473.
+%%
+%% Every test above this one passes `undefined` or a base fee with a **1559**
+%% transaction, so neither combination was covered. That is the whole reason it lived:
+%% the two cases that exist were both correct, and the third one nobody wrote.
+%% ---------------------------------------------------------------------------
+
+%% The core. A legacy transaction in a block that has a base fee, which is every block
+%% from London on.
+a_legacy_transaction_in_a_block_with_a_base_fee_pays_its_gas_price_test() ->
+    with_ctx(fun() ->
+        {Priv, Sender} = new_key(),
+        {_P2, Miner} = new_key(),
+        fund(Sender, 1000 * ?WEI, 0),
+        fund(Miner, 0, 0),
+        BaseFee = 7,
+        GasPrice = 10,
+        Tx = signed(Priv, #{to => ?PROBE, gas => 100000, gas_price => GasPrice,
+                            input => <<>>}),
+        Parent = store_parent(eth_mpt:state_root()),
+        {ok, Finalized, _V} = eth_block:finalize(
+            (child_block_to(Parent, 1, [Tx], Miner))#block{
+                base_fee_per_gas = BaseFee}),
+        Used = Finalized#block.gas_used,
+        %% **The assertion that bites.** Not `1000000`. The gas limit is what the
+        %% sender is billed when the effective price is zero, so this one number is
+        %% the difference between the bug and the fix.
+        ?assert(Used < 100000),
+        ?assertEqual(1000 * ?WEI - Used * GasPrice, committed_balance(Sender)),
+        %% And it burned the base fee exactly as a 1559 transaction would: the miner
+        %% gets the tip, `gasPrice - baseFee', and the base fee portion is gone. This
+        %% is the part that was *not* wrong before, and asserting it is what stops a
+        %% fix that made the price right by making it zero everywhere.
+        ?assertEqual(Used * (GasPrice - BaseFee), committed_balance(Miner)),
+        ?assertEqual(Used * BaseFee,
+                     1000 * ?WEI - committed_balance(Sender)
+                     - committed_balance(Miner))
+    end).
+
+%% The control: the same transaction against a block whose header carries **no** base
+%% fee, which was already right because `undefined' short-circuited the 1559 clause.
+%% Asserted so that "the sender pays gasUsed * gasPrice" cannot be satisfied by a fix
+%% that only works when a base fee is absent.
+%%
+%% This is about the *header field*, not about a fork, and the distinction matters:
+%% Sepolia has no pre-London block to test with (`fork_at(0)' is `london', because
+%% Sepolia launched after the Merge), so naming a fork here would be a claim the
+%% configured network cannot support. What the price logic actually branches on is
+%% whether a base fee is present, and that is what these two tests vary.
+a_legacy_transaction_in_a_block_with_no_base_fee_pays_its_gas_price_test() ->
+    with_ctx(fun() ->
+        {Priv, Sender} = new_key(),
+        {_P2, Miner} = new_key(),
+        fund(Sender, 1000 * ?WEI, 0),
+        fund(Miner, 0, 0),
+        GasPrice = 10,
+        Tx = signed(Priv, #{to => ?PROBE, gas => 100000, gas_price => GasPrice,
+                            input => <<>>}),
+        Parent = store_parent(eth_mpt:state_root()),
+        B = child_block_to(Parent, 1, [Tx], Miner),
+        ?assertEqual(undefined, B#block.base_fee_per_gas),
+        {ok, Finalized, _V} = eth_block:finalize(B),
+        Used = Finalized#block.gas_used,
+        ?assert(Used < 100000),
+        %% With no base fee the whole price is the tip, so the miner gets all of it.
+        ?assertEqual(1000 * ?WEI - Used * GasPrice, committed_balance(Sender)),
+        ?assertEqual(Used * GasPrice, committed_balance(Miner))
+    end).
+
+%% The 1559 clause that was already correct, with a real base fee: the price is
+%% `min(maxFee, baseFee + priority)' and not `gasPrice', which a typed transaction does
+%% not have. Pinned so the legacy fix cannot have been "return GasPrice" and passed.
+a_1559_transaction_in_a_block_with_a_base_fee_pays_the_tip_plus_one_test() ->
+    with_ctx(fun() ->
+        {Priv, Sender} = new_key(),
+        {_P2, Miner} = new_key(),
+        fund(Sender, 1000 * ?WEI, 0),
+        fund(Miner, 0, 0),
+        BaseFee = 7,
+        MaxPriority = 3,
+        MaxFee = 10,
+        Tx = signed_1559(Priv, MaxFee, MaxPriority),
+        Parent = store_parent(eth_mpt:state_root()),
+        {ok, Finalized, _V} = eth_block:finalize(
+            (child_block_to(Parent, 1, [Tx], Miner))#block{
+                base_fee_per_gas = BaseFee}),
+        Used = Finalized#block.gas_used,
+        Effective = min(MaxFee, BaseFee + MaxPriority),
+        ?assertEqual(1000 * ?WEI - Used * Effective, committed_balance(Sender)),
+        ?assertEqual(Used * (Effective - BaseFee), committed_balance(Miner))
+    end).
+
+%% **NOT a test, and the reason is a second defect this one is not allowed to fix.**
+%%
+%% The above half of this change is `effective_gas_price/4'. The other half is
+%% `buy_gas/4', and it is a different function with a different blast radius.
+%% EIP-1559's reference implementation charges the sender
+%% `gas_limit * effective_gas_price' and refunds `gas_refund * effective_gas_price', so
+%% the net is `gas_used * effective_gas_price'. `buy_gas/4' charges
+%% `gas_limit * max_fee_per_gas' -- the **ceiling** -- and `settle_gas/8' refunds at the
+%% effective price, so an overpaying sender is charged
+%%
+%%     (gas_limit - gas_used) * (max_fee_per_gas - effective_gas_price)
+%%
+%% more than it owes. It is invisible in every existing test because they all set
+%% `max_fee_per_gas = base_fee_per_gas + max_priority_fee_per_gas`, and there
+%% `effective == max_fee`, so the two forms coincide. The case that separates them --
+%% `max_fee_per_gas > base_fee_per_gas + max_priority_fee_per_gas` -- is the one nobody
+%% wrote, and writing it here would make this commit red for a cause it does not own.
+%%
+%% Named, with its expected shape, and it is the next change. See TASKS.md.
+
+%% The **tip** is what isolates `effective_gas_price/4' from the `buy_gas/4' defect
+%% above, so it is the only half of this that can be pinned on its own. The miner is
+%% paid `gasUsed * max(0, effective - baseFee)', and with no base fee that is the whole
+%% effective price: 3 a gas here, and **0** if the 1559 clause is skipped, because a
+%% typed transaction carries no `gasPrice' for the catch-all to return. Nothing in this
+%% assertion involves what the sender was charged.
+a_1559_transaction_with_no_base_fee_pays_its_priority_fee_to_the_miner_test() ->
+    with_ctx(fun() ->
+        {Priv, Sender} = new_key(),
+        {_P2, Miner} = new_key(),
+        fund(Sender, 1000 * ?WEI, 0),
+        fund(Miner, 0, 0),
+        MaxFee = 10,
+        MaxPriority = 3,
+        Tx = signed_1559(Priv, MaxFee, MaxPriority),
+        Parent = store_parent(eth_mpt:state_root()),
+        B = child_block_to(Parent, 1, [Tx], Miner),
+        ?assertEqual(undefined, B#block.base_fee_per_gas),
+        {ok, Finalized, _V} = eth_block:finalize(B),
+        Used = Finalized#block.gas_used,
+        ?assertEqual(Used * MaxPriority, committed_balance(Miner))
+    end).
+
+%% A signed type-2 transaction for the configured chain. `signed/2' only builds legacy
+%% and 2930 ones, and the 1559 price is the thing under test here, so the type has to
+%% be the real one rather than a legacy map with 1559 fields bolted on.
+signed_1559(Priv, MaxFee, MaxPriority) ->
+    Tx = #{<<"type">> => <<"0x2">>,
+           <<"chainId">> => eth_hex:encode_int(eth_fork_schedule:chain_id()),
+           <<"nonce">> => <<"0x0">>,
+           <<"maxPriorityFeePerGas">> => eth_hex:encode_int(MaxPriority),
+           <<"maxFeePerGas">> => eth_hex:encode_int(MaxFee),
+           <<"gas">> => eth_hex:encode_int(100000),
+           <<"to">> => hex(?PROBE),
+           <<"value">> => <<"0x0">>,
+           <<"input">> => <<"0x">>,
+           <<"yParity">> => <<"0x0">>},
+    {R, S, Y} = sign_1559(Priv, Tx),
+    Tx#{<<"r">> => hex(int_to_32(R)),
+        <<"s">> => hex(int_to_32(S)),
+        <<"v">> => eth_hex:encode_int(Y)}.
+
 sign_1559(Priv, Tx) ->
     F = [eth_hex:decode(maps:get(<<"chainId">>, Tx)),
          eth_hex:decode(maps:get(<<"nonce">>, Tx)),
