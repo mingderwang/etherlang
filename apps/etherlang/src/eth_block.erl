@@ -665,8 +665,8 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     %% when the code ran perfectly. Without the nonce bump a second transaction
     %% from the same sender cannot validate, because the account nonce never
     %% moves; without the gas purchase the coinbase is never credited.
-    State0 = begin_transaction(State, Tx, Sender, Target, Value,
-                                GasLimitTx, IsCreate),
+    State0 = begin_transaction(State, Sender, Target, Value,
+                                GasLimitTx, IsCreate, EffectiveGasPrice),
     %% The EVM runs with what the intrinsic cost left, never the full limit.
     EvmGas = max(0, GasLimitTx - Intrinsic),
     %% The EVM reads its message and environment through atom keys (s_msg/3,
@@ -780,8 +780,9 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
 %% price, so the difference is the miner/validator's tip plus the portion of the
 %% cap that was never needed. That is why an over-paying 1559 sender is not
 %% refunded the cap.
-begin_transaction(State, Tx, Sender, Target, Value, GasLimit, IsCreate) ->
-    S1 = buy_gas(State, Tx, Sender, GasLimit),
+begin_transaction(State, Sender, Target, Value, GasLimit, IsCreate,
+                  EffectivePrice) ->
+    S1 = buy_gas(State, Sender, GasLimit, EffectivePrice),
     S2 = eth_state:set_nonce(S1, Sender, eth_state:nonce(S1, Sender) + 1),
     case IsCreate of
         true -> S2;
@@ -810,17 +811,32 @@ deploy(State, _Result, _Output, _Address, _IsCreate) ->
 
 %% Charged at the sender's ceiling, not the effective price: the client is
 %% committing to the cap and only the difference comes back.
-buy_gas(State, Tx, Sender, GasLimit) ->
-    Ceiling = gas_ceiling(Tx),
-    Debit = GasLimit * Ceiling,
+%% **Charge at the effective price, not at the ceiling.** EIP-1559's reference
+%% implementation says:
+%%
+%%     signer.balance -= transaction.gas_limit * effective_gas_price
+%%     ...
+%%     signer.balance += gas_refund * effective_gas_price
+%%
+%% so the net is `gas_used * effective_gas_price` -- the cap appears nowhere in the
+%% charge. This charged `gasLimit * maxFeePerGas` and `settle_gas/8' refunded at the
+%% effective price, which left an overpaying sender charged an extra
+%%
+%%     (gas_limit - gas_used) * (max_fee_per_gas - effective_gas_price)
+%%
+%% **and that term is zero whenever `max_fee == base_fee + max_priority`**, which is
+%% what every test in this repository set. The case that separates them --
+%% `max_fee > base_fee + max_priority`, a sender deliberately overpaying its cap so the
+%% base fee can rise without a second transaction -- was the one nobody wrote, and it
+%% is the case EIP-1559 exists for.
+%%
+%% The ceiling is not lost: it is what the sender must be *able* to pay, and
+%% `eth_tx:fee_ceiling_ok/4' still checks that against `gasLimit * maxFeePerGas`, which
+%% is a validity rule and stays where the EIP puts it. The two were conflated into one
+%% number used for both jobs, and only the charge was wrong.
+buy_gas(State, Sender, GasLimit, EffectivePrice) ->
+    Debit = GasLimit * EffectivePrice,
     eth_state:set_balance(State, Sender, eth_state:balance(State, Sender) - Debit).
-
-gas_ceiling(Tx) ->
-    case eth_tx:tx_type(Tx) of
-        eip1559 -> uint(maps:get(<<"maxFeePerGas">>, Tx, 0));
-        eip4844 -> uint(maps:get(<<"maxFeePerGas">>, Tx, 0));
-        _ -> uint(maps:get(<<"gasPrice">>, Tx, 0))
-    end.
 
 transfer(State, From, To, Value) ->
     S1 = eth_state:set_balance(State, From, eth_state:balance(State, From) - Value),

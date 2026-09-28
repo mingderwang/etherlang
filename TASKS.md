@@ -29,8 +29,8 @@
 
 ## The queue, re-derived
 
-**Re-measured after `v1.42`, from the committed corpus: 189 of 266 match, 3 are
-`fork_unreachable`, and 74 are `state_mismatch`. `crash`, `unpriced`,
+**Re-measured after `v1.43`, from the committed corpus: 194 of 266 match, 3 are
+`fork_unreachable`, and 69 are `state_mismatch`. `crash`, `unpriced`,
 `sender_mismatch` and `expected_rejection_not_raised` are all 0.**
 
 (The 78/185 figures below are the *pre-`v1.42`* measurement, kept because the two
@@ -83,21 +83,23 @@ implemented, so none of the 12/4/2/1 fixtures in those files is a missing opcode
 
 **Then the structural items, which are not conformance and are not ordered by size:**
 
-- **`buy_gas/4` charges the sender at the ceiling, not the effective price**
-  (`v1.42` found it; the fix is not yet made). EIP-1559's reference implementation is
-  explicit:
+- ~~**`buy_gas/4` charges the sender at the ceiling**~~ **Fixed (`v1.43`), +5
+  fixtures, zero regressions.** EIP-1559's reference implementation is explicit:
   `signer.balance -= transaction.gas_limit * effective_gas_price`, then
-  `signer.balance += gas_refund * effective_gas_price`. `buy_gas/4` charges
-  `gasLimit * max_fee_per_gas` and `settle_gas/8` refunds at the effective price, so an
-  overpaying sender is charged an extra
-
-      (gas_limit - gas_used) * (max_fee_per_gas - effective_gas_price)
-
-  which is **zero** whenever `max_fee == base_fee + max_priority` -- and every existing
-  test sets exactly that, which is why it has never been visible. The separating case,
-  `max_fee > base_fee + max_priority`, is the one nobody wrote. Validty is unaffected
-  and must not be: the EIP still asserts the sender can afford
-  `gas_limit * max_fee_per_gas` and that `max_fee >= base_fee_per_gas`.
+  `+= gas_refund * effective_gas_price`. The cap appears in **neither** line, so the net
+  is `gas_used * effective_gas_price`. `buy_gas/4` charged
+  `gasLimit * max_fee_per_gas` and `settle_gas/8` refunded at the effective price,
+  charging an overpaying sender an extra
+  `(gas_limit - gas_used) * (max_fee_per_gas - effective_gas_price)` -- **zero**
+  whenever `max_fee == base_fee + max_priority`, which is what every test set.
+  `gas_ceiling/1` is deleted; it had one caller and it was the thing that was wrong.
+  The ceiling is not lost: it is what the sender must be *able* to pay, and
+  `eth_tx:fee_ceiling_ok/4` still checks it, which is a validity rule and belongs where
+  the EIP puts it. The two jobs were conflated into one number used for both.
+  **The five fixtures are the `typed_transaction_2` cases of `test_chainid`** -- the only
+  ones with `maxFee > baseFee + maxPriority`, which is the confirmation the diagnosis
+  predicted. And the existing test that *did* use a high cap asserted the buggy figure
+  and defended it in a comment; corrected, not deleted.
 - **Block-level conformance is never run.** Every figure above comes from
   `eth_block:run_transaction/5`; nothing in this repository executes a whole block
   against a fixture. That is a different measurement and the one a block-producing node

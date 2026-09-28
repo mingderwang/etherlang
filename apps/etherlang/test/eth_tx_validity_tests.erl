@@ -653,17 +653,41 @@ unspent_gas_comes_back_at_the_effective_price_test() ->
             (child_block(Parent, 1, [Signed]))#block{
                 base_fee_per_gas = BaseFee, miner = Miner}),
         Used = Finalized#block.gas_used,
-        Unused = 100000 - Used,
         Effective = min(MaxFee, BaseFee + 1),
         ?assertEqual(21000, Used),
-        %% The cap is charged for the whole limit and the *unused* gas comes back
-        %% at the effective price -- not at the cap, and not at the base fee. So
-        %% the sender is out 100000 * 1000 - 79000 * 11, and the part of that
-        %% which is neither the effective price nor the tip is the base fee burnt
-        %% on gas the transaction never used. This is the whole reason 1559 sends
-        %% people away with a high cap, and it is not a bug.
-        ?assertEqual(1000 * ?WEI - (100000 * MaxFee - Unused * Effective),
-                     committed_balance(Sender)),
+        %% **This assertion used to be the other way round, and its comment argued for
+        %% it.** It said the cap is charged for the whole limit and the unused gas comes
+        %% back at the effective price, so the sender is out
+        %% `100000 * 1000 - 79000 * 11`, and called the remainder "the base fee burnt on
+        %% gas the transaction never used. It ended with "this is the whole reason 1559
+        %% sends people away with a high cap, and it is not a bug."
+        %%
+        %% The reasoning is wrong, and it is wrong about the burn. EIP-1559's reference
+        %% implementation is explicit:
+        %%
+        %%     signer.balance -= transaction.gas_limit * effective_gas_price
+        %%     ...
+        %%     signer.balance += gas_refund * effective_gas_price
+        %%
+        %% The cap appears in **neither** line, so the net is `gas_used *
+        %% effective_gas_price` = 21000 * 11 = 231,000. And the burn is
+        %% `gas_used * base_fee_per_gas` on gas that *was* used -- there is no burn at
+        %% all on unused gas, because unused gas was never charged for. The old figure
+        %% charged the sender 99,131,000 for 21,000 gas of work, and described the
+        %% difference as a burn.
+        %%
+        %% This is the same failure mode as the SSZ `withdrawalsRoot` test `v1.7`
+        %% replaced: a test that encodes a defect as a requirement is worse than no
+        %% test, because it stops the defect being a defect. It is corrected rather than
+        %% deleted, and it is now the only test in the module that exercises
+        %% `max_fee > base_fee + max_priority` -- the one case where the ceiling and the
+        %% effective price differ at all, and the only case where this could be seen.
+        ?assertEqual(1000 * ?WEI - Used * Effective, committed_balance(Sender)),
+        %% And the burn is exactly the base fee on the gas used, which is the other
+        %% half of the same statement and was equally wrong: 21000 * 10.
+        ?assertEqual(Used * BaseFee,
+                     1000 * ?WEI - committed_balance(Sender)
+                     - committed_balance(Miner)),
         ?assertEqual(Used * (Effective - BaseFee), committed_balance(Miner))
     end).
 

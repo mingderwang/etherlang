@@ -444,7 +444,6 @@ is worse than none. It is now two tables.
 | `ECADD`/`ECMUL` cannot add or multiply anything but the point at infinity | EIP-196 | Measured, not recalled: an input **shorter than 128 bytes** succeeds (correct -- EIP-196 says short input is "virtually padded with zeros", and `(0,0)` is the point at infinity), and an input of **128 bytes or more** answers `unsupported` at every fork, **including a point that is on the curve**. `(1,2)` is on it: `1^2 = 1` and `1^3 + 3 = 4`. So the precompiles can only ever do the identity, and `unsupported` makes `eth_block:run_transaction/5` **refuse the whole block**. Two errors at once: a real operation reported as absent, and an invalid one (an off-curve point, which EIP-196 makes a *call failure*) not distinguished from it. The same conflation `v1.35` fixed for the pairing check and blake2f. The 26 `eip196_ec_add_mul` fixtures turned out **not** to be this: see `v1.42`. |
 | EIP-7702's state transition | EIP-7702 | A type-4 transaction is priced, validated and executed as though it carried **no** authorizations. Decode, sender recovery and both validity rules are done. |
 | `eth_createAccessList` | — | The one genuinely absent JSON-RPC method. |
-| `buy_gas/4` charges at the ceiling | EIP-1559 | Charges `gasLimit * maxFeePerGas`; the EIP charges `gasLimit * effectiveGasPrice` and refunds the remainder at the same price. Invisible whenever `max_fee == base_fee + max_priority`, which is what every test sets. Named in TASKS with the expected shape. |
 | `eth_tx:intrinsic_gas/1` takes no fork | — | Falls back to the operator's `ETH_FORK` pin. Correct for pool admission, where no block exists; **wrong** for `eth_call`, `estimateGas` and block execution, which must use `intrinsic_gas/2`. Not a gap so much as a hazard: it is a one-argument function that answers correctly in the one place nobody calls it wrongly. |
 
 ### Closed by a decision, or fixed. Do not "re-open" these.
@@ -498,6 +497,17 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
   second list to fall out of step; and `schedule_fork_at/3` asks about **mainnet**,
   because `fork_point/1`'s activation numbers are mainnet's and asking the configured
   network answers a different question.
+- **A test that asserts a defect and argues for it is worse than no test.**
+  `unspent_gas_comes_back_at_the_effective_price_test` set `maxFee = 1000` against
+  `baseFee + priority = 11`, asserted that the sender pays
+  `gasLimit * maxFee - unused * effective`, and closed with "this is the whole reason
+  1559 sends people away with a high cap, and it is not a bug". It was the only test
+  exercising `maxFee > baseFee + maxPriority` -- the single case where the ceiling and
+  the effective price differ -- and it pinned the bug. EIP-1559 charges
+  `gas_limit * effective_gas_price` and refunds at the same price, so the cap appears in
+  neither line; and the burn is `gas_used * base_fee` on gas that *was* used, so there
+  is no burn at all on unused gas. Corrected rather than deleted. Same shape as the SSZ
+  `withdrawalsRoot` test `v1.7` replaced.
 - **A default of zero is not the same as an absent field.** `eth_block:effective_gas_price/4`
   was handed a legacy transaction's `maxFeePerGas` and `maxPriorityFeePerGas` with a
   default of `0` and guarded on `is_integer/1`, so "has no such field" and "asks for a
