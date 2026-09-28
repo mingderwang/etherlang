@@ -29,8 +29,8 @@
 
 ## The queue, re-derived
 
-**Re-measured after `v1.45`, from the committed corpus: 206 of 266 match, 3 are
-`fork_unreachable`, and 57 are `state_mismatch`. `crash`, `unpriced`,
+**Re-measured after `v1.46`, from the committed corpus: 214 of 266 match, 3 are
+`fork_unreachable`, and 49 are `state_mismatch`. `crash`, `unpriced`,
 `sender_mismatch` and `expected_rejection_not_raised` are all 0.**
 
 (The 78/185 figures below are the *pre-`v1.42`* measurement, kept because the two
@@ -100,8 +100,9 @@ implemented, so none of the 12/4/2/1 fixtures in those files is a missing opcode
   ones with `maxFee > baseFee + maxPriority`, which is the confirmation the diagnosis
   predicted. And the existing test that *did* use a high cap asserted the buggy figure
   and defended it in a comment; corrected, not deleted.
-- **EIP-2930's access list is priced and never applied. Measured, implemented once,
-  and reverted: it cost 11 fixtures and fixed none.** `eth_tx:intrinsic_gas/2` charges
+- ~~**EIP-2930's access list is priced and never applied.**~~ **Fixed (`v1.46`),
+  206 -> 214, zero regressions.** The reverted first attempt is below, and the reason it
+  failed is worth more than the fix. `eth_tx:intrinsic_gas/2` charges
   `ACCESS_LIST_ADDRESS_COST * n + ACCESS_LIST_STORAGE_KEY_COST * k` **correctly** --
   verified directly, 21,000 -> 29,600 for the two-entry list in
   `eip2930_access_list/test_repeated_address_acl`, a difference of exactly 8,600 =
@@ -126,10 +127,33 @@ implemented, so none of the 12/4/2/1 fixtures in those files is a missing opcode
      stack, where it is a word, and the access list carries 32 bytes. The wrong key is a
      warm set that is present, correct-looking and completely inert -- the third time
      this repository has paid for that asymmetry.
-  The likely real cause of the regression is (1) being a *runner* problem rather than a
-  node one: if the runner ought to be presenting `accessLists` as `accessList`, then the
-  node is being handed a transaction with no list and the correct fix is upstream of the
-  warm set. **That is where to look first.**
+  **The cause of the regression, found afterwards: the runner never uses the fixture's
+  `transaction` dict.** It decodes from the post-state's `txbytes` via
+  `eth_tx:from_rlp/1`, so the node always saw a proper `<<"accessList">>` -- and the
+  plural spelling is confined to the JSON, which nothing reads. The list was **priced**
+  (`validate/2` and `intrinsic_gas/2` both call `access_list_field/1`) and never
+  **applied**.
+
+  The fix is one line in each of three places, and the second of them is the whole
+  lesson:
+
+  1. `eth_block:run_transaction/5` puts `eth_tx:access_list_field(Tx)` on the **Msg** --
+     the *same function `validate/2` priced*, so the list that is charged for and the
+     list that is applied cannot disagree.
+  2. `eth_evm:initial_access/3` seeds the warm sets from it, converting each slot to the
+     interpreter's **word**: `SLOAD` and `SSTORE` both `pop` the slot off the stack, and
+     the list carries 32 bytes, so `{warm_store, Addr, <<0:256>>}` is a **different
+     key** from `{warm_store, Addr, 0}`. A warm set written under a key nothing reads
+     is present, correct-looking and inert.
+  3. The **expected difference is 2,000, not 2,500.** The three warm-set tests beside it
+     measure *account* accesses (`COLD_ACCOUNT_ACCESS_COST - WARM_ACCESS`), this one
+     measures a *storage* access (`COLD_SLOAD_COST - WARM_STORAGE_READ_COST`). EIP-2930
+     warms both sets and they are priced from two different constants.
+
+  **Eight fixtures, zero regressions**: the six `eip2930_access_list/test_acl` entries
+  and two `osaka/eip7825_transaction_gas_limit_cap` entries, which also carry an access
+  list. Independently confirmed by the second file, which was not part of the
+  diagnosis.
 - **Nothing in the corpus exercises an invalid ECADD or ECMUL.** Worth stating because
   it is why `v1.44` moved the tally by zero and was still the right change: the
   committed fixtures only ever call 0x06/0x07 with *empty* input (valid -- EIP-196 pads

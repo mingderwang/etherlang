@@ -92,8 +92,47 @@ initial_access(Msg, Env, Fork) ->
                      maps:get(address, Msg, <<0:160>>)]
                     ++ coinbase_at(Fork, maps:get(coinbase, Env, undefined))
                     ++ eth_fork_schedule:precompile_addresses(Fork),
-            lists:foldl(fun(Addr, Acc) -> Acc#{{warm_account, Addr} => true} end,
-                        #{}, Addrs)
+            Warmed = lists:foldl(fun(Addr, Acc) -> Acc#{{warm_account, Addr} => true} end,
+                                 #{}, Addrs),
+            access_list_access(Msg, Warmed)
+    end.
+
+%% EIP-2930, quoted at the point of use: "The address and storage keys would be
+%% **immediately loaded** into the accessed_addresses and accessed_storage_keys global
+%% sets; this can be done using the following logic (which doubles as a
+%% specification-in-code of validation of the RLP-decoded access list)."
+%%
+%% The **addresses** were already warm: the frame's own `address` is the transaction's
+%% recipient, and a list naming any other address adds only that address. The **storage
+%% keys** are the whole of it -- a `(address, key)` pair the list declared is warm from
+%% the first instruction, so the `SLOAD` that reads it costs 100 rather than 2,100. That
+%% is the EIP's entire purpose, and it was not happening.
+%%
+%% **The slot is converted to an integer here, and that is load-bearing.** `SLOAD` and
+%% `SSTORE` both `pop` the slot off the stack -- where it is a word -- and hand it
+%% straight to `warm_store/3`, so the key the interpreter looks up is
+%% `{warm_store, Addr, 0}`. The list carries 32 bytes, and `{warm_store, Addr,
+%% <<0:256>>}` is a **different key**. Writing the right value under a key nothing reads
+%% is a warm set that is present, correct-looking and completely inert -- the same
+%% asymmetry `eth_state:slot_key/1' has with `eth_mpt:encode_slot/1', and the third time
+%% this repository has met it.
+%%
+%% The entries arrive already normalised by `eth_tx:access_list_field/1' as
+%% `{Address, [Slot]}` with **raw** 20- and 32-byte binaries. A malformed list cannot
+%% reach here: `access_list_field/1` throws and `eth_tx:validate/2' calls it before any
+%% frame runs, so the clause below is a fallback rather than a validator.
+access_list_access(Msg, Warmed) ->
+    case maps:get(access_list, Msg, []) of
+        L when is_list(L) ->
+            lists:foldl(fun({Addr, Slots}, Acc) ->
+                                lists:foldl(fun(Slot, A) ->
+                                                    A#{{warm_store, Addr,
+                                                        binary:decode_unsigned(Slot)}
+                                                       => true}
+                                            end, Acc, Slots)
+                        end, Warmed, L);
+        _ ->
+            Warmed
     end.
 
 %% **EIP-3651: the coinbase is warm from the first instruction of the transaction.**

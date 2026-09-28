@@ -15,7 +15,16 @@
 -export([
            calldata/1,to_rlp/1, from_rlp/1, tx_root/1, sender/1,
          blob_versioned_hashes/1, valid_versioned_hashes/1,
-         validate/1, validate/2, intrinsic_gas/1, intrinsic_gas/2, tx_type/1]).
+         validate/1, validate/2, intrinsic_gas/1, intrinsic_gas/2, tx_type/1,
+         %% **Exported for the frame, not for a test.** EIP-2930: "The address and
+         %% storage keys would be immediately loaded into the accessed_addresses and
+         %% accessed_storage_keys global sets." Applying the list is `eth_evm`'s job, and
+         %% the normalised shape is this module's -- `validate/2' prices exactly this
+         %% function's output, and an access list is in two shapes depending on whether it
+         %% came off the wire or off JSON-RPC. Re-deriving it in `eth_block' is how
+         %% `eth_tx:calldata/1' came to exist, and the first attempt at this fix did
+         %% precisely that and was reverted for costing eleven fixtures.
+         access_list_field/1]).
 
 %% The first byte of every versioned hash, per EIP-4844. Only the KZG-commitment
 %% variant is defined, so a transaction carrying anything else is invalid.

@@ -683,7 +683,25 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
         data => Data,
         gas_price => EffectiveGasPrice,
         static => false,
-        depth => 0
+        depth => 0,
+        %% EIP-2930's access list, in the frame, because the frame is where it has to
+        %% act. `eth_tx:access_list_field/1' is the **same function `validate/2`
+        %% priced**, so the list that is charged for and the list that is applied cannot
+        %% disagree -- which is the whole reason it is called rather than re-derived.
+        %%
+        %% It was priced and never applied. `intrinsic_gas/2` charges
+        %% `ACCESS_LIST_ADDRESS_COST * n + ACCESS_LIST_STORAGE_KEY_COST * k` correctly --
+        %% 21,000 -> 29,600 on `eip2930_access_list/test_repeated_address_acl`, a
+        %% difference of exactly 8,600 = `2400*2 + 1900*2` -- and nothing anywhere put the
+        %% entries in the warm sets. So a sender who declared an access paid for it
+        %% twice: once in the intrinsic, and again as a cold access on every use.
+        %%
+        %% The corpus figure is `+4,000` on six fixtures plus three `test_chainid`
+        %% entries, and `4,000` is exactly `(COLD_SLOAD_COST - WARM_STORAGE_READ_COST) *
+        %% 2` = `(2,100 - 100) * 2` -- two cold `SLOAD`s of slots the list had already
+        %% paid to warm, with **no intrinsic term**, which is what confirmed the
+        %% intrinsic was right and the application was what was missing.
+        access_list => eth_tx:access_list_field(Tx)
     },
     %% Code is read through the same state view the EVM executes against.
     %% Fetching it from a separate store would let a call run against code that

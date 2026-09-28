@@ -2172,6 +2172,104 @@ a_missing_coinbase_warms_nothing_test() ->
                                               #{fork => paris, coinbase => Named},
                                               paris)))).
 
+%% ---------------------------------------------------------------------------
+%% EIP-2930: a declared access is warm from the first instruction
+%% ---------------------------------------------------------------------------
+%%
+%% "The address and storage keys would be **immediately loaded** into the
+%% `accessed_addresses` and `accessed_storage_keys` global sets." The list was being
+%% **priced** -- `eth_tx:intrinsic_gas/2` charged `2400 * n + 1900 * k` correctly -- and
+%% never applied, so a sender who declared an access paid for it twice: once in the
+%% intrinsic and again as a cold access on every use. The corpus figure was `+4,000`,
+%% which is exactly `(COLD_SLOAD_COST - WARM_STORAGE_READ_COST) * 2` = `2,000 * 2`, and
+%% the absence of any intrinsic term is what said the price was right and the
+%% application was not.
+%%
+%% Same construction as the two tests above: the same address both times, the slot
+%% declared in one access list and absent from the other, cold as the **minuend**.
+%% **The list is on the Msg, not the Env.** It came off the transaction, and the frame
+%% reads it from the same place it reads `to', `value' and `data' -- which is the whole
+%% argument for putting it there rather than in the block environment. The first version
+%% of this test put it in the Env and measured 0, for a reason that looked exactly like
+%% "the seeding does not work".
+%% **An `SLOAD`, not a `BALANCE`, and on the Msg rather than the Env.** Both were got
+%% wrong in turn, and each time the measurement came out 0 and read as "the seeding does
+%% not work":
+%%
+%%   * `BALANCE` of the declared address is an **account** access, priced by
+%%     `warm_account/2`. The list warms an account only if the frame is not already at
+%%     it, and the address being measured was a bystander, so both readings were cold.
+%%   * The list is on the **Msg**, not the Env: it came off the *transaction*, and the
+%%     frame reads it from the same place it reads `to`, `value` and `data`.
+%%
+%% What the list warms is the `(address, key)` **pair**, so the measurement has to touch
+%% the key. The frame's own account is `?MSG0`'s `address`, which `warm_set_state()`
+%% seeds, so the account is readable and the *slot* is the only thing that can differ.
+declared_slot_warmth(Slots, Fork) -> declared_slot_warmth(Slots, 0, Fork).
+
+%% The slot the `SLOAD` reads is a parameter, so "the declared slot is warm" and "an
+%% undeclared slot is cold" are statements about the *same* program.
+declared_slot_warmth(Slots, Read, Fork) ->
+    Self = maps:get(address, ?MSG0),
+    Env = #{fork => Fork},
+    Cold = sload_cost(?MSG0, Env, Read),
+    Base0 = ?MSG0,
+    Warm = sload_cost(Base0#{access_list => [{Self, Slots}]}, Env, Read),
+    Cold - Warm.
+
+%% `PUSH<n> <slot>; SLOAD; POP; STOP`, with `n` chosen so any slot up to 32 bytes can
+%% be named. The push width has to be right or the SLOAD reads a **different slot** than
+%% the one declared, and the measurement returns 0 -- which is the same "the seeding does
+%% not work" reading, from a third direction. Only `1` and `4` are used here.
+sload_cost(Msg, Env, Slot) when Slot =< 255 ->
+    Code = <<16#60, Slot, 16#54, 16#50, 16#00>>,
+    run_sload(Code, Msg, Env);
+sload_cost(Msg, Env, Slot) when Slot =< 16#FFFFFFFF ->
+    Code = <<16#63, Slot:32, 16#54, 16#50, 16#00>>,
+    run_sload(Code, Msg, Env).
+
+%% The only thing that can move the price is whether the `(address, slot)` pair is in
+%% `accessed_storage_keys`.
+run_sload(Code, Msg, Env) ->
+    {ok, _, Left, _, _} = eth_evm:run(Code, Msg, warm_set_state(), Env, ?GAS),
+    ?GAS - Left.
+
+%% The slot must be a 32-byte binary, because that is the shape
+%% `eth_tx:access_list_field/1' hands the frame, and it must be turned into the
+%% interpreter's **word** before the key is built -- `SLOAD` and `SSTORE` both `pop` the
+%% slot off the stack. Getting that wrong produces a warm set that is present,
+%% correct-looking and completely inert.
+%% **2,000 and not 2,500**, and the difference is the point of the test. The three warm
+%% -set tests above measure **account** accesses, whose cold term is
+%% `COLD_ACCOUNT_ACCESS_COST` (2,600) against `WARM_ACCESS` (100) -- a difference of
+%% 2,500. This one measures a **storage** access, whose cold term is `COLD_SLOAD_COST`
+%% (2,100) against `WARM_STORAGE_READ_COST` (100) -- **2,000**. EIP-2930 warms both sets,
+%% and they are priced from two different constants, so a test that copies the number
+%% from its neighbour asserts the wrong one. The corpus figure is the same 2,000 twice
+%% over: `+4,000` on six fixtures.
+a_declared_storage_key_is_warm_at_the_first_instruction_test() ->
+    [?assertEqual({F, 2000}, {F, declared_slot_warmth([<<0:256>>], F)})
+     || F <- [shanghai, cancun, prague]],
+    %% **The control, and it is the half that matters**: a list that declares a
+    %% *different* slot leaves this one cold. Without it, "the declared slot is warm"
+    %% could be satisfied by the slot being warm for any reason at all -- and the two
+    %% attempts that measured `BALANCE` instead of `SLOAD` passed exactly that way.
+    [?assertEqual({F, 0}, {F, declared_slot_warmth([<<16#1234:256>>], F)})
+     || F <- [shanghai, cancun]],
+    %% And symmetrically: declaring slot 0 leaves a *different* slot cold. One direction
+    %% of the control would pass with a seeding that warmed every slot.
+    [?assertEqual({F, 0}, {F, declared_slot_warmth([<<0:256>>], 16#1234, F)})
+     || F <- [shanghai, cancun]],
+    %% And an empty list changes nothing, so the whole of the effect is attributable to
+    %% the declaration rather than to carrying an access list at all.
+    [?assertEqual({F, 0}, {F, declared_slot_warmth([], F)})
+     || F <- [shanghai, cancun]],
+    %% A slot past a byte, so the conversion from the list's 32 bytes to the
+    %% interpreter's word is exercised on a value that is not zero.
+    [?assertEqual({F, 2000},
+                  {F, declared_slot_warmth([<<16#deadbeef:256>>], 16#deadbeef, F)})
+     || F <- [shanghai]].
+
 %% The coinbase comes from the **Env**, not the message, so this needs its own
 %% construction rather than the `msg_warmth/2` above. The same shape otherwise:
 %% `PUSH20 <addr>; BALANCE; STOP`, with the coinbase named in the Env and an address
