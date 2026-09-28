@@ -944,10 +944,19 @@ do_call(Kind, Op, E, Ctx) ->
                                                    CtxA#ctx.fork, Value) of
                                         {oog, _Why} ->
                                             oog(E10, CtxA);
-                                        {CallGas, _ChildGas} ->
+                                        {CallGas, ChildGas} ->
+                                            %% **Charge the pre-stipend figure; run the
+                                            %% child on the post-stipend one.** The
+                                            %% stipend is not the caller's to pay for --
+                                            %% see the note on `child_gas/4'. Every use of
+                                            %% `CallGas' inside `run_call/10' wants the
+                                            %% child's figure, because a precompile draws
+                                            %% its cost from the forwarded allowance, a
+                                            %% frame runs on it, and the
+                                            %% insufficient-balance path refunds it.
                                             {ok, E11} = charge(E10, CallGas),
                                             run_call(Kind, To, ToW, Value, Args,
-                                                     CallGas, RetOff, RetLen,
+                                                     ChildGas, RetOff, RetLen,
                                                      E11, CtxA)
                                     end
                             end
@@ -955,58 +964,70 @@ do_call(Kind, Op, E, Ctx) ->
             end
     end.
 
-%% The gas a child frame receives, as `{CallGas, ChildGas}'.
+%% The gas a call forwards, as `{CallGas, ChildGas}': what the caller is **charged**,
+%% and what the child frame actually **receives**. They differ by the stipend and
+%% both are the specification's, not this module's invention.
 %%
-%% `CallGas' is the whole figure and it is what the caller is **charged**, because the
-%% caller is refunded exactly `CallGas - Cost' on the way back -- so charging or
-%% refunding any other figure hands out or takes back gas nobody paid for. My first
-%% version of this change charged the pre-stipend figure and refunded the
-%% post-stipend one, and two existing tests caught it at 9300 against 11600.
-%%
-%% **One figure where the specification has two. Recorded, not shipped.**
-%%
-%% EIP-150 writes two lines:
-%%
-%%     gas = min(gas, max_call_gas(compustate.gas - extra_gas))
-%%     submsg_gas = gas + opcodes.GSTIPEND * (value > 0)
-%%
-%% and the spec names both:
+%% `ethereum/forks/berlin/vm/gas.py', `calculate_message_call_gas', verbatim:
 %%
 %%     call_stipend = Uint(0) if value == 0 else call_stipend
+%%     if gas_left < extra_gas + memory_cost:
+%%         return MessageCallGas(gas + extra_gas, gas + call_stipend)
 %%     gas = min(gas, max_message_call_gas(gas_left - memory_cost - extra_gas))
 %%     return MessageCallGas(gas + extra_gas, gas + call_stipend)
 %%
-%% so `cost` is the clamped gas **plus `extra_gas`** and `sub_call` is the clamped gas
-%% **plus the stipend**. The stipend is in the child's allowance and **not** in the
-%% caller's charge. This module returns one number for both, `min(gas + stipend, cap)`,
-%% which is the same figure in the other field.
+%% and `forks/berlin/vm/instructions/system.py', `call':
 %%
-%% Three separate wrong readings of that, all caught, which is why the shape is written
-%% down rather than left implicit:
+%%     charge_gas(evm, message_call_gas.cost + extend_memory.cost)
+%%     ...
+%%     if sender_balance < value:
+%%         push(evm.stack, U256(0))
+%%         evm.return_data = b""
+%%         evm.gas_left += message_call_gas.sub_call
 %%
-%%   * A `CALL` whose value the caller cannot cover **consumed** its forwarded
-%%     allowance. The spec returns it -- `evm.gas_left += message_call_gas.sub_call` --
-%%     and the corpus named that as a uniform **+45,247** across the six forks of
-%%     `eip2929_gas_cost_increases/test_call_insufficient_balance`. **Fixed**, because
-%%     the spec says so in one line and the corpus agrees.
-%%   * With the refund in place, the same six fixtures sat at **+2,300**, which is the
-%%     stipend exactly -- the consequence of the one-figure model above, and not
-%%     independently fixable.
-%%   * The first attempt at the split put the stipend in `cost`
-%%     (`{Sub + Stipend, Sub}`) rather than in `sub_call`, and the same six fixtures
-%%     then charged their **whole 100,000 allowance**: `Sub + 2300` can exceed the gas
-%%     remaining and `charge/2' answers `oog'. The error was not a wrong total but a
-%%     **halt**, which is much louder than a total and which is the only reason the
-%%     mistake is recorded at this length.
+%% So `cost' is the clamped gas **plus `extra_gas`** -- the stipend is **not** in it --
+%% and `sub_call' is the clamped gas **plus the stipend**. Three consequences, and this
+%% module had two of the three wrong:
 %%
-%% So the split is not shipped. The residual +2,300 is one gas figure on six fixtures
-%% and the fix is a change to **every** value-bearing `CALL`'s accounting, which is not
-%% something to ship on the strength of a transcription when the corpus neither
-%% confirms nor refutes it. It is named in TASKS.md with the spec text quoted, so the
-%% next person does not have to rediscover that the two figures are different.
+%%   * **The stipend is not charged to the caller.** It is created from nothing. The
+%%     caller pays `extra_gas' and the clamped gas; the child gets 2,300 more than the
+%%     caller paid for.
+%%   * **The clamp applies to the pre-stipend figure.** `min(gas, cap)`, then
+%%     `+ call_stipend' -- not `min(gas + stipend, cap)', which is what this did and
+%%     which silently absorbs the stipend into the cap whenever the cap binds, i.e.
+%%     on every `GAS`-forwarding call.
+%%   * **The refund on the insufficient-balance path returns the stipend too**, because
+%%     it returns `sub_call' and the caller was never charged it. So a `CALL' that
+%%     cannot cover its value hands the caller 2,300 gas it never paid for.
+%%
+%% `Avail' is the specification's `gas_left - memory_cost - extra_gas' exactly: it is
+%% read after `call_cost/3' and both `charge_mem/2' calls have been charged, and
+%% `extra_gas' at Berlin is `access + create + transfer', which is what `call_cost/3'
+%% returns. So the cap base needed no change, and only the stipend's position did.
+%%
+%% Two wrong readings of this, both recorded because both were **halts** rather than
+%% wrong totals, which is the only reason they were caught at all:
+%%
+%%   * Putting the stipend in `cost' (`{Sub + Stipend, Sub}') charges the caller a
+%%     figure that can exceed the gas remaining, and `charge/2' answers `oog' -- the
+%%     frame then burns its whole allowance. This is also the objection recorded for
+%%     years in TASKS.md, that "the reading which follows the EIP makes a child's
+%%     allowance exceed the caller's remaining". It does, and that is **correct**:
+%%     the stipend is a gift the caller does not pay for, so the child holding more
+%%     than the parent has left is the specified behaviour, not an overflow. The
+%%     child's gas lives in its own frame and is not drawn from the caller's.
+%%
+%%   * A `CALL' whose value the caller cannot cover **consumed** its forwarded
+%%     allowance rather than returning it, which the corpus named as a uniform
+%%     **+45,247** across the six forks of
+%%     `eip2929_gas_cost_increases/test_call_insufficient_balance`.
+%%
+%% With the return in place those six sat at **+2,300**, which is the stipend to the
+%% gas, and the note here said the split was not shippable "on the strength of a
+%% transcription". It is no longer a transcription: it is the Berlin source, which is
+%% the code that generated the fixtures now disagreeing by 2,300.
 %%
 %% Before Tangerine Whistle there is no cap and no stipend at all. The EIP gives the
-%% code it replaced:%% Before Tangerine Whistle there is no cap and no stipend at all. The EIP gives the
 %% code it replaced:
 %%
 %%     if compustate.gas < gas + extra_gas:
@@ -1025,8 +1046,13 @@ child_gas(GasReq, Avail, Fork, Value) ->
                          0 -> 0;
                          _ -> eth_fork_schedule:call_stipend(Fork)
                      end,
-            Call = min(GasReq + Stipend, Avail - Avail div 64),
-            {Call, Call};
+            %% **The clamp is on the pre-stipend figure**, per the spec quoted on
+            %% `child_gas/4`. `min(GasReq + Stipend, cap)` -- what this did -- is a
+            %% different function, and it is wrong in the common case: a `GAS`-forwarding
+            %% call saturates the cap, and then the stipend is silently swallowed by it
+            %% and the child never receives it.
+            Call = min(GasReq, Avail - Avail div 64),
+            {Call, Call + Stipend};
         false ->
             case Avail < GasReq of
                 true -> {oog, gas_request_exceeds_remaining};

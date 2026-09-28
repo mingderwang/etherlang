@@ -439,7 +439,6 @@ is worse than none. It is now two tables.
 |------|-----------|----------------|
 | `eth_kzg:blob_to_kzg_commitment/1` | EIP-4844 | Needs the `g1_lin` derivation. No local blob fixture, and the EIP's own test vector fetch 404'd. Do not "finish" it with an approximation. |
 | `TERMINAL_BLOCK_HASH` | EIP-3675 | Chain-config data, not in the EIP. Carried and echoed, **never checked** against a post-Merge block's difficulty. |
-| Where the 2300 stipend sits relative to the 63/64 cap | EIP-150 | The EIP's pseudocode adds it after the clamp, this module adds it before, and the reading that follows the EIP makes a child's allowance exceed the caller's remaining. Not changed on a reading. |
 | Pre-Berlin `SSTORE` **at Constantinople** | EIP-1283 | The only fork still refused. EIP-1283 replaced the rule and Petersburg reverted it, so a single figure would be right for two spans and wrong at the third -- and wrong *only* at Constantinople is never noticed. Unreachable by block number on mainnet. |
 | A warm-set entry keyed on a value the frame cannot name | EIP-2929/3651 | `initial_access/3` warms `coinbase` from the **Env** with `maps:get/3`, so an Env that omits it warms nothing. `maps:get/2` would have warmed `undefined`. `v1.45`. |
 | EIP-7702's state transition | EIP-7702 | A type-4 transaction is priced, validated and executed as though it carried **no** authorizations. Decode, sender recovery and both validity rules are done. |
@@ -451,6 +450,7 @@ is worse than none. It is now two tables.
 | Item | Which EIP | Where it ended |
 |------|-----------|----------------|
 | EIP-196: an invalid point answered `unsupported` | EIP-196 | **Fixed (`v1.44`).** Note what the corpus could not tell us: the tally did **not** move, because the committed fixtures only ever call ECADD with *empty* input (valid -- the point at infinity) or with gas they cannot afford (so the precompile never runs). Nothing in the corpus exercises an invalid ECADD. The severity was not in a gas figure at all: `unsupported` is a halt, and `eth_block:run_transaction/5` turns a halt into a **refusal to produce the block**, so a mainnet contract doing a real curve operation would have made this node reject its block. `ECADD`/`ECMUL` now answer `{failed, {ecadd, not_on_curve}}` and `{failed, {ecmul, not_on_curve}}`, with the two EIP invalidity conditions -- off the curve, and a coordinate at or above `p` -- told apart. |
+| EIP-150's stipend: one figure where the spec has two | EIP-150 | **Fixed (`v1.47`)**, +6 fixtures, zero regressions. `child_gas/4` returned `min(request + stipend, cap)` for both roles. The spec's `MessageCallGas` has two: `cost = gas + extra_gas` (**no stipend**) and `sub_call = gas + stipend`. So the clamp belongs on the **pre-stipend** figure, and the insufficient-balance refund returns `sub_call` -- a `CALL` that cannot cover its value hands the caller 2,300 gas it never paid for, and a frame can finish with more gas than it started with. The old form swallowed the stipend into the cap whenever the cap binds, which is every `GAS`-forwarding call. The child legitimately holding more than the parent has left is **specified**, not an overflow: the stipend is a gift. |
 | EIP-2930's access list: priced, never applied | EIP-2930 | **Fixed (`v1.46`)**, +8 fixtures, zero regressions. The list was charged for and ignored, so a declared access was paid for twice -- once in the intrinsic and again as a cold access on every use. `eth_block` now puts `eth_tx:access_list_field/1` on the Msg -- the *same function* `validate/2` priced, so the list that is charged for and the list that is applied cannot disagree -- and `initial_access/3` seeds the warm sets, converting each slot to the interpreter's **word**. |
 | EIP-7685 `requestsHash` field position | EIP-7685 | The EIP does not fix the position. It is **pinned** by a test against a real Sepolia Prague header, and appending last reproduces the claimed hash exactly. Not open. |
 | Per-fork gas *price* wiring | many | Done. `eth_fork_schedule` is the execution path's only owner of prices; the interpreter's duplicate table is deleted. |
@@ -458,7 +458,7 @@ is worse than none. It is now two tables.
 | EIP-2929's cold `SSTORE` term | EIP-2929 | `sstore_cold_cost/2` adds the **additional** `COLD_SLOAD_COST` for a pair not in `accessed_storage_keys`. |
 | EIP-2929's transaction-start warm set | EIP-2929 | `eth_evm:initial_access/2`, gated on Berlin, seeds `tx.sender`, `tx.to` (or the address being created) and the precompiles -- asked of `precompile_at/2` rather than kept as a second list. |
 | A `CALL` the caller cannot afford | EIP-150 / the yellow paper | Pushes 0, **empties the return data**, and adds `sub_call` back. `CALLCODE` gained the check and the transfer it never had. |
-| EIP-150's 63/64 rule and the 2300 stipend | EIP-150 | Both fork-gated (Tangerine Whistle and later; zero before). Only the stipend's *position* remains open, and it is the row above. |
+| EIP-150's 63/64 rule and the 2300 stipend | EIP-150 | Both fork-gated (Tangerine Whistle and later; zero before), and the stipend's *position* is now the specification's rather than a reading. See the row above. |
 | Pre-Berlin `SSTORE` at every other fork | EIP-2200 | The flat rule with EIP-2200's inherited figures; `SLOAD_GAS` fork-selected 50/200/800 by EIP-150 and EIP-1884. |
 | A precompile's return data | EIP-211 | `v1.41`. Seven sites, one of which a `grep finish_call(` cannot find. |
 
@@ -474,7 +474,7 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
 | `TERMINAL_BLOCK_HASH` (EIP-3675) | Chain-config data, not in the EIP. Carried and echoed, never checked against a post-Merge block's difficulty. |
 | Per-fork gas *price* wiring | Done. One owner of every price; the interpreter's duplicate table is deleted. SSTORE included (EIP-2200, Berlin and later). |
 | `eth_tx:intrinsic_gas/1` fork-awareness | Takes no fork and falls back to the operator's `ETH_FORK` pin. Correct for pool admission, where no block exists; wrong for `eth_call`/`eth_estimateGas` and block execution, which pass the block's own fork through `intrinsic_gas/2`. Do not use the one-argument form where a block is in hand. |
-| EIP-150's 63/64 rule and 2300 stipend | **Both are now fork-gated** (Tangerine Whistle and later; zero before), and the pre-Whistle rule is derived rather than invented because EIP-150's own `substitute` block is the code it replaced. That gained a corpus fixture: 11 -> 12 matches. What is **still open** is where the stipend sits relative to the cap — the EIP's pseudocode adds it after the clamp, this module adds it before, and the reading that follows the EIP makes a child's allowance exceed the caller's remaining. Not changed on a reading; see TASKS.md. |
+| EIP-150's 63/64 rule and 2300 stipend | **Both are now fork-gated** (Tangerine Whistle and later; zero before), and the pre-Whistle rule is derived rather than invented because EIP-150's own `substitute` block is the code it replaced. That gained a corpus fixture: 11 -> 12 matches. Where the stipend sits relative to the cap was **open for a long time and was refused on purpose**, because the EIP's reading made a child's allowance exceed the caller's remaining and that could not be settled from the text. It is now settled from the specification's *source* rather than the EIP, and the recorded worry turned out not to apply: the stipend is a gift the caller does not pay for, so the child holding more than the parent has left is correct. `v1.47`; +6 fixtures. See TASKS.md. |
 | The code-deposit cost | `G_codedeposit` = 200 per byte of returned code, at every fork, from `eth_fork_schedule:code_deposit_cost/1`; a create that cannot pay it fails and its whole forwarded allowance goes (EIP-2 item 3). It was charged **nowhere**, and the EIP-170 cap was a bare guard rather than a price. `max_code_size/1` answers `infinity` below Spurious Dragon. See TASKS.md. |
 | EIP-2929's cold `SSTORE` term | `sstore_cost/4` is only half of EIP-2929's SSTORE clause. The other half — "charge an **additional** `COLD_SLOAD_COST`" for a pair not in `accessed_storage_keys` — is `sstore_cold_cost/2`, and omitting it under-charges the *first* touch of a slot by 2,100 while leaving every second touch right. That asymmetry is invisible to any test that writes a slot twice. |
 | EIP-2929's transaction-start warm set | `eth_evm:initial_access/2`, gated on Berlin, seeds `accessed_addresses` with `tx.sender`, `tx.to` (or the address being created) and `eth_fork_schedule:precompile_addresses/1` — which **asks** `precompile_at/2` rather than keeping a second list, bounded by a pin that keeps the bound and the layout's catch-all clause the same statement. It was absent, so every precompile and both of those addresses cost `COLD_ACCOUNT_ACCESS_COST` on first touch. |
@@ -557,6 +557,28 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
   a caller supplying `data` means it. `eth_tx:calldata/1` states the rule because getting
   it wrong makes a test that *adds* `data` to a map already carrying an empty `input`
   fail for a reason that is not the one under test.
+
+- **A comparison between two paths can be exactly zero for a reason that is not the one
+  under test, and the tell is in the forks.** Fixing EIP-150's stipend took three
+  attempts at one measurement. The first compared a *successful* value-bearing `CALL`
+  with an *unsuccessful* one and got **0** at every fork -- which reads as "the stipend
+  does not matter here", and the actual reason is that a callee consisting of a single
+  `STOP` hands the stipend back on **both** paths, so the two cancel. The second gave
+  the callee eleven gas of pure computation and got **11** at every fork -- the callee's
+  own consumption, still not the stipend. The measurement that worked asserts an
+  **absolute**: `spent = pushes + call_cost - stipend`, which holds at every fork
+  including Tangerine Whistle, where it comes out **negative** because there is no
+  EIP-161 9,000 there to absorb the gift.
+  The tell that the first attempt was measuring nothing: **the number was the same at
+  Tangerine Whistle as at Cancun**, and Tangerine Whistle predates both the 9,000 and
+  the fork at which the 63/64 cap exists. A figure that does not move across a boundary
+  where the terms around it change is measuring the wrapper, not the thing.
+  Related, and the reason the third attempt was needed at all: **there are two
+  saturation regimes and they are different tests.** With a large frame the *request*
+  decides the child's allowance; with a small one the 63/64 *cap* does, and only then
+  does the stipend's position show up at all. "Assert the frame" is worth doing --
+  `?assert(Request > Cap)` -- because a test that quietly stops saturating goes on
+  passing for the wrong reason.
 
 ## 11. Known dead code
 

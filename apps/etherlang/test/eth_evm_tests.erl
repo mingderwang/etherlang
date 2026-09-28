@@ -220,27 +220,43 @@ a_call_the_caller_cannot_afford_returns_its_forwarded_gas_test() ->
     %% leaving it in made the difference 34,000 rather than 9,000 and sent me looking
     %% for a sign error that was not there.
     %% The same program twice, once sending 40 the caller cannot cover and once
-    %% sending nothing. What is left after the two cancel is EIP-161's 9,000 for the
-    %% value transfer and nothing else -- **provided** the failed call handed its
-    %% forwarded gas back. A version that consumed it differs by most of a million,
-    %% because `call_args/2' forwards 0xFFFF.
+    %% sending nothing. What is left after the two cancel is **6,700**, and for a year
+    %% this test asserted 9,000 with a comment saying it was "EIP-161's 9,000 for the
+    %% value transfer and nothing else". The 9,000 is right and "and nothing else"
+    %% was the defect: the refund on this path returns `sub_call', which is the
+    %% forwarded gas **plus the 2,300 stipend**, and the caller was charged `cost',
+    %% which does not include the stipend. So the caller is handed 2,300 it never paid
+    %% for, and the difference is 9,000 - 2,300.
+    %%
+    %% **This is the fourth test in this repository that recorded a defect as a
+    %% requirement**, and the second whose *justification* is what made it wrong -- a
+    %% confident comment explaining why the wrong number was right. The corpus named
+    %% the residue as a uniform **+2,300** across the six forks of
+    %% `eip2929_gas_cost_increases/test_call_insufficient_balance`, which is the
+    %% stipend to the gas, and this test asserted the number that defect produced.
+    %%
+    %% What the test is actually for survives the correction: **provided** the failed
+    %% call handed its forwarded gas back, the difference is the refund and nothing
+    %% else. A version that consumed the forwarded gas differs by most of a million,
+    %% because `call_args/2' forwards 0xFFFF -- so it still catches that, which is the
+    %% defect it was written for, and it now catches this one as well.
     %% Under `with_local_reads/1' because the target's account is only partly seeded
     %% and an unseeded read does not answer zero -- it falls through `eth_state' to the
     %% configured base source, which in the default `upstream' mode is an RPC call, and
     %% in a unit test that is a *crash* rather than a failure. The same trap the note on
     %% `both_slots/3' describes.
     eth_test_util:with_local_reads(fun() ->
-        [?assertEqual({F, 9000},
+        [?assertEqual({F, 6700},
                       {F, unaffordable_call_cost(F) - affordable_call_cost(F)})
          || F <- [istanbul, berlin, cancun]],
         %% And the absolute figures, so the difference above cannot be satisfied by two
-        %% wrong numbers that happen to differ by 9,000. They are the access price and
-        %% the access price plus EIP-161's 9,000, and nothing else -- no part of the
-        %% 0xFFFF the call forwards. The two forks are listed separately because
+        %% wrong numbers that happen to differ by 6,700. They are the access price and
+        %% the access price plus 6,700, and nothing else -- no part of the 0xFFFF the
+        %% call forwards. The two forks are listed separately because
         %% EIP-2929's `COLD_ACCOUNT_ACCESS_COST` is 2,600 and not 700, and a single
         %% bound written against Istanbul's 721 is off by a factor at every fork after
         %% it.
-        [?assertEqual({F, {A, A + 9000}},
+        [?assertEqual({F, {A, A + 6700}},
                       {F, {affordable_call_cost(F), unaffordable_call_cost(F)}})
          || {F, A} <- [{istanbul, 721}, {berlin, 2621}, {cancun, 2621}]]
     end).
@@ -754,15 +770,25 @@ call_family_warm_target_costs_one_hundred_test() ->
      || Op <- [16#F1, 16#F2, 16#F4, 16#FA]],
     ok.
 
+%% **Every assertion of the form "the caller pays 9,000 more for a value-bearing call"
+%% in this module was short by the stipend.** The caller is charged `MessageCallGas.cost'
+%% = `gas' + `extra_gas', and the stipend is in `sub_call' only -- it is a gift, created
+%% from nothing, and the caller never pays for it. When the callee runs nothing the
+%% whole allowance comes back, so the caller's net is `extra_gas' **less** the 2,300.
+%% Three tests here asserted the caller paid it, each wrong by exactly 2,300, and all
+%% three were written to pin EIP-161's and EIP-150's figures rather than this one.
 %% The two optional terms, and the condition on the second: the 25000 new-account
 %% charge only applies to a call that transfers value, because a call that
 %% transfers nothing cannot create an account. Charging it on a zero-value call
 %% would make every read-only call cost 25000 more than it should.
+%%
+%% The value transfer is **9,000 less the 2,300 stipend**, not 9,000. This test
+%% asserted 9,000 and the node charged 9,000, and both were wrong together.
 call_optional_terms_follow_the_specification_test() ->
     NoValue = call_gas(16#F1, cold, funded),
     WithValue = call_gas(16#F1, cold, funded_with_value),
     NewAccount = call_gas(16#F1, cold, empty_account),
-    ?assertEqual(NoValue + 9000, WithValue),
+    ?assertEqual(NoValue + 9000 - 2300, WithValue),
     ?assertEqual(WithValue + 25000, NewAccount).
 
 %% Gas one call opcode costs, measured by running the argument pushes, the call
@@ -1778,7 +1804,12 @@ call_costs_only_the_access_term_before_spurious_dragon_test() ->
         Absent = eth_state:new(0, #{{balance, ?CALLER} => 1000}),
         WithValue = <<(call_args(16#0E, 40))/binary, 16#F1, 16#50, 16#00>>,
         Pushes2 = spent(<<(call_args(16#0E, 40))/binary, 16#00>>, Absent, byzantium),
-        ?assertEqual(700 + 9000 + 25000 + 2,
+        %% **Less the 2,300 stipend**, for the reason on
+        %% `call_optional_terms_follow_the_specification_test'. Byzantium is after
+        %% Tangerine Whistle, so the stipend is 2,300 here; this test asserted
+        %% 34,702 and the node charged it. The 25,000 and the 9,000 are Spurious
+        %% Dragon's and EIP-161's and are unchanged.
+        ?assertEqual(700 + 9000 + 25000 + 2 - 2300,
                      spent(WithValue, Absent, byzantium) - Pushes2)
     end).
 
@@ -2247,28 +2278,40 @@ run_sload(Code, Msg, Env) ->
 %% and they are priced from two different constants, so a test that copies the number
 %% from its neighbour asserts the wrong one. The corpus figure is the same 2,000 twice
 %% over: `+4,000` on six fixtures.
+%% **Under `with_local_reads/1'`, and that is a repair rather than a style choice.**
+%% `warm_set_state/0' seeds balances and nonces and **no storage**, so the `SLOAD' this
+%% measures falls through `eth_state' to `base_source' -- which in the default
+%% `upstream' mode is an RPC call, and a unit test that reaches the network is a test
+%% that hangs when the node is offline. This one shipped in `v1.46' without the wrapper
+%% and passed only because an earlier test happened to leave the process-wide base
+%% source somewhere local. An unrelated change to the call gas accounting moved the
+%% ordering and it hung, at a distance of several commits from its cause, which is the
+%% worst way to find out. Eighteen tests in this module already wrap for the same
+%% reason; this one should have.
 a_declared_storage_key_is_warm_at_the_first_instruction_test() ->
-    [?assertEqual({F, 2000}, {F, declared_slot_warmth([<<0:256>>], F)})
-     || F <- [shanghai, cancun, prague]],
-    %% **The control, and it is the half that matters**: a list that declares a
-    %% *different* slot leaves this one cold. Without it, "the declared slot is warm"
-    %% could be satisfied by the slot being warm for any reason at all -- and the two
-    %% attempts that measured `BALANCE` instead of `SLOAD` passed exactly that way.
-    [?assertEqual({F, 0}, {F, declared_slot_warmth([<<16#1234:256>>], F)})
-     || F <- [shanghai, cancun]],
-    %% And symmetrically: declaring slot 0 leaves a *different* slot cold. One direction
-    %% of the control would pass with a seeding that warmed every slot.
-    [?assertEqual({F, 0}, {F, declared_slot_warmth([<<0:256>>], 16#1234, F)})
-     || F <- [shanghai, cancun]],
-    %% And an empty list changes nothing, so the whole of the effect is attributable to
-    %% the declaration rather than to carrying an access list at all.
-    [?assertEqual({F, 0}, {F, declared_slot_warmth([], F)})
-     || F <- [shanghai, cancun]],
-    %% A slot past a byte, so the conversion from the list's 32 bytes to the
-    %% interpreter's word is exercised on a value that is not zero.
-    [?assertEqual({F, 2000},
-                  {F, declared_slot_warmth([<<16#deadbeef:256>>], 16#deadbeef, F)})
-     || F <- [shanghai]].
+    eth_test_util:with_local_reads(fun() ->
+            [?assertEqual({F, 2000}, {F, declared_slot_warmth([<<0:256>>], F)})
+             || F <- [shanghai, cancun, prague]],
+            %% **The control, and it is the half that matters**: a list that declares a
+            %% *different* slot leaves this one cold. Without it, "the declared slot is warm"
+            %% could be satisfied by the slot being warm for any reason at all -- and the two
+            %% attempts that measured `BALANCE` instead of `SLOAD` passed exactly that way.
+            [?assertEqual({F, 0}, {F, declared_slot_warmth([<<16#1234:256>>], F)})
+             || F <- [shanghai, cancun]],
+            %% And symmetrically: declaring slot 0 leaves a *different* slot cold. One direction
+            %% of the control would pass with a seeding that warmed every slot.
+            [?assertEqual({F, 0}, {F, declared_slot_warmth([<<0:256>>], 16#1234, F)})
+             || F <- [shanghai, cancun]],
+            %% And an empty list changes nothing, so the whole of the effect is attributable to
+            %% the declaration rather than to carrying an access list at all.
+            [?assertEqual({F, 0}, {F, declared_slot_warmth([], F)})
+             || F <- [shanghai, cancun]],
+            %% A slot past a byte, so the conversion from the list's 32 bytes to the
+            %% interpreter's word is exercised on a value that is not zero.
+            [?assertEqual({F, 2000},
+                          {F, declared_slot_warmth([<<16#deadbeef:256>>], 16#deadbeef, F)})
+             || F <- [shanghai]]
+    end).
 
 %% The coinbase comes from the **Env**, not the message, so this needs its own
 %% construction rather than the `msg_warmth/2` above. The same shape otherwise:
@@ -2539,6 +2582,178 @@ the_allowance_boundary_is_the_precompiles_cost_exactly_test() ->
     ?assertEqual(1, eth_state:storage(FlagExact, ?MSG0_ADDRESS, 0)).
 
 %% ---------------------------------------------------------------------------
+%% EIP-150: the stipend is in `sub_call' and not in `cost'
+%% ---------------------------------------------------------------------------
+%%
+%% `the_stipend_goes_to_the_child_and_is_refunded_if_unused_test' above pins what
+%% happens when the value **is** affordable: the stipend is handed to the child and the
+%% child hands it straight back, so the two readings of `MessageCallGas` agree and
+%% that test cannot tell them apart. It passed unchanged against both.
+%%
+%% These two can, because each observes a figure the other reading gets wrong:
+%%
+%%   * when the **63/64 cap binds**, the child receives `cap + stipend`. Reading it as
+%%     `min(request + stipend, cap)` -- which is what this did -- swallows the stipend
+%%     into the cap and the child never sees it. This is the *common* case, because
+%%     `GAS`-forwarding calls saturate the cap.
+%%   * when the value is **unaffordable**, the refund returns `sub_call`, and since the
+%%     caller was charged `cost` -- which excludes the stipend -- the caller is handed
+%%     2,300 gas it never paid for. So an unaffordable value-bearing call costs exactly
+%%     the stipend *less* than an affordable one.
+%%
+%% The second is what the corpus found: a uniform **+2,300** across the six forks of
+%% `eip2929_gas_cost_increases/test_call_insufficient_balance`, which is the stipend to
+%% the gas. `+45,247` before that was the forwarded allowance being consumed rather
+%% than returned, and the residue after fixing that was this.
+
+%% In the **cap-binding** regime a value-bearing `CALL' the caller cannot cover costs
+%% the caller `call_cost' **less the stipend** -- an exact figure, and the clearest
+%% statement of the defect there is. The charge is the pre-stipend clamped figure; the
+%% refund is `sub_call', which includes the stipend; so the caller is handed 2,300 it
+%% never paid for, and a frame can finish with *more* gas than it started with.
+%%
+%% **This is the regime the corpus found.** `test_call_insufficient_balance' forwards
+%% `GAS' from an account holding nothing, so the cap binds and the old
+%% `min(request + stipend, cap)' swallowed the stipend into it -- `+2,300' on six
+%% forks. The sibling test above measures the *request*-binding regime instead, and the
+%% two are genuinely different tests: with a large frame the request rather than the cap
+%% decides, the stipend comes back on the success path *and* on the failure path, and it
+%% cancels -- so a difference measured there is the callee's own gas and nothing else.
+%% My first attempt at this used the large frame and measured **11** at every fork,
+%% which is the callee's eleven gas of pure computation and says nothing about the
+%% stipend. The tell was that the number came out the same at Tangerine Whistle, which
+%% has no EIP-161 9,000 for it to cancel against.
+a_failed_value_bearing_call_costs_the_stipend_less_test() ->
+    %% Under `with_local_reads/1' for the reason the sibling test gives: the callee's
+    %% account is only partly seeded, and an unseeded read goes to the configured base
+    %% source, which in a unit test is a hang rather than a zero.
+    eth_test_util:with_local_reads(fun() ->
+        %% `call_args/2''s six PUSH1 and one PUSH2. Written down because the assertion
+        %% below is an absolute figure, and a figure with an unaccounted-for wrapper
+        %% around it is not a figure that can be checked.
+        Pushes = 21,
+        Price = fun(F) ->
+            eth_fork_schedule:call_cost(16#F1, F,
+                                       #{warm => false, value_transfer => true,
+                                         new_account => false})
+        end,
+        [?assertEqual({F, Pushes + Price(F) - eth_fork_schedule:call_stipend(F)},
+                      {F, value_call_cost(F, 200, 40000)})
+         || F <- [tangerine, spurious_dragon, byzantium, istanbul, berlin, london,
+                  shanghai, cancun, prague, osaka]],
+        %% **Before Tangerine Whistle there is no stipend to hand back**, so the figure
+        %% is the price and the pushes and nothing else. Without this the test would
+        %% also pass against a `call_stipend/1' that ignored its fork.
+        %%
+        %% **At 1,000,000, not 40,000**, and the reason is a real fork difference rather
+        %% than a convenience: there is no 63/64 cap before Tangerine Whistle, so
+        %% `call_args/2''s 65,535 request against a 40,000 frame is an out-of-gas **halt**
+        %% -- `huge_call_is_clamped_at_tangerine_whistle_and_halts_before_it_test' above
+        %% pins exactly that -- and there is no cost left to assert. Tangerine Whistle
+        %% introduced the cap, which is what lets the small frame work at all.
+        [?assertEqual({F, Pushes + Price(F)}, {F, value_call_cost(F, 200, 1000000)})
+         || F <- [frontier, homestead, dao]],
+        %% And the frame does not matter, which is worth stating because it is why the
+        %% first attempt failed: the cap cancels out of the charge and the refund, and
+        %% what is left is the price and the stipend. Measured at a frame that saturates
+        %% the cap and one that does not.
+        [?assertEqual({F, value_call_cost(F, 200, 40000)},
+                      {F, value_call_cost(F, 200, 1000000)})
+         || F <- [tangerine, istanbul, berlin, cancun]]
+    end).
+
+%% What a value-bearing `CALL' costs the caller. The caller holds 100, so 200 cannot be
+%% covered and 0 always can. The callee is a single STOP, and it matters that it consumes
+%% **nothing**: this measures the caller's charge, and a callee that burned gas would put
+%% its own consumption into any difference taken against another value.
+%%
+%% Three arguments, not two: the frame is a parameter because the two saturation regimes
+%% are the whole point, and pinning one of them silently is how the first version of this
+%% test managed to measure nothing at all.
+value_call_cost(Fork, Value, Frame) ->
+    Code = <<(call_args(16#0D, Value))/binary, 16#F1, 16#00>>,
+    {ok, _, Left, _, _} = eth_evm:run(Code, ?MSG0, call_state(100, <<16#00>>),
+                                      #{fork => Fork}, Frame),
+    Frame - Left.
+
+%% When the cap binds the child still receives the stipend **on top of** it. The
+%% child's own `GAS' is the observation, because the caller's cost cannot tell the two
+%% readings apart here: with the cap binding, `min(req, cap)' and `min(req + stipend,
+%% cap)' are both `cap'.
+%%
+%% **Two frames, because there are two regimes and the defect only shows in one of
+%% them.** `call_args/2' asks for 65,535. At a large frame the *request* binds and the
+%% child should receive exactly 65,535 + 2,300. At a small frame the *cap* binds --
+%% which is the common case, because `GAS`-forwarding calls saturate it -- and the child
+%% should receive `cap + 2,300` rather than `cap`. A version reading the stipulation as
+%% `min(req + stipend, cap)' gets the first regime right by accident and the second
+%% wrong, so testing only the large frame would pass against it.
+child_gas_at_a_saturating_call_is_the_cap_plus_the_stipend_test() ->
+    %% `GAS; PUSH1 0; SSTORE; STOP` -- the child records the allowance it was handed at
+    %% slot 0, which is the only place the figure is observable. Under
+    %% `with_local_reads/1' for the reason the sibling test gives: the slot is written
+    %% but not seeded, and an unseeded read falls through `eth_state' to the configured
+    %% base source. Without it this test read **9,300** -- a number belonging to another
+    %% test in this module, left in the shared store -- and looked like a failure of the
+    %% change rather than of the test.
+    eth_test_util:with_local_reads(fun() ->
+        Stipend = eth_fork_schedule:call_stipend(istanbul),
+        Request = 16#FFFF,
+        %% **The child charges its own first instruction before `GAS' reads the
+        %% counter**, so the figure observed is always the allowance less that. Measured
+        %% here from the request-binding frame, where the allowance is known to be
+        %% exactly `Request', rather than written down as a magic number -- a fudge
+        %% constant in a gas test is a second copy of the implementation.
+        Big = 1000000,
+        Prologue = Request - child_gas(Big, 0, istanbul),
+        %% ==================== regime 1: the *request* binds ====================
+        %% The child's allowance is `Request + Stipend'. This is the regime the old
+        %% reading also got right, which is why it is not the only one tested.
+        ?assertEqual(Stipend, child_gas(Big, 40, istanbul) - child_gas(Big, 0, istanbul)),
+        ?assertEqual(Request + Stipend - Prologue, child_gas(Big, 40, istanbul)),
+        %% ==================== regime 2: the *cap* binds ====================
+        %% The common case: a `GAS'-forwarding call saturates the 63/64 cap. Reading the
+        %% stipulation as `min(req + stipend, cap)' gives the child `cap' here and the
+        %% stipend is silently swallowed -- and the **caller's** cost is `cap' either
+        %% way, so nothing but the child can see it.
+        %%
+        %% `Avail' is what is left after `call_args/2''s seven pushes (four PUSH1, two
+        %% more, one PUSH2 = 21) and the CALL's own price. The target holds code and is
+        %% therefore alive, so there is no 25,000.
+        Small = 40000,
+        Base = eth_fork_schedule:call_cost(16#F1, istanbul,
+                                           #{warm => false, value_transfer => true,
+                                             new_account => false}),
+        Avail = Small - 21 - Base,
+        Cap = Avail - Avail div 64,
+        %% **Asserted, not assumed.** A test that picks a small number and hopes the cap
+        %% binds is a test that quietly stops testing the case it exists for.
+        ?assert(Request > Cap),
+        ?assert(Avail < Small),
+        ?assertEqual(Cap + Stipend - Prologue, child_gas(Small, 40, istanbul)),
+        %% And stated as the thing it is: the child's share is **above** the cap, not
+        %% equal to it. Under the old reading this last figure was `Cap - Prologue`.
+        ?assert(child_gas(Small, 40, istanbul) > Cap),
+        %% ==================== the fork gate ====================
+        [?assertEqual({F, eth_fork_schedule:call_stipend(F)},
+                      {F, child_gas(Big, 40, F) - child_gas(Big, 0, F)})
+         || F <- [tangerine, spurious_dragon, byzantium, berlin, london, shanghai,
+                  cancun, prague, osaka]],
+        %% **Before Tangerine Whistle there is no stipend**, so the two are identical.
+        %% Without this the test would also pass against a `call_stipend/1' that ignored
+        %% its fork, which is the other thing that could produce a 2,300.
+        [?assertEqual({F, 0}, {F, child_gas(Big, 40, F) - child_gas(Big, 0, F)})
+         || F <- [frontier, homestead, dao]]
+    end).
+%% The allowance a value-bearing `CALL` hands its child, observed from inside the child.
+child_gas(Frame, Value, Fork) ->
+    Reporter = <<16#5A, 16#60, 0, 16#55, 16#00>>,
+    Code = <<(call_args(16#0D, Value))/binary, 16#F1, 16#00>>,
+    {ok, _, _, St, _} = eth_evm:run(Code, ?MSG0, call_state(1000000, Reporter),
+                                    #{fork => Fork}, Frame),
+    eth_state:storage(St, ?CALLEE, 0).
+
+%% ---------------------------------------------------------------------------
 %% EIP-150: the 63/64 cap and the stipend, as behaviour
 %% ---------------------------------------------------------------------------
 %% The table test pins the two figures. These pin the two *behaviours*, and they are
@@ -2600,10 +2815,15 @@ the_stipend_goes_to_the_child_and_is_refunded_if_unused_test() ->
         ?GAS - L0
     end,
     WithValue = ?GAS - Left,
-    %% EIP-161's 9000 for the value transfer, and **not** 9000 + 2300: the stipend is
-    %% handed to the child and the child hands it back, so it is not part of what the
-    %% caller pays. Before Tangerine Whistle there is no 9000 either and no stipend.
-    ?assertEqual(NoValue() + 9000, WithValue),
+    %% EIP-161's 9000 for the value transfer, less the 2,300 stipend. **Not** 9,000 and
+    %% **not** 11,300: the stipend is handed to the child and the child hands it back,
+    %% and it was never part of what the caller was charged in the first place. Before
+    %% Tangerine Whistle there is no 9,000 either and no stipend, so the two agree.
+    %% **`NoValue() + 9000 - 2300`, not `NoValue() + 9000`.** The caller is charged
+    %% `cost', which excludes the stipend, and the callee here runs nothing, so the
+    %% whole allowance including the stipend comes back -- netting 9,000 - 2,300. This
+    %% test asserted 9,000, which is the node charging the caller for a gift.
+    ?assertEqual(NoValue() + 9000 - 2300, WithValue),
     {ok, _, L1, _, _} = eth_evm:run(Code, ?MSG0, call_state(1000000, <<16#00>>),
                                     #{fork => homestead}, ?GAS),
     ?assertEqual(NoValue() + 0, ?GAS - L1).

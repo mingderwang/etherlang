@@ -29,8 +29,8 @@
 
 ## The queue, re-derived
 
-**Re-measured after `v1.46`, from the committed corpus: 214 of 266 match, 3 are
-`fork_unreachable`, and 49 are `state_mismatch`. `crash`, `unpriced`,
+**Re-measured after `v1.47`, from the committed corpus: 220 of 266 match, 3 are
+`fork_unreachable`, and 43 are `state_mismatch`. `crash`, `unpriced`,
 `sender_mismatch` and `expected_rejection_not_raised` are all 0.**
 
 (The 78/185 figures below are the *pre-`v1.42`* measurement, kept because the two
@@ -696,24 +696,70 @@ behavioural change per commit, and each step says what it now does.
      for. The conclusion happened to be right and the observation could not support it.
      A histogram is read in full or not read; a partial one is a list of the entries
      that happened to be near the top.
-   - **Where the 2300 stipend sits relative to the 63/64 cap: open, and left open on
-     purpose.** EIP-150's pseudocode reads
+   - ~~**Where the 2300 stipend sits relative to the 63/64 cap.**~~ **Fixed
+     (`v1.47`), 214 -> 220, zero regressions.** This one was open *on purpose* and the
+     refusal was correct; what changed is what was available to decide it with.
+   - **Why it was open, and the reasoning is worth keeping.** EIP-150's pseudocode
+     reads
 %%
 %%         gas = min(gas, max_call_gas(compustate.gas - extra_gas))
 %%         submsg_gas = gas + opcodes.GSTIPEND * (value > 0)
 %%
-%%     which says the stipend is added **after** the clamp. This module adds it before,
-%%     which is symmetric with the charge and is what it has always done. I implemented
-%%     the reading above, and it made the child's allowance `cap + 2300` while the
-%%     caller was charged `cap + 2300` — so with a callee that spends everything it is
-%%     given, the child's allowance exceeds what the caller had left and the CALL's own
-%%     charge raises. That is second-order accounting I could not settle from the text,
-%%     and a CALL's gas is not something to change on a reading. **So the fork gating
-%%     is fixed and the ordering is not.** The fix that did land is the one the EIP's
-%%     `substitute` block gives verbatim: before Tangerine Whistle there is no cap and
-%%     no stipend, a call gets whatever the parent has left, and asking for more is an
-%%     out-of-gas error rather than a clamp — which is a different *answer*, not a
-%%     different number, and the corpus gained a fixture from it (11 -> 12 matches).
+%%     which says the stipend is added **after** the clamp. This module added it before,
+%%     symmetric with the charge, which is what it had always done. Implementing the
+%%     reading above made the child's allowance `cap + 2300` while the caller was
+%%     charged `cap + 2300` -- so with a callee that spends everything it is given, the
+%%     child's allowance exceeded what the caller had left and the CALL's own charge
+%%     could raise. That is second-order accounting that could not be settled from the
+%%     text, and a CALL's gas is not something to change on a reading. **The refusal was
+%%     the right call and the reasoning behind it is unchanged.**
+   - **What settled it: the specification's source, not the EIP, and then the corpus.**
+     `ethereum/forks/berlin/vm/gas.py`, `calculate_message_call_gas`:
+%%
+%%         call_stipend = Uint(0) if value == 0 else call_stipend
+%%         gas = min(gas, max_message_call_gas(gas_left - memory_cost - extra_gas))
+%%         return MessageCallGas(gas + extra_gas, gas + call_stipend)
+%%
+%%     and `forks/berlin/vm/instructions/system.py`, `call`:
+%%
+%%         charge_gas(evm, message_call_gas.cost + extend_memory.cost)
+%%         ...
+%%         if sender_balance < value:
+%%             push(evm.stack, U256(0)); evm.return_data = b""
+%%             evm.gas_left += message_call_gas.sub_call
+%%
+%%     Three consequences, and the node had two of the three wrong. **`cost` excludes the
+%%     stipend** -- it is a gift, created from nothing, and the caller never pays for it.
+%%     **The clamp applies to the pre-stipend figure**, so `min(gas + stipend, cap)`
+%%     silently swallows the stipend into the cap whenever the cap binds, which is the
+%%     common case because `GAS`-forwarding calls saturate it. And **the refund returns
+%%     the stipend too**, because it returns `sub_call` and the caller was never charged
+%%     it -- so a `CALL` that cannot cover its value hands the caller 2,300 gas it never
+%%     paid for, and a frame can finish with *more* gas than it started with.
+   - **The prediction was made before the measurement.** A comment on `child_gas/4` had
+%%     already recorded that with the forwarded-gas refund in place the same six fixtures
+%%     sat at `+2,300` -- "the stipend exactly -- the consequence of the one-figure model
+%%     above, and not independently fixable" -- and that the split was "not shippable on
+%%     the strength of a transcription". It was not a transcription any more: it was the
+%%     Berlin source, which is the code that generated the fixtures disagreeing by 2,300.
+%%     **Six fixtures, all of them `eip2929_gas_cost_increases/test_call_insufficient_balance`,
+%%     and zero regressions.**
+   - **The recorded worry was real and the resolution is that it does not apply.** "The
+%%     reading which follows the EIP makes a child's allowance exceed the caller's
+%%     remaining" is true, and it is **correct**: the stipend is not the caller's to give,
+%%     so the child holding more than the parent has left is specified behaviour rather
+%%     than an overflow. The child's gas lives in its own frame and is never drawn from
+%%     the caller's. What the earlier attempt got wrong was putting the stipend in
+%%     `cost`, which *does* charge the caller a figure that can exceed the gas remaining
+%%     -- and that was a **halt**, not a wrong total, which is the only reason it was
+%%     caught at all.
+   - **Four tests in this repository asserted that the caller pays the stipend.** All
+%%     four were wrong by exactly 2,300 and all four were written to pin EIP-150's or
+%%     EIP-161's figures rather than this one; they are corrected, not deleted, and each
+%%     still catches the defect it was written for. This is the fourth instance of a test
+%%     recording a defect as a requirement, and the second whose *justification* is what
+%%     made it wrong -- `a_call_the_caller_cannot_afford_returns_its_forwarded_gas_test`
+%%     said the residue was "EIP-161's 9000 for the value transfer and nothing else".
    - **`-1208` gas, 1 fixture, `homestead/coverage` at Homestead.** **Unresolved.**
    - **Precompile pricing took no fork at all. Fixed** (`v1.27`). This was a
      structural gap rather than a corpus finding, and it was a large one:
