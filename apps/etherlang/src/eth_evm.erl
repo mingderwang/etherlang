@@ -32,7 +32,7 @@
 -record(ctx, {state, env, msg, transient = #{}, originals = #{}, fork}).
 
 -export([run/5,
-           initial_access/2, valid_jumpdests/1]).
+           initial_access/3, valid_jumpdests/1]).
 
 %% ---------------------------------------------------------------------------
 %% Public API
@@ -44,7 +44,7 @@
 run(Code, Msg, State, Env, Gas) when is_binary(Code) ->
     Fork = fork_of(Env),
     {Res, _Transient, _Originals} =
-        run_t(Code, Msg, State, Env, Gas, initial_access(Msg, Fork), #{}, Fork),
+        run_t(Code, Msg, State, Env, Gas, initial_access(Msg, Env, Fork), #{}, Fork),
     Res.
 
 %% EIP-2929, "When a transaction execution begins", in the EIP's own words:
@@ -74,7 +74,7 @@ run(Code, Msg, State, Env, Gas) when is_binary(Code) ->
 %% Berlin-gated because EIP-2929 introduces the access list as well as this rule, and
 %% because below Berlin `access_cost/3' ignores `warm' -- so seeding earlier would be
 %% harmless and would also be a claim about a fork whose schedule has no such concept.
-initial_access(Msg, Fork) ->
+initial_access(Msg, Env, Fork) ->
     case eth_fork_schedule:at_least(Fork, berlin) of
         false ->
             #{};
@@ -90,9 +90,32 @@ initial_access(Msg, Fork) ->
             %% start a frame at all.
             Addrs = [maps:get(origin, Msg, <<0:160>>),
                      maps:get(address, Msg, <<0:160>>)]
+                    ++ coinbase_at(Fork, maps:get(coinbase, Env, undefined))
                     ++ eth_fork_schedule:precompile_addresses(Fork),
             lists:foldl(fun(Addr, Acc) -> Acc#{{warm_account, Addr} => true} end,
                         #{}, Addrs)
+    end.
+
+%% **EIP-3651: the coinbase is warm from the first instruction of the transaction.**
+%% "At the start of transaction execution, accessed_addresses shall be initialized to
+%% also include the address returned by COINBASE (0x41)." Shanghai, and gated like every
+%% other arrival rather than written in unconditionally.
+%%
+%% The EIP's own reason is the one worth keeping, because it is the *same* argument as
+%% the sender and `to' and not a discount: "The COINBASE address should also always be
+%% loaded because it receives the block reward and the transaction fees." Without it,
+%% every direct payment to the miner is charged `COLD_ACCOUNT_ACCESS_COST` (2,600) on
+%% first touch, and a contract that pays the coinbase and branches on the result -- the
+%% pattern EIP-3651 exists for -- is charged as though it were reading an account it had
+%% never heard of.
+%%
+%% `maps:get/3' and not `maps:get/2': a caller that omits `coinbase' from the Env has
+%% not said the coinbase is `<<0:160>>', it has said nothing, and warming the zero
+%% address would be a warm entry nothing in the frame can use.
+coinbase_at(Fork, Addr) ->
+    case Addr =/= undefined andalso eth_fork_schedule:at_least(Fork, shanghai) of
+        true -> [Addr];
+        false -> []
     end.
 
 %% The fork this frame executes under, taken from the Env.

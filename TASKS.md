@@ -29,8 +29,8 @@
 
 ## The queue, re-derived
 
-**Re-measured after `v1.43`, from the committed corpus: 194 of 266 match, 3 are
-`fork_unreachable`, and 69 are `state_mismatch`. `crash`, `unpriced`,
+**Re-measured after `v1.45`, from the committed corpus: 206 of 266 match, 3 are
+`fork_unreachable`, and 57 are `state_mismatch`. `crash`, `unpriced`,
 `sender_mismatch` and `expected_rejection_not_raised` are all 0.**
 
 (The 78/185 figures below are the *pre-`v1.42`* measurement, kept because the two
@@ -61,7 +61,7 @@ implemented, so none of the 12/4/2/1 fixtures in those files is a missing opcode
 | n | file | what is likely, and what would settle it |
 |---|---|---|
 | 6 | `byzantium/eip196_ec_add_mul/test_gas.py` | **26 -> 6 across `v1.42`/`v1.43`, and the cause was neither the precompile nor the fee path this row guessed.** Every one of the 26 is `enough_gas_False` or `True` with a contract that forwards **149** gas to a 150-gas ECADD and **5,999** to a 6,000-gas ECMUL -- one gas short in both cases, by design, so the precompile never runs and the chain's own post-state is `storage = {}`. The node's EVM does exactly the same. All ten `enough_gas_True` cases were the **fee path** (`v1.42`, `v1.43`). The six that remain are also `enough_gas_False`, and their residue is `+10500` (pre-London) and `+3746`/`+2576` (London+) in *gas*; it is **not yet attributed**, and the two groups differing suggests more than one cause. |
-| 24 | `shanghai/eip3651_warm_coinbase/test_warm_coinbase.py` | EIP-3651. `eth_evm:initial_access/2` (added in `v1.37`) already seeds `tx.to`, so the seeding is either incomplete for this shape or the runner is not applying it. Measure before touching either. |
+| ~~24~~ | `shanghai/eip3651_warm_coinbase/test_warm_coinbase.py` | **Fixed (`v1.45`), and the queue's guess was wrong.** `eth_evm:initial_access/2` was not failing to apply -- it was **incomplete**: seeded with the sender, `tx.to` and the precompiles, and not with the coinbase. A uniform +2,500 on twelve fixtures. |
 | 20 | `homestead/identity_precompile/test_identity.py` | 16 of this file's 28 entries were fixed by `v1.41`. Six remain, in the same code. |
 | 18 | `istanbul/eip1344_chainid/test_chainid.py` | `CHAINID` **is** implemented, so this is a value or a chain-id source defect. 18 fixtures with one wrong value is the cheapest thing on this list, if that is what it is. |
 | 12 | `shanghai/eip3855_push0/test_push0.py` | `PUSH0` **is** implemented and Shanghai-only, so suspect the fork gate or its gas. |

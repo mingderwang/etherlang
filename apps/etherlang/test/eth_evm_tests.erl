@@ -2114,6 +2114,87 @@ msg_warmth(Key, Fork) ->
 
 balance_cost(Addr, Fork) -> balance_cost_in(Addr, ?MSG0, Fork).
 
+%% ---------------------------------------------------------------------------
+%% EIP-3651: the coinbase is warm from the first instruction
+%% ---------------------------------------------------------------------------
+%%
+%% "At the start of transaction execution, `accessed_addresses' shall be initialized to
+%% **also** include the address returned by COINBASE (0x41)." Shanghai.
+%%
+%% The EIP's reason is the same argument as the sender and `to', not a discount, and it
+%% is worth quoting because it is why this is not a subsidy: "The COINBASE address
+%% should also always be loaded because it receives the block reward and the transaction
+%% fees." Without it a direct payment to the miner is charged
+%% `COLD_ACCOUNT_ACCESS_COST' on first touch, and a contract that pays the coinbase and
+%% branches on the result -- the pattern the EIP exists for -- is priced as though it
+%% were reading an account it had never heard of.
+%%
+%% The corpus named it as **twelve fixtures**, and this is the same construction as the
+%% two tests above: `BALANCE' of the coinbase less `BALANCE' of an address nobody
+%% mentioned, so the whole difference is the warm/cold term.
+the_coinbase_is_warm_at_the_first_instruction_from_shanghai_test() ->
+    [?assertEqual({F, 2500}, {F, coinbase_warmth(F)})
+     || F <- [shanghai, cancun, prague, osaka]],
+    %% **And not at Paris.** EIP-3651 is a Shanghai arrival and the warm set is
+    %% EIP-2929's, so a Paris block charging the coinbase cold is not a gap in the
+    %% rule -- it is the rule as it stood. Asserted because a fix that forgot the fork
+    %% gate would pass the four forks above and be wrong for every block between
+    %% Berlin and Shanghai.
+    [?assertEqual({F, 0}, {F, coinbase_warmth(F)})
+     || F <- [paris, london, berlin, istanbul]].
+
+%% An Env with no `coinbase' key has not said the coinbase is the zero address -- it has
+%% said nothing, and warming `<<0:160>>' would put a warm entry in the set that nothing
+%% in the frame can name. The fork gate and the presence check are two different
+%% conditions and are asserted separately here, because the one above only ever supplies
+%% a coinbase.
+a_missing_coinbase_warms_nothing_test() ->
+    Named = <<0:152, 16#2A:8>>,
+    %% Present and Shanghai: warmed.
+    %% `maps:is_key/2' and not a `?assertMatch' on `{K, V}': that pattern only matches a
+    %% one-element map, and the warm set is a map of a dozen.
+    ?assert(maps:is_key({warm_account, Named},
+                        eth_evm:initial_access(?MSG0,
+                                               #{fork => shanghai, coinbase => Named},
+                                               shanghai))),
+    %% Absent: **no** entry, and in particular not one keyed on `undefined'.
+    Warm = eth_evm:initial_access(?MSG0, #{fork => shanghai}, shanghai),
+    ?assertNot(lists:keymember({warm_account, undefined}, 1, maps:to_list(Warm))),
+    %% `<<0:160>>` is deliberately *not* asserted absent: it is `?MSG0's `address' and
+    %% `origin', so it is in the set for a reason that has nothing to do with the
+    %% coinbase. An assertion that it was missing would be testing the wrong thing and
+    %% would only pass if `?MSG0' were changed.
+    %% Present but pre-Shanghai: not warmed, which is the fork gate and not the
+    %% presence check.
+    ?assertNot(lists:keymember({warm_account, Named}, 1,
+                               maps:to_list(eth_evm:initial_access(
+                                              ?MSG0,
+                                              #{fork => paris, coinbase => Named},
+                                              paris)))).
+
+%% The coinbase comes from the **Env**, not the message, so this needs its own
+%% construction rather than the `msg_warmth/2` above. The same shape otherwise:
+%% `PUSH20 <addr>; BALANCE; STOP`, with the coinbase named in the Env and an address
+%% nobody named as the control.
+%% **The same address both times**, with the coinbase named in one Env and absent from
+%% the other. The first version named the coinbase and compared against a *different*
+%% address -- `?CALLER` -- which is warmed as the frame's own `address', so both sides
+%% cost 100 and the difference was 0. The comparison has to isolate the coinbase and
+%% nothing else, and the cold reading is the **minuend** for the same reason as
+%% `precompile_warmth/1`: cold is the more expensive of the two, so the difference comes
+%% out positive.
+coinbase_warmth(Fork) ->
+    A = ?UNTOUCHED,
+    Cold = balance_cost_in_env(A, #{fork => Fork}),
+    Warm = balance_cost_in_env(A, #{fork => Fork, coinbase => A}),
+    Cold - Warm.
+
+%% The fork is already in the Env, so it is not a second argument.
+balance_cost_in_env(Addr, Env) ->
+    Code = <<16#73, Addr/binary, 16#31, 16#00>>,
+    {ok, _, Left, _, _} = eth_evm:run(Code, ?MSG0, warm_set_state(), Env, ?GAS),
+    ?GAS - Left.
+
 %% `?STATE' holds one account, `<<0:160>>', and reading the balance or the code of an
 %% address it does not hold falls through `eth_state' to the configured base source --
 %% which in the default `upstream' mode is an RPC call, and in a unit test is a *hang*

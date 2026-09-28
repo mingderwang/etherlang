@@ -202,8 +202,8 @@
 %% the frame finishing `result=ok charged0=26006`, and 26,006 is the chain's own figure
 %% for that transaction, so both the gas and the write were right and only the
 %% comparison was wrong. See `overlay_key/1'.
--define(EXPECTED, #{match => 194,
-                    state_mismatch => 69,
+-define(EXPECTED, #{match => 206,
+                    state_mismatch => 57,
                     unpriced => 0,
                     tx_decode_failed => 0,
                     tx_roundtrip_mismatch => 0,
