@@ -27,6 +27,73 @@
 > labels are counted, not asserted; re-derive them with
 > `grep -cE '^- \[[ x]\]' TASKS.md` before quoting them.
 
+## The queue, re-derived
+
+**Re-measured after `v1.41`, from the committed corpus: 78 of 266 match, 3 are
+`fork_unreachable`, and 185 are `state_mismatch`. `crash`, `unpriced`,
+`sender_mismatch` and `expected_rejection_not_raised` are all 0.**
+
+Two numbers decide what the work is, and neither is the tally:
+
+**Only 28 of the 185 have a gas delta, in six values.** Everything else reports
+`gas => unavailable`, which is `gas_story/5`'s answer when the **sender's balance is
+not among the differing accounts**. So for **157** fixtures the node is not diverging
+in what the sender paid, and the six gas figures below are the whole of the priced
+part:
+
+| gas delta | n | note |
+|---|---|---|
+| `+978527` | 5 | a whole 1,000,000 allowance: the code's own comment says this "says that something is wrong and nothing about which rule" |
+| `+928876` | 5 | same magnitude class |
+| `+156732` | 5 | schedule-sized, so a real rule |
+| `+54154` | 6 | schedule-sized |
+| `+32030` | 6 | schedule-sized |
+| `+76268` | 1 | schedule-sized |
+
+**All 22 remaining files, largest first.** Checked and ruled out as a shortcut:
+`CHAINID`, `PUSH0`, `MCOPY`, `TLOAD`, `TSTORE`, `BLOBHASH` and `BLOBBASEFEE` are **all**
+implemented, so none of the 12/4/2/1 fixtures in those files is a missing opcode.
+
+| n | file | what is likely, and what would settle it |
+|---|---|---|
+| 26 | `byzantium/eip196_ec_add_mul/test_gas.py` | The **named** open item: an off-curve point is reported `unsupported`, where EIP-196 makes it a **call failure**. `unsupported` makes `eth_block:run_transaction/5` refuse the whole block, so this is the same class as the blake2f defect `v1.35` fixed. Largest cluster. |
+| 24 | `shanghai/eip3651_warm_coinbase/test_warm_coinbase.py` | EIP-3651. `eth_evm:initial_access/2` (added in `v1.37`) already seeds `tx.to`, so the seeding is either incomplete for this shape or the runner is not applying it. Measure before touching either. |
+| 20 | `homestead/identity_precompile/test_identity.py` | 16 of this file's 28 entries were fixed by `v1.41`. Six remain, in the same code. |
+| 18 | `istanbul/eip1344_chainid/test_chainid.py` | `CHAINID` **is** implemented, so this is a value or a chain-id source defect. 18 fixtures with one wrong value is the cheapest thing on this list, if that is what it is. |
+| 12 | `shanghai/eip3855_push0/test_push0.py` | `PUSH0` **is** implemented and Shanghai-only, so suspect the fork gate or its gas. |
+| 11 | `frontier/create/test_create_deposit_oog.py` | The "cannot pay `G_codedeposit`" arm, directly downstream of the `v1.36` fix. |
+| 10 | `frontier/identity_precompile/test_identity_returndatasize.py` | 8 of 16 fixed by `v1.41`; 8 remain in the same code. |
+| 10 | `byzantium/eip197_ec_pairing/test_gas.py` | Same shape as the `ec_add_mul` cluster, and the pairing check's own price. |
+| 7 | `istanbul/eip152_blake2/test_blake2_delegatecall.py` | Already narrowed once; the `DELEGATECALL` calldata-length question. |
+| 6 | `cancun/eip6780_selfdestruct/test_selfdestruct_revert.py` | The same-tx-created restriction, Cancun. |
+| 6 | `berlin/eip2930_access_list/test_acl.py` | The long-standing `+4000 x6`. EIP-2930 intrinsic. |
+| 6 | `berlin/eip2929_gas_cost_increases/test_call.py` | Holds the `+152536`-class deltas. |
+| 5 | `prague/eip7623_increase_calldata_cost/test_execution_gas.py` | EIP-7623, not implemented. |
+| 5 | `osaka/eip7883_modexp_gas_increase/test_modexp_thresholds.py` | Osaka. |
+| 5 | `osaka/eip7825_transaction_gas_limit_cap/test_tx_gas_limit.py` | Osaka. |
+| 4 | `cancun/eip5656_mcopy/test_mcopy_contexts.py` | `MCOPY` is implemented. |
+| 3 | `homestead/coverage/test_coverage.py` | |
+| 2 | `frontier/opcodes/test_all_opcodes.py` | |
+| 2 | `cancun/eip1153_tstore/test_basic_tload.py` | `TLOAD`/`TSTORE` are implemented. |
+| 1 each | `prague/eip2537_bls_12_381...`, `cancun/eip7516_blobgasfee...`, `cancun/eip4844_blobs/test_point_evaluation_precompile` | |
+
+**Then the structural items, which are not conformance and are not ordered by size:**
+
+- **Block-level conformance is never run.** Every figure above comes from
+  `eth_block:run_transaction/5`; nothing in this repository executes a whole block
+  against a fixture. That is a different measurement and the one a block-producing node
+  needs.
+- **`eth_createAccessList`** — the one RPC method genuinely absent.
+- **Hive.** The interoperability row in `README.md` is empty: `etherlang` is not in
+  Hive, has never been driven by a mock consensus client, and has never spoken to
+  another client. See the "What compatible means here" table.
+- **The full-corpus figure** (2,681 files) has still never been measured. The 5.6-hour
+  run was killed. No number is claimed.
+- **EIP-7702's state transition** — named, not done; 3 fixtures execute a type-4
+  transaction as though it carried no authorizations.
+- **Pre-Berlin `SSTORE` at Constantinople** (EIP-1283) — named, not done, and
+  unreachable by block number on mainnet.
+
 ## What to do next, in order
 
 This list exists so that work is not chosen by whichever item is nearest to hand.
