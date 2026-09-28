@@ -451,6 +451,15 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
   read as "this node does not execute a valid EIP-1559 transaction" when the node
   finished it at `charged0=26006`, the chain's own figure. **When a write and a read of
   the same map disagree, suspect the key before the value.**
+- **A function that takes a name may be handed a label.** `base_fee_for/1` took the
+  fixture's fork *name*, which `fork_of_key/1`'s binary capture makes a **binary**,
+  where `eth_fork_schedule:at_least/2` wanted an atom. An unrecognised fork ranks as
+  ancient, so it answered `undefined` for every fork — correct before London, wrong
+  from it, which is why two thirds of the corpus never noticed. The fix asks
+  `current_fork/4'` about the *block* rather than translating the name, so there is no
+  second list to fall out of step; and `schedule_fork_at/3` asks about **mainnet**,
+  because `fork_point/1`'s activation numbers are mainnet's and asking the configured
+  network answers a different question.
 - **A gas figure read off a balance difference can be a fee bug.** `+517,958` is
   `(gasLimit - gasUsed) * price`. It looks like a pricing bug and is arithmetic about
   the *price*, and an instrumented run is what separated them: `charged0` was already

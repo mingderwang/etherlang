@@ -88,7 +88,8 @@
 -include_lib("eunit/include/eunit.hrl").
 -include("eth_block.hrl").
 
--export([corpus/0, committed/0, entries/0, entries/1, outcomes/0,
+-export([schedule_fork_of_key/1,
+           corpus/0, committed/0, entries/0, entries/1, outcomes/0,
          tally/1, report/0, report/1, survey/1, survey/0, survey/2, files/1]).
 
 %% A streaming pass over a corpus: the tally, a per-fork breakdown, a histogram of
@@ -655,7 +656,8 @@ block(Fork, Entry, BaseFee) ->
         total_difficulty = TD,
         gas_limit = int(maps:get(<<"currentGasLimit">>, Env, <<"0x0">>)),
         gas_used = 0,
-        base_fee_per_gas = merge_base_fee(base_fee_for(Fork), BaseFee),
+        base_fee_per_gas = merge_base_fee(base_fee_for(schedule_fork_at(Number, Timestamp, TD)),
+                                                    BaseFee),
         mix_hash = <<0:256>>,
         logs_bloom = eth_bloom:new()}.
 
@@ -671,6 +673,63 @@ block(Fork, Entry, BaseFee) ->
 %% schedule rather than like a defaulted argument. It is worth knowing that this
 %% function has that failure mode; it is not reachable from `finalize/1', which
 %% passes the block's own base fee and a pre-London block has none.
+%% **Which fork this block is, asked of the schedule.**
+%%
+%% `block/3` was handing `base_fee_for/1` the *fixture's* fork name, and that name is a
+%% **binary**: `fork_of_key/1' does a binary capture out of the entry's key, so it is
+%% `<<"Paris">>' and not `paris'. `eth_fork_schedule:at_least/2' takes an atom and
+%% answers `false` for anything it does not recognise -- that is the module's stated
+%% direction, an unrecognised fork ranks as ancient -- so:
+%%
+%%     at_least(<<"London">>, london) = false      (verified, not inferred)
+%%     at_least(london, london)        = true
+%%
+%% and `base_fee_for/1` therefore answered `undefined` for **every** fork. Pre-London
+%% that is the correct answer, which is exactly why the bug was invisible for the two
+%% thirds of the corpus that predates London and fatal for the rest: the block carried
+%% no base fee, `effective_gas_price/4' took its `undefined` branch, and a **typed**
+%% transaction -- which has no `gasPrice` field to fall back on -- was executed at an
+%% effective price of **0**. An instrumented run of
+%% `london/eip1559_fee_market_change/test_eip1559_tx_validity` reads
+%% `basefee=undefined eff=0 ceiling=7 charged=26006 sender_drop=0`: the sender is
+%% debited 700,000 at `maxFeePerGas` and refunded nothing, for gas that was correct.
+%%
+%% The fix asks `current_fork/4'` about the block the runner is building, using the
+%% `{Number, Timestamp, TD}` that `fork_point/1' already returned. Two reasons for that
+%% rather than translating the name:
+%%
+%%   * it is a **list that does not exist**. The alternative -- a `<<"Frontier">> ->
+%%     frontier' clause per name -- is a second copy of `eth_fork_schedule`'s fork list,
+%%     in the one place that cannot check it. EEST's `ConstantinopleFix` has no schedule
+%%     atom at all, so the list needs a clause that is a lie: that fork is Petersburg's
+%%     rules, as the note on `fork_point/1' already says.
+%%   * the block's own point is the thing being asked about. The name is a label; the
+%%     number and timestamp are what `current_fork/4' decides on.
+%%
+%% Both forms were measured and both are worth +7 fixtures **once the base fee itself
+%% is right** (see `derived_base_fee/3`), and neither is worth anything alone. That is
+%% the part worth remembering: this fixes a wrong *argument* to a correct question, and
+%% the question then turned out to have a wrong *input* as well.
+schedule_fork_at(Number, Timestamp, TD) ->
+    %% **mainnet, not `configured_network()'**, because the numbers `fork_point/1'
+    %% supplies are mainnet's. Asking the configured network -- Sepolia by default --
+    %% answers a different question: mainnet's Berlin activation is 12,244,000 and
+    %% Sepolia's London is long before 12,250,000, so `schedule_fork_at/3` said `london'
+    %% for a Berlin fixture. The new invariant test caught that on its first run, which
+    %% is the argument for writing it before trusting the function.
+    case eth_fork_schedule:current_fork(mainnet, Number, Timestamp, TD) of
+        {ok, F} -> F;
+        _ -> frontier
+    end.
+
+%% The schedule fork a fixture name resolves to, for a test that wants to assert the
+%% mapping without reaching into `block/3'. Exported for the same reason `outcomes/0'
+%% is: the invariant is worth stating and the arithmetic behind it is not.
+-spec schedule_fork_of_key(binary()) -> atom().
+schedule_fork_of_key(Name) when is_binary(Name) ->
+    {Number, Timestamp, TD} = fork_point(Name),
+    schedule_fork_at(Number, Timestamp, TD).
+
 base_fee_for(Fork) ->
     case eth_fork_schedule:at_least(Fork, london) of
         true -> 0;
@@ -684,32 +743,48 @@ merge_base_fee(Base, none) -> Base;
 merge_base_fee(_Base, Derived) -> Derived.
 
 %% Recover the base fee from the expected post-state, or `none'.
-%% **The fixture states the base fee in `env.currentBaseFee' and this ignores it.**
+%% **The fixture states the base fee, so read it before deriving one.**
 %%
-%% Recorded because it cost an hour, and because the reason it is *not* fixed is the
-%% interesting part. The derivation answers `none' for a type-2 transaction --
-%% `effective_price/2' is `min(maxFeePerGas, maxPriorityFeePerGas)' = `min(7, 1)' = 1,
-%% not the 7 the sender actually pays, because the base fee is the very term being
-%% derived and cannot appear in the price that derives it -- so the block came out with
-%% `base_fee_per_gas = undefined', `run_transaction/5' computed `EffectiveGasPrice = 0',
-%% `buy_gas/4' charged the sender nothing and `settle_gas/8' refunded nothing. The
-%% corpus reported that as a **gas** divergence of **+517,958**, which is
-%% `(gasLimit - gasUsed) * price' and looks exactly like a pricing bug.
+%% `env.currentBaseFee' is in the fixture -- `0x07' throughout
+%% `london/eip1559_fee_market_change/test_eip1559_tx_validity` -- and the derivation
+%% below cannot recover it for these entries. Not because the arithmetic is wrong, but
+%% because it has nothing to stand on:
 %%
-%% It is not. An instrumented run of `test_eip1559_tx_validity` reports
-%% `result=ok charged0=26006', and 26,006 is the chain's own figure for that
-%% transaction -- so the gas and the storage write were both right, and the whole of
-%% `+517,958` was the comparison.
+%%     Spend = GasUsed * E               E = min(maxFee, baseFee + priority)
+%%     Gain  = GasUsed * (E - baseFee)
 %%
-%% Preferring the stated figure is the obvious fix and it is **not applied**: an
-%% injection that removed it left every test green, so with `overlay_key/1' in place
-%% the tally is 46 either way and the change cannot be shown to do anything. It is a
-%% real divergence between what the fixture says and what the block is built with, and
-%% it is named here rather than shipped -- a change to a *measurement* that cannot be
-%% shown to change a number is a change to the ruler, not to the node, and this
-%% repository does not ship those without the number to show for it.
-
+%% With `baseFee = 7, maxFee = 7, priority = 1` the **tip is zero**: `E = min(7, 8) = 7`
+%% and `E - baseFee = 0`, so `Gain` is 0 and the sender's spend cannot separate the base
+%% fee from the effective price. The derivation reads the sender's price as
+%% `effective_price/2', which returns `min(maxFee, priority)' = `min(7, 1)' = **1** --
+%% the *tip*, not the price -- and with a zero tip that assumption collapses the two
+%% equations into one.
+%%
+%% Solving both equations properly was written and measured, and it is the weaker fix:
+%% +2 fixtures against this one's +7, and it needs explicit integer arithmetic in the
+%% measurement path because the rational form is a float in Erlang, a float became a
+%% block's `base_fee_per_gas', and `eth_word:mask/1' raised `badarith` **inside the
+%% node** on a block the test had malformed.
+%%
+%% So the stated figure wins, and the derivation is kept for the fixtures that state
+%% none. The three readings are in one place and in this order, deliberately:
+%%
+%%   1. `env.currentBaseFee` -- the fixture's own header field, authoritative;
+%%   2. the derivation from the two balance deltas -- a guess with three ways to fail;
+%%   3. `none`, which `merge_base_fee/1' turns into the fork's default.
+%%
+%% `merge_base_fee/1`'s first clause is **left alone**. It looks like the bug -- it
+%% discards a derived value whenever the fork's figure is `undefined` -- and it is
+%% instead the thing that stops a base fee being attached to a pre-London block, where
+%% the field must not exist. Removing it was measured: the tally falls **46 -> 19**.
 derived_base_fee(Entry, Post, Tx) ->
+    case maps:find(<<"currentBaseFee">>, maps:get(<<"env">>, Entry, #{})) of
+        {ok, Hex} when is_binary(Hex) -> int(Hex);
+        _ -> derive_base_fee(Entry, Post, Tx)
+    end.
+
+derive_base_fee(Entry, Post, Tx) ->
+
     State = maps:get(<<"state">>, Post, #{}),
     Sender = maps:get(<<"sender">>, maps:get(<<"transaction">>, Entry, #{}), <<"0x">>),
     Coinbase = maps:get(<<"currentCoinbase">>, maps:get(<<"env">>, Entry, #{}), <<"0x">>),

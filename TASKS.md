@@ -406,6 +406,34 @@ behavioural change per commit, and each step says what it now does.
      `test_tx_gas_limit` x3. **`+517,958` is `(gasLimit - gasUsed) * price`**: the gas
      is right -- an instrumented run reports `charged0=26006`, the chain's own figure --
      and the price is wrong.
+     **Fixed (`v1.40`), and the tally is 46 -> 53.** Two harness defects, no node
+     change. `schedule_fork_at/3` asks `current_fork/4'` about the block the runner is
+     building, on **mainnet** -- because `fork_point/1`'s numbers are mainnet's, and
+     asking the configured network (Sepolia) answers a different question: mainnet's
+     Berlin is 12,244,000 and Sepolia's London is long before 12,250,000, so Berlin came
+     back as `london`. That was caught by the new invariant test on its first run, which
+     is the argument for writing the test before trusting the function.
+     `derived_base_fee/3` prefers the fixture's own `env.currentBaseFee`, because the
+     derivation **cannot** recover it here: with `baseFee = 7, maxFee = 7, priority = 1`
+     the tip is zero, `Gain` is 0, and the sender's spend cannot separate the base fee
+     from the effective price. The derivation reads the sender's price as
+     `min(maxFee, priority)` = 1, which is the *tip*.
+     Seven fixtures flip and **nothing flips the other way**: the five
+     `test_eip1559_tx_validity` entries plus `homestead/coverage/test_coverage` at
+     Cancun and Prague -- and with them **`+152,536 x2`**, the largest unexplained
+     figure the corpus had, which was the base fee all along.
+     **The other 11 of the 18 are still open.** They move to different and still-large
+     deltas, so a second cause remains in the typed-transaction fee path that none of
+     the four measured candidates reaches.
+     **The measurement, because the choice was not obvious:**
+     `A2+env` (the fix) **+7**; `A2+solve-both-equations` **+2**, needs explicit integer
+     arithmetic because the rational form is a float in Erlang and a float became a
+     block's `base_fee_per_gas` and raised `badarith` **inside the node**; `A2` alone
+     and `env` alone **+0** each; and `merge_base_fee/1`'s first clause **-27** (46 -> 19)
+     because it is the thing that stops a base fee being attached to a pre-London block.
+     `merge_base_fee/1` is **left alone** for that reason, and `schedule_fork_at/3` has
+     no list of fork names in it on purpose -- EEST's `ConstantinopleFix` has no
+     schedule atom, so a name list needs a clause that is a lie.
      **Isolated, and it is one word.** The runner builds the block with
      `base_fee_per_gas = merge_base_fee(base_fee_for(Fork), Derived)`, and
      `base_fee_for/1` is:

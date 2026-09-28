@@ -158,6 +158,24 @@
 %% rather than anything else. The `test_gas.py` contracts behind those fixtures each
 %% call one precompile and do nothing else.
 %%
+%% `match` 46 -> **53** and `state_mismatch` 217 -> 210, from two harness defects and no
+%% node change at all. Both are in how the runner builds the *block* it executes against.
+%%
+%%   * `base_fee_for/1` was handed the fixture's fork **name**, which is a binary,
+%%     where `eth_fork_schedule:at_least/2` wants an atom -- so it answered `undefined`
+%%     for every fork, which is correct before London and wrong from it. The block
+%%     carried no base fee and a typed transaction, having no `gasPrice` field, executed
+%%     at an effective price of zero.
+%%   * the base fee was then derived from the two balance deltas, which cannot work when
+%%     the tip is zero -- and the tip is zero in every fixture here.
+%%
+%% Seven fixtures flip, and **nothing flips the other way**: the five
+%% `test_eip1559_tx_validity` entries, plus `homestead/coverage/test_coverage` at
+%% Cancun and Prague -- and with them `+152,536 x2`, the largest unexplained figure the
+%% corpus had, which turns out to have been the base fee. The other 11 of the 18
+%% typed-transaction fixtures move to different and still-large deltas, so a **second
+%% cause** remains in that path that none of these reaches. See TASKS.md.
+%%
 %% `match` 25 -> **46** and `state_mismatch` 238 -> 217, and neither number moved because
 %% the node got better at executing anything. The runner could not **see** a storage
 %% write the node had made: `eth_state:new/2` rewrites every `{store, A, S}' key of the
@@ -173,8 +191,8 @@
 %% the frame finishing `result=ok charged0=26006`, and 26,006 is the chain's own figure
 %% for that transaction, so both the gas and the write were right and only the
 %% comparison was wrong. See `overlay_key/1'.
--define(EXPECTED, #{match => 46,
-                    state_mismatch => 217,
+-define(EXPECTED, #{match => 53,
+                    state_mismatch => 210,
                     unpriced => 0,
                     tx_decode_failed => 0,
                     tx_roundtrip_mismatch => 0,
@@ -219,6 +237,7 @@ conformance_tally_is_reported() ->
                     not lists:member(O, eest_state_tests:outcomes())],
     ?assertEqual([], Unknown),
     assert_not_mostly_matching(Results),
+    assert_the_block_resolves_to_the_fork_the_fixture_names(Results),
     assert_unreachable_are_reported(Results),
     ?assertEqual(?EXPECTED, eest_state_tests:tally(Results)).
 
@@ -278,6 +297,37 @@ assert_not_mostly_matching(Results) ->
 %% *executed* rather than being wrongly executed, and the difference matters: an
 %% honest gap is not a wrong answer. Pinned so the runner cannot start quietly
 %% dropping them, which would raise the match rate it reports.
+%% **The block the runner builds for a fixture must resolve to the fork the fixture
+%% names.**
+%%
+%% This is the invariant `schedule_fork_at/3' was added to restore, and it is worth
+%% pinning separately from the tally because the tally cannot tell you *which* of two
+%% defects it is looking at. `base_fee_for/1` was handed the entry's fork *name* --
+%% a binary, from `fork_of_key/1' -- where `eth_fork_schedule:at_least/2` wants an
+%% atom, so it answered `undefined` for every fork. That is the correct answer before
+%% London, which is why two thirds of the corpus never noticed, and it is why the
+%% tally was the only place the divergence could show up.
+%%
+%% The check is deliberately about the *block* and not about the name: the entry names
+%% `Paris', `fork_point/1' turns that into a number and a timestamp, and what matters is
+%% that `current_fork/4'` on that point says Paris. A name check would pass while the
+%% block was wrong, which is the bug.
+assert_the_block_resolves_to_the_fork_the_fixture_names(Results) ->
+    Pairs = [{<<"London">>, london}, {<<"Paris">>, paris}, {<<"Shanghai">>, shanghai},
+             {<<"Cancun">>, cancun}, {<<"Prague">>, prague}, {<<"Osaka">>, osaka},
+             {<<"Berlin">>, berlin}, {<<"Istanbul">>, istanbul}],
+    %% Keyed on the *matched* entries only. An assertion over the whole corpus would be
+    %% vacuous for any fork the corpus happens not to match, and would then stop
+    %% checking anything the moment the tally moved -- which is the opposite of what a
+    %% pin is for.
+    Seen = [N || {K, match, _, _} <- Results,
+                 {N, _} <- Pairs,
+                 binary:match(K, <<"fork_", N/binary, "-">>) =/= nomatch],
+    [?assertEqual({N, F}, {N, eest_state_tests:schedule_fork_of_key(N)})
+     || {N, F} <- Pairs, lists:member(N, Seen)],
+    %% And at least one is exercised, or the list above was checked against nothing.
+    ?assert(length(Seen) > 0).
+
 assert_unreachable_are_reported(Results) ->
     Unreachable = [R || {_, fork_unreachable, _, _} = R <- Results],
     ?assert(length(Unreachable) > 0),
