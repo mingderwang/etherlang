@@ -424,9 +424,46 @@ Do not add a default to `config/sys.config`; it is empty on purpose.
 
 ---
 
-## 10. Deliberately not done
+## 10. Deliberately not done, and decided against
 
-Do not "fix" these by guessing. Each is listed in `TASKS.md`.
+**This table used to be one list under one heading, and the heading was wrong for
+nine of its twelve rows.** It said "Do not fix these by guessing" over rows that
+described fixes already made, so a reader looking for what was *left undone* got a
+list where three-quarters of the entries began "Done", "is now", or "was charged
+nowhere". That is the same defect as a wrong number: a handle that cannot be trusted
+is worse than none. It is now two tables.
+
+### Open. Do not fix these by guessing; each is in `TASKS.md`.
+
+| Item | Which EIP | Why it is open |
+|------|-----------|----------------|
+| `eth_kzg:blob_to_kzg_commitment/1` | EIP-4844 | Needs the `g1_lin` derivation. No local blob fixture, and the EIP's own test vector fetch 404'd. Do not "finish" it with an approximation. |
+| `TERMINAL_BLOCK_HASH` | EIP-3675 | Chain-config data, not in the EIP. Carried and echoed, **never checked** against a post-Merge block's difficulty. |
+| Where the 2300 stipend sits relative to the 63/64 cap | EIP-150 | The EIP's pseudocode adds it after the clamp, this module adds it before, and the reading that follows the EIP makes a child's allowance exceed the caller's remaining. Not changed on a reading. |
+| Pre-Berlin `SSTORE` **at Constantinople** | EIP-1283 | The only fork still refused. EIP-1283 replaced the rule and Petersburg reverted it, so a single figure would be right for two spans and wrong at the third -- and wrong *only* at Constantinople is never noticed. Unreachable by block number on mainnet. |
+| `ECADD`/`ECMUL` report an off-curve point as `unsupported` | EIP-196 | EIP-196 makes it a **call failure**. `unsupported` makes `eth_block:run_transaction/5` refuse the whole block. The same class as the blake2f defect `v1.35` fixed; named, not done. |
+| EIP-7702's state transition | EIP-7702 | A type-4 transaction is priced, validated and executed as though it carried **no** authorizations. Decode, sender recovery and both validity rules are done. |
+| `eth_createAccessList` | — | The one genuinely absent JSON-RPC method. |
+| `eth_tx:intrinsic_gas/1` takes no fork | — | Falls back to the operator's `ETH_FORK` pin. Correct for pool admission, where no block exists; **wrong** for `eth_call`, `estimateGas` and block execution, which must use `intrinsic_gas/2`. Not a gap so much as a hazard: it is a one-argument function that answers correctly in the one place nobody calls it wrongly. |
+
+### Closed by a decision, or fixed. Do not "re-open" these.
+
+| Item | Which EIP | Where it ended |
+|------|-----------|----------------|
+| EIP-7685 `requestsHash` field position | EIP-7685 | The EIP does not fix the position. It is **pinned** by a test against a real Sepolia Prague header, and appending last reproduces the claimed hash exactly. Not open. |
+| Per-fork gas *price* wiring | many | Done. `eth_fork_schedule` is the execution path's only owner of prices; the interpreter's duplicate table is deleted. |
+| The code-deposit cost | EIP-2 | `G_codedeposit` = 200 per byte at every fork, from `eth_fork_schedule:code_deposit_cost/1`; a create that cannot pay it fails and its whole forwarded allowance goes. |
+| EIP-2929's cold `SSTORE` term | EIP-2929 | `sstore_cold_cost/2` adds the **additional** `COLD_SLOAD_COST` for a pair not in `accessed_storage_keys`. |
+| EIP-2929's transaction-start warm set | EIP-2929 | `eth_evm:initial_access/2`, gated on Berlin, seeds `tx.sender`, `tx.to` (or the address being created) and the precompiles -- asked of `precompile_at/2` rather than kept as a second list. |
+| A `CALL` the caller cannot afford | EIP-150 / the yellow paper | Pushes 0, **empties the return data**, and adds `sub_call` back. `CALLCODE` gained the check and the transfer it never had. |
+| EIP-150's 63/64 rule and the 2300 stipend | EIP-150 | Both fork-gated (Tangerine Whistle and later; zero before). Only the stipend's *position* remains open, and it is the row above. |
+| Pre-Berlin `SSTORE` at every other fork | EIP-2200 | The flat rule with EIP-2200's inherited figures; `SLOAD_GAS` fork-selected 50/200/800 by EIP-150 and EIP-1884. |
+| A precompile's return data | EIP-211 | `v1.41`. Seven sites, one of which a `grep finish_call(` cannot find. |
+
+### The originals, kept because the reasoning is the point
+
+The two tables above are the status. These are the *arguments*, which are the part
+that stops the next person re-deriving them. Nothing here is a separate claim.
 
 | Item | Why |
 |------|-----|
