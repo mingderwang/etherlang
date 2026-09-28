@@ -154,18 +154,23 @@ blake2f_vector7_single_round_test() ->
                  Out),
     ?assertEqual(1, Gas).
 
+%% EIP-152 fixes the input at exactly 213 bytes, and input it rejects is a **call
+%% failure** -- the call returns nothing and consumes its forwarded gas -- which is not
+%% the same as this node lacking the contract. These asserted `unsupported', and the
+%% consequence was that seven `eip152_blake2' fixtures reported a missing
+%% implementation the node has: the fixture DELEGATECALLs 0x09 with *zero-length*
+%% calldata, the call should fail, and the node was refusing the whole block.
 blake2f_bad_length_test() ->
-    ?assertEqual(unsupported, eth_evm_precompiles:precompile(9, <<>>, istanbul)),
-    ?assertEqual(unsupported,
-                 eth_evm_precompiles:precompile(9, binary:part(blake2f_input(12, 1), 0, 212), istanbul)),
-    ?assertEqual(unsupported,
-                 eth_evm_precompiles:precompile(9, <<(blake2f_input(12, 1))/binary, 0>>,
-                                                istanbul)).
+    [?assertMatch({failed, {blake2f, {input_length, Len, 213}}},
+                  eth_evm_precompiles:precompile(9, D, istanbul))
+     || {Len, D} <- [{0, <<>>},
+                     {212, binary:part(blake2f_input(12, 1), 0, 212)},
+                     {214, <<(blake2f_input(12, 1))/binary, 0>>}]].
 
 blake2f_bad_flag_test() ->
     Good = blake2f_input(12, 1),
     Bad = binary:part(Good, 0, 212),
-    ?assertEqual(unsupported,
+    ?assertMatch({failed, {blake2f, {final_flag, 2}}},
                  eth_evm_precompiles:precompile(9, <<Bad/binary, 2>>, istanbul)).
 
 blake2f_recognized_test() ->
@@ -245,10 +250,13 @@ pairing_empty_test() ->
                  eth_evm_precompiles:precompile(8, <<>>, istanbul)).
 
 pairing_bad_length_test() ->
-    ?assertEqual(unsupported,
-                 eth_evm_precompiles:precompile(8, binary:copy(<<0>>, 191), istanbul)),
-    ?assertEqual(unsupported,
-                 eth_evm_precompiles:precompile(8, binary:copy(<<0>>, 193), istanbul)).
+    %% EIP-197, like EIP-152: a length that is not a whole number of pairs is input
+    %% the check rejects, so the call fails. `unsupported' here said the node could not
+    %% run the check, and refusing the block over it turned a correct rejection into a
+    %% refusal that looked like a gap.
+    [?assertMatch({failed, {ecpairing, {length_not_a_multiple_of_192, Len}}},
+                  eth_evm_precompiles:precompile(8, binary:copy(<<0>>, Len), istanbul))
+     || Len <- [191, 193]].
 
 pairing_single_nondegenerate_test() ->
     %% e(G1,G2) =/= 1 (non-degeneracy): check returns 0.
@@ -274,13 +282,15 @@ pairing_bad_g1_test() ->
     %% x = p is not a valid encoding.
     P = 21888242871839275222246405745257275088696311157297823662689037894645226208583,
     Bad = <<P:256, 0:256, (pairing_g2())/binary>>,
-    ?assertEqual(unsupported, eth_evm_precompiles:precompile(8, Bad, istanbul)).
+    ?assertMatch({failed, {ecpairing, {off_curve_point, 1}}},
+                 eth_evm_precompiles:precompile(8, Bad, istanbul)).
 
 pairing_off_curve_g2_test() ->
     %% Flip a Y bit of the generator: on-wire valid, off the twisted curve.
     <<Xa:256, Xb:256, Ya:256, Yb:256>> = pairing_g2(),
     Bad = <<(pairing_g1())/binary, Xa:256, Xb:256, (Ya + 1):256, Yb:256>>,
-    ?assertEqual(unsupported, eth_evm_precompiles:precompile(8, Bad, istanbul)).
+    ?assertMatch({failed, {ecpairing, {off_curve_point, 1}}},
+                 eth_evm_precompiles:precompile(8, Bad, istanbul)).
 
 pairing_recognized_test() ->
     ?assertEqual(true, eth_evm_precompiles:is_precompile(8, ?FORK)).

@@ -931,6 +931,13 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
                                 {ok, Out, Cost} when CallGas >= Cost ->
                                     finish_call(add_gas(E, CallGas - Cost), Ctx, St0,
                                                 Out, RetOff, RetLen, 1);
+                                {failed, _Why} ->
+                                    %% The precompile ran and its answer is that the
+                                    %% call fails: it returns nothing, and the forwarded
+                                    %% allowance is consumed -- which it already was,
+                                    %% the caller having been charged `CallGas' before
+                                    %% the precompile was asked. The caller carries on.
+                                    finish_call(E, Ctx, St0, <<>>, RetOff, RetLen, 0);
                                 {ok, _Out, _Cost} ->
                                     %% Not enough forwarded gas for the precompile.
                                     %% The call fails and the whole forwarded

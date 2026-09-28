@@ -1254,70 +1254,76 @@ the_evm_allowance_follows_the_blocks_own_fork_test() ->
 %% `execute_transactions/5` propagates it, which is the path it already had for a
 %% transaction it cannot execute. The state is not committed either.
 
-a_pre_berlin_sstore_transaction_is_refused_rather_than_executed_test() ->
+%% ---------------------------------------------------------------------------
+%% Pre-Berlin SSTORE is priced; Constantinople's is refused
+%% ---------------------------------------------------------------------------
+%% The interpreter used to refuse SSTORE at every pre-Berlin fork, and the refusal was
+%% *executed*: recorded as an ordinary failed transaction, charged its whole gas
+%% limit, and the block's state root committed. That was 48 of the 266 committed
+%% fixtures. Pricing the flat rule fixed the 48; refusing is now confined to
+%% Constantinople, where EIP-1283 replaced the rule and Petersburg reverted it.
+%%
+%% The trace that named the cause is worth keeping: the largest single divergence the
+%% corpus had was two `byzantium/eip197_ec_pairing` fixtures where a nineteen-byte
+%% callee spent 979,000 of a 979,000 allowance the chain spends in 35,723, and running
+%% that callee directly showed the call to the pairing check was fine and the `SSTORE`
+%% that stored its return value was the whole of it.
+
+a_pre_berlin_sstore_transaction_is_priced_and_not_refused_test() ->
     with_network("mainnet", fun() -> with_ctx(fun() ->
         {Priv, Sender} = new_key(),
         fund(Sender, 1000 * ?WEI, 0),
         %% `0x60 0x00 0x60 0x01 0x55` is PUSH1 0, PUSH1 1, SSTORE.
         %%
-        %% `to => <<>>` so that `input' is **init code** and this body is what actually
+        %% `to => <<>>` so that `input' is **init code** and this body is what
         %% executes. My first version left `to' at the default probe account, which
         %% made `input' *calldata* -- the frame called an account with no code, ran
-        %% nothing, and the transaction succeeded. The refusal never fired and the test
-        %% would have passed for the wrong reason had the assertion been weaker.
+        %% nothing, and the transaction succeeded.
         Code = <<16#60, 0, 16#60, 1, 16#55>>,
         Tx = signed(Priv, #{to => <<>>, gas => 200000, gas_price => 1, input => Code}),
-        %% The **number** carries the fork, not the timestamp: mainnet reaches Byzantium
-        %% at block 4,370,000 and this node's `fork_at/1' helper resolves a *timestamp*
-        %% at block 1, which is a different question. A timestamp of 4,370,001 at block
-        %% 1 is 1970, and resolves to `paris'.
+        Run = fun(N) ->
+            B = (eth_block:new(<<0:256>>, N))#block{timestamp = 1,
+                                                  gas_limit = 1000000},
+            eth_block:run_transaction(B, Tx, eth_state:new(0, #{}), undefined, 1000000)
+        end,
+        %% Byzantium and Berlin both execute it. A creation's own 53,000 intrinsic is
+        %% charged whatever the body does, so the assertion is that neither is charged
+        %% its whole 200,000 limit -- which is what the refused case looked like.
         ?assertEqual(byzantium, fork_at_number(4370001)),
-        Byzantium = (eth_block:new(<<0:256>>, 4370001))#block{
-                       timestamp = 1, gas_limit = 1000000},
-        Result = eth_block:run_transaction(Byzantium, Tx, eth_state:new(0, #{}),
-                                           undefined, 1000000),
-        ?assertMatch({error, {unpriced, {sstore, byzantium}}}, Result),
-        %% And it is *refused*, not executed: the same transaction at Berlin, whose
-        %% schedule is implemented, produces a block with a receipt. Without this the
-        %% test would pass if `run_transaction/5` simply failed for every reason.
         ?assertEqual(berlin, fork_at_number(12244001)),
-        Berlin = (eth_block:new(<<0:256>>, 12244001))#block{
-                     timestamp = 1, gas_limit = 1000000},
-        {BerlinBlock, _State} = eth_block:run_transaction(
-                                 Berlin, Tx, eth_state:new(0, #{}),
-                                 undefined, 1000000),
-        [Receipt] = BerlinBlock#block.receipts,
-        ?assertEqual(1, maps:get(<<"status">>, Receipt)),
-        %% A creation's own 53,000 intrinsic is charged whatever the body does, so the
-        %% assertion is that it is *not* the whole 200,000 limit -- which is what an
-        %% ordinary execution looks like and what the refused one no longer is.
-        ?assert(maps:get(<<"gasUsed">>, Receipt) < 200000)
+        [begin
+             {B, _S} = Run(N),
+             [R] = B#block.receipts,
+             ?assertEqual(1, maps:get(<<"status">>, R)),
+             ?assert(200000 > maps:get(<<"gasUsed">>, R))
+         end || N <- [4370001, 12244001]]
     end) end).
 
-a_refused_transaction_commits_no_state_test() ->
-    %% `finalize/1' already refused to commit a block whose body contained a
-    %% transaction it could not execute, and deliberately did not commit the state
-    %% either. This asserts it still does, for this reason.
-    with_network("mainnet", fun() -> with_ctx(fun() ->
-        {Priv, Sender} = new_key(),
-        fund(Sender, 1000 * ?WEI, 0),
-        Code = <<16#60, 0, 16#60, 1, 16#55>>,
-        Tx = signed(Priv, #{to => <<>>, gas => 200000, gas_price => 1, input => Code}),
-        Parent = store_parent(eth_mpt:state_root()),
-        Block = (child_block(Parent, 4370001, [Tx]))#block{timestamp = 1,
-                                                          gas_limit = 1000000},
-        %% Measured immediately before the call rather than against `Parent', because
-        %% `store_parent/1' itself writes to the trie and so the parent's root is not
-        %% what the trie holds at this point. The claim under test is that `finalize/1'
-        %% changed nothing, and that is a before-and-after.
-        Before = eth_mpt:state_root(),
-        ?assertMatch({error, {unpriced, {sstore, byzantium}}},
-                     eth_block:finalize(Block)),
-        ?assertEqual({unchanged, Before}, {unchanged, eth_mpt:state_root()})
-    end) end).
+a_constantinople_is_unreachable_by_block_number_and_that_is_why_it_is_the_one_gap_test() ->
+    %% Constantinople and Petersburg activate at the **same** mainnet block, 7,280,000,
+    %% and the last one at a block wins -- so no block ever executes under
+    %% `constantinople' on mainnet. That is why the flat pre-Berlin SSTORE rule can be
+    %% implemented for the eight other pre-Berlin forks and Constantinople is the sole
+    %% refusal: the fork is reachable as a *name* (the corpus passes one, and EEST's
+    %% `Constantinople' is exactly the schedule that never ran on mainnet) and not as a
+    %% block.
+    %%
+    %% I wrote this test expecting a mainnet block at Constantinople and asserting one
+    %% there, and `fork_at_number(7280000)` answered `petersburg`. The refusal is still
+    %% the right behaviour and is pinned where it is reachable -- at the table, in
+    %% `sstore_is_refused_at_constantinople_and_supported_elsewhere_test' -- and this
+    %% pins the reachability fact that makes it the only gap.
+    ?assertEqual(petersburg, fork_at_number(7280000)),
+    ?assertEqual(petersburg, fork_at_number(7280001)),
+    ?assertNot(eth_fork_schedule:sstore_supported(constantinople)),
+    ?assert(eth_fork_schedule:sstore_supported(petersburg)),
+    %% And the two neighbours either side of it, so the assertion is about the block
+    %% pair and not about a number that happens to be one past it.
+    ?assertEqual(byzantium, fork_at_number(7279999)),
+    ?assert(eth_fork_schedule:sstore_supported(byzantium)).
 
 %% The fork a mainnet block *number* lands on, which is a different question from
-%% `fork_at/1' above and the one a block's header actually asks.
+%% `fork_at/1' and the one a block's header actually asks.
 fork_at_number(Number) ->
     {ok, F} = eth_fork_schedule:current_fork(mainnet, Number, 1),
     F.
@@ -1325,7 +1331,7 @@ fork_at_number(Number) ->
 %% mainnet, because **Sepolia's schedule in this node begins at London**, so on the
 %% configured network a pre-Berlin fork is unreachable -- `current_fork(sepolia, N, _)'
 %% answers London or later for every N. The conformance runner sets the same variable
-%% for the same reason. Without it these two tests cannot name a pre-Berlin fork at all,
+%% for the same reason. Without it these tests cannot name a pre-Berlin fork at all,
 %% and a test that cannot reach the state it is about is not a test.
 with_network(Network, Fun) ->
     Previous = os:getenv("ETH_NETWORK"),

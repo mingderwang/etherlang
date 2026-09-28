@@ -649,10 +649,23 @@ wrongly_priced_opcodes_are_now_right_test() ->
 sload_is_warm_cold_with_its_own_cold_cost_test() ->
     ?assertEqual(2100, eth_fork_schedule:gas_cost(16#54, cancun, 0, #{})),
     ?assertEqual(100,  eth_fork_schedule:gas_cost(16#54, cancun, 0, #{warm => true})),
-    %% Before Berlin it was a flat 200, raised by EIP-150, with no warm/cold
-    %% distinction to honour.
-    ?assertEqual(200,  eth_fork_schedule:gas_cost(16#54, istanbul, 0, #{})),
-    ?assertEqual(200,  eth_fork_schedule:gas_cost(16#54, istanbul, 0, #{warm => true})).
+    %% Before Berlin there is no warm/cold distinction at all, but the price is still
+    %% not one number: EIP-150 takes it 50 -> 200 at Tangerine Whistle and EIP-1884
+    %% takes it 200 -> 800 at Istanbul. This asserted 200 at every pre-Berlin fork,
+    %% which is right for one span of three.
+    ?assertEqual(50,   eth_fork_schedule:gas_cost(16#54, frontier, 0, #{})),
+    ?assertEqual(50,   eth_fork_schedule:gas_cost(16#54, homestead, 0, #{})),
+    ?assertEqual(200,  eth_fork_schedule:gas_cost(16#54, tangerine, 0, #{})),
+    ?assertEqual(200,  eth_fork_schedule:gas_cost(16#54, byzantium, 0, #{})),
+    ?assertEqual(800,  eth_fork_schedule:gas_cost(16#54, istanbul, 0, #{})),
+    ?assertEqual(800,  eth_fork_schedule:gas_cost(16#54, istanbul, 0, #{warm => true})),
+    %% Muir Glacier shares Istanbul's rank and so its 800.
+    ?assertEqual(800,  eth_fork_schedule:gas_cost(16#54, muir_glacier, 0, #{warm => true})),
+    %% The three figures are EIP-150's, EIP-1884's and EIP-2929's, and the warm/cold
+    %% split is EIP-2929's -- `warm' is ignored before Berlin on purpose, which is what
+    %% the repeated 50 and 200 assert.
+    ?assertEqual(50,   eth_fork_schedule:gas_cost(16#54, frontier, 0, #{warm => true})),
+    ?assertEqual(200,  eth_fork_schedule:gas_cost(16#54, tangerine, 0, #{warm => true})).
 
 %% MCOPY copies whole words, so it charges 3 base plus 3 per word -- the same
 %% shape as the other copy opcodes. It had no clause, so copying memory, which
@@ -1042,9 +1055,17 @@ pre_berlin_access_costs_are_eip_150s_test() ->
     [?assertEqual(700, eth_fork_schedule:access_cost(16#3C, F, #{})) || F <- Pre],
     [?assertEqual(700, eth_fork_schedule:access_cost(Op, F, #{}))
      || F <- Pre, Op <- [16#F1, 16#F2, 16#F4, 16#FA]],
-    %% SLOAD is COLD_SLOAD_COST's own legacy figure, 200, and not an account's
-    %% 400. The two were separate functions before and are one table now.
-    [?assertEqual(200, eth_fork_schedule:access_cost(16#54, F, #{})) || F <- Pre],
+    %% SLOAD has its own legacy figure and is not an account's 400, but it is not
+    %% *one* legacy figure either: EIP-150 takes it 50 -> 200 at Tangerine Whistle, so
+    %% the three forks before it are at 50, and EIP-1884 takes it to 800 at Istanbul.
+    %% This asserted 200 across the whole pre-Berlin span, which is right for one of
+    %% the three spans inside it.
+    [?assertEqual(50, eth_fork_schedule:access_cost(16#54, F, #{}))
+     || F <- [frontier, homestead, dao]],
+    [?assertEqual(200, eth_fork_schedule:access_cost(16#54, F, #{}))
+     || F <- [tangerine, spurious_dragon, byzantium, constantinople, petersburg]],
+    [?assertEqual(800, eth_fork_schedule:access_cost(16#54, F, #{}))
+     || F <- [istanbul, muir_glacier]],
     %% Warmth is not observable before Berlin, so the argument makes no
     %% difference: there is one pre-Berlin price per opcode.
     [?assertEqual(eth_fork_schedule:access_cost(Op, F, #{}),
@@ -1234,17 +1255,61 @@ sstore_sentry_is_2300_from_berlin_test() ->
 %% (a different schedule, not a restatement of the flat one), and Petersburg's
 %% revert of it. So pre-Berlin is refused rather than priced, and a caller that
 %% forgot to check gets 0 rather than a plausible number.
-sstore_is_refused_before_berlin_test() ->
-    [?assertEqual(false, eth_fork_schedule:sstore_supported(F))
+%% SSTORE is supported at every fork except Constantinople, and the test said the
+%% opposite for eight of them. That was not a harmless over-restriction: the refusal
+%% was *executed* rather than reported, so a pre-Berlin SSTORE consumed the
+%% transaction's whole gas limit and the block's state root was committed anyway. 48
+%% of the 266 committed fixtures.
+%%
+%% Constantinople is the exception and the reason is EIP-1283: it replaced the flat
+%% rule with net metering, and Petersburg reverted it. The flat rule is therefore right
+%% for the eight other pre-Berlin forks and wrong for exactly that one -- which is why
+%% `sstore_supported/1` is a single exception rather than a fork boundary.
+sstore_is_refused_at_constantinople_and_supported_elsewhere_test() ->
+    ?assertNot(eth_fork_schedule:sstore_supported(constantinople)),
+    [?assert(eth_fork_schedule:sstore_supported(F))
      || F <- [frontier, homestead, dao, tangerine, spurious_dragon, byzantium,
-              constantinople, petersburg, istanbul, muir_glacier]],
-    [?assertEqual(true, eth_fork_schedule:sstore_supported(F))
-     || F <- [berlin, london, arrow_glacier, gray_glacier, merge, paris, shanghai,
-              cancun, prague, osaka, amsterdam]],
-    ?assertEqual(false, eth_fork_schedule:sstore_supported(no_such_fork)),
-    %% And the refusal is a refusal, not a price: the fallback answers 0.
-    ?assertEqual({0, 0}, eth_fork_schedule:sstore_cost(constantinople, 0, 0, 1)),
-    ?assertEqual({0, 0}, eth_fork_schedule:sstore_cost(frontier, 7, 7, 0)).
+              petersburg, istanbul, muir_glacier, berlin, london, arrow_glacier,
+              gray_glacier, merge, paris, shanghai, cancun, prague, osaka,
+              amsterdam]],
+    ?assertNot(eth_fork_schedule:sstore_supported(no_such_fork)),
+    %% Constantinople still has no price -- the refusal has to remain a refusal rather
+    %% than become a plausible number, and the clause that answers it must not answer
+    %% 0 *as if* 0 were the price.
+    ?assertEqual({0, 0}, eth_fork_schedule:sstore_cost(constantinople, 0, 0, 1)).
+
+%% The flat rule, priced per fork. `SLOAD_GAS` is fork-selected (50 / 200 / 800 by
+%% EIP-150 and EIP-1884) and the other three figures are EIP-2200's own, quoted as
+%% "SSTORE_SET_GAS: 20000, not changed", "SSTORE_RESET_GAS: 5000, not changed" and
+%% "SSTORE_CLEARS_SCHEDULE: 15000, not changed".
+the_pre_berlin_sstore_is_the_flat_rule_from_eip_2200s_own_figures_test() ->
+    %% A write into an empty slot: SSTORE_SET_GAS, and no refund.
+    [?assertEqual({20000, 0}, eth_fork_schedule:sstore_cost(F, 0, 0, 1))
+     || F <- [frontier, homestead, byzantium, petersburg]],
+    %% A no-op: SLOAD_GAS, which is the fork's, and no refund.
+    [?assertEqual({50, 0}, eth_fork_schedule:sstore_cost(F, 7, 7, 7))
+     || F <- [frontier, homestead]],
+    [?assertEqual({200, 0}, eth_fork_schedule:sstore_cost(F, 7, 7, 7))
+     || F <- [tangerine, byzantium, petersburg]],
+    [?assertEqual({800, 0}, eth_fork_schedule:sstore_cost(F, 7, 7, 7))
+     || F <- [istanbul, muir_glacier]],
+    %% A rewrite of a set slot: SSTORE_RESET_GAS, 5,000 -- *not* Berlin's 2,900,
+    %% which is EIP-2929's table folding the cold-slot access into it and is a
+    %% different rule rather than a different fork's number for the same rule.
+    [?assertEqual({5000, 0}, eth_fork_schedule:sstore_cost(F, 1, 1, 2))
+     || F <- [frontier, homestead, tangerine, byzantium, petersburg, istanbul]],
+    %% A write back to zero refunds SSTORE_CLEARS_SCHEDULE, 15,000 -- and EIP-3529
+    %% lowers that to 4,800 at London, which is *after* Berlin and so does not appear
+    %% in this branch at all.
+    [?assertEqual({5000, 15000}, eth_fork_schedule:sstore_cost(F, 1, 1, 0))
+     || F <- [frontier, homestead, tangerine, byzantium, petersburg, istanbul]],
+    %% And Berlin, for contrast: its reset is 2,900 (EIP-2929 folding the cold-slot
+    %% access in, a different rule rather than another fork's number for this one), and
+    %% its clears refund is still 15,000 -- EIP-3529 lowers that at **London**, which is
+    %% the fork after Berlin, so it does not appear in this branch at all.
+    ?assertEqual({2900, 15000}, eth_fork_schedule:sstore_cost(berlin, 1, 1, 0)),
+    ?assertEqual({20000, 0}, eth_fork_schedule:sstore_cost(berlin, 0, 0, 1)),
+    ?assertEqual({2900, 4800}, eth_fork_schedule:sstore_cost(london, 1, 1, 0)).
 
 %% ---------------------------------------------------------------------------
 %% EIP-7623: the calldata floor

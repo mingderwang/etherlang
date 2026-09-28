@@ -12,8 +12,18 @@
 %% variant can be verified against this implementation in the future.
 %%
 %% Entry point check_pairing/1 takes the raw precompile input and returns
-%% `{ok, 32-byte 0/1}'` or `unsupported` (bad length, bad points, or any internal
-%% error -> the caller proxies upstream, never wrong data).
+%%
+%%   `{ok, 32-byte 0/1}'`                     -- the check ran
+%%   `{error, invalid_input, Why}'`            -- the input is one EIP-197 rejects
+%%   `unsupported`                             -- this node cannot run the check
+%%
+%% Those three are different facts and were two. `unsupported` meant both "the input
+%% is bad" and "I cannot do this", and the caller could not tell them apart -- so
+%% seven corpus fixtures where the node declines for the first reason were reported as
+%% though it lacked the implementation, and a refusal that was right became a gap that
+%% looked real. EIP-197's rule is that an input the pairing check rejects is a **call
+%% failure**: the CALL returns nothing and consumes the gas it forwarded. Only the
+%% third answer is an absence.
 %%
 %% **It used to return the gas cost as a third element, and that was a second owner of
 %% a consensus constant.** The figure was `34000 * K + 45000` -- EIP-1108's Istanbul
@@ -41,7 +51,7 @@
 -define(XI_I, 1).
 
 check_pairing(Data) when byte_size(Data) rem 192 =/= 0 ->
-    unsupported;
+    {error, invalid_input, {length_not_a_multiple_of_192, byte_size(Data)}};
 check_pairing(Data) ->
     K = byte_size(Data) div 192,
     try parse_pairs(Data, K, []) of
@@ -55,9 +65,16 @@ check_pairing(Data) ->
                 end,
             {ok, <<V:256>>};
         unsupported ->
-            unsupported
-    catch _:_ ->
-        unsupported
+            {error, invalid_input, {off_curve_point, K}}
+    catch
+        %% An *internal* failure is not the same as input the node cannot accept, and
+        %% the two used to be the same `unsupported'. EIP-197 makes an input the
+        %% pairing check rejects a **call failure** -- the call returns nothing and
+        %% consumes its forwarded gas -- so that case must not be reported as an
+        %% absence. A crash here is the absence: this node cannot run the check, and
+        %% `eth_block:run_transaction/5' refuses the block rather than committing a
+        %% state root nobody else would produce.
+        _:_ -> unsupported
     end.
 
 parse_pairs(<<>>, 0, Acc) -> {ok, lists:reverse(Acc)};

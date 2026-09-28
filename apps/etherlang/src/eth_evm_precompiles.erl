@@ -40,7 +40,14 @@
 is_precompile(Addr, Fork) ->
     eth_fork_schedule:precompile_at(Fork, Addr) =/= undefined.
 
-%% -> {ok, Output, GasCost} | unsupported
+%% -> `{ok, Output, GasCost}' | `{failed, Why}' | `unsupported'
+%%
+%% The three are different facts. `unsupported' is "this node cannot run this", and
+%% only that: the interpreter raises it as a halt, which `eth_block:run_transaction/5'
+%% turns into a refusal to produce the block at all. `{failed, Why}' is "the EVM's
+%% answer is that the call fails" -- it returns nothing, consumes its forwarded gas, and
+%% the caller carries on. Collapsing the second into the first is what made seven
+%% corpus fixtures report an absence that was really a rejected input.
 precompile(Addr, Data, Fork) ->
     case eth_fork_schedule:precompile_at(Fork, Addr) of
         undefined ->
@@ -70,8 +77,22 @@ run(ecpairing, Data, Fork) ->
     %% a property of the fork, and `eth_pairing_bn128' is given neither the fork nor
     %% any reason to know the price. See the note on that module's `check_pairing/1'.
     case eth_pairing_bn128:check_pairing(Data) of
-        {ok, Out} -> {ok, Out, bn128_cost(ecpairing, Fork, pairings(Data))};
-        Error -> Error
+        {ok, Out} ->
+            {ok, Out, bn128_cost(ecpairing, Fork, pairings(Data))};
+        {error, invalid_input, Why} ->
+            %% A **call failure**, not an absence. EIP-197 makes input the pairing check
+            %% rejects a failed call: it returns nothing and the forwarded gas is gone.
+            %% `failed/1' is the shape `eth_evm:run_call/10' already handles for a
+            %% precompile it cannot afford, so the two paths agree -- and the forwarded
+            %% allowance is consumed either way, because the caller was charged it
+            %% before the precompile was asked.
+            {failed, {ecpairing, Why}};
+        unsupported ->
+            %% This node cannot run the check. `eth_block:run_transaction/5' turns the
+            %% resulting `unsupported' halt into `{error, {unpriced, _}}' and refuses
+            %% the block, which is the honest answer: a state root this node cannot
+            %% produce is worse than no answer.
+            unsupported
     end;
 run(blake2f, Data, _Fork) ->
     blake2f(Data);
@@ -197,10 +218,16 @@ blake2f(Data) when byte_size(Data) =:= 213 ->
     case F of
         0 -> blake2f_run(Rounds, HBin, MBin, T0, T1, false);
         1 -> blake2f_run(Rounds, HBin, MBin, T0, T1, true);
-        _ -> unsupported
+        _ -> {failed, {blake2f, {final_flag, F}}}
     end;
-blake2f(_) ->
-    unsupported.
+blake2f(Data) ->
+    %% EIP-152 fixes the input at exactly 213 bytes, and anything else is input the
+    %% precompile rejects -- which is a **failed call**, not an absence. Returning
+    %% `unsupported' here is what made seven `eip152_blake2' fixtures report an absence
+    %% the node did not have: the fixture DELEGATECALLs 0x09 with **zero-length**
+    %% calldata, the call should fail, and the node was refusing the whole block
+    %% because it had confused a rejected input with an unimplemented contract.
+    {failed, {blake2f, {input_length, byte_size(Data), 213}}}.
 
 blake2f_run(Rounds, HBin, MBin, T0, T1, Final) ->
     H = [W || <<W:64/little>> <= HBin],

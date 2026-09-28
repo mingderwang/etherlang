@@ -66,6 +66,7 @@
           set_code_auth_cost/1,
           all_but_one_64th/1,
           call_stipend/1,
+          sload_gas/1,
           modexp_cost/1,
           modexp_complexity/2,
           precompile_at/2,
@@ -88,10 +89,19 @@
 -define(MOD_EXP_GQUADDIVISOR_BERLIN, 3).
 -define(MOD_EXP_MIN_BERLIN, 200).
 -define(MOD_EXP_GQUADDIVISOR_BYZANTIUM, 20).
+%% The pre-Berlin SSTORE figures, which EIP-2200 quotes as its own "old values ... not
+%% changed". See `sstore_cost/4'. Berlin's reset is 2,900, not 5,000, and that is
+%% EIP-2929's table rather than a disagreement.
+-define(SSTORE_SET_GAS, 20000).
+-define(SSTORE_RESET_GAS, 5000).
 %% EIP-150's GSTIPEND. The interpreter's comment called this EIP-2929's; it is not --
 %% EIP-2929 prices the callee's first access, and the stipend is what pays for it. The
 %% stipend is EIP-150's, from Tangerine Whistle.
 -define(CALL_STIPEND, 2300).
+%% EIP-2929's COLD_SLOAD_COST. Named because `access_prices/1''s second column is
+%% the cold figure and this is the one that is not 2600: an account access is 2600 and a
+%% cold *slot* is 2100, and they are different constants rather than different regimes.
+-define(COLD_SLOAD_COST, 2100).
 -define(BASE_FEE_INITIAL, 1000000000).
 -define(MIN_BASE_FEE, 7).
 -define(MAX_WITHDRAWALS_PER_PAYLOAD, 16).
@@ -1336,7 +1346,7 @@ access_prices(16#31) -> {400, 2600};   % BALANCE
 access_prices(16#3B) -> {700, 2600};   % EXTCODESIZE
 access_prices(16#3C) -> {700, 2600};   % EXTCODECOPY
 access_prices(16#3F) -> {400, 2600};   % EXTCODEHASH
-access_prices(16#54) -> {200, 2100};   % SLOAD
+access_prices(16#54) -> {sload_gas(homestead), 2100};   % SLOAD, see sload_gas/1
 access_prices(Op) when Op >= 16#F1, Op =< 16#F4 -> {700, 2600};  % the CALL family
 access_prices(16#FA) -> {700, 2600};   % STATICCALL
 access_prices(_Op) -> {0, 0}.
@@ -1384,17 +1394,62 @@ constant_cost(_Op, _Fork) ->
 -spec access_cost(integer(), atom(), map()) -> non_neg_integer().
 access_cost(Op, Fork, Args) when is_map(Args) ->
     {Legacy, Cold} = access_prices(Op),
-    case at_least(Fork, berlin) of
-        false ->
-            Legacy;
-        true ->
-            case maps:get(warm, Args, false) of
-                true -> 100;
-                false -> Cold
+    case Op of
+        %% SLOAD is the one opcode whose *non-Berlin* price is not a constant, so the
+        %% table's second element cannot hold it. It was 200 at every fork, which is
+        %% right for exactly one span: EIP-150 takes it 50 -> 200 at Tangerine Whistle
+        %% and EIP-1884 takes it 200 -> 800 at Istanbul. So a Frontier SLOAD cost a
+        %% third of what it should and an Istanbul one 400 too little.
+        16#54 ->
+            access_cost_sload(Fork, Args);
+        _ ->
+            case at_least(Fork, berlin) of
+                false ->
+                    Legacy;
+                true ->
+                    case maps:get(warm, Args, false) of
+                        true -> 100;
+                        false -> Cold
+                    end
             end
     end;
 access_cost(_Op, _Fork, _Args) ->
     0.
+
+access_cost_sload(Fork, Args) ->
+    case at_least(Fork, berlin) of
+        false ->
+            sload_gas(Fork);
+        true ->
+            case maps:get(warm, Args, false) of
+                true -> 100;
+                false -> ?COLD_SLOAD_COST
+            end
+    end.
+
+%% SLOAD_GAS, and it is not one number.
+%%
+%% EIP-150, in its own table of what it changed: "Increase the gas cost of SLOAD to
+%% 200 (from 50)." EIP-1884, likewise: "The SLOAD (0x54) operation changes from 200
+%% to 800 gas." EIP-2929 then makes it the warm/cold pair from Berlin, and the cold
+%% figure is 2100.
+%%
+%% So: 50 at Frontier through the DAO fork, 200 from Tangerine Whistle through
+%% Byzantium, and 800 from Istanbul -- which is EIP-1884's Istanbul, and the figure
+%% EIP-2200 quotes as the "old" value when it sets 800 again at Berlin. The three
+%% numbers are the three EIPs' and not a recollection.
+-spec sload_gas(atom()) -> non_neg_integer().
+sload_gas(Fork) when is_atom(Fork) ->
+    case at_least(Fork, istanbul) of
+        true -> 800;
+        false ->
+            case at_least(Fork, tangerine) of
+                true -> 200;
+                false -> 50
+            end
+    end;
+sload_gas(_Fork) ->
+    200.
 
 %% The CALL family: cold/warm access cost plus, for a value-bearing call, the
 %% 9000 gas stipend (EIP-161) and the 25000 new-account cost (EIP-161).
@@ -1482,9 +1537,32 @@ sstore_sentry(_Fork) -> 0.
 %% `unsupported' error, which `eth_call' answers with an upstream fallback. A
 %% fabricated number would be worse than another node's answer: this one would be
 %% indistinguishable from a correct one.
+%% SSTORE is supported at every fork **except Constantinople**.
+%%
+%% This used to answer `at_least(Fork, berlin)', so every pre-Berlin fork was
+%% refused, and -- much worse than a gap -- the refusal was *executed*: the halt was
+%% recorded as an ordinary failed transaction, charged its whole gas limit, and the
+%% block's state root was committed. That was 48 of the 266 committed fixtures. The
+%% refusal is still correct for Constantinople and for nothing else, and the reason is
+%% below.
 -spec sstore_supported(atom()) -> boolean().
-sstore_supported(Fork) when is_atom(Fork) -> at_least(Fork, berlin);
-sstore_supported(_Fork) -> false.
+sstore_supported(constantinople) ->
+    false;
+sstore_supported(Fork) when is_atom(Fork) ->
+    %% An unrecognised fork is **refused** the rule, not granted it, which is the
+    %% direction this module takes everywhere else. The catch is that `frontier' shares
+    %% rank 0 with every unknown atom -- it is the bottom of the order by definition --
+    %% so `fork_rank(Fork) > 0' on its own refuses Frontier as well. It did, and a test
+    %% said so. `frontier' is 0, not 1; I read it as 1 twice.
+    %%
+    %% My first version was plain `Fork =/= constantinople', which granted the rule at
+    %% *every* unknown fork: `sstore_supported(no_such_fork)' answered `true'. Between
+    %% those two, the two facts that matter are kept apart -- Frontier is a fork,
+    %% `no_such_fork' is not -- and neither version is a list of forks, which would be a
+    %% second copy of the thing this module exists to hold in one place.
+    fork_rank(Fork) > 0 orelse Fork =:= frontier;
+sstore_supported(_Fork) ->
+    false.
 
 %% ---------------------------------------------------------------------------
 %% Transaction-type availability
@@ -1793,13 +1871,64 @@ clears_schedule(_Fork) -> 15000.
           {non_neg_integer(), integer()}.
 sstore_cost(Fork, Original, Current, New)
   when is_atom(Fork), is_integer(Original), is_integer(Current), is_integer(New) ->
+    case sstore_supported(Fork) of
+        false ->
+            %% Refused, so there is no price. This is the only fork that reaches it,
+            %% because the `false' branch below prices every other pre-Berlin fork --
+            %% and it is here so a caller that forgets `sstore_supported/1' gets the
+            %% pre-fork answer rather than a plausible number for a rule this node
+            %% does not implement.
+            {0, 0};
+        true ->
     case at_least(Fork, berlin) of
         false ->
-            %% Not reachable: `sstore_supported/1' is checked by the caller, which
-            %% refuses rather than reaches here. Answering something anyway would be
-            %% inventing a price; the clause exists so a future caller that forgets
-            %% the check gets 0 rather than a plausible number.
-            {0, 0};
+            %% **The flat rule**, which is the yellow paper's and which Petersburg put
+            %% back. EIP-2200 states the figures it inherited:
+            %%
+            %%     Define variables SLOAD_GAS, SSTORE_SET_GAS, SSTORE_RESET_GAS and
+            %%     SSTORE_CLEARS_SCHEDULE. The old and new values for those variables
+            %%     are:
+            %%
+            %%     SLOAD_GAS             : changed from 200 to 800.
+            %%     SSTORE_SET_GAS        : 20000, not changed.
+            %%     SSTORE_RESET_GAS      : 5000, not changed.
+            %%     SSTORE_CLEARS_SCHEDULE: 15000, not changed.
+            %%
+            %% and the rule those figures go with is the three-case one:
+            %%
+            %%     if current value equals new value:            SLOAD_GAS
+            %%     else if current value is zero:                SSTORE_SET_GAS
+            %%     else:                                         SSTORE_RESET_GAS
+            %%         and if new value is zero, add SSTORE_CLEARS_SCHEDULE to refunds
+            %%
+            %% Berlin's figures differ from these -- its reset is 2,900, not 5,000,
+            %% because EIP-2929 folds the cold-slot access into it -- which is why
+            %% this is the `false' branch and the EIP-2200 case below is the `true' one.
+            %%
+            %% `SLOAD_GAS' is itself fork-selected: 50 before Tangerine Whistle,
+            %% 200 from it, 800 from Istanbul (EIP-150, then EIP-1884). Quoting EIP-2200's
+            %% "200" alone would be right for two of the three spans.
+            %%
+            %% **Constantinople is the one fork this does not answer for.** EIP-1283
+            %% replaced the three-case rule with net metering, and Petersburg reverted
+            %% it -- so the flat rule is right for the eight other pre-Berlin forks and
+            %% wrong for exactly one. `sstore_supported/1' still refuses there, and the
+            %% refusal is now safe: `eth_block:run_transaction/5' answers
+            %% `{error, {unpriced, What}}' rather than committing a state root the
+            %% chain would not produce. No committed fixture exercises it, so this is a
+            %% named gap and not a measured one.
+            case Current =:= New of
+                true ->
+                    {sload_gas(Fork), 0};
+                false ->
+                    case Current of
+                        0 -> {?SSTORE_SET_GAS, 0};
+                        _ -> {?SSTORE_RESET_GAS, case New of
+                                                 0 -> clears_schedule(Fork);
+                                                 _ -> 0
+                                             end}
+                    end
+            end;
         true ->
             case Current =:= New of
                 true -> {100, 0};                                    % (1.)
@@ -1809,6 +1938,7 @@ sstore_cost(Fork, Original, Current, New)
                         false -> sstore_dirty(Fork, Original, Current, New)  % (2.2.)
                     end
             end
+    end
     end;
 sstore_cost(_Fork, _Original, _Current, _New) ->
     {0, 0}.

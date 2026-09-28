@@ -1136,8 +1136,20 @@ sload_costs_200_before_berlin_test() ->
     State = eth_state:new(0, #{{store, ?CALLER, 5} => 77}),
     Code = <<16#60, 5, 16#54, 16#50, 16#00>>,
     Push = 3 + 2,
+    %% SLOAD is not one number. EIP-150: "Increase the gas cost of SLOAD to 200 (from
+    %% 50)." EIP-1884: "The SLOAD (0x54) operation changes from 200 to 800 gas."
+    %% EIP-2929 then makes it a warm/cold pair from Berlin.
+    %%
+    %% This test asserted 200 at *every* pre-Berlin fork, which is right for exactly one
+    %% span of three: a Frontier SLOAD cost 50 and an Istanbul one 800. All three
+    %% figures are the EIPs' own.
+    [?assertEqual({F, 50}, {F, spent(Code, State, F) - Push})
+     || F <- [frontier, homestead]],
     [?assertEqual({F, 200}, {F, spent(Code, State, F) - Push})
-     || F <- [frontier, byzantium, petersburg, istanbul]],
+     || F <- [tangerine, spurious_dragon, byzantium, petersburg]],
+    %% Muir Glacier shares Istanbul's rank, so it shares its 800.
+    [?assertEqual({F, 800}, {F, spent(Code, State, F) - Push})
+     || F <- [istanbul, muir_glacier]],
     %% Berlin and later: COLD_SLOAD_COST, which is 2100 and not 2600.
     ?assertEqual(2100, spent(Code, State, berlin) - Push),
     ?assertEqual(2100, spent(Code, State, cancun) - Push).
@@ -1425,15 +1437,31 @@ sstore_at_or_below_the_stipend_fails_the_frame_test() ->
 %% `unsupported' is the reason `eth_call' answers with an upstream fallback, so
 %% this degrades to another node's answer rather than to a plausible wrong one of
 %% this node's own.
-sstore_before_berlin_is_refused_rather_than_priced_test() ->
+%% The pre-Berlin SSTORE is **priced**, not refused, and this test used to assert the
+%% opposite -- that every pre-Berlin fork is refused -- which is how 48 of the 266
+%% committed fixtures came to be executed into wrong state roots. The rule is the flat
+%% one, the figures are EIP-2200's own ("SSTORE_SET_GAS: 20000, not changed",
+%% "SSTORE_RESET_GAS: 5000, not changed"), and `SLOAD_GAS` is itself fork-selected.
+%%
+%% **Constantinople is the one fork still refused**: EIP-1283 replaced the flat rule
+%% with net metering and Petersburg reverted it, so the flat rule is right for the
+%% eight other pre-Berlin forks and wrong for exactly that one.
+the_pre_berlin_sstore_is_the_flat_rule_and_only_constantinople_is_refused_test() ->
     Code = sstore_op(1, 1),
     St = eth_state:set_storage(?STATE, ?ACCT, 1, 0),
-    [?assertMatch({error, {unsupported, {sstore, F}}, _, _},
+    %% A store into an empty slot, at the pre-Berlin forks: SSTORE_SET_GAS, 20,000.
+    [?assertMatch({ok, _, _, _, _},
                   eth_evm:run(Code, ?MSG0, St, #{fork => F}, ?GAS))
-     || F <- [frontier, byzantium, constantinople, petersburg, istanbul]],
-    %% And Berlin is not refused, which is what makes the boundary the boundary.
-    ?assertMatch({ok, _, _, _, _},
-                 eth_evm:run(Code, ?MSG0, St, #{fork => berlin}, ?GAS)).
+     || F <- [frontier, homestead, tangerine, spurious_dragon, byzantium,
+              petersburg, istanbul]],
+    [?assert(eth_fork_schedule:sstore_supported(F))
+     || F <- [frontier, homestead, tangerine, spurious_dragon, byzantium,
+              petersburg, istanbul, muir_glacier, berlin, london, cancun, prague]],
+    ?assertNot(eth_fork_schedule:sstore_supported(constantinople)),
+    [?assertMatch({error, {unsupported, {sstore, constantinople}}, _, _},
+                  eth_evm:run(Code, ?MSG0, St, #{fork => constantinople}, ?GAS)),
+     ?assertMatch({ok, _, _, _, _},
+                  eth_evm:run(Code, ?MSG0, St, #{fork => berlin}, ?GAS))].
 
 %% ---------------------------------------------------------------------------
 %% Calling a precompile

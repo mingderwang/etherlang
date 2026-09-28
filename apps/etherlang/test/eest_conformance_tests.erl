@@ -101,9 +101,29 @@
 %% Both are real gaps and both are now loud, which is the point: a wrong state root
 %% committed to the trie is the failure mode this project exists to avoid, and a
 %% refusal is the correct answer while the schedule is missing.
--define(EXPECTED, #{match => 12,
-                    state_mismatch => 196,
-                    unpriced => 55,
+%%
+%% `unpriced` 55 -> **0**. Nothing in the corpus is now executed that this node cannot
+%% price, and that took two fixes:
+%%
+%%   - **48 pre-Berlin `sstore`.** The flat rule is now implemented for the eight
+%%     pre-Berlin forks that had it, with EIP-2200's own figures
+%%     ("SSTORE_SET_GAS: 20000, not changed", "SSTORE_RESET_GAS: 5000, not changed")
+%%     and `SLOAD_GAS` fork-selected at 50 / 200 / 800 by EIP-150 and EIP-1884.
+%%     Constantinople stays refused, and it is the *only* one that does.
+%%   - **7 `precompile 9`.** `eip152_blake2`'s DELEGATECALLs to 0x09 carry
+%%     **zero-length** calldata; blake2f needs exactly 213 bytes, so the call should
+%%     fail. `eth_evm_precompiles` reported that as `unsupported`, which the block
+%%     layer reads as "this node cannot run this" and refuses the block over. The same
+%%     conflation was in the pairing check, whose `check_pairing/1` returned one atom for
+%%     both a rejected input and a missing implementation.
+%%
+%% `match` 12 -> **17**, so the five fixtures the pre-Berlin rule fixed outright are
+%% now correct rather than merely priced. `state_mismatch` 196 -> 246 is the other side
+%% of the same move: 43 entries now execute and differ for whatever else is wrong with
+%% them, which is a diagnosis rather than a refusal.
+-define(EXPECTED, #{match => 17,
+                    state_mismatch => 246,
+                    unpriced => 0,
                     tx_decode_failed => 0,
                     tx_roundtrip_mismatch => 0,
                     sender_mismatch => 0,
