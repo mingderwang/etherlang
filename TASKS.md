@@ -100,6 +100,36 @@ implemented, so none of the 12/4/2/1 fixtures in those files is a missing opcode
   ones with `maxFee > baseFee + maxPriority`, which is the confirmation the diagnosis
   predicted. And the existing test that *did* use a high cap asserted the buggy figure
   and defended it in a comment; corrected, not deleted.
+- **EIP-2930's access list is priced and never applied. Measured, implemented once,
+  and reverted: it cost 11 fixtures and fixed none.** `eth_tx:intrinsic_gas/2` charges
+  `ACCESS_LIST_ADDRESS_COST * n + ACCESS_LIST_STORAGE_KEY_COST * k` **correctly** --
+  verified directly, 21,000 -> 29,600 for the two-entry list in
+  `eip2930_access_list/test_repeated_address_acl`, a difference of exactly 8,600 =
+  `2400 * 2 + 1900 * 2`. And **nothing anywhere puts the entries in the warm sets**:
+  EIP-2930 says "The address and storage keys would be immediately loaded into the
+  accessed_addresses and accessed_storage_keys global sets", and there is no such code.
+  The corpus figure is **`+4,000` on six fixtures** = `(COLD_SLOAD_COST -
+  WARM_STORAGE_READ_COST) * 2` = `(2,100 - 100) * 2` -- exactly two cold `SLOAD`s of
+  slots the list had already paid to warm, and **no intrinsic term at all**, which is
+  what confirmed the intrinsic was right and the application was missing.
+- **The attempted fix, and why it was reverted.** Seeding `eth_evm:initial_access/3`
+  from the transaction's access list took the tally **206 -> 195**: eleven
+  `istanbul/eip1344_chainid` fixtures stopped matching and **nothing** improved. Two
+  things that should have made it inert, and did not:
+  1. **Every fixture in both affected files spells the field `accessLists`, plural.**
+     The node reads `<<"accessList">>`, singular, so it saw no list at all -- and yet
+     the change moved 11 fixtures. Unexplained, and that is why it was reverted rather
+     than investigated further on the same commit: a change that is net **-11** with no
+     positive result is not worth landing to keep a note, and the note is here.
+  2. The key had to be `{warm_store, Addr, IntegerSlot}` and **not**
+     `{warm_store, Addr, <<0:256>>}`: `SLOAD` and `SSTORE` both `pop` the slot off the
+     stack, where it is a word, and the access list carries 32 bytes. The wrong key is a
+     warm set that is present, correct-looking and completely inert -- the third time
+     this repository has paid for that asymmetry.
+  The likely real cause of the regression is (1) being a *runner* problem rather than a
+  node one: if the runner ought to be presenting `accessLists` as `accessList`, then the
+  node is being handed a transaction with no list and the correct fix is upstream of the
+  warm set. **That is where to look first.**
 - **Nothing in the corpus exercises an invalid ECADD or ECMUL.** Worth stating because
   it is why `v1.44` moved the tally by zero and was still the right change: the
   committed fixtures only ever call 0x06/0x07 with *empty* input (valid -- EIP-196 pads
