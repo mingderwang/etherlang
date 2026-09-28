@@ -760,6 +760,46 @@ run_transaction_executes_calldata_spelled_data_test() ->
 run_transaction_executes_calldata_spelled_input_test() ->
     with_ctx(fun() -> calldata_under("input") end).
 
+%% **The property that made the EIP-196 defect severe, end to end.** A precompile that
+%% answers `unsupported' is a *halt*, and `run_transaction/5' turns a halt into
+%% `{error, {unpriced, What}}' -- a refusal to produce the block at all. So a contract
+%% feeding ECADD a point that is not on the curve did not just get a failed call: it made
+%% this node reject the block containing it, while every other client executed it.
+%%
+%% The contract stores the point `(1,1)`, which is off the curve (`1^2 = 1`,
+%% `1^3 + 3 = 4`), calls ECADD with it, and stores the success flag. The flag must be 0
+%% and the block must exist.
+an_off_curve_ecadd_produces_a_block_rather_than_refusing_it_test() ->
+    with_ctx(fun() ->
+        Code = <<16#60, 1, 16#60, 0, 16#52,            % mem[0..32]  = 1   (x)
+                 16#60, 1, 16#60, 32, 16#52,           % mem[32..64] = 1   (y)
+                 16#60, 0,                            % retlen  = 0
+                 16#60, 0,                            % retoff  = 0
+                 16#60, 64,                           % argslen = 64
+                 16#60, 0,                            % argsoff = 0
+                 16#60, 0,                            % value   = 0
+                 16#60, 6,                            % to      = ECADD
+                 16#61, 16#FF, 16#FF,                 % gas
+                 16#F1,                               % CALL -- leaves the flag
+                 16#60, 7, 16#55,                     % PUSH1 7; SSTORE
+                 16#00>>,
+        ok = eth_mpt:put_code(eth_keccak:hash(Code), Code),
+        ok = eth_mpt:put_account(?PROBE, 0, 0, eth_keccak:hash(Code)),
+        {Priv, Sender} = new_key(),
+        fund(Sender, 1000 * ?WEI, 0),
+        Tx = signed(Priv, #{to => ?PROBE, gas => 100000, gas_price => 1}),
+        {Block, _State1} = eth_block:run_transaction(
+                             eth_block:new(<<0:256>>, 1), Tx, eth_state:new(0, #{}),
+                             undefined, 1000000),
+        [Receipt] = Block#block.receipts,
+        %% It executed, and the call failed: status 1 for the *transaction*, flag 0
+        %% stored. Before the fix this returned `{error, {unpriced, {precompile, 6}}}'
+        %% and there was no receipt to read.
+        ?assertEqual(1, maps:get(<<"status">>, Receipt)),
+        ?assert(0 < maps:get(<<"gasUsed">>, Receipt)),
+        ?assertEqual(0, eth_state:storage(_State1, ?PROBE, 7))
+    end).
+
 calldata_under(Key) ->
     %% `CALLDATASIZE; PUSH1 0; SSTORE` -- and the operand order is the whole point:
     %% `SSTORE' pops the **key** from the top, so the value has to be pushed first. I

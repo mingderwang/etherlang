@@ -420,21 +420,64 @@ secp_egcd(A, B, X, Y, M) ->
     secp_egcd(B rem A, A, Y - Q * X, X, M).
 -define(BN128_P, 21888242871839275222246405745257275088696311157297823662689037894645226208583).
 
+%% EIP-196, on invalid input, in its own words: "Fails on invalid input and consumes
+%% all gas provided." That is a **call failure**: the precompile returns nothing, the
+%% forwarded allowance is gone, and the caller carries on.
+%%
+%% Both of these answered `unsupported', which is a different and much worse thing.
+%% `unsupported' means "this node cannot run this at all", `eth_evm:run_call/10' turns
+%% it into a halt, and `eth_block:run_transaction/5' turns *that* into a refusal to
+%% produce the block -- so a contract that fed ECADD a point not on the curve made this
+%% node **reject the block containing it**, where every other client executes it. An
+%% off-curve point is not a missing implementation; it is a number.
+%%
+%% This is the same conflation `v1.35` fixed for blake2f and that the pairing check
+%% already had, and it is the third time in this module. Measured, after the fix:
+%% ECADD and ECMUL answer `{failed, _}' for an off-curve point, `{ok, _, _}' for
+%% `(1,2) + (0,0)' and for `(0,0) + (0,0)', and `unsupported' is now reachable only for
+%% a precompile this node genuinely does not implement.
 bn128_add(Data, Fork) ->
     <<X1:256, Y1:256, X2:256, Y2:256, _/binary>> = bn128_pad(Data, 128),
-    case {bn128_point(X1, Y1), bn128_point(X2, Y2)} of
-        {error, _} -> unsupported;
-        {_, error} -> unsupported;
-        {P1, P2} -> {ok, bn128_encode(bn128_add_points(P1, P2)),
+    case field_elements([X1, Y1, X2, Y2]) of
+        {error, Why} ->
+            {failed, {ecadd, Why}};
+        ok ->
+            case {bn128_point(X1, Y1), bn128_point(X2, Y2)} of
+                {P1, P2} when P1 =:= error; P2 =:= error ->
+                    {failed, {ecadd, not_on_curve}};
+                {P1, P2} ->
+                    {ok, bn128_encode(bn128_add_points(P1, P2)),
                      bn128_cost(ecadd, Fork, 0)}
+            end
     end.
 
 bn128_mul(Data, Fork) ->
     <<X:256, Y:256, S:256, _/binary>> = bn128_pad(Data, 96),
-    case bn128_point(X, Y) of
-        error -> unsupported;
-        P -> {ok, bn128_encode(bn128_mul_point(P, S)),
-              bn128_cost(ecmul, Fork, 0)}
+    %% **The scalar is deliberately not range-checked.** EIP-196: "The scalar can be
+    %% any number between 0 and 2**256-1", and its test-case list includes "Multiply
+    %% point with scalar that lies between the order of the group and the field (should
+    %% succeed)" and "larger than the field order (should succeed)". Only the *point* is
+    %% checked. Checking the scalar too would refuse inputs the EIP requires to work.
+    case field_elements([X, Y]) of
+        {error, Why} ->
+            {failed, {ecmul, Why}};
+        ok ->
+            case bn128_point(X, Y) of
+                error -> {failed, {ecmul, not_on_curve}};
+                P -> {ok, bn128_encode(bn128_mul_point(P, S)),
+                      bn128_cost(ecmul, Fork, 0)}
+            end
+    end.
+
+%% EIP-196 lists two ways a coordinate is invalid, separately: "if any input point does
+%% not lie on the curve **or any of the field elements (point coordinates) is equal or
+%% larger than the field modulus p**". They are different failures and a client
+%% debugging a rejected call wants to know which one it hit, so they are told apart
+%% rather than both answered `unsupported'.
+field_elements(Xs) ->
+    case [X || X <- Xs, X >= ?BN128_P] of
+        [] -> ok;
+        [X | _] -> {error, {coordinate_not_in_field, X}}
     end.
 
 %% The alt_bn128 price for a fixed number of units, from the fork table's `{Base,

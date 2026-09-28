@@ -116,6 +116,76 @@ kzg_failure_is_not_a_fallback_test() ->
     ?assertNotEqual(unsupported, eth_evm_precompiles:precompile(10, <<>>, ?FORK)).
 
 %% ---------------------------------------------------------------------------
+%% EIP-196 ECADD / ECMUL. The arithmetic was always right; the *error* branch was not.
+%% ---------------------------------------------------------------------------
+
+%% A curve point, as the EIP encodes one: two 32-byte big-endian field elements.
+pt(X, Y) -> <<X:256, Y:256>>.
+
+%% **The property that matters is that a block is still produced.** `unsupported` is a
+%% halt, and `eth_block:run_transaction/5' turns a halt into a refusal to produce the
+%% block at all -- so a contract feeding ECADD a point not on the curve made this node
+%% reject the block containing it, where every other client executes it. EIP-196 says
+%% only: "Fails on invalid input and consumes all gas provided."
+an_off_curve_point_is_a_call_failure_and_not_a_refusal_test() ->
+    ?assertEqual({failed, {ecadd, not_on_curve}},
+                 eth_evm_precompiles:precompile(6, <<(pt(1,1))/binary,
+                                                       (pt(0,0))/binary>>, ?FORK)),
+    ?assertEqual({failed, {ecmul, not_on_curve}},
+                 eth_evm_precompiles:precompile(7, <<(pt(1,1))/binary, 1:256>>,
+                                                ?FORK)),
+    %% And the shape is a *call failure*, which `eth_evm:run_call/10' handles by
+    %% consuming the forwarded gas and letting the caller carry on -- not the
+    %% `unsupported' clause, which is the one that refuses.
+    ?assertNotEqual(unsupported,
+                    eth_evm_precompiles:precompile(6, <<(pt(1,1))/binary,
+                                                       (pt(0,0))/binary>>, ?FORK)).
+
+%% A point off the curve, which is the whole reason the branch above exists. `(1,1)` is
+%% off it: `1^2 = 1` but `1^3 + 3 = 4`. `(1,2)` is on it, and the two are one digit
+%% apart, so a test that gets them the wrong way round is a test that asserts nothing.
+one_one_is_off_the_curve_and_one_two_is_on_it_test() ->
+    ?assertMatch({ok, _, _}, eth_evm_precompiles:precompile(6, <<(pt(1,2))/binary,
+                                                            (pt(0,0))/binary>>, ?FORK)),
+    ?assertMatch({failed, _}, eth_evm_precompiles:precompile(6, <<(pt(1,1))/binary,
+                                                               (pt(0,0))/binary>>, ?FORK)).
+
+%% Adding the point at infinity is the identity, and the point at infinity is `(0,0)` --
+%% which is **not** on the curve, so it has to be a special case or a correct ECADD
+%% would reject its own encoding. EIP-196's encoding section says so directly.
+the_point_at_infinity_is_the_identity_element_test() ->
+    ?assertEqual(<<(pt(1,2))/binary>>,
+                 ok_out(eth_evm_precompiles:precompile(6, <<(pt(1,2))/binary,
+                                                        (pt(0,0))/binary>>, ?FORK))),
+    ?assertEqual(<<(pt(0,0))/binary>>,
+                 ok_out(eth_evm_precompiles:precompile(6, <<(pt(0,0))/binary,
+                                                        (pt(0,0))/binary>>, ?FORK))),
+    ?assertEqual(<<(pt(1,2))/binary>>,
+                 ok_out(eth_evm_precompiles:precompile(7, <<(pt(1,2))/binary, 1:256>>,
+                                                      ?FORK))).
+
+%% A real doubling, pinned to the value rather than to a formula. `(1,2) + (1,2)` on
+%% alt_bn128 is `03 0644E7...` for x and `ED 73...` for y, and that constant is the
+%% check: a test that recomputes it with this repository's own `bn128_add_points/2' and
+%% compares the two would pass with the addition formula itself wrong.
+ecadd_doubles_a_point_on_the_curve_test() ->
+    ?assertEqual(
+       binary:decode_hex(
+         <<"030644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd315"
+           "ed738c0e0a7c92e7845f96b2ae9c0a68a6a449e3538fc7ff3ebf7a5a18a2c4">>),
+       ok_out(eth_evm_precompiles:precompile(6, <<(pt(1,2))/binary, (pt(1,2))/binary>>,
+                                             ?FORK))).
+
+%% EIP-196's own test-case list includes "Both contracts should succeed on empty
+%% input", which is true because short input is "virtually padded with zeros" and
+%% `(0,0)` is the point at infinity. It is pinned because the opposite reading -- that
+%% empty input is a length error -- is a plausible thing to add, and adding it would
+%% break every fixture that calls a precompile with no arguments.
+empty_input_succeeds_because_it_pads_to_the_point_at_infinity_test() ->
+    [?assertMatch({ok, <<_:512>>, _}, eth_evm_precompiles:precompile(N, <<>>, ?FORK))
+     || N <- [6, 7]].
+
+%% ---------------------------------------------------------------------------
 %% EIP-152 BLAKE2b-F vectors (inputs built from parts, outputs verbatim).
 %% ---------------------------------------------------------------------------
 
@@ -211,17 +281,34 @@ ecmul_zero_scalar_test() ->
     ?assertEqual(binary:copy(<<0>>, 64), Out),
     ?assertEqual(6000, Gas).
 
+%% **These two asserted `unsupported', which is the defect this change fixes.** EIP-196
+%% lists the two ways a coordinate is invalid in one sentence and separates them: "if any
+%% input point does not lie on the curve **or any of the field elements (point
+%% coordinates) is equal or larger than the field modulus p**". Both are a *failed call*
+%% -- "Fails on invalid input and consumes all gas provided" -- and neither is a missing
+%% implementation.
+%%
+%% `unsupported` is not a smaller wrong answer. `eth_evm:run_call/10' halts on it and
+%% `eth_block:run_transaction/5' turns that halt into a refusal to produce the block, so
+%% a contract that fed ECADD a bad point made this node **reject the block containing
+%% it** while every other client executed it. These two fixtures assert the difference.
 ecadd_coordinate_at_field_test() ->
     P = 21888242871839275222246405745257275088696311157297823662689037894645226208583,
     In = <<(bn128_u(P))/binary, (bn128_u(0))/binary,
            (bn128_u(0))/binary, (bn128_u(0))/binary>>,
-    ?assertEqual(unsupported, eth_evm_precompiles:precompile(6, In, ?FORK)).
+    ?assertMatch({failed, {ecadd, {coordinate_not_in_field, P}}},
+                 eth_evm_precompiles:precompile(6, In, ?FORK)),
+    ?assertNotEqual(unsupported, eth_evm_precompiles:precompile(6, In, ?FORK)).
 
 ecadd_off_curve_test() ->
-    %% (2,2): 4 =/= 11 mod p.
+    %% (2,2): 4 =/= 11 mod p.  A *different* failure from the one above -- the
+    %% coordinate is in the field, the point is not on the curve -- and it is told apart
+    %% so a caller can say which.
     In = <<(bn128_u(2))/binary, (bn128_u(2))/binary,
            (bn128_u(0))/binary, (bn128_u(0))/binary>>,
-    ?assertEqual(unsupported, eth_evm_precompiles:precompile(6, In, ?FORK)).
+    ?assertEqual({failed, {ecadd, not_on_curve}},
+                 eth_evm_precompiles:precompile(6, In, ?FORK)),
+    ?assertNotEqual(unsupported, eth_evm_precompiles:precompile(6, In, ?FORK)).
 
 ecmul_short_input_padded_test() ->
     %% 64 bytes (no scalar): zero-padded scalar 0 -> infinity.
@@ -350,3 +437,5 @@ the_pairing_module_does_not_price_anything_test() ->
     %% match and bypassed the fork, so the arity is the thing that has to be pinned.
     ?assertEqual({ok, <<1:256>>}, eth_pairing_bn128:check_pairing(<<>>)),
     ?assertEqual(2, tuple_size(eth_pairing_bn128:check_pairing(<<>>))).
+
+ok_out({ok, Out, _Cost}) -> Out.

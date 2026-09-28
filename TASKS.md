@@ -60,7 +60,7 @@ implemented, so none of the 12/4/2/1 fixtures in those files is a missing opcode
 
 | n | file | what is likely, and what would settle it |
 |---|---|---|
-| 26 | `byzantium/eip196_ec_add_mul/test_gas.py` | **Fixed by `v1.42`, and not by this row's guess.** These 26 were never the ECADD/ECMUL defect: the contract forwards 149 gas, ECADD costs 500 at Byzantium and 150 from Istanbul, and the fixture's own post-state is `storage = {}` -- so the chain's call fails on *affordability*. The real cause was `eth_block:effective_gas_price/4`. The ECADD/ECMUL defect is real and still open; see AGENTS.md §10. |
+| 6 | `byzantium/eip196_ec_add_mul/test_gas.py` | **26 -> 6 across `v1.42`/`v1.43`, and the cause was neither the precompile nor the fee path this row guessed.** Every one of the 26 is `enough_gas_False` or `True` with a contract that forwards **149** gas to a 150-gas ECADD and **5,999** to a 6,000-gas ECMUL -- one gas short in both cases, by design, so the precompile never runs and the chain's own post-state is `storage = {}`. The node's EVM does exactly the same. All ten `enough_gas_True` cases were the **fee path** (`v1.42`, `v1.43`). The six that remain are also `enough_gas_False`, and their residue is `+10500` (pre-London) and `+3746`/`+2576` (London+) in *gas*; it is **not yet attributed**, and the two groups differing suggests more than one cause. |
 | 24 | `shanghai/eip3651_warm_coinbase/test_warm_coinbase.py` | EIP-3651. `eth_evm:initial_access/2` (added in `v1.37`) already seeds `tx.to`, so the seeding is either incomplete for this shape or the runner is not applying it. Measure before touching either. |
 | 20 | `homestead/identity_precompile/test_identity.py` | 16 of this file's 28 entries were fixed by `v1.41`. Six remain, in the same code. |
 | 18 | `istanbul/eip1344_chainid/test_chainid.py` | `CHAINID` **is** implemented, so this is a value or a chain-id source defect. 18 fixtures with one wrong value is the cheapest thing on this list, if that is what it is. |
@@ -100,6 +100,11 @@ implemented, so none of the 12/4/2/1 fixtures in those files is a missing opcode
   ones with `maxFee > baseFee + maxPriority`, which is the confirmation the diagnosis
   predicted. And the existing test that *did* use a high cap asserted the buggy figure
   and defended it in a comment; corrected, not deleted.
+- **Nothing in the corpus exercises an invalid ECADD or ECMUL.** Worth stating because
+  it is why `v1.44` moved the tally by zero and was still the right change: the
+  committed fixtures only ever call 0x06/0x07 with *empty* input (valid -- EIP-196 pads
+  it to the point at infinity) or with gas they cannot afford (so it never runs). The
+  defect it fixed was not a gas figure at all but `unsupported` refusing the block.
 - **Block-level conformance is never run.** Every figure above comes from
   `eth_block:run_transaction/5`; nothing in this repository executes a whole block
   against a fixture. That is a different measurement and the one a block-producing node

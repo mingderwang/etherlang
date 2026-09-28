@@ -441,7 +441,7 @@ is worse than none. It is now two tables.
 | `TERMINAL_BLOCK_HASH` | EIP-3675 | Chain-config data, not in the EIP. Carried and echoed, **never checked** against a post-Merge block's difficulty. |
 | Where the 2300 stipend sits relative to the 63/64 cap | EIP-150 | The EIP's pseudocode adds it after the clamp, this module adds it before, and the reading that follows the EIP makes a child's allowance exceed the caller's remaining. Not changed on a reading. |
 | Pre-Berlin `SSTORE` **at Constantinople** | EIP-1283 | The only fork still refused. EIP-1283 replaced the rule and Petersburg reverted it, so a single figure would be right for two spans and wrong at the third -- and wrong *only* at Constantinople is never noticed. Unreachable by block number on mainnet. |
-| `ECADD`/`ECMUL` cannot add or multiply anything but the point at infinity | EIP-196 | Measured, not recalled: an input **shorter than 128 bytes** succeeds (correct -- EIP-196 says short input is "virtually padded with zeros", and `(0,0)` is the point at infinity), and an input of **128 bytes or more** answers `unsupported` at every fork, **including a point that is on the curve**. `(1,2)` is on it: `1^2 = 1` and `1^3 + 3 = 4`. So the precompiles can only ever do the identity, and `unsupported` makes `eth_block:run_transaction/5` **refuse the whole block**. Two errors at once: a real operation reported as absent, and an invalid one (an off-curve point, which EIP-196 makes a *call failure*) not distinguished from it. The same conflation `v1.35` fixed for the pairing check and blake2f. The 26 `eip196_ec_add_mul` fixtures turned out **not** to be this: see `v1.42`. |
+| EIP-196's two invalidity conditions | EIP-196 | **Fixed (`v1.44`)**, and note what the corpus could not tell us: the tally did **not** move, because the committed fixtures only ever call ECADD with *empty* input (valid -- the point at infinity) or with gas they cannot afford (so the precompile never runs). Nothing in the corpus exercises an invalid ECADD. The severity was not in a gas figure at all: `unsupported` is a halt, and `eth_block:run_transaction/5` turns a halt into a **refusal to produce the block**, so a mainnet contract doing a real curve operation would have made this node reject its block. |
 | EIP-7702's state transition | EIP-7702 | A type-4 transaction is priced, validated and executed as though it carried **no** authorizations. Decode, sender recovery and both validity rules are done. |
 | `eth_createAccessList` | — | The one genuinely absent JSON-RPC method. |
 | `eth_tx:intrinsic_gas/1` takes no fork | — | Falls back to the operator's `ETH_FORK` pin. Correct for pool admission, where no block exists; **wrong** for `eth_call`, `estimateGas` and block execution, which must use `intrinsic_gas/2`. Not a gap so much as a hazard: it is a one-argument function that answers correctly in the one place nobody calls it wrongly. |
@@ -497,6 +497,13 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
   second list to fall out of step; and `schedule_fork_at/3` asks about **mainnet**,
   because `fork_point/1`'s activation numbers are mainnet's and asking the configured
   network answers a different question.
+- **A byte width in a hand-written probe is a silent wrong answer.** `<<1:512, 2:512>>`
+  is two **64-byte** fields, not two 32-byte coordinates, so the node read it as the
+  points `(1,0)` and `(2,0)` -- both off the curve -- and I concluded a correct ECADD was
+  broken. Three probes in one session were wrong this way: `16#62` for PUSH2 (it is
+  PUSH3), a 17-byte address, and now a 64-byte field element. A probe is a test with
+  the assertions removed and it fails the same way; the tell is that it disagrees with
+  a derivation you can do on paper.
 - **A test that asserts a defect and argues for it is worse than no test.**
   `unspent_gas_comes_back_at_the_effective_price_test` set `maxFee = 1000` against
   `baseFee + priority = 11`, asserted that the sender pays
