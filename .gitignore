@@ -6,6 +6,10 @@ session*.md
 *.beam
 .rebar3/
 doc/
+# ...but `apps/etherlang/doc/README.md' is source, not a build artifact, and the
+# `doc/' pattern above matches at any depth so it would swallow this too. It is
+# what `make docs' output is *not*, which is the useful part of it.
+!apps/etherlang/doc/
 logs/
 .DS_Store
 node_modules/
