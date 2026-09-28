@@ -79,7 +79,12 @@ depends on execution order, suspect the build before you suspect the code.
 
 ## 3. Architecture
 
-47 modules in `apps/etherlang/src`, 44 test modules in `apps/etherlang/test`.
+48 modules in `apps/etherlang/src` (13,527 lines of code), 51 test modules in
+`apps/etherlang/test` (10,903), and 746 eunit tests. **These counts drift and this
+one had drifted** -- it said 47 and 44 for several commits after it stopped being
+true, which is the same defect as a stale conformance figure: a number in the
+architecture section that a reader will use as a measure of size and that no longer
+describes the tree. Re-derive it with `git ls-files` rather than editing it by hand.
 Every stateful module is a `gen_server` registered under its own module name;
 the tree is in `etherlang_sup`. The rest are pure or stateless (`eth_rlp`,
 `eth_keccak`, `eth_hex`, `eth_word`, `eth_fork_schedule`, `eth_evm`, …) — keep
