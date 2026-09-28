@@ -226,8 +226,11 @@ behavioural change per commit, and each step says what it now does.
 5. ~~**EEST conformance work.**~~  **Done as far as it can be, and the answer is
    bad.** `apps/etherlang/test/eest_state_tests.erl` runs the `execution-spec-tests`
    `state_tests` corpus against this node's state transition and classifies every
-   entry. **78 of 266 committed entries match — 29.3% — and the figure is
+   entry. **220 of 266 committed entries match — 82.7% — and the figure is
    reproducible**, identical per entry from a fresh VM and from inside the suite.
+   (This paragraph said 78 of 266 for several commits after it had stopped being
+   true; the live figure is at "Re-measured after `v1.47`" above, and a second copy
+   of a number that drifts is a second thing to forget to update.)
    Nothing in this repository had ever been measured against a third party's
    expected results before; the opcode table was cross-checked against instruction
    *counts* and the gas schedule was derived from the EIPs, and a schedule can be
@@ -876,7 +879,7 @@ they are not forgotten rather than worked on prematurely.
   - Lighthouse requires both methods, so "Lighthouse-compatible" is not currently true of the engine surface
 - [ ] **`engine_notifyHeaders`** — absent (see the Beacon requests item under Phase 3). The clause does not appear in any per-fork file of the `execution-apis` repository (`paris`, `shanghai`, `cancun`, `prague`, `osaka`, `amsterdam`, `bogota`, `common`); only the V2 `getPayloadBodiesBy*` methods appear under those names. Its shape would have to be guessed, so it is left undone rather than invented
 - [x] **Block authoring** — `payloadAttributes` are read, `forkchoiceUpdated` returns a `payloadId`, and `getPayload` returns a real block. This item said "no `payloadAttributes` handling, so `forkchoiceUpdated` can never return a `payloadId` and the node cannot build a block for the CL", which was true when written and stopped being true when `eth_block_builder` was added to the supervisor's child list; the box outlived the sentence. The builder was rewritten rather than switched on, because the dead version assembled a block with its own header constants, three of which were wrong in ways already found and fixed in `eth_block`, and discarded every `payloadAttributes` field.
-  **The block it builds is still not the block the network would build.** Its state root does not match the network's, for the reasons in item 7 — the same gas-schedule divergences that make the conformance tally 78 of 266. So the item is closed as *wiring* and the divergence is tracked where it can be seen, not here.
+  **The block it builds is still not the block the network would build.** Its state root does not match the network's, for the reasons in item 7 — the same gas-schedule divergences that hold the conformance tally at 220 of 266 rather than all of it. So the item is closed as *wiring* and the divergence is tracked where it can be seen, not here.
 
 ### What the engine could not do before this pass
 
@@ -1234,8 +1237,9 @@ Recorded because the documentation claimed otherwise, and because each of these 
 - [ ] **Performance benchmarks** — block processing speed, state access latency
 - [x] **Conformance tests** — `eest_state_tests.erl` runs the `execution-spec-tests`
   `state_tests` corpus. **Started, and the first measurement is about 2%**
-  (78 of 266 committed entries; see "What to do next" item 5 for the number, the
-  two real defects it found, and why the figure is not yet reproducible). The
+  (78 of 266 committed entries at the first measurement, 220 of 266 now; see "What
+  to do next" item 5 for the number, the real defects it found, and the two harness
+  bugs that made the figure irreproducible until they were fixed). The
   Ethereum Foundation's own `ethereum/tests` block-level suites and EEST's
   `blockchain_tests` are **not** run, and the fork table's provenance check against
   instruction counts is a weaker claim than running the fixtures

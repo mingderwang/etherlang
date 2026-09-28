@@ -580,6 +580,20 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
   `?assert(Request > Cap)` -- because a test that quietly stops saturating goes on
   passing for the wrong reason.
 
+- **`DATA_DIR` is not pid-scoped, and two runs of the corpus tool will corrupt each
+  other's MPT.** `eth_test_util:tmp_dir/0` scopes the *test* directories by pid, and
+  §5 says so, and it is easy to read that as covering everything a run touches. It does
+  not. `eth_mpt` opens `mpt_state.dets` in the configured data dir, `DATA_DIR` defaults
+  to `./data`, and **nothing scopes it**. Six concurrent `eest_report` workers -- which
+  is how one would sensibly shard a 235-file run across six cores -- all opened the same
+  DETS file, and every worker but the one that won the race died at boot with
+  `{badmatch, {error, {needs_repair, "./data/mpt_state.dets"}}}`, with a
+  `CRASH REPORT` for `eth_mpt:ensure_dets/0` and **no conformance output at all**.
+  The failure looks like a corpus or harness problem and is neither: give each worker
+  its own `DATA_DIR` and it is a non-issue. The general form is the one in §5: a
+  resource shared by two processes needs to be scoped by something that differs between
+  them, and "the tests are pid-scoped" is a statement about the tests.
+
 ## 11. Known dead code
 
 - `eth_block_builder` **is now started** and issues `payloadId`s. It was rewritten
