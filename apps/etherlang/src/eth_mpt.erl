@@ -60,7 +60,12 @@
 }).
 
 -define(TAB, eth_mpt_state).
--define(SNAPSHOT_DIR, "data/mpt_snapshots/").
+%% The snapshot lives under the **configured** data dir. It did not: this was the
+%% relative literal `"data/mpt_snapshots/"', so a node started with
+%% `DATA_DIR=/var/lib/etherlang' wrote its trie snapshot into whatever directory it
+%% happened to be launched from, and two nodes sharing a working directory shared a
+%% snapshot file. See the note on `ensure_dets/0' -- the two were the same defect.
+-define(SNAPSHOT_NAME, "mpt_snapshots/mpt_snapshot.dat").
 
 %% ---------------------------------------------------------------------------
 %% Startup
@@ -88,7 +93,7 @@ init([]) ->
         root = eth_trie:root([]),
         trie = none,
         persisted = false,
-        snapshot_file = ?SNAPSHOT_DIR ++ "mpt_snapshot.dat"
+        snapshot_file = filename:join([eth_config:data_dir(), ?SNAPSHOT_NAME])
     },
     case load_snapshot(State) of
         {ok, Restored} ->
@@ -386,8 +391,24 @@ ensure_table() ->
         _ -> ok
     end.
 
+%% **`eth_config:data_dir/0`, not a literal.** This said `Dir = "./data"', which made
+%% `DATA_DIR` -- documented in `AGENTS.md` §7 as "directory for persisted chain data" --
+%% a knob that does nothing for the one piece of state that is persisted. The trie went
+%% to the process's working directory whatever the operator asked for.
+%%
+%% It is also what made a sharded corpus run impossible. `eth_test_util:tmp_dir/0`
+%% scopes the *test* directories by pid, and it is easy to read that as covering
+%% everything a run touches; `DATA_DIR` is the documented way to move the rest, and it
+%% was inert. Six concurrent `eest_report` workers therefore opened one
+%% `mpt_state.dets` and every worker but the one that won the race died at boot with
+%% `{needs_repair, ...}` or `{not_a_dets_file, ...}` and no conformance output at all --
+%% a failure that presents as a corpus problem and is neither.
+%%
+%% `{repair, force}' is on the open, so the file is repaired rather than refused. It
+%% cannot repair a file another VM is *writing*, which is why the shared case produced
+%% two different errors on two different runs.
 ensure_dets() ->
-    Dir = "./data",
+    Dir = eth_config:data_dir(),
     ok = filelib:ensure_dir(filename:join(Dir, "x")),
     case dets:info(?TAB) of
         undefined ->

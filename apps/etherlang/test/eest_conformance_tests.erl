@@ -374,6 +374,70 @@ fork_named(Key) ->
 
 %% The committed corpus is neither empty nor the whole upstream suite. Either would
 %% make the reported tally mean something other than what it says.
+%% The per-fork breakdown must be a **flat** list of `{Outcome, Count}' with integer
+%% counts, and the counts must add up to the fork's entry count. `eest_report' does
+%% `lists:sum/1' over them, so a count that is anything else is not a wrong figure --
+%% it is a crash, and the tool that exists to print the breakdown died instead of
+%% printing it.
+%%
+%% It did. `survey_one/2' read
+%%
+%%     fun(N) -> [{Outcome, N} | N] end,   %% initialiser [{Outcome, 1}]
+%%
+%% where `N' is already the **list** of pairs for that fork, so each entry's "count" was
+%% the whole accumulation so far. Three consequences, none visible on the committed
+%% 266-entry subset, which is why this went unnoticed:
+%%
+%%   * `print_by_fork/1' raised `badarith' -- `0 + [{match, [{match, ...}]}]' -- at the
+%%     **second** entry of the first fork with two entries. The by-fork section had
+%%     never been printed, on any corpus.
+%%   * The structure grew with the **square** of the entries per fork. A full-corpus run
+%%     reached 1,993 entries on prague and the VM gave up.
+%%   * The `n=' and `match=' figures it would have printed, had it printed anything, were
+%%     sums of 1s and lists.
+%%
+%% The committed subset has 266 entries over 13 forks, so its forks hold 3 to 30 entries
+%% each -- comfortably enough to have caught this, and did not, because nothing read the
+%% field. That is the shape of the defect: the consumer was the only thing that could
+%% see it, and the consumer was a developer tool nobody ran at scale.
+the_surveys_by_fork_breakdown_is_a_flat_list_of_outcome_counts_test() ->
+    #{by_fork := Bf} = eest_state_tests:survey(eest_state_tests:committed(), 1000),
+    Forks = maps:to_list(Bf),
+    [begin
+         %% Flat, and every count an integer. These two are the whole invariant.
+         ?assert(is_list(L)),
+         [?assert(well_formed_count(P)) || P <- L],
+         %% And the counts are the fork's entries: the sum is the `n=' the report prints
+         %% and the length is the same number computed a second way, so neither can be
+         %% satisfied by a list that happens to sum right for the wrong reason.
+         ?assertEqual(length(L), lists:sum([C || {_, C} <- L]))
+     end || {_Fork, L} <- Forks],
+    ?assert(length(Forks) >= 8).
+
+%% **NOT ASSERTED HERE: that the per-fork counts add up to `total'.** They do not, in
+%% this process, and I could not attribute it. Measured on the committed corpus, same
+%% code, same corpus:
+%%
+%%   * a **fresh VM** (`erl -noshell -s eest_report main <corpus>`): `total = 266`,
+%%     11 fork keys, and `length/1` over their lists sums to **266**. Exact.
+%%   * **inside this suite**: `total = 266`, and the same sum is **255** -- 11 short,
+%%     **exactly one per fork**, all eleven of them.
+%%
+%% `total` and `by_fork` are updated in the **same map literal** in `survey_one/2`, a
+%% line apart, so every `T + 1' is accompanied by a `maps:update_with/4' on `by_fork'
+%% and they cannot legitimately disagree. So whatever accounts for the 11 is not a
+%% missing update, which means my reading of the code or of the measurement is wrong
+%% somewhere. The honest thing is to say so: asserting `266 = 255` would make the suite
+%% green on a defect, and asserting either figure alone would pin one of them without
+%% knowing which is right. Recorded in TASKS.md with these numbers.
+
+%% One `{Outcome, Count}' from `by_fork': the outcome an atom and the count a positive
+%% integer. The old fold produced a count that was a **list**, which is the whole
+%% failure in one predicate.
+well_formed_count({Outcome, Count}) ->
+    is_atom(Outcome) andalso is_integer(Count) andalso Count >= 1.
+
+
 committed_subset_is_a_real_subset_test() ->
     Files = subset_files(),
     ?assert(length(Files) >= 20),

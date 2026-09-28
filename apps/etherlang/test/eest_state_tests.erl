@@ -162,9 +162,33 @@ survey_one({Key, Outcome, Detail, _File} = R, Acc) ->
     Fork = fork_of_key(Key),
     Acc1 = Acc#{total => T + 1,
                 tally => maps:update_with(Outcome, fun(N) -> N + 1 end, 1, Tl),
+                %% **One count per entry, prepended -- not the previous list used as
+                %% the new entry's count.** This read
+%%%
+%%     fun(N) -> [{Outcome, N} | N] end,   %% initialiser [{Outcome, 1}]
+%%%
+                %% where `N' is already the **list** of `{Outcome, Count}' pairs for this
+                %% fork, so every entry's "count" became the whole accumulation so far
+                %% and the structure grew quadratically. It had three consequences, all
+                %% of them only visible at corpus scale, which is why the committed
+                %% 266-entry subset never showed any of them:
+                %%
+                %%   * `eest_report:print_by_fork/1' does `lists:sum/1' over the counts
+                %%     and got a **list** where it wanted a number -- `badarith: 0 +
+                %%     [{match, [{match, ...}]}]` -- at the **second** entry of the
+                %%     first fork with two entries. So the by-fork breakdown had never
+                %%     been printed at all, on any corpus, and the developer tool
+                %%     whose job is to print it died instead.
+                %%   * Memory grew with the square of the entries per fork. The prague
+                %%     run reached 1,993 entries and then the VM gave up.
+                %%   * The `n=' and `match=' figures it would have printed, had it
+                %%     printed anything, were sums of 1s and lists.
+                %%
+                %% `print_by_fork/1' counts the occurrences itself, so duplicates are
+                %% correct here; what it needed was a **flat** list.
                 by_fork => maps:update_with(Fork,
-                                           fun(N) -> [{Outcome, N} | N] end,
-                                           [{Outcome, 1}], Bf),
+                                           fun(L) -> [{Outcome, 1} | L] end,
+                                           [], Bf),
                 gas => add_gas_delta(G, Outcome, Detail)},
     Acc2 = case Outcome =:= match orelse length(S) >= Lim of
                true -> Acc1;

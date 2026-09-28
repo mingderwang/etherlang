@@ -27,6 +27,73 @@
 > labels are counted, not asserted; re-derive them with
 > `grep -cE '^- \[[ x]\]' TASKS.md` before quoting them.
 
+## Two defects in the corpus tool, found by finally running the full corpus
+
+Both were in `eest_state_tests` / `eest_report` — the **harness**, not the node — and
+between them they are why the full-corpus figure had never been produced. They are
+recorded here rather than as consensus gaps, because neither is a gas figure and neither
+is a state answer.
+
+1. **`survey_one/2`'s per-fork fold grew quadratically and crashed the report.**
+   `by_fork` was accumulated as
+   `fun(N) -> [{Outcome, N} | N] end` with initialiser `[{Outcome, 1}]`, where `N` is
+   already the **list** of `{Outcome, Count}` pairs for that fork — so each entry's
+   "count" became the whole accumulation so far. Three consequences, **none of them
+   visible on the committed 266-entry subset**, which is how it survived:
+   - `eest_report:print_by_fork/1` does `lists:sum/1` over the counts and was handed a
+     **list** where it wanted a number: `badarith, 0 + [{match, [{match, ...}]}]`, at
+     the **second** entry of the first fork with two entries. **The by-fork breakdown
+     had therefore never been printed, on any corpus, by the tool whose job is to print
+     it.**
+   - the structure grew with the **square** of the entries per fork, so memory was the
+     real blocker on a large run rather than time;
+   - the `n=` and `match=` figures it would have printed, had it printed anything, were
+     sums of `1`s and lists.
+
+   Fixed to `fun(L) -> [{Outcome, 1} | L] end` with initialiser `[]`, and pinned by
+   `eest_conformance_tests`, whose new test asserts the shape (**flat list, integer
+   counts**) and that each fork's counts sum to its own length. It bites: the old fold
+   fails `well_formed_count/1` on the first fork.
+
+2. **`DATA_DIR` was documented and inert for the trie.** `eth_mpt:ensure_dets/0` read
+   `Dir = "./data"` and `?SNAPSHOT_DIR` was a relative literal, so the MPT's persistent
+   state followed the **working directory** and `DATA_DIR` — `AGENTS.md` §7's "directory
+   for persisted chain data" — did nothing for the one thing that is persisted. It is
+   also what made a sharded run impossible: `eth_test_util:tmp_dir/0` scopes the *test*
+   directories by pid, it is easy to read that as covering everything a run touches, and
+   six concurrent `eest_report` workers therefore shared one `mpt_state.dets` and every
+   worker but the one that won the race died at boot with `{needs_repair, ...}` or
+   `{not_a_dets_file, ...}` and **no conformance output at all**. Now honours
+   `eth_config:data_dir/0` for both the DETS file and the snapshot.
+
+### Open: `total` and `by_fork` disagree inside the suite, and I could not attribute it
+
+**Measured, unresolved, and deliberately not asserted.** On the committed corpus, same
+code, same corpus:
+
+| where | `total` | sum of `length` over `by_fork`'s lists | forks |
+|---|---|---|---|
+| fresh VM (`erl -noshell -s eest_report main <corpus>`) | 266 | **266** | 11 |
+| inside `eest_conformance_tests` | 266 | **255** | 11 |
+
+**11 short, exactly one per fork, all eleven of them.** `total` and `by_fork` are
+updated in the **same map literal** in `survey_one/2`, one line apart, so every `T + 1`
+is accompanied by a `maps:update_with/4` on `by_fork` and they cannot legitimately
+disagree. Which means either my reading of the code or my reading of the measurement is
+wrong, and the two possibilities have very different fixes — so this is recorded, not
+guessed at.
+
+The test asserts the *shape* (which is what the crash needed) and **deliberately does
+not** assert the cross-fork sum: asserting `266 = 255` would make the suite green on a
+defect, and asserting either figure alone would pin one of them without knowing which is
+right.
+
+Separately, and also recorded in `PROVENANCE.md` and not fixed here: **the outcomes
+drift between a fresh VM and the suite.** Measured on Berlin: a fresh VM gives 5
+`match` / 18 `state_mismatch`; inside the suite, 19 / 3. That is the store-leakage
+hazard `PROVENANCE.md` describes, and it means a full-corpus figure is only meaningful
+from a fresh VM, one fork per process.
+
 ## The queue, re-derived
 
 **Re-measured after `v1.47`, from the committed corpus: 220 of 266 match, 3 are
