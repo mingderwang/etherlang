@@ -224,7 +224,12 @@
 %% through the generator below; the compiler only knows a function is used if it is
 %% exported, and `warnings_as_errors' turns "function ... is unused" into a build
 %% failure.
--export([conformance_tally_is_reported/0]).
+-export([conformance_tally_is_reported/0,
+         %% Same reason as the one above, and the same mistake otherwise: as a
+         %% `_test/0' this one hit EUnit's five-second default and was reported as a
+         %% **cancelled** test rather than a pass, on a machine that also happened to
+         %% be running a corpus sweep. It is the same 266-entry traversal.
+         the_surveys_by_fork_breakdown_is_a_flat_list_of_outcome_counts/0]).
 
 %% The timeout is attached through a generator rather than by naming the function
 %% `_test', which would run it a second time under the five-second default.
@@ -400,7 +405,13 @@ fork_named(Key) ->
 %% each -- comfortably enough to have caught this, and did not, because nothing read the
 %% field. That is the shape of the defect: the consumer was the only thing that could
 %% see it, and the consumer was a developer tool nobody ran at scale.
-the_surveys_by_fork_breakdown_is_a_flat_list_of_outcome_counts_test() ->
+%% The timeout is attached through a generator, for the reason on
+%% `conformance_tally_is_reported_test_/0'. Without it this is a *cancelled* test and
+%% not a failure, which is the worst way for a regression gate to report itself.
+the_surveys_by_fork_breakdown_is_a_flat_list_of_outcome_counts_test_() ->
+    {timeout, 300, fun the_surveys_by_fork_breakdown_is_a_flat_list_of_outcome_counts/0}.
+
+the_surveys_by_fork_breakdown_is_a_flat_list_of_outcome_counts() ->
     #{by_fork := Bf} = eest_state_tests:survey(eest_state_tests:committed(), 1000),
     Forks = maps:to_list(Bf),
     [begin

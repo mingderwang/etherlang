@@ -594,6 +594,26 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
   resource shared by two processes needs to be scoped by something that differs between
   them, and "the tests are pid-scoped" is a statement about the tests.
 
+- **The committed conformance subset is the smallest file in each suite, so it is the
+  easiest 2% of the corpus, and quoting it as "the conformance figure" overstates the
+  node by roughly 40 points.** Measured: 220 of 266 entries on the committed subset
+  (82.7%), **6,786 of 15,660 on the 229 non-`static` files** (43.3%), one fork per fresh
+  VM. Both are true; they are different measurements. The subset is a **regression
+  gate** -- it is small, pinned, and has a clean per-entry attribution -- and it is good
+  at that. It is not a quality claim, and §5's "the committed subset is what CI runs"
+  should be read as *what CI gates on*, not *how good the node is*. The `unpriced` claim
+  is the sharpest illustration: 0 on the subset, **86** on the corpus, written as "nothing
+  is executed that this node cannot price". A property measured on 266 entries and
+  stated without its scope is a claim about the node that the node does not support.
+
+- **A progress interval expressed in files is silent on any corpus smaller than it.**
+  `eest_state_tests:survey/2` reports every 25 files, which is right for 2,681 and useless
+  for a fork with six: `istanbul` ran for **45 minutes of CPU** across five
+  `test_blake2b*` gas-limit sweeps and emitted **nothing**, so it was indistinguishable
+  from a hung worker. The tell that it was not hung was `ps` showing CPU time climbing at
+  104%. Report on a *time* interval as well as a count -- a long-running unit that cannot
+  be observed is indistinguishable from a dead one.
+
 ## 11. Known dead code
 
 - `eth_block_builder` **is now started** and issues `payloadId`s. It was rewritten

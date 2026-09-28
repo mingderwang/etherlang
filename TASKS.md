@@ -27,6 +27,120 @@
 > labels are counted, not asserted; re-derive them with
 > `grep -cE '^- \[[ x]\]' TASKS.md` before quoting them.
 
+## The full-corpus figure, measured for the first time
+
+**229 of the 235 non-`static` files, 15,660 entries: 6,786 match — 43.3%.** This is the
+number the documentation had been carrying as "never measured", and it is **less than
+half** the 82.7% the committed 25-file subset reports. Both numbers are true and the gap
+between them is the most useful thing in this section.
+
+**Why the subset flatters.** The committed subset was chosen by a rule -- *the smallest
+file in each suite* -- to keep it under 150 KB per fixture. The smallest file in a suite
+is the one with the fewest entries and the least state, so the subset is systematically
+the easiest material. 25 files, 266 entries, 82.7%. 229 files, 15,660 entries, 43.3%.
+**The subset measures that the fixes work; the corpus measures what is still broken.**
+
+Per fork, biggest first:
+
+| fork | files | entries | match | |
+|---|---|---|---|---|
+| frontier | 28 | 5,625 | 3,384 | 60.2% |
+| berlin | 6 | 2,957 | 1,486 | 50.3% |
+| cancun | 60 | 2,990 | 436 | 14.6% |
+| prague | 105 | 2,019 | 279 | 13.8% |
+| osaka | 11 | 911 | 763 | 83.8% |
+| byzantium | 3 | 405 | 128 | 31.6% |
+| constantinople | 2 | 192 | 57 | 29.7% |
+| paris | 2 | 180 | 36 | 20.0% |
+| shanghai | 8 | 288 | 125 | 43.4% |
+| homestead | 3 | 82 | 82 | **100%** |
+| london | 1 | 11 | 10 | 90.9% |
+| **total** | **229** | **15,660** | **6,786** | **43.3%** |
+
+`istanbul` (6 files, 4 MB, all `test_blake2b*` gas-limit sweeps) was still running at
+45 minutes of CPU when this was written and is **excluded**; it is 1.3% of the files.
+
+### The outcome breakdown is the more useful number than the percentage
+
+| outcome | count | share |
+|---|---|---|
+| `match` | 6,786 | 43.3% |
+| `state_mismatch` | 6,434 | 41.1% |
+| **`rejection_mismatch`** | **1,975** | **12.6%** |
+| `fork_unreachable` | 363 | 2.3% |
+| **`unpriced`** | **86** | **0.5%** |
+| `expected_rejection_not_raised` | 16 | 0.1% |
+
+**`rejection_mismatch` at 12.6% is the largest unaddressed cluster and the committed
+subset cannot see it at all** -- it is 0 there. It means the node's *admission* decision
+disagrees with the chain's on one entry in eight: it refuses something the chain accepts,
+or accepts something the chain refuses. That is a different class of defect from a gas
+delta, it is invisible in the gas histogram entirely, and 1,975 entries is more than the
+entire `state_mismatch` cluster in the committed subset. **It should be the next thing
+measured, and it is a queue item below.**
+
+**`unpriced` is 86, not 0.** The documentation claimed -- in `README.md` and here --
+that `unpriced` is **0**, "nothing is executed that this node cannot price". That is true
+of the committed subset and **false of the corpus**: 86 entries execute something this
+node cannot price, which `AGENTS.md` §3 makes a refusal rather than a number, so those
+86 commit no state root. The claim was measured on the easy 2% of the material and stated
+as if it were a property of the node. **Corrected below.**
+
+### The gas histogram, in full, and it corrects two more claims
+
+Top schedule-sized deltas (positive = this node spent more), as a share of all 15,660
+entries:
+
+| delta | count | share |
+|---|---|---|
+| **−70,919 / −70,920** | **649** | **4.1%** |
+| +2 | 118 | 0.8% |
+| **−19,880** | **96** | **0.6%** |
+| −100 | 50 | 0.3% |
+| −29,436 | 47 | 0.3% |
+| −39,972 | 47 | 0.3% |
+| **+10,500** | **47** | **0.3%** |
+| −200 | 46 | 0.3% |
+| −47,900 | 45 | 0.3% |
+| −17,811 / −18,072 | 88 | 0.6% |
+| −4,800 | 44 | 0.3% |
+| +10,400 | 42 | 0.3% |
+| +3,717 | 36 | 0.2% |
+| +2,500 | 32 | 0.2% |
+
+Two of these contradict the documentation directly:
+
+  * **−19,880 on 96 entries is `SSTORE_SET_GAS` (20,000) − `SLOAD_GAS` (100)** -- the
+    exact EIP-2200 arm-(1.) signature the README describes as *found and fixed*. It is
+    fixed on the committed subset and **live on 96 corpus entries**. So either the fix is
+    partial (some path still takes arm (1.) when `new' reads as zero) or these 96 go
+    through a route the subset does not exercise. **Unattributed; it is a queue item.**
+  * **−70,919 / −70,920 on 649 entries is the single largest signature in the corpus**
+    and nothing in this repository has a note about it. It is 4.1% of everything. The
+    pair differing by exactly 1 across 649 entries is a strong hint it is an
+    off-by-one in a price or a refund rather than a missing rule -- but that is a
+    hypothesis, not a finding, and it is recorded as one.
+
+`+10,500` on 47 entries is the `eip196_ec_add_mul` `enough_gas_False` delta the committed
+subset shows on 4 fixtures; it is the same defect at corpus scale, still unattributed.
+
+### What the measurement is and is not
+
+  * It is **not** a block-level or Engine-API figure. Nothing here says the node builds
+    or validates a block correctly; it is the state transition alone, per transaction.
+  * It is **from one fork per fresh VM**, which is the only valid methodology: outcomes
+    **drift** between a fresh VM and the suite (see the `DATA_DIR`/drift note below), and
+    a single-VM run over 15,660 entries would be scoring some entries against state
+    another entry left behind.
+  * It is the **non-`static`** half. The 2,446 `static/` files are 315 MB of legacy
+    VMTests and were not run; they are 90% of the file count and are where the
+    documentation says the time goes. **So "the full corpus" is not what this measures**
+    and the number above is "the full EIP-named corpus", which is what
+    `PROVENANCE.md` calls the practical run.
+  * `rebar3 eunit` pins the **266-entry subset** at 220 matches. That pin is unchanged
+    and still passes; it is a regression gate, not a quality claim, and the two numbers
+    should never be quoted interchangeably again.
+
 ## Two defects in the corpus tool, found by finally running the full corpus
 
 Both were in `eest_state_tests` / `eest_report` — the **harness**, not the node — and
@@ -503,7 +617,12 @@ behavioural change per commit, and each step says what it now does.
      project exists to avoid, and a refusal is the correct answer while the schedule is
      missing.
    - ~~**Two named gaps remain behind those 55.**~~ **Both closed** (`v1.35`), and
-     `unpriced` is now **0**: nothing in the corpus is executed that this node cannot
+     `unpriced` is now **0** -- **on the committed subset**. That is the whole scope of
+     the claim, and the full-corpus measurement above falsifies the wider reading of it:
+     **86** entries on the 229-file non-`static` corpus execute something this node cannot
+     price. The sentence used to say "nothing in the corpus", which is a statement about
+     the node written from a measurement of 266 entries. Corrected here and in
+     `README.md`; the underlying gap is unchanged and still open.
      price.
      - **Pre-Berlin SSTORE is priced.** The flat rule — the yellow paper's, which
        Petersburg put back — with the figures EIP-2200 quotes as its own inherited
