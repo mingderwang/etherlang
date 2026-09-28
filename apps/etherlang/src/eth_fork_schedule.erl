@@ -67,6 +67,9 @@
           all_but_one_64th/1,
           call_stipend/1,
           sload_gas/1,
+          sstore_cold_cost/2,
+          code_deposit_cost/1,
+          max_code_size/1,
           modexp_cost/1,
           modexp_complexity/2,
           precompile_at/2,
@@ -93,6 +96,9 @@
 %% changed". See `sstore_cost/4'. Berlin's reset is 2,900, not 5,000, and that is
 %% EIP-2929's table rather than a disagreement.
 -define(SSTORE_SET_GAS, 20000).
+%% EIP-170's MAX_CODE_SIZE, `0x6000` -- the EIP states the parameter in hex and
+%% `2**14 + 2**13` is 24576. See `max_code_size/1'.
+-define(MAX_CODE_SIZE, 24576).
 -define(SSTORE_RESET_GAS, 5000).
 %% EIP-150's GSTIPEND. The interpreter's comment called this EIP-2929's; it is not --
 %% EIP-2929 prices the callee's first access, and the stipend is what pays for it. The
@@ -1830,6 +1836,74 @@ introduced_tx_type(_Type) -> undefined.
 %% it -- with `SSTORE_RESET_GAS + ACCESS_LIST_STORAGE_KEY_COST', which is
 %% (5000 - 2100) + 1900 = 4800. EIP-2929 is what put SSTORE_RESET_GAS at 2900 in
 %% the first place, so the sum is over the *Berlin* reset figure and not over 5000.
+%% The code-deposit cost and the maximum deployable code size, which are two
+%% different things that are constantly confused because EIP-170 changed one of
+%% them.
+%%
+%% `code_deposit_cost/1' is the yellow paper's `G_codedeposit', **200 per byte**,
+%% and it is 200 at every fork in this table: no EIP has ever changed it. EIP-2
+%% did not introduce it and did not change it -- EIP-2 introduced the *consequence*
+%% (item 3: "If contract creation does not have enough gas to pay for the final gas
+%% fee for adding the contract code to the state, the contract creation fails (i.e.
+%% goes out-of-gas) rather than leaving an empty contract"), which is why before
+%% Homestead the gas went and the deployment did not, and from Homestead the
+%% deployment fails as well. `max_code_size/1' is EIP-170's `MAX_CODE_SIZE', 0x6000
+%% = 24576, and EIP-170 is Spurious Dragon.
+%%
+%% So the pair is: 200/byte always, and a 24,576-byte cap only from Spurious Dragon.
+%% Before it there is no cap, only a price -- which is why a 10,000-byte deployment
+%% is legitimate at any fork as long as the caller can pay 2,000,000 gas, and why
+%% `max_code_size/1' answers `infinity' rather than 24576 below Spurious Dragon.
+-spec code_deposit_cost(atom()) -> non_neg_integer().
+code_deposit_cost(Fork) when is_atom(Fork) ->
+    %% One number, deliberately. It is the yellow paper's, and the module comment
+    %% on `access_prices/1' records what happens to a table that assumes a figure
+    %% cannot move: SLOAD's was 200 at every fork and that was right for one span of
+    %% three. This one is pinned by the corpus instead -- `create_deposit_oog' deploys
+    %% 10,000 bytes into a frame holding under 1,000,000 gas, and the fixture's
+    %% expected spend is the whole allowance, which is what "2,000,000 gas of deposit
+    %% out of 934,172 available" has to look like.
+    200;
+code_deposit_cost(_Fork) ->
+    200.
+
+-spec max_code_size(atom()) -> pos_integer() | infinity.
+max_code_size(Fork) when is_atom(Fork) ->
+    case at_least(Fork, spurious_dragon) of
+        true -> ?MAX_CODE_SIZE;
+        false -> infinity
+    end;
+max_code_size(_Fork) ->
+    infinity.
+
+%% EIP-2929's "SSTORE changes", which is two instructions and the node did one of them.
+%%
+%%   When calling `SSTORE', check if the `(address, storage_key)' pair is in
+%%   `accessed_storage_keys'. If it is not, charge an **additional** `COLD_SLOAD_COST'
+%%   gas, and add the pair to `accessed_storage_keys'. Additionally, modify the
+%%   parameters defined in EIP-2200 as follows:
+%%
+%%     SLOAD_GAS        : 800 -> = WARM_STORAGE_READ_COST
+%%     SSTORE_RESET_GAS : 5000 -> 5000 - COLD_SLOAD_COST
+%%
+%% "The other parameters defined in EIP 2200 are unchanged."
+%%
+%% The second half -- the parameter rewrites -- is what `sstore_cost/4' does, and the
+%% first half was missing: the price came from `sstore_cost/4' and nothing added the
+%% additional 2,100. So every **first** touch of a storage slot at Berlin and later
+%% cost 2,100 too little, and the *second* write to the same slot was right, which is
+%% a fingerprint worth naming because it is invisible in any test that writes a slot
+%% twice. It is the largest single divergence in the corpus: 40 of the 217 fixtures
+%% that carry a comparable gas figure, all at exactly -2,100.
+-spec sstore_cold_cost(atom(), boolean()) -> non_neg_integer().
+sstore_cold_cost(Fork, Warm) when is_atom(Fork), is_boolean(Warm) ->
+    case at_least(Fork, berlin) andalso Warm =:= false of
+        true -> ?COLD_SLOAD_COST;
+        false -> 0
+    end;
+sstore_cold_cost(_Fork, _Warm) ->
+    0.
+
 -spec clears_schedule(atom()) -> integer().
 clears_schedule(Fork) when is_atom(Fork) ->
     case at_least(Fork, london) of

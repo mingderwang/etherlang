@@ -783,6 +783,161 @@ created_address(create2, _Nonce, Init) ->
     Addr.
 
 %% ---------------------------------------------------------------------------
+%% The code-deposit cost
+%% ---------------------------------------------------------------------------
+%%
+%% `G_codedeposit` is 200 per byte of the code a create hands back, at every fork, and
+%% it was charged **nowhere**. The size cap was a bare `byte_size(Code) =< 24576' in a
+%% guard -- a predicate with no price behind it, applied at every fork including the
+%% ones before EIP-170 introduced it -- so this node deployed code of any size for
+%% free, and never went out of gas on a create whose deposit it could not pay.
+%%
+%% The corpus is what found it, and the arithmetic is what makes it certain rather than
+%% likely. `create/test_create_deposit_oog` has a twenty-three-byte callee that stores a
+%% word and then `CREATE`s six bytes of init code which itself `RETURN`s 10,000 bytes:
+%% a 2,000,000-gas deposit against a 934,172-gas frame. Seven of those fixtures
+%% expected the whole 1,000,000 allowance to be spent and the node spent 57,062,
+%% handing back 918,145 gas the chain never returns.
+deposit_is_two_hundred_a_byte_at_every_fork_test() ->
+    [?assertEqual({F, 200}, {F, marginal_deposit(F, 8)})
+     || F <- [frontier, homestead, byzantium, petersburg, istanbul, berlin,
+              london, cancun, prague]],
+    %% And the absolute figure, not only the marginal one, because a marginal test
+    %% cannot see a deposit charged at the wrong *rate* for one size and the right one
+    %% for another -- it can only see a difference between two sizes.
+    %%
+    %% Against **one** byte and not against zero, and the 3 gas of difference is the
+    %% reason. A `RETURN' of any non-empty length expands the child's memory by a word
+    %% and a return of nothing expands none, so a zero-byte control folds 3 gas of
+    %% memory expansion into a figure that is supposed to be a deposit, and it comes out
+    %% 3,203 against a 0-byte control. One byte is the smallest deployment that pays
+    %% the memory term, so both
+    %% sides pay it and what is left is the 15 extra bytes at 200 each.
+    ?assertEqual({16, 3000}, {16, deposit_for(16) - deposit_for(1)}).
+
+%% EIP-2 item 3, verbatim: "If contract creation does not have enough gas to pay for
+%% the final gas fee for adding the contract code to the state, the contract creation
+%% fails (i.e. goes out-of-gas) rather than leaving an empty contract."
+%%
+%% The whole forwarded allowance goes, which is what a frame that halts has always done
+%% in this module and what `create_with_value/9' did for the *init code* running out of
+%% gas. It had no clause for the deposit, so it deployed instead.
+a_create_that_cannot_pay_its_deposit_fails_and_consumes_its_forwarded_gas_test() ->
+    [begin
+         {_Left, Deployed} = deploy_probe(10000, ?GAS, F),
+         ?assertEqual({F, {failed, 0}}, {F, Deployed})
+     end || F <- [homestead, byzantium, petersburg, istanbul, berlin, cancun]],
+    %% **Two failing sizes leave the parent with exactly the same gas**, and that is
+    %% the sharpest statement of "the forwarded allowance is gone" available here.
+    %% 5,000 and 6,000 both encode as `PUSH2', so the two parent programs are
+    %% byte-identical apart from the immediate, the child's own four instructions cost
+    %% the same, and the deposits -- 1,000,000 and 1,200,000 -- differ by 200,000. If
+    %% any of the child's unused allowance were returned, the two would differ by it.
+    {Left5, _} = deploy_probe(5000, ?GAS, cancun),
+    {Left6, _} = deploy_probe(6000, ?GAS, cancun),
+    ?assertEqual(Left5, Left6),
+    %% A create that *can* pay leaves the parent far more behind, and the difference is
+    %% the refund the failing one does not make. At 4,000 bytes the deposit is 800,000
+    %% and the frame can pay it, so the child hands back everything it did not spend.
+    {Left4, Deployed4} = deploy_probe(4000, ?GAS, cancun),
+    ?assertEqual({ok, 1}, Deployed4),
+    ?assert(Left4 - Left5 > 100000).
+
+%% EIP-170: `MAX_CODE_SIZE` is `0x6000`, and "if contract creation initialization
+%% returns data with length of **more than** MAX_CODE_SIZE bytes, contract creation
+%% fails with an out of gas error". Spurious Dragon introduced it and nothing before
+%% that fork had one -- the cap is a Spurious Dragon fact, not a constant.
+eip_170_caps_deployed_code_at_spurious_dragon_and_not_before_test() ->
+    %% 24,577 bytes, affordable at 4,915,400 gas of allowance, so the *only* thing
+    %% that can reject it is the cap.
+    Gas = 6000000,
+    {LeftOver, DeployedEIP170} = deploy_probe(24577, Gas, berlin),
+    ?assertEqual({failed, 0}, DeployedEIP170),
+    %% 4,915,400 gas of deposit against a 5,906,250-gas frame, so the failure is the
+    %% **cap** and not the price -- the create is affordable and is rejected anyway.
+    %% EIP-170 says "fails with an out of gas error", and an out-of-gas frame returns
+    %% nothing, so the parent is left holding only the 1/64th EIP-150 withholds.
+    {LeftUnder, DeployedUnder} = deploy_probe(24576, Gas, berlin),
+    ?assertEqual({ok, 1}, DeployedUnder),
+    ?assert(LeftUnder - LeftOver > 900000),
+    %% Before Spurious Dragon there is no cap, so the very same create succeeds --
+    %% `max_code_size/1' answers `infinity' rather than 24576 there, and a constant
+    %% 24576 would have been right for one span of the schedule and wrong for eight.
+    {_, DeployedFrontier} = deploy_probe(24577, Gas, frontier),
+    ?assertEqual({ok, 1}, DeployedFrontier),
+    ?assertEqual(infinity, eth_fork_schedule:max_code_size(frontier)),
+    ?assertEqual(24576, eth_fork_schedule:max_code_size(spurious_dragon)).
+
+%% A parent that CODECOPYs an init-code buffer to offset 0, issues CREATE over it, and
+%% stops. The buffer is `PUSH<n> Size; PUSH1 0; RETURN`, so the child hands back
+%% exactly `Size' bytes of its own (zero) memory: a deployment of `Size' bytes and
+%% nothing else, with the child executing four instructions whatever `Size' is. That
+%% last part is what makes the marginal figure below a *deposit* and not a memory
+%% expansion.
+deployed_bytes(Size) ->
+    Buffer = <<(push_len(Size))/binary, 16#60, 0, 16#F3>>,
+    BLen = byte_size(Buffer),
+    Args = <<16#60, BLen, 16#60, 0, 16#60, 0, 16#F0>>,   %% length, offset, value
+    Copy = <<16#60, BLen, 16#60, 0, 16#60, 0, 16#39>>,   %% destination, offset, length
+    Stop = <<16#00>>,
+    Offset = byte_size(Copy) + byte_size(Args) + byte_size(Stop),
+    <<16#60, BLen, 16#60, Offset, 16#60, 0, 16#39, Args/binary,
+      Stop/binary, Buffer/binary>>.
+
+push_len(N) when N > 255 -> <<16#61, N:16>>;
+push_len(N) -> <<16#60, N>>.
+
+%% Gas the parent spends on a create deploying `Size' bytes, minus what it would
+%% spend deploying one byte. Everything except the deposit is identical between the
+%% two -- the parent is the same program, the child runs the same four instructions,
+%% and the only difference is how many bytes the child's RETURN produced.
+marginal_deposit(Fork, Size) ->
+    deposit_for(Size + 1, Fork) - deposit_for(Size, Fork).
+
+deposit_for(Size) -> deposit_for(Size, cancun).
+deposit_for(Size, Fork) -> deploy_gas(Size, ?GAS, Fork).
+
+deploy_gas(Size, Gas, Fork) ->
+    State = created_address_probe(create, Size),
+    {ok, _, Left, _, _} = eth_evm:run(deployed_bytes(Size), ?MSG0, State,
+                                      #{fork => Fork}, Gas),
+    Gas - Left.
+
+%% `{Left, {ok, 1}}` when the address is deployed, `{Left, {failed, 0}}` when CREATE
+%% pushed 0, and the parent's `Left` in both cases -- which is the half of the answer
+%% that says whether the forwarded allowance was consumed.
+deploy_probe(Size, Gas, Fork) ->
+    State = created_address_probe(create, Size),
+    Code = deployed_bytes(Size),
+    Addr = probe_created_address(Size),
+    {Result, Left} = case eth_evm:run(Code, ?MSG0, State, #{fork => Fork}, Gas) of
+                         {ok, _Out, L, St, _Logs} -> {created(St, Addr), L};
+                         {error, Reason, _St, _Logs} -> erlang:error({create_failed, Reason})
+                     end,
+    {Left, Result}.
+
+created(St, Addr) ->
+    case eth_state:code(St, Addr) of
+        <<>> -> {failed, 0};
+        _ -> {ok, 1}
+    end.
+
+%% The create address for a one-nonce caller and a given init code, seeded as an
+%% empty account so `eth_state:exists/2' does not send the test upstream. The child's
+%% nonce is what the CREATE reads, and the caller starts at 0.
+created_address_probe(create, Size) ->
+    Addr = probe_created_address(Size),
+    eth_state:new(0, #{{balance, ?CALLER} => 1000000000,
+                       {nonce, ?CALLER} => 0,
+                       {balance, Addr} => 0,
+                       {nonce, Addr} => 0,
+                       {code, Addr} => <<>>}).
+
+probe_created_address(Size) ->
+    Buffer = <<(push_len(Size))/binary, 16#60, 0, 16#F3>>,
+    created_address(create, 0, Buffer).
+
+%% ---------------------------------------------------------------------------
 %% Opcode availability by fork
 %% ---------------------------------------------------------------------------
 %%
@@ -1343,20 +1498,32 @@ sstore_tracks_an_original_for_each_slot_separately_test() ->
     Code = <<(sstore_op(1, 1))/binary, (sstore_op(7, 2))/binary>>,
     St0 = eth_state:set_storage(?STATE, ?ACCT, 1, 0),
     St = eth_state:set_storage(St0, ?ACCT, 2, 5),
-    ?assertEqual(2900, sstore_net(Code, St, cancun)).
+    %% 5,000, and the number is worth pausing on. EIP-2929 rewrites EIP-2200's
+    %% `SSTORE_RESET_GAS' to `5000 - COLD_SLOAD_COST' = 2,900 *and* charges an
+    %% additional `COLD_SLOAD_COST' when the slot is cold, so the chain's cost for a
+    %% clean reset of a cold slot is 2,900 + 2,100 = 5,000 -- the figure EIP-2200
+    %% itself names. This asserted 2,900, which is the price of the same reset of a
+    %% slot the frame had already touched.
+    ?assertEqual(5000, sstore_net(Code, St, cancun)).
 
 %% The original is per (address, slot), and this is the only test that can tell
 %% the two apart. The caller writes its *own* slot 1, which starts at 0; the
 %% callee then writes the *callee's* slot 1, which starts at 5. Keyed on the slot
 %% alone, the callee's write would inherit the caller's original of 0, see
-%% 0 =/= 5, and price a clean reset as a dirty write at 100 instead of 2900.
+%% 0 =/= 5, and price a clean reset as a dirty write at 100 instead of the 2,900 it
+%% should be paying before EIP-2929's additional 2,100.
+%%
+%% The answer is 5,000, the same 5,000 as the sibling test above and for the same
+%% reason: the callee's own slot 1 is cold, because warmth is tracked per
+%% `(address, storage_key)' pair, and the caller warming *its* slot 1 does not warm the
+%% callee's. 2,900 + 2,100.
 sstore_tracks_an_original_for_each_account_separately_test() ->
     Callee = <<(sstore_op(7, 1))/binary, 16#00>>,
     Parent = <<(sstore_op(1, 1))/binary, (call_seq(16#0D, 0, 16#F1))/binary, 16#00>>,
     NoStore = <<(sstore_blunt(7, 1))/binary, 16#00>>,   %% the callee's SSTORE, neutered
     With = both_slots(call_state(1000, Callee), 0, 5),
     Without = both_slots(call_state(1000, NoStore), 0, 5),
-    ?assertEqual(2900, callee_net(Parent, With, Without, cancun)).
+    ?assertEqual(5000, callee_net(Parent, With, Without, cancun)).
 
 %% Seed slot 1 of *both* accounts a CALL test touches.
 %%
@@ -1406,7 +1573,14 @@ sstore_after_a_reverted_delegatecall_is_priced_as_a_first_write_test() ->
     St = both_slots(call_state(1000, Callee), 0, 0),
     Sharp = <<(dcall_seq(16#0D, 16#F4))/binary, (sstore_op(3, 1))/binary>>,
     Blunt = <<(dcall_seq(16#0D, 16#F4))/binary, (sstore_blunt(3, 1))/binary>>,
-    ?assertEqual(20000, net_price(Sharp, Blunt, St, cancun)).
+    %% 20,000 plus EIP-2929's additional 2,100. The cold term belongs in *this*
+    %% assertion rather than anywhere else in the test because of what the test is
+    %% about: the DELEGATECALL warmed this very slot -- it is the same
+    %% `(address, storage_key)' pair, DELEGATECALL running the child with the parent's
+    %% address -- and the revert discarded the warmth, so the write that follows is
+    %% the first touch of a cold slot. An assertion of 20,000 could not tell a
+    %% discarded warm marking from a retained one.
+    ?assertEqual(22100, net_price(Sharp, Blunt, St, cancun)).
 
 %% EIP-2200 clause (0), at the boundary. Gas at the SSTORE is 2301 in the first
 %% run and exactly 2300 in the second, and the comparison is `=<', so the first
@@ -1416,7 +1590,13 @@ sstore_after_a_reverted_delegatecall_is_priced_as_a_first_write_test() ->
 sstore_at_or_below_the_stipend_fails_the_frame_test() ->
     Code = sstore_op(7, 1),                       %% a no-op write, so 100
     St = eth_state:set_storage(?STATE, ?ACCT, 1, 7),
-    Sstore = element(1, eth_fork_schedule:sstore_cost(cancun, 7, 7, 7)),
+    %% The *whole* price, cold term included. `sstore_cost/4' is only EIP-2200's half
+    %% of it; EIP-2929's half -- "charge an additional `COLD_SLOAD_COST'" for a slot
+    %% not in `accessed_storage_keys' -- is a separate term, and this slot is cold, so
+    %% leaving it out put the calibration 2,100 gas above the boundary under test and
+    %% made the `=<` assertion below about nothing.
+    Sstore = element(1, eth_fork_schedule:sstore_cost(cancun, 7, 7, 7))
+             + eth_fork_schedule:sstore_cold_cost(cancun, false),
     %% Calibrate on what the program actually spends, because the push price is
     %% a per-byte tier `constant_cost/2' does not carry: it answers 0 for PUSH1
     %% as well as for JUMPDEST, so a threshold computed from the table would sit
@@ -1430,13 +1610,53 @@ sstore_at_or_below_the_stipend_fails_the_frame_test() ->
     ?assertMatch({ok, _, _, _, _},
                  eth_evm:run(Code, ?MSG0, St, ?ENV, At + 1)).
 
-%% Pre-Berlin, SSTORE is refused and says so. There are three pre-Berlin
-%% schedules -- the flat rule, EIP-1283's net metering at Constantinople, and
-%% Petersburg reverting it -- and only EIP-2200's text is implemented here, so a
-%% single pre-Berlin price would be right for two spans and wrong for the third.
-%% `unsupported' is the reason `eth_call' answers with an upstream fallback, so
-%% this degrades to another node's answer rather than to a plausible wrong one of
-%% this node's own.
+%% ---------------------------------------------------------------------------
+%% EIP-2929's additional cold-slot term on SSTORE
+%% ---------------------------------------------------------------------------
+%%
+%% "When calling `SSTORE', check if the `(address, storage_key)' pair is in
+%% `accessed_storage_keys'. If it is not, charge an **additional** `COLD_SLOAD_COST`
+%% gas, and add the pair to `accessed_storage_keys'."
+%%
+%% `sstore_cost/4' carries EIP-2929's *parameter rewrites* -- `SLOAD_GAS` -> 100 and
+%% `SSTORE_RESET_GAS' -> 2,900 -- and the "additional" was missing, so every first
+%% touch of a slot cost 2,100 too little and every second touch was right. The
+%% asymmetry is why it survived: a test that writes a slot twice cannot see it, and
+%% the corpus gave it up only as a -2,100 delta, 40 fixtures all at the same number.
+a_first_write_to_a_slot_pays_eip_2929s_additional_cold_cost_test() ->
+    %% A **no-op** write -- the slot already holds 7 and 7 is written -- and that is
+    %% the whole trick. EIP-2200 arms the two writes identically (`SLOAD_GAS' either
+    %% way), so the first-minus-second difference is EIP-2929's term and nothing else.
+    %% A write of a *different* value would measure arm (2.1.1) against arm (1.) --
+    %% 20,000 against 100 -- and the cold term would be a rounding error in a 22,000
+    %% figure, which is how a missing 2,100 hides inside an assertion that looks
+    %% specific.
+    One = sstore_op(7, 1),
+    St = eth_state:set_storage(?STATE, ?ACCT, 1, 7),
+    [?assertEqual({F, 2100}, {F, cold_sstore_penalty(One, St, F)})
+     || F <- [berlin, london, cancun, prague]],
+    %% And not below Berlin, where there is no access list and no such term. EIP-2929
+    %% is the fork that introduces both halves, so a version of this that also charged
+    %% it at Istanbul would be right for one span of four and wrong for three.
+    [?assertEqual({F, 0}, {F, cold_sstore_penalty(One, St, F)})
+     || F <- [byzantium, petersburg, istanbul, muir_glacier]].
+
+%% `2 * once - twice`, which is the "additional" and nothing else.
+%%
+%% `Code` here is **one** write to a cold slot. `Twice` is the same program with a second
+%% identical write, and the first write is byte-for-byte the same in both, so
+%% `twice - once` is the *second* write's price -- with the slot already warm, because
+%% the first write put the pair in `accessed_storage_keys'. Subtracting that from
+%% `once` leaves exactly EIP-2929's additional term, with the opcode, the push prices
+%% and EIP-2200's arm all cancelling. Written as the arithmetic it is rather than by
+%% neutralising one program against another, because the neutralised version needs a
+%% hand-matched control and a control that drifts is a test that quietly stops
+%% testing.
+cold_sstore_penalty(Code, State, Fork) ->
+    Once = <<Code/binary, 16#00>>,
+    Twice = <<Code/binary, Code/binary, 16#00>>,
+    2 * spent(Once, State, Fork) - spent(Twice, State, Fork).
+
 %% The pre-Berlin SSTORE is **priced**, not refused, and this test used to assert the
 %% opposite -- that every pre-Berlin fork is refused -- which is how 48 of the 266
 %% committed fixtures came to be executed into wrong state roots. The rule is the flat

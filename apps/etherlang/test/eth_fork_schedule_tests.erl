@@ -1265,6 +1265,49 @@ sstore_sentry_is_2300_from_berlin_test() ->
 %% rule with net metering, and Petersburg reverted it. The flat rule is therefore right
 %% for the eight other pre-Berlin forks and wrong for exactly that one -- which is why
 %% `sstore_supported/1` is a single exception rather than a fork boundary.
+code_deposit_cost_is_two_hundred_at_every_fork_test() ->
+    %% The yellow paper's `G_codedeposit', and no EIP has ever changed it -- EIP-2
+    %% introduced the *consequence* of not being able to pay it and left the figure
+    %% alone. A table that said otherwise would be right at one fork and wrong at
+    %% every other, and the corpus would only see the one it happened to test.
+    [?assertEqual({F, 200}, {F, eth_fork_schedule:code_deposit_cost(F)})
+     || F <- [frontier, homestead, dao, tangerine, spurious_dragon, byzantium,
+              constantinople, petersburg, istanbul, muir_glacier, berlin, london,
+              arrow_glacier, gray_glacier, merge, paris, shanghai, cancun, prague,
+              osaka, amsterdam]],
+    ?assertEqual(200, eth_fork_schedule:code_deposit_cost(no_such_fork)).
+
+%% EIP-170's `MAX_CODE_SIZE' is `0x6000' = 24576 and EIP-170 is Spurious Dragon, so
+%% below it there is **no cap** and the only thing bounding a deployment is what the
+%% caller can pay. Answering 24576 everywhere would be right for one span of the
+%% schedule and wrong for eight forks, and pre-Spurious-Dragon blocks are on the chain.
+max_code_size_is_eip_170s_and_only_from_spurious_dragon_test() ->
+    [?assertEqual({F, infinity}, {F, eth_fork_schedule:max_code_size(F)})
+     || F <- [frontier, homestead, dao, tangerine]],
+    [?assertEqual({F, 24576}, {F, eth_fork_schedule:max_code_size(F)})
+     || F <- [spurious_dragon, byzantium, constantinople, petersburg, istanbul,
+              muir_glacier, berlin, london, cancun, prague, osaka, amsterdam]],
+    ?assertEqual(infinity, eth_fork_schedule:max_code_size(no_such_fork)).
+
+%% EIP-2929, verbatim: "When calling `SSTORE', check if the `(address, storage_key)'
+%% pair is in `accessed_storage_keys'. If it is not, charge an **additional**
+%% `COLD_SLOAD_COST' gas, and add the pair to `accessed_storage_keys'."
+%%
+%% This is the term the interpreter was not charging, and it is Berlin-and-later only
+%% because EIP-2929 introduces the access list as well as the term.
+sstore_cold_cost_is_eip_2929s_additional_term_from_berlin_only_test() ->
+    [?assertEqual({F, 2100}, {F, eth_fork_schedule:sstore_cold_cost(F, false)})
+     || F <- [berlin, london, arrow_glacier, gray_glacier, merge, paris, shanghai,
+              cancun, prague, osaka, amsterdam]],
+    [?assertEqual({F, 0}, {F, eth_fork_schedule:sstore_cold_cost(F, false)})
+     || F <- [frontier, homestead, dao, tangerine, spurious_dragon, byzantium,
+              constantinople, petersburg, istanbul, muir_glacier]],
+    %% Warm is 0 at every fork: a slot already in the set is not charged again, and
+    %% that is the property the interpreter's marking-then-charging order exists for.
+    [?assertEqual(0, eth_fork_schedule:sstore_cold_cost(F, true))
+     || F <- [frontier, istanbul, berlin, cancun, prague]],
+    ?assertEqual(0, eth_fork_schedule:sstore_cold_cost(no_such_fork, false)).
+
 sstore_is_refused_at_constantinople_and_supported_elsewhere_test() ->
     ?assertNot(eth_fork_schedule:sstore_supported(constantinople)),
     [?assert(eth_fork_schedule:sstore_supported(F))

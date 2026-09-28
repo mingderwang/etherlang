@@ -493,13 +493,15 @@ do_op(16#55, E, Ctx) ->
         false ->
             case eth_fork_schedule:sstore_supported(Ctx#ctx.fork) of
                 false ->
-                    %% Refused rather than priced. There are three pre-Berlin
-                    %% SSTORE schedules and only EIP-2200's text is implemented
-                    %% here, so a single pre-Berlin figure would be right for two
-                    %% spans and wrong for Constantinople -- and `unsupported' is
-                    %% what eth_call answers with an upstream fallback, so this
-                    %% degrades to another node's answer rather than to a
-                    %% plausible wrong one of this node's own.
+                    %% **Constantinople only.** The flat rule -- the yellow paper's,
+                    %% which Petersburg put back -- is priced at the other eight
+                    %% pre-Berlin forks, with EIP-2200's own inherited figures. It is
+                    %% EIP-1283 that replaced the rule with net metering, Petersburg
+                    %% reverted that, and Constantinople is the one fork left with a
+                    %% schedule this module does not implement. `unsupported' is what
+                    %% `eth_call' answers with an upstream fallback, so this degrades
+                    %% to another node's answer rather than to a plausible wrong one
+                    %% of this node's own.
                     unsupported({sstore, Ctx#ctx.fork}, E, Ctx);
                 true -> sstore(E, Ctx)
             end
@@ -613,12 +615,30 @@ sstore(E, Ctx) ->
     case E2#e.gas =< eth_fork_schedule:sstore_sentry(Ctx#ctx.fork) of
         true -> oog(E2, Ctx);
         false ->
-            {Original, CtxA} = original_of(Ctx, Addr, Slot, Current),
+            %% EIP-2929's SSTORE clause, in the EIP's own order: check the
+            %% `(address, storage_key)' pair against `accessed_storage_keys', charge an
+            %% **additional** `COLD_SLOAD_COST' if it is not there, and add it.
+            %%
+            %% The "additional" was missing. The price came from `sstore_cost/4' -- which
+            %% does carry EIP-2929's parameter rewrites, `SLOAD_GAS' -> 100 and
+            %% `SSTORE_RESET_GAS' -> 2,900 -- and nothing ever added the 2,100, so
+            %% every *first* touch of a slot at Berlin and later cost 2,100 too little
+            %% and every second touch was right. That asymmetry is why it survived: a
+            %% test that writes a slot twice cannot see it, and the corpus gave it up
+            %% only as a -2,100 delta on 40 fixtures, all the same number.
+            %%
+            %% Marking and charging are one step here, as they are for SLOAD
+            %% (`store_access_price/3'): the price depends on the answer and the answer
+            %% changes as a side effect of asking, so peeking first is the only order
+            %% that gets the second write right.
+            {Warm, CtxW} = warm_store(Ctx, Addr, Slot),
+            Cold = eth_fork_schedule:sstore_cold_cost(Ctx#ctx.fork, Warm),
+            {Original, CtxA} = original_of(CtxW, Addr, Slot, Current),
             {Cost, Refund} = eth_fork_schedule:sstore_cost(
                                 Ctx#ctx.fork, Original, Current, Val),
-            case charge(E2, Cost) of
+            case charge(E2, Cost + Cold) of
                 {ok, E3} ->
-                    State1 = eth_state:set_storage(Ctx#ctx.state, Addr, Slot, Val),
+                    State1 = eth_state:set_storage(CtxA#ctx.state, Addr, Slot, Val),
                     next(E3#e{refund = E3#e.refund + Refund},
                          CtxA#ctx{state = State1});
                 oog -> oog(E2, CtxA)
@@ -1186,21 +1206,67 @@ create_with_value(_Op, Init, Value, Sender, NewAddr, State1, E1, Ctx, ChildGas) 
     Result = run_t(Init, ChildMsg, State2, Env, ChildGas, Ctx#ctx.transient,
                    Ctx#ctx.originals, Ctx#ctx.fork),
     case Result of
-        {{ok, Code, Left, St, Logs}, ChildT, ChildO} when byte_size(Code) =< 24576 ->
-            St1 = eth_state:set_code(St, NewAddr, Code),
-            %% Record the creation for EIP-6780 (same-tx self-destruct).
-            St2 = eth_state:mark_created(St1, NewAddr),
-            MergedT = maps:merge(Ctx#ctx.transient, ChildT),
-            E2 = E1#e{gas = E1#e.gas + Left, logs = E1#e.logs ++ Logs},
-            next(push(E2, eth_word:from_bytes(NewAddr)),
-                 Ctx#ctx{state = St2, transient = MergedT, originals = ChildO});
-        {{ok, _Code, _Left, _St, _}, _ChildT, ChildO} ->
-            %% code too large: consume gas, fail with no deployment and no
-            %% value movement (nonce from State1 is kept). The init code's SSTORE
-            %% originals are kept: the code ran, so the facts it recorded are
-            %% transaction facts whatever became of the deployment.
-            next(push(E1#e{gas = E1#e.gas, retdata = <<>>}, 0),
-                 Ctx#ctx{state = State1, originals = ChildO});
+        {{ok, Code, Left, St, Logs}, ChildT, ChildO} ->
+            %% **The code-deposit cost was not charged here at all.** Not the 200 per
+            %% byte of the returned code, and not the EIP-170 size cap -- that one was
+            %% a bare `byte_size(Code) =< 24576' in a guard, so it held at every fork
+            %% and was measured in the wrong unit: it was a *predicate* with no price
+            %% behind it. The consequence is that this node deploys code of any size
+            %% for free, and never goes out of gas on a create whose deposit it cannot
+            %% pay.
+            %%
+            %% The corpus caught it, and the arithmetic is what makes it certain rather
+            %% than likely. `create/test_create_deposit_oog` has a twenty-three-byte
+            %% callee that stores a word, then `CREATE`s six bytes of init code which
+            %% itself `RETURN`s 10,000 bytes -- so the deposit is 200 x 10,000 =
+            %% 2,000,000 gas against a 934,172-gas frame. Seven of those fixtures
+            %% expected the **whole** 1,000,000 allowance to be spent and this node
+            %% spent 57,062, handing back 918,145 that the chain never returns. The
+            %% 200 is the yellow paper's `G_codedeposit' and no EIP has changed it;
+            %% what EIP-2 changed is the *consequence*, quoted in `code_deposit_cost/1'.
+            %%
+            %% Three ways to fail, and they are three different rules:
+            %%
+            %%   * cannot pay the deposit (Homestead+, EIP-2 item 3) -- the create goes
+            %%     out of gas and **all** the forwarded gas is gone, which is what
+            %%     `{{error, _, _, _}}' already means everywhere else in this module.
+            %%   * code over `max_code_size/1' (Spurious Dragon+, EIP-170) -- "contract
+            %%     creation fails with an out of gas error", so the same thing. The
+            %%     cap did not exist before Spurious Dragon, so below it a deployment
+            %%     is bounded only by what the caller can pay.
+            %%   * neither -- deploy, charging `Left' back less the deposit.
+            Size = byte_size(Code),
+            Deposit = eth_fork_schedule:code_deposit_cost(Ctx#ctx.fork) * Size,
+            case {E1#e.gas + Left < Deposit,
+                  eth_fork_schedule:max_code_size(Ctx#ctx.fork) < Size} of
+                {true, _} ->
+                    %% Out of gas paying the deposit. Nothing is added back, so the
+                    %% frame's entire forwarded allowance is consumed -- which is the
+                    %% rule a frame that halts has always had here, and the one EIP-2
+                    %% says applies to the deposit. No deployment, no value movement
+                    %% (State1 has the nonce and nothing else), and the init code's
+                    %% SSTORE originals are kept: the code ran, so the facts it
+                    %% recorded are transaction facts whatever became of the
+                    %% deployment.
+                    next(push(E1#e{retdata = <<>>}, 0),
+                         Ctx#ctx{state = State1, originals = ChildO});
+                {_, true} ->
+                    %% EIP-170's size cap. Same accounting -- the forwarded allowance
+                    %% is gone -- and same state. It is a separate clause only because
+                    %% before Spurious Dragon this branch is unreachable, so the two
+                    %% rules do not exist at the same time at any one fork.
+                    next(push(E1#e{retdata = <<>>}, 0),
+                         Ctx#ctx{state = State1, originals = ChildO});
+                {false, false} ->
+                    St1 = eth_state:set_code(St, NewAddr, Code),
+                    %% Record the creation for EIP-6780 (same-tx self-destruct).
+                    St2 = eth_state:mark_created(St1, NewAddr),
+                    MergedT = maps:merge(Ctx#ctx.transient, ChildT),
+                    E2 = E1#e{gas = E1#e.gas + Left - Deposit,
+                              logs = E1#e.logs ++ Logs},
+                    next(push(E2, eth_word:from_bytes(NewAddr)),
+                         Ctx#ctx{state = St2, transient = MergedT, originals = ChildO})
+            end;
         {{revert, Out, Left, _St, _}, _ChildT, ChildO} ->
             %% Revert rolls back deployment AND the value transfer; the
             %% sender nonce increment (State1) is kept. The init code's SSTORE

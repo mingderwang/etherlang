@@ -316,18 +316,61 @@ behavioural change per commit, and each step says what it now does.
      - **SLOAD itself was mispriced at both ends.** `access_prices(16#54)` was
        `{200, 2100}` at every fork, right for exactly one span of three: a Frontier
        SLOAD cost a third of what it should and an Istanbul one 400 too little.
-     - `match` 12 → **17**. `state_mismatch` 196 → 246 is the other side of the same
-       move, not a regression: 43 entries now execute and differ for whatever else is
-       wrong with them, which is a diagnosis rather than a refusal.
+     - `match` 12 → **17** there, and the corpus then found three more missing prices,
+       all of them on the create and store paths and all of them found by the corpus
+       rather than by a test. **17 → 24.**
+     - **The code-deposit cost was charged nowhere** (`v1.36`). `G_codedeposit` is 200
+       per byte of the code a create hands back, at every fork, and `create_with_value/9`
+       never took it. Worse, the EIP-170 size cap was a bare `byte_size(Code) =< 24576`
+       in a guard — a predicate with no price behind it, and applied at *every* fork
+       including the eight before EIP-170 introduced it. So this node deployed code of
+       any size for free, and never went out of gas on a create whose deposit it could
+       not pay. `create/test_create_deposit_oog` is the fixture that names it: a
+       twenty-three-byte callee that stores a word, then `CREATE`s six bytes of init
+       code which itself `RETURN`s 10,000 bytes — a 2,000,000-gas deposit against a
+       934,172-gas frame. Seven of those fixtures expected the **whole** 1,000,000
+       allowance to be spent; the node spent 57,062 and handed back 918,145 gas the
+       chain never returns. EIP-2 item 3 is the rule: "If contract creation does not
+       have enough gas to pay for the final gas fee for adding the contract code to the
+       state, the contract creation fails (i.e. goes out-of-gas) rather than leaving
+       an empty contract."
+     - **EIP-170's cap is now a fork fact, not a constant.** `max_code_size/1` answers
+       `infinity` below Spurious Dragon, where there was no cap and the only thing
+       bounding a deployment was what the caller could pay.
+     - **EIP-2929's "additional" `COLD_SLOAD_COST` on `SSTORE` was missing.** The EIP
+       has two halves: rewrite EIP-2200's `SLOAD_GAS` to 100 and `SSTORE_RESET_GAS` to
+       2,900, *and* charge an extra 2,100 for a `(address, storage_key)` pair not in
+       `accessed_storage_keys`. The node had the first and not the second, so every
+       **first** touch of a slot cost 2,100 too little and every second touch was right.
+       The asymmetry is why it survived: a test that writes a slot twice cannot see it,
+       and four existing tests did exactly that. The corpus gave it up as a −2,100
+       delta on **40** fixtures, all at the same number.
+     - **What the two fixes did to the histogram.** The `−9xxxxx` cluster (18 fixtures,
+       ~928,000 gas each) is gone entirely. Comparable gas figures fell from 217 to
+       160, which is a *change* and not an improvement in itself: 79 fixtures no longer
+       yield a figure at all, because the sender's balance no longer implies a whole
+       number of gas. That is a symptom of the node's balance now differing from the
+       fixture's in a way the derivation cannot express, and it is **not yet explained**.
+       Named, not chased.
+     - **Remaining fingerprints**, largest first: `+2497` ×24 and `+2500` ×24
+       (`test_gas.py` ECADD/ECMUL/pairing), `−19900` ×12, `−17400` ×12, `−17412` ×6
+       (`test_modexp_thresholds`), `−3` ×12 (`test_identity` pre-Shanghai), `+4000` ×6
+       (`test_acl`), `+4576`/`+5746`/`+5776` ×5 each, `+9139`/`+10500`/`+10689`/`+11750`,
+       `+20176` (BLS12-381 G1MSM), `+2100`, `+2300`, `−23000`, `−48300`.
+       `−17412` is the clearest of them: 6 × 2,952, and 2,952 is not a number this
+       node's table contains, so the ModExp complexity formula is still wrong somewhere
+       rather than a constant being off by a little.
      - **ECADD and ECMUL still conflate the two and are named open.** `bn128_add/2`
        returns `unsupported` for an off-curve point where EIP-196 makes it a call
        failure. I stopped there because the `byzantium/eip196_ec_add_mul` fixtures pass
        with the present shape and a change there could move them in a direction I had
        not measured. Named, not done.
-   - **`+56668` and `+56665`.** **Unresolved**, and no longer the largest thing in the
-     histogram: a current run of the same corpus puts the biggest positive deltas on
-     the `enough_gas_False` pairing cases above, so this fingerprint has to be
-     re-derived rather than chased.
+   - **`+56668` and `+56665`.** **Unresolved, and gone from the histogram.** Neither
+     figure appears in a current run, so whatever produced them is fixed by one of the
+     three pricing fixes above — which is worth recording, because the entry spent
+     several revisions saying this fingerprint had to be "re-derived rather than
+     chased" when it was neither re-derived nor chased: it dissolved. The largest
+     positives now are the `test_gas.py` precompile prices.
    - **Where the 2300 stipend sits relative to the 63/64 cap: open, and left open on
      purpose.** EIP-150's pseudocode reads
 %%

@@ -436,6 +436,8 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
 | Per-fork gas *price* wiring | Done. One owner of every price; the interpreter's duplicate table is deleted. SSTORE included (EIP-2200, Berlin and later). |
 | `eth_tx:intrinsic_gas/1` fork-awareness | Takes no fork and falls back to the operator's `ETH_FORK` pin. Correct for pool admission, where no block exists; wrong for `eth_call`/`eth_estimateGas` and block execution, which pass the block's own fork through `intrinsic_gas/2`. Do not use the one-argument form where a block is in hand. |
 | EIP-150's 63/64 rule and 2300 stipend | **Both are now fork-gated** (Tangerine Whistle and later; zero before), and the pre-Whistle rule is derived rather than invented because EIP-150's own `substitute` block is the code it replaced. That gained a corpus fixture: 11 -> 12 matches. What is **still open** is where the stipend sits relative to the cap — the EIP's pseudocode adds it after the clamp, this module adds it before, and the reading that follows the EIP makes a child's allowance exceed the caller's remaining. Not changed on a reading; see TASKS.md. |
+| The code-deposit cost | `G_codedeposit` = 200 per byte of returned code, at every fork, from `eth_fork_schedule:code_deposit_cost/1`; a create that cannot pay it fails and its whole forwarded allowance goes (EIP-2 item 3). It was charged **nowhere**, and the EIP-170 cap was a bare guard rather than a price. `max_code_size/1` answers `infinity` below Spurious Dragon. See TASKS.md. |
+| EIP-2929's cold `SSTORE` term | `sstore_cost/4` is only half of EIP-2929's SSTORE clause. The other half — "charge an **additional** `COLD_SLOAD_COST`" for a pair not in `accessed_storage_keys` — is `sstore_cold_cost/2`, and omitting it under-charges the *first* touch of a slot by 2,100 while leaving every second touch right. That asymmetry is invisible to any test that writes a slot twice. |
 | Pre-Berlin SSTORE | **Priced, except at Constantinople.** The flat rule (the yellow paper's, which Petersburg restored) with EIP-2200's own inherited figures, and `SLOAD_GAS` fork-selected 50/200/800 by EIP-150 and EIP-1884. Constantinople is the *only* fork still refused, because EIP-1283 replaced the rule and Petersburg reverted it — and it is unreachable by block number on mainnet anyway, since it and Petersburg share block 7,280,000. `SLOAD` itself was also a flat 200 at every fork, right for one span of three. See §3 "Fork awareness" and TASKS.md. |
 
 ## 11. Known dead code
@@ -480,6 +482,18 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
   against real data — and the point is that the pin already existed and I read past
   it. `requestsHash` was never "inert because upstream JSONs do not carry it": upstream
   JSONs **do** carry it, from Prague on.
+- **A price the node does not charge is worse than one it charges wrongly.**
+  `G_codedeposit` was absent from the execution path entirely, so a `CREATE` deployed
+  code of any size for free. The corpus found it as a −918,145 gas delta on seven
+  fixtures of one file, and the giveaway was the *size* of the number: a gas bug that
+  large is not a mispriced opcode, it is a missing term. Read the histogram for
+  magnitude, not just for repetition — a −2,100 repeated 40 times and a −918,145
+  repeated 7 times are the same kind of evidence and they point at different things.
+- **EIP-2929's `SSTORE` clause has two halves and they are separable.** Rewriting
+  EIP-2200's `SLOAD_GAS` and `SSTORE_RESET_GAS` is a change to `sstore_cost/4`; charging
+  the additional `COLD_SLOAD_COST` for a cold slot is a *separate* term. Implementing
+  the first and not the second is a coherent-looking table that is wrong on every first
+  access, and it is wrong in a way a test repeating an access cannot see.
 - **`unsupported` is not one thing.** `eth_evm_precompiles:precompile/3` has three
   answers: `{ok, Output, GasCost}`, `{failed, Why}` (the EVM's answer is that the call
   fails — nothing returned, forwarded gas consumed, caller carries on), and

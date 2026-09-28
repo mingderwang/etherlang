@@ -121,8 +121,31 @@
 %% now correct rather than merely priced. `state_mismatch` 196 -> 246 is the other side
 %% of the same move: 43 entries now execute and differ for whatever else is wrong with
 %% them, which is a diagnosis rather than a refusal.
--define(EXPECTED, #{match => 17,
-                    state_mismatch => 246,
+%%
+%% `match` 17 -> **24** since that, from two more missing prices, both found by the
+%% corpus rather than by a test:
+%%
+%%   - **`G_codedeposit` was never charged.** 200 per byte of the code a create hands
+%%     back, at every fork, charged nowhere. The size cap was a bare
+%%     `byte_size(Code) =< 24576' in a guard -- a predicate with no price behind it, and
+%%     applied at every fork including the eight before EIP-170 introduced the cap -- so
+%%     this node deployed code of any size for free and never went out of gas on a
+%%     create whose deposit it could not pay. `create/test_create_deposit_oog` has a
+%%     twenty-three-byte callee that stores a word and then `CREATE`s six bytes of init
+%%     code which itself `RETURN`s 10,000 bytes: a 2,000,000-gas deposit against a
+%%     934,172-gas frame. Seven of those fixtures expected the whole 1,000,000
+%%     allowance to be spent and the node spent 57,062, handing back 918,145 gas the
+%%     chain never returns. That fixture's delta is now -2,100 rather than -918,145, and
+%%     the residue is the *next* bug on this list.
+%%   - **EIP-2929's "additional" `COLD_SLOAD_COST` on `SSTORE` was not charged.** The
+%%     EIP has two halves -- rewrite EIP-2200's `SLOAD_GAS` to 100 and
+%%     `SSTORE_RESET_GAS` to 2,900, *and* charge an extra 2,100 for a slot not in
+%%     `accessed_storage_keys` -- and the node had the first. So every *first* touch of
+%%     a slot cost 2,100 too little and every second touch was right, which is why it
+%%     survived: a test that writes a slot twice cannot see it. The corpus gave it up
+%%     as a -2,100 delta on 40 fixtures, all at the same number.
+-define(EXPECTED, #{match => 24,
+                    state_mismatch => 239,
                     unpriced => 0,
                     tx_decode_failed => 0,
                     tx_roundtrip_mismatch => 0,
