@@ -396,12 +396,30 @@ behavioural change per commit, and each step says what it now does.
      too. **The committed corpus cannot see this** — every fixture arrives carrying
      `input` — so it is pinned by two unit tests and the commit says the corpus did not
      find it.
-   - **The conformance runner's `derived_base_fee/3` ignores `env.currentBaseFee`** and
-     derives a figure that comes out `none` for a type-2 transaction, leaving the block
-     with no base fee and the sender charged nothing for gas. **Named, not fixed**: an
-     injection that preferred the stated figure left every test green once
-     `overlay_key/1` was in place, so it cannot be shown to change a number, and this
-     repository does not ship a change to a measurement that has no number to show.
+   - **The EIP-1559 fee side, and it is 18 fixtures with one cause, not five.**
+     Sharper than the entry above, and measured. Every one of the **type 2, 3 and 4**
+     transactions in the committed corpus fails on the fee side rather than the gas
+     side: `test_tx_type::test_eip1559_tx_validity` x5 at `+517,958`, and 13 more whose
+     delta is not a number at all but `no_comparable_gas` -- the sender's balance
+     difference does not divide by the price, so the runner cannot state a figure. Those
+     13 are `test_chainid` x8 (types 2, 3, 4), `test_execution_gas` x2 (types 3, 4) and
+     `test_tx_gas_limit` x3. **`+517,958` is `(gasLimit - gasUsed) * price`**: the gas
+     is right -- an instrumented run reports `charged0=26006`, the chain's own figure --
+     and the price is wrong.
+     The runner builds the block with `base_fee_per_gas = merge_base_fee(base_fee_for(Fork),
+     Derived)`, and `base_fee_for/1` answers **0** for every fork at London and later.
+     So the sender is charged `maxFeePerGas` against a base fee of 0, the tip is the
+     whole price, and the fee recipient's balance comes out wrong. `merge_base_fee/1`'s
+     first clause -- `merge_base_fee(undefined, _Derived) -> undefined` -- also discards
+     a derived value outright whenever the fork's own figure is `undefined`.
+     **Not fixed, and the fix is not yet isolated.** Preferring the
+     `env.currentBaseFee` the fixture states was tried and moved neither the tally nor
+     `+517958`, so the defect is in the fee path and not in the base fee's *source*. A
+     change to `base_fee_for/1` or `merge_base_fee/1` is the obvious next thing and is
+     deliberately not made on this reading: a wrong fee is a wrong balance for every
+     post-London block, and that is not a change to ship without a number to show for
+     it.
+     **The largest single cluster of what is left, and one cause rather than eighteen.**
    - **Remaining fingerprints**, largest first: `+517958` ×5, `+152536` ×2
        (`test_coverage`), `−19900` ×24, `−19912` ×6, `−3` ×36, `+10500` ×6,
        `+2576`/`+3746`/`+3776` ×5 each, `+4000` ×6 (`test_acl`), `+2300` ×7,
