@@ -66,8 +66,8 @@ beacon, validators, or block production).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**724 tests, green**).
-* **Status** — v0.7.0; eunit green (724 tests) and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**730 tests, green**).
+* **Status** — v0.7.0; eunit green (730 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -522,7 +522,7 @@ Where the work actually stands:
 | Block execution: receipts, logs, bloom, state root, EIP-4788, EIP-4895, EIP-2935 | done, and the two system-contract EIPs verified against live Sepolia data |
 | Block authoring (proposer duties) | **not done** — the node builds and executes blocks but is never selected to author one |
 | Per-fork exact gas schedule | **done, Berlin and later.** `eth_fork_schedule` owns every price the interpreter charges and `eth_evm:base_cost/1`, a second fork-free copy of the schedule, is deleted. SSTORE included: EIP-2200's net metering, with EIP-2929's figures and EIP-3529's refunds. **Pre-Berlin SSTORE is refused, not priced** — three schedules exist there (the flat rule, EIP-1283 at Constantinople, Petersburg's revert of it) and only EIP-2200's text is implemented, so a single pre-Berlin figure would be right for two spans and wrong for the third. Fork-selected now: every opcode's constant price, EIP-150's pre-Berlin access costs, EIP-2929's warm/cold split, EIP-161's 9000/25000, the refund cap, EIP-6780, EIP-3860, and `eth_tx`'s intrinsic floor. Getting there meant picking one owner of each price's composition — the two tables agreed on most totals and split four groups differently — and comparing them found two live bugs: `ADDRESS` cost 3 where it is 2, and EIP-161's terms gated on Berlin rather than Spurious Dragon. SSTORE net metering needed the transaction-start value of each slot, which this node did not track; it now does, in a map of its own, and the 2700-gas-per-no-op-write overcharge is gone. Whether the gas schedule is the *only* reason this node's state roots do not match the network's is unverified: it cannot be checked end-to-end without real prestate |
-| Conformance against a third party's expected results | **measured, and the measurement is bad.** `eest_state_tests.erl` runs the `execution-spec-tests` `state_tests` corpus. **53 of 266 committed fixtures match — 19.9%**, and **no** fixture is executed that this node cannot price — and the figure is reproducible: identical per entry from a fresh VM and from inside the suite. Two real defects it found with no new code written for it: the node **accepted an EIP-1559 transaction at a pre-London fork** (now fixed and the five fixtures verify), and it **could not decode an EIP-7702 (type 4) transaction at all** (decode, sender recovery, pricing and both validity rules now implemented; **the authorization list is still not applied**, so a type-4 transaction executes as though it carried none). A third was hiding underneath the first and only surfaced when the first was fixed: `eth_tx:ctx_fork/1` had a guard that `undefined` satisfied, so the fork a validation context speaks for was never resolved, and ten blob-transaction tests across three modules were passing through a fork named `undefined`. Nothing in this repository had been *run* against a third party's expected results before this; the opcode table was cross-checked against instruction counts and the gas schedule was derived from the EIPs, and a schedule can be wrong in both senses and still self-consistent |
+| Conformance against a third party's expected results | **measured, and the measurement is bad.** `eest_state_tests.erl` runs the `execution-spec-tests` `state_tests` corpus. **78 of 266 committed fixtures match — 29.3%** (up from 53, with **zero** fixtures regressing), and **no** fixture is executed that this node cannot price — and the figure is reproducible: identical per entry from a fresh VM and from inside the suite. Two real defects it found with no new code written for it: the node **accepted an EIP-1559 transaction at a pre-London fork** (now fixed and the five fixtures verify), and it **could not decode an EIP-7702 (type 4) transaction at all** (decode, sender recovery, pricing and both validity rules now implemented; **the authorization list is still not applied**, so a type-4 transaction executes as though it carried none). A third was hiding underneath the first and only surfaced when the first was fixed: `eth_tx:ctx_fork/1` had a guard that `undefined` satisfied, so the fork a validation context speaks for was never resolved, and ten blob-transaction tests across three modules were passing through a fork named `undefined`. Nothing in this repository had been *run* against a third party's expected results before this; the opcode table was cross-checked against instruction counts and the gas schedule was derived from the EIPs, and a schedule can be wrong in both senses and still self-consistent. The largest single win came from reading a histogram rather than a fixture: 24 fixtures sat at **-19,900**, which is `SSTORE_SET_GAS` (20,000) minus `SLOAD_GAS` (100) -- EIP-2200's arm (1.) taken because the *new value* read as zero. `eth_evm:run_call/10'` gave the **precompile** path no way to publish its output (`finish_call/8` does not set `retdata`; `handle_child/9` does, for an account call), so `RETURNDATASIZE` after a precompile call reported whatever the previous call had left. A state defect first and a gas defect second |
 | Honest stateRoot verification | done for the current block; historical blocks are not re-executed |
 | Receipt verification on the peer path | done — a peer's `receiptsRoot` is recomputed from the executed body and compared, and reported as `{verified, Root} \| {unverified, Reason}` |
 | Transaction validation (nonce, balance, chain ID, gas limit, intrinsic gas, signature) | done — one validator, called on the peer path before execution, with the offending transaction's index reported |
@@ -571,7 +571,7 @@ Where the work actually stands:
   distinct on purpose: a transaction that does not decode, a signature that recovers the wrong address, a
   transaction the node admits that the specification rejects, and a state that comes out different are four
   different bugs with four different owners, and one `fail` bucket would sum them and hide all four.
-  - **53 of 266 entries match — 19.9%.** `unpriced` is **0**: nothing is executed that this node cannot price, which for a while it was — 48 pre-Berlin `SSTORE` fixtures and 7 blake2f ones were being charged their whole gas limit and committed as a state root the chain would never produce.
+  - **78 of 266 entries match — 29.3%**, up from 53 with **zero** regressions. `unpriced` is **0**: nothing is executed that this node cannot price, which for a while it was — 48 pre-Berlin `SSTORE` fixtures and 7 blake2f ones were being charged their whole gas limit and committed as a state root the chain would never produce.
     Four missing prices have been found and fixed since, all four by the corpus rather than by a test, and all four on the create, store and access paths. A fifth defect was not in that list at all, because it was in the **runner**: `eth_state:new/2` rewrites every `{store, A, S}` overlay key through `eth_state:slot_key/1`, and the comparison read the slot back under the un-normalised key, so **every storage read on the way back returned zero** and a node that stored `1` was reported as having stored nothing. Twenty-one fixtures were being scored on a comparison that could not see storage: **the code-deposit cost was never charged at all** (`G_codedeposit`, 200 per byte, so a create deployed code of any size for free and never went out of gas on a deposit it could not pay — the size cap was a bare `byte_size(Code) =< 24576` guard, a predicate with no price behind it, applied at every fork including the eight before EIP-170 introduced it); **EIP-170's size cap was a constant rather than a fork fact** (`infinity` below Spurious Dragon); and **EIP-2929's "additional" `COLD_SLOAD_COST` on `SSTORE` was missing** — the EIP has two halves, the EIP-2200 parameter rewrites *and* an extra 2,100 for a slot not in `accessed_storage_keys`, and the node had the first, so every *first* touch of a slot cost 2,100 too little while every second touch was right; and **EIP-2929's transaction-start warm set was never seeded** (its own text: "`accessed_addresses` is initialized to include the `tx.sender`, `tx.to` ... and the set of all precompiles"), so the transaction's own recipient, its own sender and every precompile were each charged `COLD_ACCOUNT_ACCESS_COST` on first touch — a uniform +2,500 on twenty-four fixtures, and 2,500 is `2,600 − 100` exactly. The gas figure is recovered from the balances the way a state test
     encodes it, so a divergence reads as a gas number rather than as a wei difference — the first fixture looked
     at reported `45,247` gas, which is EIP-2929's cold account charge and about sixteen times that.
@@ -675,6 +675,37 @@ It is **not** established that the gas schedule is the *only* remaining divergen
   - [x] **SSTORE refunds applied to gas** — EIP-2200 refunds capped at
     half gas used, added to final gas (`eth_evm:run_t`) (v0.7.3).
 ---
+
+## What "compatible" means here, and what would prove it
+
+`etherlang` shares no code with Geth, Nethermind, Besu, Erigon or Reth, and is not meant
+to. Compatibility is a property of the **protocol result**, not of the implementation,
+and it is established in independent layers. What this repository has done, and what it
+has not, in each:
+
+| Layer | What has to agree | How it is tested | `etherlang` today |
+|---|---|---|---|
+| EVM execution | Same result for the same bytecode | `execution-spec-tests` fixtures | **78 of 266 committed fixtures match**, up from 53, with **zero** regressions |
+| State transition | Same post-state, same state root | The same fixtures, comparing post-state | The same 78. The *runner* had two defects that hid storage entirely, so 21 fixtures were being scored on a comparison that could not see a value |
+| Gas and fork rules | Same price, same opcode availability, per fork | The same fixtures, via the gas figures they encode | `eth_fork_schedule` is the execution path's only owner of prices; **five defects found by the corpus and fixed** |
+| Block validation | Same valid/invalid decision | Execution tests, then block-level fixtures | `eth_block:finalize/1` returns **verdicts** (`{verified, Root}` / `{unverified, Reason}`), never a bare root. Block-level conformance is **not yet run** |
+| Engine API | Same protocol behaviour | Hive's Engine API simulator — a mock consensus client | Methods implemented and versioned; `forkchoiceUpdatedV3`, `getPayloadV3` and the `-38005` / `-38003` gates are **not** done |
+| JSON-RPC | Common surface, common answers | `rpc-compat` in Hive | Seven of the eight previously-missing methods answer from this node's own state; **`eth_createAccessList` is absent** |
+| P2P and sync | Discover, sync, propagate | Hive, against another client | devp2p/RLPx implemented with an RPC fallback; **never run against a real client** |
+| Database, language, internal architecture | **Nothing** | — | Irrelevant by construction |
+
+**The strongest available proof would be to put `etherlang` in the same Hive matrix as
+the other clients** — consume the same fixtures, and be driven by the same mock
+consensus client — and then show it interoperating. This repository does the first of
+those (`eest_state_tests.erl` against `execution-spec-tests`) and **none of the rest**.
+`etherlang` is not in Hive, has never been driven by a mock consensus client, and has
+never spoken to another client. Nothing in this file should be read as a claim that
+those layers are verified.
+
+What is deliberately *not* required, and is the whole reason this is achievable at all:
+a shared database, a shared language, or a shared internal architecture. Filling the
+table's last four rows is the remaining work, and it is a different kind of work from
+the first six.
 
 ## How syncing works
 

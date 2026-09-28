@@ -158,8 +158,19 @@
 %% rather than anything else. The `test_gas.py` contracts behind those fixtures each
 %% call one precompile and do nothing else.
 %%
-%% `match` 46 -> **53** and `state_mismatch` 217 -> 210, from two harness defects and no
-%% node change at all. Both are in how the runner builds the *block* it executes against.
+%% `match` 53 -> **78** and `state_mismatch` 210 -> 185, and this one is a **node**
+%% defect, found by reading a histogram rather than by reasoning about the fixtures.
+%% Twenty-four fixtures ended a frame with `CALL; POP; RETURNDATASIZE; PUSH1 k;
+%% SSTORE' and were **-19,900**, which is `SSTORE_SET_GAS` (20,000) minus `SLOAD_GAS`
+%% (100) -- EIP-2200's arm (1.) taken because the new value read as 0. The new value
+%% read as 0 because `eth_evm:run_call/10'` gave the precompile path no way to publish
+%% its output: `finish_call/8' does not set `retdata' (`handle_child/9' does, for an
+%% account call), so `RETURNDATASIZE' after a *precompile* call reported whatever the
+%% previous call had left. A state defect first and a gas defect second; the fix is in
+%% `eth_evm.erl' and the pins are in `eth_evm_tests'.
+%%
+%% A second `match` figure, `46 -> 53`, was a harness defect and no node change at
+%% all. Both are in how the runner builds the *block* it executes against.
 %%
 %%   * `base_fee_for/1` was handed the fixture's fork **name**, which is a binary,
 %%     where `eth_fork_schedule:at_least/2` wants an atom -- so it answered `undefined`
@@ -191,8 +202,8 @@
 %% the frame finishing `result=ok charged0=26006`, and 26,006 is the chain's own figure
 %% for that transaction, so both the gas and the write were right and only the
 %% comparison was wrong. See `overlay_key/1'.
--define(EXPECTED, #{match => 53,
-                    state_mismatch => 210,
+-define(EXPECTED, #{match => 78,
+                    state_mismatch => 185,
                     unpriced => 0,
                     tx_decode_failed => 0,
                     tx_roundtrip_mismatch => 0,

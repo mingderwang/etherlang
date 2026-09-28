@@ -977,7 +977,12 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
     Env = Ctx#ctx.env,
     Depth = s_msg(depth, Ctx, 0),
     case Depth >= 1024 of
-        true -> finish_call(E, Ctx, Ctx#ctx.state, <<>>, RetOff, RetLen, 0);
+        %% A call that did not happen leaves no return data. This and the two create-side
+        %% failures below were the remaining `finish_call/8' sites that left `retdata'
+        %% alone, and they are the same defect as the precompile path rather than a
+        %% separate one: EIP-211 makes the buffer part of the call's result.
+        true -> finish_call(E#e{retdata = <<>>}, Ctx, Ctx#ctx.state, <<>>,
+                            RetOff, RetLen, 0);
         false ->
             %% A precompile's identity and price are both fork questions, and the
             %% frame carries the fork in its own record for exactly this. The record
@@ -1024,21 +1029,47 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
                             case eth_evm_precompiles:precompile(ToW, Args,
                                                               Ctx#ctx.fork) of
                                 {ok, Out, Cost} when CallGas >= Cost ->
-                                    finish_call(add_gas(E, CallGas - Cost), Ctx, St0,
-                                                Out, RetOff, RetLen, 1);
+                                    %% **`retdata = Out`, and it was missing.**
+                                    %% `finish_call/8' does not set it: the caller is
+                                    %% responsible, exactly as `handle_child/9' is. So
+                                    %% `RETURNDATASIZE' after a **precompile** call
+                                    %% reported whatever the *previous* call left, or
+                                    %% zero if there had been none.
+                                    %%
+                                    %% The corpus named it. `test_identity_returndatasize`
+                                    %% and `test_warm_coinbase` both end a frame with
+                                    %% `CALL; POP; RETURNDATASIZE; PUSH1 k; SSTORE', and
+                                    %% the delta is **-19,900** on twenty-four fixtures:
+                                    %% 19,900 = `SSTORE_SET_GAS` (20,000) - `SLOAD_GAS`
+                                    %% (100), which is the node taking EIP-2200's arm (1.)
+                                    %% `current == new' -- because `new' read as 0 -- where
+                                    %% the chain takes arm (2.1.1). So it is a **state**
+                                    %% defect and not only a gas one: a contract that
+                                    %% hashes or compares a precompile's output gets a
+                                    %% wrong answer, and the state root is wrong with it.
+                                    finish_call(add_gas(E#e{retdata = Out}, CallGas - Cost),
+                                                Ctx, St0, Out, RetOff, RetLen, 1);
                                 {failed, _Why} ->
                                     %% The precompile ran and its answer is that the
                                     %% call fails: it returns nothing, and the forwarded
                                     %% allowance is consumed -- which it already was,
                                     %% the caller having been charged `CallGas' before
                                     %% the precompile was asked. The caller carries on.
-                                    finish_call(E, Ctx, St0, <<>>, RetOff, RetLen, 0);
+                                    %%
+                                    %% `retdata = <<>>' for the same reason the success
+                                    %% branch sets it to `Out'. EIP-211 makes the buffer
+                                    %% part of the call's *result*, and a result nobody
+                                    %% writes is whatever was there before -- which is
+                                    %% wrong without looking wrong.
+                                    finish_call(E#e{retdata = <<>>}, Ctx, St0, <<>>,
+                                                RetOff, RetLen, 0);
                                 {ok, _Out, _Cost} ->
                                     %% Not enough forwarded gas for the precompile.
                                     %% The call fails and the whole forwarded
                                     %% allowance is gone -- it was not a CALL frame,
                                     %% so there is nothing to hand the remainder to.
-                                    finish_call(E, Ctx, St0, <<>>, RetOff, RetLen, 0);
+                                    finish_call(E#e{retdata = <<>>}, Ctx, St0, <<>>,
+                                                RetOff, RetLen, 0);
                                 unsupported ->
                                     unsupported({precompile, ToW}, E, Ctx);
                                 {error, Reason} ->
@@ -1274,7 +1305,7 @@ do_create(Op, E, Ctx) ->
 run_create(Op, Init, Salt, Value, E, Ctx) ->
     case s_msg(depth, Ctx, 0) >= 1024 of
         true ->
-            finish_call(E, Ctx, Ctx#ctx.state, <<>>, 0, 0, 0);
+            finish_call(E#e{retdata = <<>>}, Ctx, Ctx#ctx.state, <<>>, 0, 0, 0);
         false ->
             run_create1(Op, Init, Salt, Value, E, Ctx)
     end.
@@ -1301,7 +1332,7 @@ run_create1(Op, Init, Salt, Value, E, Ctx) ->
             case can_transfer(State1, Sender, Value) of
                 false ->
                     %% Nonce stays consumed (as in geth); no value moves.
-                    finish_call(E1, Ctx, State1, <<>>, 0, 0, 0);
+                    finish_call(E1#e{retdata = <<>>}, Ctx, State1, <<>>, 0, 0, 0);
                 true ->
                     create_with_value(Op, Init, Value, Sender, NewAddr, State1, E1, Ctx, ChildGas)
             end
@@ -1375,7 +1406,31 @@ create_with_value(_Op, Init, Value, Sender, NewAddr, State1, E1, Ctx, ChildGas) 
                     St2 = eth_state:mark_created(St1, NewAddr),
                     MergedT = maps:merge(Ctx#ctx.transient, ChildT),
                     E2 = E1#e{gas = E1#e.gas + Left - Deposit,
-                              logs = E1#e.logs ++ Logs},
+                              logs = E1#e.logs ++ Logs,
+                              %% **`retdata = <<>>`, on success as well as on failure.**
+                              %% The specification is explicit:
+                              %%
+                              %%     incorporate_child_on_success(evm, child_evm)
+                              %%     evm.return_data = b""
+                              %%     push(evm.stack, U256.from_be_bytes(
+                              %%         child_evm.message.current_target))
+                              %%
+                              %% (`execution-specs', `forks/cancun/vm/instructions/
+                              %% system.py'.) The **stack** receives the address; the
+                              %% buffer receives nothing. This is the one `retdata' site
+                              %% a grep for `finish_call(' cannot find, because the
+                              %% success path pushes the address itself rather than
+                              %% going through `finish_call/8' -- so a contract reading
+                              %% `RETURNDATASIZE' after deploying a contract saw the
+                              %% size of whatever it had called before.
+                              %%
+                              %% An earlier reading of EIP-211 -- that the created
+                              %% address is left in the buffer, 32 bytes left-padded --
+                              %% is wrong for the current specification. It was read
+                              %% from the EIP rather than recalled, and it is written
+                              %% down here because it is a plausible mistake rather than
+                              %% an arbitrary one.
+                              retdata = <<>>},
                     next(push(E2, eth_word:from_bytes(NewAddr)),
                          Ctx#ctx{state = St2, transient = MergedT, originals = ChildO})
             end;

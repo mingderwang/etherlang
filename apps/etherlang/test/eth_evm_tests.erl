@@ -297,6 +297,318 @@ a_call_the_caller_cannot_afford_empties_the_return_data_test() ->
         ?assertEqual(0, eth_state:storage(St2, ?CALLER, 6))
     end).
 
+%% ---------------------------------------------------------------------------
+%% A precompile's output is the call's output, and `finish_call/8' does not publish
+%% it. EIP-211 makes the buffer part of the call's *result*: a call that returned one
+%% byte leaves one byte readable by `RETURNDATASIZE', `RETURNDATACOPY' and `SHA3'.
+%% `finish_call/8' copies `Out' into memory and pushes the success flag; it does not
+%% touch `retdata', because for an account CALL that is `handle_child/9''s job and it
+%% does it. **The precompile path had no such job**, so all three of its branches
+%% handed the caller back to the interpreter with the register holding whatever the
+%% *previous* call had left.
+%%
+%% The corpus named it, at -19,900 on twenty-four fixtures. See
+%% `storing_a_precompiles_return_size_costs_the_set_price_test/0', which is the gas
+%% half; the defect is a state one first and a gas one second.
+%% ---------------------------------------------------------------------------
+
+%% `mem[0] = 1`, then `CALL` identity with one byte in and one byte out, so its answer
+%% is exactly `<<1>>'. `RETURNDATASIZE' then stores the *length* at slot 5 and the word
+%% the buffer was copied into at slot 6 -- because a test that only asserted the length
+%% would pass on a buffer holding the right number of zero bytes. One byte in is
+%% enough; the first version of this probe used a `PUSH32' word and stopped 15 gas in,
+%% having mis-parsed its own immediate.
+one_byte_to_identity() ->
+    <<16#60, 1, 16#60, 0, 16#53,                  % PUSH1 1; PUSH1 0; MSTORE8
+      16#60, 1, 16#60, 0,                        % retlen=1   retoff=0
+      16#60, 1, 16#60, 0,                        % argslen=1  argsoff=0
+      16#60, 0,                                  % value = 0
+      16#60, 16#04, 16#5A, 16#F1,                % PUSH1 4; GAS; CALL
+      16#50>>.                                   % POP the success flag
+
+%% `mem[0] = 1` and nothing else, so `RETURNDATASIZE' is read with no call having
+%% happened. This is the control both tests below need.
+no_call_at_all() -> <<16#60, 1, 16#60, 0, 16#53>>.
+
+%% A CALL to a precompile with `argslen = ArgLen' and `retlen = 0', which is the shape
+%% the `call_seq/3' helper cannot express: it hard-codes both lengths at 0. 0x08 wants
+%% a whole number of 192-byte pairs, so an input that is not a multiple of 192 is the
+%% rejected-input case -- and **empty input is not one**, because the pairing of zero
+%% pairs is trivially true and EIP-197 answers with 32 bytes of 1. The first version
+%% of the test below passed empty input, the call *succeeded*, and the assertion read
+%% 32 where it expected the buffer to be cleared.
+precompile_call(ToByte, ArgLen) ->
+    <<16#60, 0, 16#60, 0,                        % retlen=0   retoff=0
+      16#60, ArgLen, 16#60, 0,                   % argslen   argsoff=0
+      16#60, 0,                                  % value = 0
+      16#60, ToByte, 16#5A, 16#F1, 16#50>>.      % PUSH1 to; GAS; CALL; POP
+
+a_precompile_call_publishes_its_return_data_test() ->
+    eth_test_util:with_local_reads(fun() ->
+        Fork = cancun,
+        Code = <<(one_byte_to_identity())/binary,
+                 16#3D,                          % RETURNDATASIZE
+                 16#60, 5, 16#55,                % PUSH1 5; SSTORE  -> the length
+                 16#60, 0, 16#51,                % PUSH1 0; MLOAD   -> the word
+                 16#60, 6, 16#55,                % PUSH1 6; SSTORE  -> that word
+                 16#00>>,
+        {ok, _, _, St, _} = eth_evm:run(Code, ?MSG0, call_state(1000, <<>>),
+                                        #{fork => Fork}, ?GAS),
+        %% `1 bsl 248' and not 1: `MLOAD' reads **32** bytes big-endian, and the one
+        %% byte the CALL copied sits at the low end of that word. Masking with `AND
+        %% 0xFF' reads the *high* end and answers 0, which is what the first version of
+        %% this assertion got -- a correct buffer and a wrong test, which is the one
+        %% outcome worse than a wrong node.
+        ?assertEqual({1, 1 bsl 248}, {eth_state:storage(St, ?CALLER, 5),
+                                     eth_state:storage(St, ?CALLER, 6)}),
+        %% **The control: a frame that called nothing reads zero.** Without it the
+        %% pair above is a statement about a register that could have been right for
+        %% free -- which is the exact shape of the defect being pinned, since a
+        %% precompile call that published nothing also read 0. A positive assertion
+        %% needs something that could have made it different, and this is it.
+        {ok, _, _, St0, _} =
+            eth_evm:run(<<(no_call_at_all())/binary,
+                          16#3D, 16#60, 5, 16#55, 16#00>>,
+                        ?MSG0, call_state(1000, <<>>), #{fork => Fork}, ?GAS),
+        ?assertEqual(0, eth_state:storage(St0, ?CALLER, 5))
+    end).
+
+%% The gas half, and how the corpus found the state half.
+%% `test_identity_returndatasize' and `test_warm_coinbase' both end a frame with
+%% `CALL; POP; RETURNDATASIZE; PUSH1 k; SSTORE', and the delta was **-19,900** on
+%% twenty-four fixtures: `SSTORE_SET_GAS` (20,000) minus `SLOAD_GAS` (100). That is
+%% EIP-2200's arm (1.) `current == new', taken because `new' read as 0, where the
+%% chain takes arm (2.1.1). Reading the histogram is what named the cause: a 19,900
+%% that decomposes onto two neighbouring constants is not a mispriced opcode, it is a
+%% wrong *value* feeding the right price.
+storing_a_precompiles_return_size_costs_the_set_price_test() ->
+    eth_test_util:with_local_reads(fun() ->
+        Fork = cancun,
+        WithSize = <<(one_byte_to_identity())/binary,
+                     16#3D, 16#60, 9, 16#55, 16#00>>,
+        WithZero = <<(one_byte_to_identity())/binary,
+                     16#60, 0, 16#60, 9, 16#55, 16#00>>,
+        S = call_state(1000, <<>>),
+        {ok, _, L1, St1, _} = eth_evm:run(WithSize, ?MSG0, S, #{fork => Fork}, ?GAS),
+        {ok, _, L0, St0, _} = eth_evm:run(WithZero, ?MSG0, S, #{fork => Fork}, ?GAS),
+        %% The two post-states differ, so this is measuring two outcomes and not one
+        %% program run twice. Asserted because the whole point is that the *value*
+        %% changes: two identical states would make the gas difference meaningless.
+        ?assertEqual({1, 0}, {eth_state:storage(St1, ?CALLER, 9),
+                              eth_state:storage(St0, ?CALLER, 9)}),
+        %% Every term read from the schedule, including the one-gas gap between
+        %% `PUSH1' and `RETURNDATASIZE'. Nothing here is a written-down number, because
+        %% a test that repeats a constant in the module it is testing cannot tell a
+        %% price change from a typo.
+        %%
+        %% `sstore_cost/4' answers `{Cost, Refund}', and only the cost belongs in a
+        %% spend comparison -- the first version added the tuple, and the error was
+        %% `3 + {100, 0}', which is what a wrong return shape looks like rather than a
+        %% wrong price.
+        Set = element(1, eth_fork_schedule:sstore_cost(Fork, 0, 0, 1)),
+        Noop = element(1, eth_fork_schedule:sstore_cost(Fork, 0, 0, 0)),
+        ?assertEqual(eth_fork_schedule:constant_cost(16#60, Fork) + Noop
+                     - eth_fork_schedule:constant_cost(16#3D, Fork) - Set,
+                     (?GAS - L0) - (?GAS - L1))
+    end).
+
+%% A precompile that **ran and rejected** its input is a call failure, and EIP-211
+%% makes the buffer empty for one -- so it must clear what the previous call left.
+%% This is the worse half of the defect and the half with no `-19,900' to announce it:
+%% reading **zero** is merely wrong, reading the *previous* call's length is wrong in
+%% a way that depends on what the frame did before, which no gas figure will show you.
+a_rejected_precompile_call_clears_a_stale_return_data_buffer_test() ->
+    eth_test_util:with_local_reads(fun() ->
+        %% The first call succeeds and leaves a return data of size 1 -- the callee is
+        %% `PUSH1 1; PUSH1 0; RETURN', which returns one byte. The second is 0x08, the
+        %% pairing check, handed **one** byte: EIP-197 wants a whole number of 192-byte
+        %% pairs, so that is `invalid_input' -- a *failed call*, which
+        %% `eth_pairing_bn128' reports as `{error, invalid_input, _}' and
+        %% `eth_evm_precompiles' as `{failed, _}'. Deliberately **not** `unsupported`:
+        %% that word means this node cannot run the check at all, and the test would
+        %% then be measuring a refusal to produce the block rather than a call failure,
+        %% which is a different thing with a different fix.
+        %%
+        %% One byte, not zero. Empty input is the *pairing of zero pairs*, which is
+        %% trivially true, so it succeeds and answers 32 bytes -- the first version of
+        %% this test passed empty input and read 32 where it meant to read a cleared
+        %% buffer.
+        Callee = <<16#60, 1, 16#60, 0, 16#F3>>,
+        Code = <<16#60, 1, 16#60, 0, 16#53,                 % mem[0] = 1
+                 (call_seq(16#0D, 0, 16#F1))/binary,        % the call that succeeds
+                 (precompile_call(16#08, 1))/binary,         % the call that fails
+                 16#3D, 16#60, 7, 16#55, 16#00>>,
+        {ok, _, _, St, _} = eth_evm:run(Code, ?MSG0, call_state(1000, Callee),
+                                        #{fork => cancun}, ?GAS),
+        ?assertEqual(0, eth_state:storage(St, ?CALLER, 7)),
+        %% And the control, which is why this test is not the mistake this module has
+        %% already paid for once: the *same* program with the rejected call removed
+        %% reads **1**. A test asserting zero that never showed a non-zero proves
+        %% nothing -- see the note on
+        %% `a_call_the_caller_cannot_afford_empties_the_return_data_test/0'.
+        {ok, _, _, St1, _} =
+            eth_evm:run(<<16#60, 1, 16#60, 0, 16#53,
+                          (call_seq(16#0D, 0, 16#F1))/binary,
+                          16#3D, 16#60, 7, 16#55, 16#00>>,
+                        ?MSG0, call_state(1000, Callee), #{fork => cancun}, ?GAS),
+        ?assertEqual(1, eth_state:storage(St1, ?CALLER, 7))
+    end).
+
+%% The other three `finish_call/8' sites that left `retdata' alone, and why they are in
+%% the same change rather than three more: they are the *same* defect. A call that did
+%% not happen -- too deep, or a `CREATE' whose sender cannot afford the value -- leaves
+%% no return data, so the buffer must be empty rather than whatever the frame last saw.
+%%
+%% **Neither depth-limit site is in this list, and the reason is worth more than the
+%% test would be.** A frame already at depth 1024 cannot make *any* call, so it cannot
+%% have populated the return-data buffer either: every `CALL` and `CREATE` it attempts is
+%% the one being refused. The buffer is only non-empty at that depth if the frame arrived
+%% by recursing, which needs a real 1024-deep call tree -- about 3,300 gas a frame, so
+%% 3.4M against this module's `?GAS'.
+%%
+%% The first version of that test set `depth' in the message and asserted the buffer was
+%% empty, and it passed with the fix **deleted**, because the control call was refused
+%% too and the buffer was empty either way. A test that cannot fail is worse than no
+%% test, so it is not here. The two `finish_call/8' lines are kept because the
+%% specification puts the reset *before* the depth check -- `evm.return_data = b""' is
+%% the first statement of both `generic_call' and `generic_create' -- and they are the
+%% same one-token change as the five that are pinned. They are **unpinned**, and saying
+%% so is the point of this note.
+%%
+%% (`?MSG0#{depth => D}' would not have compiled either -- a map literal cannot be
+%% updated in place, and the compiler says "expression updates a literal" -- so this was
+%% a function first. It is gone now that no test needs it.)
+
+%% A `CALL` whose forwarded gas and argument length are stated explicitly, so a
+%% precompile can be asked for a call it cannot afford. `call_seq/3' hard-codes the gas
+%% operand at `PUSH2 0xFFFF' and the argument length at 0, so the seven are spelled out:
+%% retlen, retoff, argslen, argsoff, value, to, gas.
+%%
+%% `retlen = ArgLen' and `argsoff = 0`, so a successful call to identity returns exactly
+%% `ArgLen' bytes into `retdata'. That is what makes the control below meaningful: with
+%% one byte in, a call that *succeeds* leaves a return data of 1, and the same call
+%% forwarding no gas leaves 0. Asserting 0 against a precompile that returns nothing
+%% would pass whether or not the branch cleared the buffer.
+call_with_gas(ToByte, ArgLen, Gas) ->
+    <<16#60,0, 16#60,0, 16#60,ArgLen, 16#60,0, 16#60,0, 16#60,ToByte,
+      (push_int(Gas))/binary, 16#F1, 16#50>>.
+
+%% `CREATE' pops value, offset and length with the value on top, so the pushes go
+%% length, offset, value. `PUSH1 0' twice then the value, then CREATE, then POP the
+%% address it pushed.
+create_seq(Value) -> <<16#60, 0, 16#60, 0, (push_int(Value))/binary, 16#F0, 16#50>>.
+
+%% **`16#61` is PUSH2, not `16#62`.** `16#62` is PUSH3, so a two-byte immediate written
+%% with it swallows the *next* opcode as its third byte -- which, in `create_seq/1', is
+%% the `CREATE` itself. The result is a program that never creates anything and reports
+%% a return-data buffer that nobody touched, which reads as a node defect and is not
+%% one. Every hand-written probe here was wrong in that single hex digit at once, and
+%% it cost four of them to find.
+push_int(V) when V > 255, V =< 65535 -> <<16#61, (V bsr 8), (V band 255)>>;
+push_int(V) -> <<16#60, V>>.
+
+a_create_the_sender_cannot_afford_empties_the_return_data() ->
+    eth_test_util:with_local_reads(fun() ->
+        %% The call succeeds first and leaves a return data of size 1, so the CREATE
+        %% has something to clear. The sender holds 1000 and the CREATE asks 20000, so
+        %% the value cannot move.
+        Callee = <<16#60, 1, 16#60, 0, 16#F3>>,
+        Code = <<(call_seq(16#0D, 0, 16#F1))/binary, 16#50,
+                 (create_seq(20000))/binary,
+                 16#3D, 16#60, 8, 16#55, 16#00>>,
+        {ok, _, _, St, _} = eth_evm:run(Code, ?MSG0, call_state(1000, Callee),
+                                        #{fork => cancun}, ?GAS),
+        ?assertEqual(0, eth_state:storage(St, ?CALLER, 8)),
+        %% The control: without the CREATE the buffer holds 1. Asserted because an
+        %% assertion of 0 means nothing if the buffer was empty to begin with -- which
+        %% is what an earlier hand-written probe of this path concluded, having
+        %% assembled the CALL wrongly and read a buffer that had never been written.
+        {ok, _, _, St1, _} =
+            eth_evm:run(<<(call_seq(16#0D, 0, 16#F1))/binary, 16#50,
+                          16#3D, 16#60, 8, 16#55, 16#00>>,
+                        ?MSG0, call_state(1000, Callee), #{fork => cancun}, ?GAS),
+        ?assertEqual(1, eth_state:storage(St1, ?CALLER, 8))
+    end).
+
+%% **`CREATE` clears the buffer on success too, and not to the new address.** This is
+%% the one a `finish_call/8' grep cannot find, because the success path does not go
+%% through `finish_call/8' -- it pushes the address itself:
+%%
+%%     incorporate_child_on_success(evm, child_evm)
+%%     evm.return_data = b""
+%%     push(evm.stack, U256.from_be_bytes(child_evm.message.current_target))
+%%
+%% (`execution-specs`, `forks/cancun/vm/instructions/system.py`.) The **stack** gets
+%% the address; the buffer gets nothing. An earlier reading of EIP-211 -- that a
+%% successful `CREATE` leaves the created address in the buffer -- is wrong for the
+%% current specification, and the specification was read rather than recalled for
+%% exactly that reason.
+a_successful_create_empties_the_return_data() ->
+    eth_test_util:with_local_reads(fun() ->
+        Callee = <<16#60, 1, 16#60, 0, 16#F3>>,
+        Code = <<(call_seq(16#0D, 0, 16#F1))/binary, 16#50,
+                 (create_seq(0))/binary,           %% value 0: deploys empty code
+                 16#3D, 16#60, 8, 16#55, 16#00>>,
+        {ok, _, _, St, _} = eth_evm:run(Code, ?MSG0, call_state(1000, Callee),
+                                        #{fork => cancun}, ?GAS),
+        ?assertEqual(0, eth_state:storage(St, ?CALLER, 8))
+    end).
+
+%% The `CREATE` half of the depth limit, which is a separate `finish_call/8' site from
+%% `CALL`'s. **`run_create/6` refuses at the same 1024**, and the test that would pin it
+%% does not exist, for a reason worth recording rather than a test worth faking:
+%%
+%% **The depth-limit branches are unobservable from a single frame.** A frame whose
+%% depth is already 1024 cannot make *any* call, so it also cannot have populated the
+%% return-data buffer -- every `CALL` and `CREATE` it attempts is the one being refused.
+%% The buffer is only non-empty at depth 1024 if the frame got there by recursing, and
+%% that needs a real 1024-deep call tree: ~3,300 gas a frame, so 3.4M against this
+%% module's `?GAS'.
+%%
+%% The first version of this test set `depth' in the message and asserted the buffer was
+%% empty, and it passed with the fix **deleted** -- because the control call was refused
+%% too, so the buffer was empty either way. A test that cannot fail is worse than no
+%% test, so it is not here. The two `finish_call/8' lines are kept because the
+%% specification puts the reset *before* the depth check
+%% (`evm.return_data = b""' is the first statement of `generic_call' and
+%% `generic_create'), and they are the same one-token change as the six that are pinned
+%% -- but they are **unpinned**, and saying so is the point of this note.
+
+a_call_that_did_not_happen_empties_the_return_data_test_() ->
+    {foreach, fun() -> ok end,
+     [fun a_create_the_sender_cannot_afford_empties_the_return_data/0,
+      fun a_successful_create_empties_the_return_data/0,
+      fun a_precompile_the_caller_cannot_afford_empties_the_return_data/0]}.
+
+%% A precompile asked for a call the caller cannot forward gas for. This is a *third*
+%% precompile outcome, distinct from the two above: the precompile ran, its answer was
+%% `{ok, Out, Cost}', and `Cost' exceeded the forwarded allowance, so the call fails and
+%% the whole allowance is gone -- it was not a CALL frame, so there is no remainder to
+%% hand back. The buffer must be empty for the same reason the other two are.
+a_precompile_the_caller_cannot_afford_empties_the_return_data() ->
+    eth_test_util:with_local_reads(fun() ->
+        Callee = <<16#60, 1, 16#60, 0, 16#F3>>,
+        %% `mem[0] = 1`, so identity is given one non-zero byte and answers with one.
+        %% Identity costs 15 + 3 per word, so forwarding 0 cannot pay for it.
+        Code = <<16#60, 1, 16#60, 0, 16#53,
+                 (call_seq(16#0D, 0, 16#F1))/binary, 16#50,
+                 (call_with_gas(16#04, 1, 0))/binary,
+                 16#3D, 16#60, 8, 16#55, 16#00>>,
+        {ok, _, _, St, _} = eth_evm:run(Code, ?MSG0, call_state(1000, Callee),
+                                        #{fork => cancun}, ?GAS),
+        ?assertEqual(0, eth_state:storage(St, ?CALLER, 8)),
+        %% **The control, and it is the whole test:** the same call with gas it can
+        %% afford succeeds and publishes its one byte of output. So the 0 above is the
+        %% branch clearing the buffer, not a precompile that had nothing to say.
+        Ok = <<16#60, 1, 16#60, 0, 16#53,
+               (call_seq(16#0D, 0, 16#F1))/binary, 16#50,
+               (call_with_gas(16#04, 1, 1000))/binary,
+               16#3D, 16#60, 8, 16#55, 16#00>>,
+        {ok, _, _, St1, _} = eth_evm:run(Ok, ?MSG0, call_state(1000, Callee),
+                                         #{fork => cancun}, ?GAS),
+        ?assertEqual(1, eth_state:storage(St1, ?CALLER, 8))
+    end).
+
 %% `CALLCODE` is the same block in the spec -- the same `sender_balance` check, the
 %% same `evm.gas_left += message_call_gas.sub_call`, and `should_transfer_value=True` --
 %% and `check_call_value/5` had only a `call` clause, so `CALLCODE` moved no value and

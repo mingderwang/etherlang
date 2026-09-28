@@ -460,6 +460,24 @@ Do not "fix" these by guessing. Each is listed in `TASKS.md`.
   second list to fall out of step; and `schedule_fork_at/3` asks about **mainnet**,
   because `fork_point/1`'s activation numbers are mainnet's and asking the configured
   network answers a different question.
+- **A result nobody writes is whatever was there before.** `finish_call/8` does not set
+  `retdata` -- for an account `CALL` that is `handle_child/9`'s job -- and the precompile
+  path had no such job, so `RETURNDATASIZE` after a *precompile* call reported the
+  previous call's length. It read as `-19,900 x24`, which is `SSTORE_SET_GAS` minus
+  `SLOAD_GAS`: a delta that decomposes onto two neighbouring constants is a wrong
+  *value* feeding a right price, not a mispriced opcode. Three traps in one fix: a
+  grep for `finish_call(` **misses the successful `CREATE`**, which pushes the address
+  itself; the older reading of EIP-211 (the created address, left-padded, left in the
+  buffer) is **wrong** for the current spec, which says the stack gets the address and
+  the buffer gets `b""`; and a test for the **depth-limit** branches cannot be written
+  cheaply, because a frame at depth 1024 cannot have populated the buffer. That test
+  passed with the fix deleted and was deleted rather than kept.
+- **A two-byte immediate written with `16#62` is a `PUSH3`.** `0x61` is `PUSH2`.
+  `PUSH3` swallows the *next* opcode as its third byte -- in a probe that next byte was
+  the `CREATE` under test -- so the program never created anything and reported a
+  buffer nobody had touched, which reads as a node defect and is not one. Four
+  hand-written probes were wrong in that one hex digit at once. A probe is a test with
+  the assertions removed, and it fails the same way.
 - **A gas figure read off a balance difference can be a fee bug.** `+517,958` is
   `(gasLimit - gasUsed) * price`. It looks like a pricing bug and is arithmetic about
   the *price*, and an instrumented run is what separated them: `charged0` was already
