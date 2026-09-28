@@ -285,22 +285,45 @@ behavioural change per commit, and each step says what it now does.
      honest** — a wrong state root committed to the trie is the failure mode this
      project exists to avoid, and a refusal is the correct answer while the schedule is
      missing.
-   - **Two named gaps remain behind those 55.**
-     - **Pre-Berlin SSTORE is still unpriced.** Refusing is now safe; pricing it is the
-       real fix. Three schedules exist before Berlin — the flat rule, EIP-1283's net
-       metering at Constantinople, and Petersburg's revert of it — and the constants
-       changed twice besides (EIP-150's `SLOAD_GAS`, EIP-1884's). That needs three
-       EIPs' texts read and each constant pinned per fork, and it is **not** something
-       to do on recollection: a wrong `SSTORE` price is a wrong state root on every
-       pre-Berlin block, which is exactly what the refusal above just stopped
-       happening.
-     - **The 7 `precompile 9` entries are a different problem and are not yet
-       separated.** `eth_pairing_bn128:check_pairing/1` returns the same `unsupported`
-       atom for "this node cannot run this" and for "the input is invalid", and an
-       invalid pairing input is a *call failure* under EIP-197/EIP-212, not an absence.
-       So on those 7 the node is declining for a reason that is not a reason to decline,
-       and until the two are distinguished it cannot be said whether the node lacks the
-       implementation or rejects input the chain accepts.
+   - ~~**Two named gaps remain behind those 55.**~~ **Both closed** (`v1.35`), and
+     `unpriced` is now **0**: nothing in the corpus is executed that this node cannot
+     price.
+     - **Pre-Berlin SSTORE is priced.** The flat rule — the yellow paper's, which
+       Petersburg put back — with the figures EIP-2200 quotes as its own inherited
+       values: "SSTORE_SET_GAS: 20000, not changed", "SSTORE_RESET_GAS: 5000, not
+       changed", "SSTORE_CLEARS_SCHEDULE: 15000, not changed". `SLOAD_GAS` is
+       fork-selected, **50 / 200 / 800**, from EIP-150 ("Increase the gas cost of
+       SLOAD to 200 (from 50)") and EIP-1884 ("The SLOAD (0x54) operation changes from
+       200 to 800 gas"). That is eight of the nine pre-Berlin forks.
+       **Constantinople is the ninth and is still refused**, and it is the *only* one:
+       EIP-1283 replaced the flat rule with net metering and Petersburg reverted it.
+       Constantinople is also **unreachable by block number on mainnet** — it and
+       Petersburg activate at the same block, 7,280,000, and the last one at a block
+       wins — so it is reachable as a name, which is how the corpus reaches it, and not
+       as a block. That fact is pinned, because a test expecting a mainnet
+       Constantinople block found `fork_at_number(7280000)` answering `petersburg`.
+     - **Rejected precompile input is now a call failure, not an absence**, and both
+       conflations were mine, in opposite directions. `check_pairing/1` returned one
+       `unsupported` for "cannot run this" and "the input is invalid", where an input
+       the pairing check rejects is a *call failure* under EIP-197; it now returns
+       `{error, invalid_input, Why}` for the second. And `blake2f/1` returned
+       `unsupported` for any input not 213 bytes, so the seven `eip152_blake2` fixtures
+       — whose DELEGATECALLs carry **zero-length** calldata, where the call should
+       simply fail — refused the whole block.
+       `precompile/3` has a third answer, `{failed, Why}`, handled by
+       `eth_evm:run_call/10` like a precompile it cannot afford: nothing returned,
+       forwarded gas consumed, caller carries on.
+     - **SLOAD itself was mispriced at both ends.** `access_prices(16#54)` was
+       `{200, 2100}` at every fork, right for exactly one span of three: a Frontier
+       SLOAD cost a third of what it should and an Istanbul one 400 too little.
+     - `match` 12 → **17**. `state_mismatch` 196 → 246 is the other side of the same
+       move, not a regression: 43 entries now execute and differ for whatever else is
+       wrong with them, which is a diagnosis rather than a refusal.
+     - **ECADD and ECMUL still conflate the two and are named open.** `bn128_add/2`
+       returns `unsupported` for an off-curve point where EIP-196 makes it a call
+       failure. I stopped there because the `byzantium/eip196_ec_add_mul` fixtures pass
+       with the present shape and a change there could move them in a direction I had
+       not measured. Named, not done.
    - **`+56668` and `+56665`.** **Unresolved**, and no longer the largest thing in the
      histogram: a current run of the same corpus puts the biggest positive deltas on
      the `enough_gas_False` pairing cases above, so this fingerprint has to be
