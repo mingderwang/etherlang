@@ -17,6 +17,7 @@
          blob_versioned_hashes/1, valid_versioned_hashes/1,
          authorization_list/1, authorization_authority/1,
          delegation_indicator/1, is_delegation_indicator/1,
+         resolve_delegation/3, delegation_target/1,
          blob_hashes_present/1, blob_hashes_well_formed/1,
          validate/1, validate/2, intrinsic_gas/1, intrinsic_gas/2, tx_type/1,
          %% **Exported for the frame, not for a test.** EIP-2930: "The address and
@@ -267,6 +268,66 @@ delegation_indicator(Address) -> delegation_indicator(eth_state:address(Address)
 is_delegation_indicator(Code) when is_binary(Code), byte_size(Code) =:= 23 ->
     binary:part(Code, 0, 3) =:= ?DELEGATION_PREFIX;
 is_delegation_indicator(_) -> false.
+
+%% The 20-byte address a delegation indicator points at, or `undefined` for any
+%% other code -- including code of a different length, which is the case that
+%% matters, since `<<16#EF, 16#01, 16#00>>` on its own is *not* a delegation.
+delegation_target(Code) when is_binary(Code), byte_size(Code) =:= 23 ->
+    case is_delegation_indicator(Code) of
+        true -> binary:part(Code, 3, 20);
+        false -> undefined
+    end;
+delegation_target(_) ->
+    undefined.
+
+%% EIP-7702, "The delegation forces all code executing operations to follow the
+%% address pointer to obtain the code to execute." Resolves **at most one** hop and
+%% answers `{Code, Delegate}`, where `Delegate` is `undefined` when no delegation
+%% was followed -- so a caller can price the resolution's account access (which
+%% the EIP charges only when a delegation *was* followed) without re-deriving
+%% whether one was.
+%%
+%% Three rules, and **all three are counter-intuitive enough that they are worth
+%% stating before they are coded**:
+%%
+%% 1. **One hop, then stop.** "In case a delegation indicator points to another
+%%    delegation, creating a potential chain or loop of delegations, clients must
+%%    retrieve only the first code and then stop following the delegation chain."
+%%    So a designator pointing at a designator resolves to *that designator's
+%%    bytes*, which are then executed as code -- and `0xef` is not an instruction
+%%    (it is the EIP-3541 banned opcode), so the frame halts. **A recursive
+%%    resolution is the wrong implementation and it is also the one that looks
+%%    right**: it terminates on no input, because `A -> B -> A` is a cycle a
+%%    resolver cannot distinguish from a chain. The halt is the specified answer.
+%%
+%% 2. **A delegation to a precompile is empty code.** "When a precompile address
+%%    is the target of a delegation, the retrieved code is considered empty ...
+%%    and therefore succeed with no execution when given enough gas to initiate the
+%%    call." So a delegation to `0x01` does **not** run `ecrecover`; it runs
+%%    nothing and succeeds. The precompile is a *destination* the designator names,
+%%    not one the call enters, and the caller's own access to the account is
+%%    still charged.
+%%
+%% 3. **The account keeps its own identity.** The returned `Code` is executed in
+%%    the context of the *account*, not the delegate -- "CALL loads the code at
+%%    `address` and executes it in the context of `authority`". This function
+%%    therefore returns code and nothing else: the frame's `address`, its storage
+%%    and its balance stay the authority's, which is what makes the delegation a
+%%    `DELEGATECALL` the user authorised rather than a call *to* the delegate.
+resolve_delegation(State, Addr, Fork) ->
+    case delegation_target(eth_state:code(State, Addr)) of
+        undefined ->
+            {eth_state:code(State, Addr), undefined};
+        Target ->
+            %% The `Addr` code is the indicator itself; the *target's* code is what
+            %% runs, and it is read once and never resolved again (rule 1).
+            Resolved = case lists:member(Target,
+                                         eth_fork_schedule:precompile_addresses(Fork)) of
+                           true -> <<>>;                        % rule 2
+                           false -> eth_state:code(State, Target)
+                       end,
+            {Resolved, Target}
+    end.
 
 %% EIP-7702 step 3, in full:
 %%
@@ -1243,7 +1304,23 @@ check_sender_is_eoa(Payer, Ctx) ->
             ok;
         {true, Fun} when is_function(Fun, 1) ->
             case Fun(Payer) of
-                {ok, Code} -> ensure(code_is_empty(Code), {error, sender_not_eoa});
+                %% **EIP-7702's "Transaction origination"** modifies EIP-3607:
+                %% "allow EOAs whose code is a valid delegation indicator ...
+                %% to originate transactions. Accounts with any other code values
+                %% may not originate transactions." So the rule is *not* "no code"
+                %% any more, it is "no code **except** a delegation indicator" --
+                %% which is the same sentence with a narrow exception in it, and the
+                %% exception is the entire feature: an account that has delegated
+                %% exists precisely in order to send transactions.
+                %%
+                %% Not fork-gated, and that is not an oversight: `0xef0100 || address`
+                %% is 23 bytes that only `process_authorizations/3' writes, and that
+                %% only runs for a type-4 transaction, which `tx_type_available/2'
+                %% refuses before Prague. So a pre-Prague block cannot contain a
+                %% delegation indicator, and the gate would be dead code.
+                {ok, Code} ->
+                    ensure(code_is_empty(Code) orelse is_delegation_indicator(Code),
+                           {error, sender_not_eoa});
                 _ -> ok
             end;
         {true, undefined} ->

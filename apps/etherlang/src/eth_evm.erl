@@ -91,6 +91,7 @@ initial_access(Msg, Env, Fork) ->
             Addrs = [maps:get(origin, Msg, <<0:160>>),
                      maps:get(address, Msg, <<0:160>>)]
                     ++ coinbase_at(Fork, maps:get(coinbase, Env, undefined))
+                    ++ delegate_at(maps:get(delegate, Msg, undefined))
                     ++ eth_fork_schedule:precompile_addresses(Fork),
             Warmed = lists:foldl(fun(Addr, Acc) -> Acc#{{warm_account, Addr} => true} end,
                                  #{}, Addrs),
@@ -156,6 +157,16 @@ coinbase_at(Fork, Addr) ->
         true -> [Addr];
         false -> []
     end.
+
+%% EIP-7702's transaction-destination delegate, in the transaction-start warm set.
+%% `undefined` for every transaction whose destination is not a delegated account,
+%% and `[]` rather than `[undefined]` -- a one-element list holding the *atom* would
+%% key the warm map on a value no 160-bit address can equal, which is the
+%% `precompile_addresses/1` seed bug AGENTS.md records: a set that is present,
+%% correctly shaped, and inert.
+delegate_at(undefined) -> [];
+delegate_at(Addr) when is_binary(Addr) -> [Addr];
+delegate_at(_) -> [].
 
 %% The fork this frame executes under, taken from the Env.
 %%
@@ -925,25 +936,59 @@ do_call(Kind, Op, E, Ctx) ->
             %%
             %% The target is warmed by the call itself, for all four kinds.
             {Warm, CtxA} = warm_account(Ctx, To),
-            Base = eth_fork_schedule:call_cost(Op, Ctx#ctx.fork,
-                                              #{warm => Warm,
-                                                value_transfer => Value =/= 0,
-                                                new_account => new_account(CtxA, To, Value)}),
+            %% **EIP-7702: resolve the delegation ONCE, here**, and use the answer
+            %% for both the price and the code. It has to be here rather than in
+            %% `run_call/11' because the price depends on it -- the EIP charges an
+            %% *additional* account access for the resolution -- and it has to be
+            %% here rather than computed twice because a resolution that answered
+            %% differently on the two calls would charge for a hop it did not take
+            %% and run a hop it did not price. The two must be one value, so there is
+            %% one call.
+            {ChildCode, Delegate} =
+                eth_tx:resolve_delegation(CtxA#ctx.state, To, Ctx#ctx.fork),
+            {Base, CtxA1} =
+                case Delegate of
+                    undefined ->
+                        {eth_fork_schedule:call_cost(
+                           Op, Ctx#ctx.fork,
+                           #{warm => Warm,
+                             value_transfer => Value =/= 0,
+                             new_account => new_account(CtxA, To, Value)}),
+                         CtxA};
+                    _ ->
+                        %% The delegate is a **second** account, warmed by this access
+                        %% and priced by it: 2600 if cold, 100 if this frame already
+                        %% reached it. Both the price and the warming live in the fork
+                        %% table -- see `delegation_resolution_cost/2'.
+                        {DelegateWarm, CtxD} = warm_account(CtxA, Delegate),
+                        Cost = eth_fork_schedule:delegation_resolution_cost(
+                                 Ctx#ctx.fork, DelegateWarm),
+                        {eth_fork_schedule:call_cost(
+                           Op, Ctx#ctx.fork,
+                           #{warm => Warm,
+                             value_transfer => Value =/= 0,
+                             new_account => new_account(CtxA, To, Value)}) + Cost,
+                         CtxD}
+                end,
+            %% The delegate is warmed in `CtxA1`'s transient map; the *state* is
+            %% untouched, so carrying the former forward and the latter back is not
+            %% a merge but a note about which of the two `warm_account/2` changes.
+            CtxA2 = CtxA1#ctx{state = CtxA#ctx.state},
             case charge(E7, Base) of
-                oog -> oog(E7, CtxA);
+                oog -> oog(E7, CtxA2);
                 {ok, E8} ->
                     case charge_mem(E8, ArgsOff + ArgsLen) of
-                        oog -> oog(E8, CtxA);
+                        oog -> oog(E8, CtxA2);
                         {ok, E9} ->
                             case charge_mem(E9, RetOff + RetLen) of
-                                oog -> oog(E9, CtxA);
+                                oog -> oog(E9, CtxA2);
                                 {ok, E10} ->
                                     Args = read(E10, ArgsOff, ArgsLen),
                                     Avail = E10#e.gas,
                                     case child_gas(GasReq, Avail,
-                                                   CtxA#ctx.fork, Value) of
+                                                   CtxA2#ctx.fork, Value) of
                                         {oog, _Why} ->
-                                            oog(E10, CtxA);
+                                            oog(E10, CtxA2);
                                         {CallGas, ChildGas} ->
                                             %% **Charge the pre-stipend figure; run the
                                             %% child on the post-stipend one.** The
@@ -957,7 +1002,7 @@ do_call(Kind, Op, E, Ctx) ->
                                             {ok, E11} = charge(E10, CallGas),
                                             run_call(Kind, To, ToW, Value, Args,
                                                      ChildGas, RetOff, RetLen,
-                                                     E11, CtxA)
+                                                     E11, CtxA2, ChildCode)
                                     end
                             end
                     end
@@ -1061,7 +1106,7 @@ child_gas(GasReq, Avail, Fork, Value) ->
     end.
 
 
-run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
+run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx, ChildCode) ->
     Env = Ctx#ctx.env,
     Depth = s_msg(depth, Ctx, 0),
     case Depth >= 1024 of
@@ -1175,12 +1220,29 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx) ->
                     CurAddr = s_msg(address, Ctx, <<0:160>>),
                     CurCaller = s_msg(caller, Ctx, <<0:160>>),
                     CurValue = s_msg(value, Ctx, 0),
-                    {ChildCode, ChildAddr, ChildCaller, ChildValue} =
+                    %% **`ChildCode` arrives already resolved.** Reading
+                    %% `eth_state:code/2` here would resolve the delegation a second
+                    %% time, on the pre-`check_call_value/5' state -- and the price
+                    %% charged upstairs came from the first one, so the hop that was
+                    %% billed and the hop that runs would be two separate readings of
+                    %% two separate values. EIP-7702's resolution is not idempotent
+                    %% under a state change: `check_call_value/5` can empty the
+                    %% account whose indicator is being followed.
+                    %%
+                    %% `ChildAddr` is the **account**, not the delegate, and that is
+                    %% the EIP's own sentence: "CALL loads the code at `address` and
+                    %% executes it in the context of `authority`." The frame's
+                    %% address, its storage and its balance therefore stay the
+                    %% account's -- which is what makes this an authorised
+                    %% `DELEGATECALL` rather than a call *to* the delegate, and which
+                    %% is why `callcode` and `delegatecall`, keeping `CurAddr`, are
+                    %% unchanged by any of it.
+                    {ChildAddr, ChildCaller, ChildValue} =
                         case Kind of
-                            call -> {eth_state:code(Ctx#ctx.state, To), To, CurAddr, Value};
-                            staticcall -> {eth_state:code(Ctx#ctx.state, To), To, CurAddr, 0};
-                            callcode -> {eth_state:code(Ctx#ctx.state, To), CurAddr, CurAddr, Value};
-                            delegatecall -> {eth_state:code(Ctx#ctx.state, To), CurAddr, CurCaller, CurValue}
+                            call -> {To, CurAddr, Value};
+                            staticcall -> {To, CurAddr, 0};
+                            callcode -> {CurAddr, CurAddr, Value};
+                            delegatecall -> {CurAddr, CurCaller, CurValue}
                         end,
                     case check_call_value(Kind, Ctx#ctx.state, CurAddr, To, Value) of
                         {error, insufficient_balance} ->

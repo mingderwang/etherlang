@@ -409,29 +409,46 @@ which needed any new code to surface:
   worst category there is;
 - `eth_tx:from_rlp/1` **has no clause for an EIP-7702 (type 4) transaction**.
 
-**EIP-7702 is now half-implemented, and which half matters.** Decoding, signing,
-pricing, validation **and the authorization state transition** are done: for each
-tuple, recover the authority over `keccak(0x05 || rlp([chain_id, address, nonce]))`
-with EIP-2's `s =< n/2` enforced, apply the EIP's validity steps, write
-`0xef0100 || address` — or *clear* the code, for the zero address — and bump the
-authority's nonce, after the sender's increment and **not rolled back** on a revert.
-**Two things are not done, and between them they mean the feature does not work:**
+**EIP-7702 is now implemented, and the last piece was the one that made it a
+feature.** Decoding, signing, pricing, validation and the authorization state
+transition were done in `v1.62`: for each tuple, recover the authority over
+`keccak(0x05 || rlp([chain_id, address, nonce]))` with EIP-2's `s =< n/2`
+enforced, apply the EIP's validity steps, write `0xef0100 || address` — or *clear*
+the code, for the zero address — and bump the authority's nonce, after the sender's
+increment and **not rolled back** on a revert.
 
-1. **The EVM does not follow a delegation.** No code-executing operation loads the
-   code a designator names, so a delegated account does not execute its delegate.
-   There is no first-hop limit either, so nothing yet prevents a chain of
-   delegations from looping.
-2. **EIP-3607 is not relaxed.** A transaction whose sender holds *any* code is
-   refused, a valid delegation indicator included, so a delegated EOA cannot
-   originate a transaction at all.
+`v1.63` made the delegation *run*. A code-executing operation now loads the code a
+designator names and executes it **in the context of the account**, so the
+delegate's code reads and writes the authority's storage, balance and `ADDRESS`.
+Three rules here read backwards, and all three are implemented as the EIP states
+them rather than as they suggest:
 
-A third, smaller: the `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` refund (12,500
-per **non-empty** authority) is not charged. The EIP adds it to the *global refund
-counter*, and EIP-3529 caps the **combined** refund at `gasUsed / 5` — but
-`eth_evm:run/5` applies that cap inside the frame and returns only the capped
-figure, so the transaction layer cannot cap a sum it cannot see. Charging it on top
-would over-refund, which is a consensus divergence, so it is a named gap rather
-than a missing line.
+* **one hop, then stop** — a delegation pointing at a delegation resolves to that
+  indicator's bytes, and `0xef` is not an instruction, so the frame halts. A
+  recursive resolver is both wrong and the implementation that looks right, since it
+  terminates on no input: a cycle is indistinguishable from a chain.
+* **a delegation to a precompile is empty code** — the precompile does not run, so
+  `0x01` does not `ecrecover`; the call succeeds with no execution.
+* **the account keeps its own identity** — this is a `DELEGATECALL` the user
+  authorised, not a call *to* the delegate.
+
+EIP-3607 is relaxed accordingly: a sender may hold a delegation indicator, and may
+hold no other code. `CODESIZE` and `CODECOPY` are untouched — they read the
+executing code — while `EXTCODESIZE` on the account still reports the indicator's 23
+bytes. Resolving a delegation costs EIP-2929's **additional** account access, 2,600
+cold or 100 warm.
+
+**One part of the EIP is still absent, and it is the only one left:** the
+`PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` refund (12,500 per **non-empty**
+authority). The EIP adds it to the *global refund counter*, and EIP-3529 caps the
+**combined** refund at `gasUsed / 5` — but `eth_evm:run/5` applies that cap inside
+the frame and returns only the capped figure, so the transaction layer cannot cap a
+sum it cannot see. Charging it on top would over-refund, which is a consensus
+divergence, so it is a named gap rather than a missing line. And it is not
+untouched ground: the corpus **does** exercise it, in
+`prague/eip7702_set_code_tx/test_intrinsic_gas_cost.json`, where the authority is
+the fixture's own `signer` and **is** present in the pre-state. All 11 remaining
+divergences in that directory are balance-only.
 
 **The figure is reproducible, and getting it there was two harness bugs.** It
 drifted at first — 5, 6, 7 and 2 across runs of identical code — for two

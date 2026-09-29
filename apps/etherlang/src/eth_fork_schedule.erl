@@ -77,6 +77,7 @@
           max_initcode_size/1,
           sender_must_be_eoa/1,
           precompile_addresses/1,
+          delegation_resolution_cost/2,
           modexp_cost/1,
           modexp_complexity/2,
           precompile_at/2,
@@ -1443,14 +1444,51 @@ base_gas_cost(_, _, _) -> 0.
 %% drift without anything noticing. SLOAD's cold cost is COLD_SLOAD_COST (2100) and
 %% an account access is COLD_ACCOUNT_ACCESS_COST (2600); they are different
 %% constants, not different regimes.
-access_prices(16#31) -> {400, 2600};   % BALANCE
-access_prices(16#3B) -> {700, 2600};   % EXTCODESIZE
-access_prices(16#3C) -> {700, 2600};   % EXTCODECOPY
-access_prices(16#3F) -> {400, 2600};   % EXTCODEHASH
+access_prices(16#31) -> {400, cold_account_access_cost()};   % BALANCE
+access_prices(16#3B) -> {700, cold_account_access_cost()};   % EXTCODESIZE
+access_prices(16#3C) -> {700, cold_account_access_cost()};   % EXTCODECOPY
+access_prices(16#3F) -> {400, cold_account_access_cost()};   % EXTCODEHASH
 access_prices(16#54) -> {sload_gas(homestead), 2100};   % SLOAD, see sload_gas/1
-access_prices(Op) when Op >= 16#F1, Op =< 16#F4 -> {700, 2600};  % the CALL family
-access_prices(16#FA) -> {700, 2600};   % STATICCALL
+access_prices(Op) when Op >= 16#F1, Op =< 16#F4 -> {700, cold_account_access_cost()};  % the CALL family
+access_prices(16#FA) -> {700, cold_account_access_cost()};   % STATICCALL
 access_prices(_Op) -> {0, 0}.
+
+%% EIP-2929's `COLD_ACCOUNT_ACCESS_COST`, which is what an account access costs
+%% when that account is cold. Named because **it was written out six times** in
+%% this table -- four here and once more for the call family -- and a fifth copy
+%% for EIP-7702's delegation resolution would have been a seventh. It is 2600 and
+%% it is not fork-selected: EIP-2929 is Berlin, and `access_cost/3` is what
+%% decides whether Berlin's regime applies at all.
+%%
+%% It is distinct from `COLD_SLOAD_COST` (2100), which is the *storage* figure and
+%% which EIP-2929 raises separately; a table that conflated them would be right
+%% about four opcodes and wrong about SLOAD, so SLOAD keeps its own literal.
+cold_account_access_cost() -> 2600.
+
+%% EIP-7702: "If a code executing instruction accesses a cold account during the
+%% resolution of delegated code, add an additional EIP-2929 `COLD_ACCOUNT_READ_COST`
+%% cost of 2600 gas to the normal cost and add the account to `accessed_addresses`.
+%% Otherwise, assess a `WARM_STORAGE_READ_COST` cost of 100."
+%%
+%% So the term is EIP-2929's *account* access cost, warmed or not, and it is
+%% **additional to** the call's own price rather than part of it -- which is why it
+%% is a separate function and not another arm of `call_cost/3`.
+%%
+%% **Zero before Berlin.** The warm/cold split is EIP-2929's and the EIP quotes its
+%% figures, so there is no such cost at an earlier fork. It is unreachable in
+%% practice -- a delegation indicator can only be written by a type-4 transaction,
+%% which `tx_type_available/2' refuses before Prague -- and zero is the honest
+%% answer rather than a figure invented for a case that cannot arise.
+-spec delegation_resolution_cost(atom(), boolean()) -> non_neg_integer().
+delegation_resolution_cost(Fork, Warm) ->
+    case at_least(Fork, berlin) of
+        false -> 0;
+        true ->
+            case Warm of
+                true -> 100;
+                false -> cold_account_access_cost()
+            end
+    end.
 
 %% Does this opcode's price depend on what this frame has already touched?
 %%

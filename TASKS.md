@@ -585,29 +585,18 @@ behavioural change per commit, and each step says what it now does.
          next. Applied after the sender's nonce increment and before the frame, so
          it is **not rolled back** when execution reverts — which is the EIP's own
          wording and the opposite of the intuitive reading.
-       - **Still open, and named rather than folded in:**
+       - **The EVM half was missing too, and `v1.63` did it** — see item 6b. What
+         is left is **one** thing, and it is a price rather than a state change:
          1. The `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` = 12,500 refund per
-            **non-empty** authority. Not implemented deliberately: the EIP adds it to
-            the *global refund counter*, and EIP-3529 caps the **combined** refund at
-            `gasUsed / 5`, but `eth_evm:run/5` applies that cap inside the frame and
-            returns only the capped figure — so the transaction layer cannot cap a
-            sum it cannot see, and charging it on top would **over**-refund. The
-            corpus cannot show this: every authority in the type-4 fixtures is absent
-            from the pre-state, hence empty, hence no refund due.
-         2. **EIP-3607 is not relaxed.** The node still refuses a transaction whose
-            sender holds *any* code, a valid delegation indicator included, so a
-            delegated EOA cannot yet originate a transaction — and the corpus has
-            `test_set_code_from_account_with_non_delegating_code.json` expecting
-            `SENDER_NOT_EOA`, with no counterpart asserting the delegating case is
-            allowed.
-         3. **The EVM does not follow a delegation.** No code-executing operation
-            loads the code a designator points at, so a delegated account does not
-            execute its delegate; there is no first-hop limit either, so nothing yet
-            prevents a chain of delegations from looping. This is the *point* of the
-            EIP, and its absence is why item 2 above is the one to do next.
+            **non-empty** authority. The `v1.62` objection — that EIP-3529 caps the
+            *combined* refund while `eth_evm:run/5` caps inside the frame and returns
+            only the capped figure — is **solvable**: seed the frame's refund counter
+            with the authorization refund and the existing cap applies to the sum.
+            **This is all 11 remaining divergences** in
+            `prague/eip7702_set_code_tx/test_intrinsic_gas_cost.json`, which the
+            `v1.62` note here claimed the corpus could not reach. Tracked as item 6e.
        - So the corpus's type-4 execution entries now land in `state_mismatch` for a
-         narrower reason: the accounts exist and carry the right shape, and the
-         delegation does not run.
+         single reason: a missing refund, which moves one balance and nothing else.
    - What the corpus found, immediately and without any new code being written for
      it: the node **accepted a type-2 (EIP-1559) transaction at a pre-London fork**,
      which the specification rejects — 5 entries, and the worst kind of divergence
@@ -771,22 +760,57 @@ behavioural change per commit, and each step says what it now does.
      term to *every* transaction, hardcoding the context's price to the floor, and
      making `blob_base_fee/1` a second derivation that always answers 1. The last two
      fail only the tests that own those two claims, which is what they are for.
-6b. **EIP-7702: make the EVM follow a delegation, and relax EIP-3607.** Ordered
-   before 6c because it is the larger of the two and because it is the part that
-   makes the feature mean anything — `v1.62` writes the designator and nothing
-   reads it. Three pieces, and they belong in one commit because each is
-   untestable without the others: a code-executing operation (`CALL`,
-   `CALLCODE`, `DELEGATECALL`, `STATICCALL`, and a transaction's own destination)
-   loads the code the designator names **or** the designator itself if that
-   account's code is not a delegation, with a **first-hop limit** so a chain of
-   delegations cannot loop; a delegation whose target is a precompile is treated
-   as **empty code**, not as a jump into it; and EIP-3607's "sender must be an
-   EOA" must accept an account whose code *is* a valid designator, which the
-   corpus already has a negative half of
-   (`test_set_code_from_account_with_non_delegating_code.json` expects
-   `SENDER_NOT_EOA`) and no positive half of. **Read the EIP for the hop limit's
-   exact form before writing it** — it is the rule most likely to be got subtly
-   wrong and least likely to be caught by a fixture that does not exist.
+6b. ~~**EIP-7702: make the EVM follow a delegation, and relax EIP-3607.**~~
+   **Done (`v1.63`), +19 tests, 11 injections.** `eth_tx:resolve_delegation/3`
+   resolves **at most one hop**, and `eth_evm:do_call/4` calls it **once**, using the
+   answer for both the price and the code — so the hop that was billed and the hop
+   that runs cannot be two separate readings. EIP-3607 now reads "no code *except* a
+   delegation indicator". Three rules the EIP states and intuition does not:
+   - **one hop, then stop.** A delegation pointing at a delegation resolves to that
+     indicator's bytes, and `0xef` is not an instruction, so the frame halts. A
+     recursive resolver is wrong **and** looks right: it terminates on no input,
+     because a cycle is indistinguishable from a chain.
+   - **a delegation to a precompile is empty code.** `0x01` does not run
+     `ecrecover`; the call succeeds with no execution.
+   - **the account keeps its own identity.** The delegate's code, the account's
+     storage, balance and `ADDRESS`. This is an authorised `DELEGATECALL`, not a
+     call *to* the delegate.
+   The resolution costs EIP-2929's **additional** account access — 2,600 cold, 100
+   warm — in `eth_fork_schedule:delegation_resolution_cost/2`, which exists because
+   `2600` was already written out four times in `access_prices/1`.
+   **The corpus does not move: `prague/eip7702_set_code_tx` 69/80 and the committed
+   subset 226/266, both unchanged.** That is the finding, not a disappointment — no
+   committed fixture has a delegated destination or a delegated `CALL`, so this half
+   of the EIP is **not measurable by the corpus at all** and the tests are the only
+   evidence for it. Both figures also confirm **zero regressions** across every
+   warm-set, access-cost and `CALL` change the work touches.
+6d. **EIP-2930: warm the access-list _address_, not only its storage keys.**
+   `eth_evm:access_list_access/2` folds the list into `{warm_store, Addr, Slot}`
+   entries and **never adds the address to `accessed_addresses`**, so an
+   access-list address is charged its 2,400 of intrinsic gas and then re-charged
+   2,600 as a cold access on first use. **Measured, and found by a test written for
+   a different EIP**: the EIP-7702 warm-resolution test warmed its delegate through
+   an access list, and the "warm" arm came out **2,400 more** than the cold one —
+   the list's own price, warming nothing. `v1.46` fixed the storage-key half; this is
+   the same defect one level up. **It is the smallest open item and the only one with
+   a reproduction already written** — the fix is to add `{warm_account, Addr}` for
+   each entry, and the `?EXPECTED`-style worry is only that every existing
+   access-list fixture's gas may move, so measure the 22-file set before and after.
+6e. **EIP-7702: the `PER_EMPTY_ACCOUNT_COST` refund, and it is 11 corpus entries.**
+   The one part of EIP-7702 still absent. **The structural objection in `v1.62` is
+   solvable and was wrong to leave standing**: the EIP adds the refund to the
+   *global* counter and EIP-3529 caps the **combined** refund, which the node
+   applies inside the frame — but `eth_evm:run/6` can be given the authorization
+   refund as an **initial refund counter**, so the frame's existing cap then applies
+   to the combined total and `run/5` is untouched. **All 11 remaining divergences in
+   `prague/eip7702_set_code_tx/test_intrinsic_gas_cost.json` are this**: balance-only,
+   with "one side produced a gas figure and the other did not", and the authority is
+   the fixture's own `signer`, which **is** in the pre-state.
+   - **And `v1.62` asserted the corpus could not show this.** It verified one file
+     — `prague/eip7623_increase_calldata_cost/test_transaction_validity_type_4.json`,
+     whose authorities are all absent from the pre-state — and wrote the conclusion
+     down as though it were a property of the corpus. A measurement scoped to one
+     sample, stated without its scope, is the defect this repository keeps paying for.
 6c. ~~**Reorder `eth_tx:validate/2` so the fee conditions come last.**~~  **Closed
    as unsupported by evidence, in `v1.57`.** The premise was the note above: that
    `fee_ceiling_ok/4` running before `check_blobs/2` and the intrinsic gas check

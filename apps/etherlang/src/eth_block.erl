@@ -743,6 +743,27 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     %% calldata at all, CALLER was the zero address, and TIMESTAMP, NUMBER,
     %% PREVRANDAO, GASLIMIT and BASEFEE all read as 0. Nothing crashed, and
     %% every one of those is load-bearing for the state root.
+    %% EIP-7702's fifth affected operation: "any transaction where `destination`
+    %% points to an address with a delegation indicator present". So a transaction
+    %% to a delegated account runs the delegate's code **in the context of the
+    %% account**: `Target` is the frame's address, its storage and its balance
+    %% below, and only `Code` comes from the delegate. That difference is the whole
+    %% point of the feature, and it is why `Target` is not re-pointed at the
+    %% delegate anywhere in this function -- doing so would make a delegation an
+    %% ordinary call to the delegate, the opposite of what it authorises.
+    %%
+    %% **Resolved here, before the Msg**, because the Msg carries `delegate' for
+    %% the warm set. The first version of this edit put the resolution at the old
+    %% `Code = ...' line, some forty lines *below* the Msg, and the compiler said
+    %% `move the binding of TxDelegate out of the map' -- which is the polite form
+    %% of "you read this variable before you wrote it". A warning about an
+    %% exported-from-subexpression binding is, in a build where warnings are
+    %% errors, the build catching a use-before-bind.
+    {Code, TxDelegate} =
+        case IsCreate of
+            true -> {Data, undefined};
+            false -> eth_tx:resolve_delegation(State0, Target, fork(Block))
+        end,
     Msg = #{
         caller => Sender,
         origin => Sender,
@@ -752,6 +773,24 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
         gas_price => EffectiveGasPrice,
         static => false,
         depth => 0,
+        %% EIP-7702: "if a transaction's `destination` has a delegation indicator,
+        %% add the target of the delegation to `accessed_addresses`."
+        %%
+        %% Carried on the **Msg** and read by `eth_evm:initial_access/3`, which is
+        %% the one function that decides the transaction-start warm set, rather than
+        %% as a warm entry planted in the Env. Two reasons, and the first is the
+        %% load-bearing one: `initial_access/3` builds the set from the Msg and the
+        %% Env and has no other input, so an Env-only entry would be dropped and the
+        %% delegate would be cold again on the very first access. A key nobody reads
+        %% is the `check_blobs/2` shape from AGENTS.md §10a -- a careful clause
+        %% around a hole.
+        %%
+        %% Without this the delegate is warm from the first frame onward where the
+        %% specification makes it cold, so every *later* access to it in the same
+        %% transaction is under-charged by 2,500 -- an error visible only on a
+        %% transaction that touches the delegate twice, which is why it needs its own
+        %% test rather than falling out of a gas total.
+        delegate => TxDelegate,
         %% EIP-2930's access list, in the frame, because the frame is where it has to
         %% act. `eth_tx:access_list_field/1' is the **same function `validate/2`
         %% priced**, so the list that is charged for and the list that is applied cannot
@@ -779,10 +818,6 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     %% the calldata is the init code, and it runs at the address the create
     %% derives. Its return value is the deployed code, which is installed below
     %% only if the frame succeeded.
-    Code = case IsCreate of
-               true -> Data;
-               false -> eth_state:code(State0, Target)
-           end,
     Env = block_env(Block, State0),
     %% **A halt that means "this node cannot price this" is not a transaction
     %% failure, and committing it as one is the worst thing available here.**
