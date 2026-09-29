@@ -74,6 +74,8 @@
           sstore_cold_cost/2,
           code_deposit_cost/1,
           max_code_size/1,
+          max_initcode_size/1,
+          sender_must_be_eoa/1,
           precompile_addresses/1,
           modexp_cost/1,
           modexp_complexity/2,
@@ -1982,6 +1984,40 @@ max_code_size(Fork) when is_atom(Fork) ->
     end;
 max_code_size(_Fork) ->
     infinity.
+
+%% EIP-3860 (Shanghai): `MAX_INITCODE_SIZE = 2 * MAX_CODE_SIZE`, so **49,152** and not a
+%% number of its own. Derived from `?MAX_CODE_SIZE' rather than transcribed, because the
+%% relation is the EIP's and a transcribed 49,152 would be a constant that could not be
+%% checked against the one it is defined in terms of. `eth_fork_schedule` already held
+%% EIP-3860's *price* half -- `initcode_word_cost/1' -- and not its *limit*, so the fork
+%% charged a per-word cost for initcode that the specification says may not exist at that
+%% size at all.
+%%
+%% `infinity' below Shanghai, for the same reason `max_code_size/1' answers `infinity'
+%% below Spurious Dragon: there was no limit, and answering 49,152 below Shanghai would
+%% refuse transactions that are valid on the chain.
+-spec max_initcode_size(atom()) -> pos_integer() | infinity.
+max_initcode_size(Fork) when is_atom(Fork) ->
+    case at_least(Fork, shanghai) of
+        true -> 2 * ?MAX_CODE_SIZE;
+        false -> infinity
+    end;
+max_initcode_size(_Fork) ->
+    infinity.
+
+%% EIP-3607 (London): a transaction whose sender has deployed code is invalid. Named for
+%% the rule rather than the EIP number, as `code_deposit_cost/1' and `max_code_size/1'
+%% are -- what matters to a caller is whether the sender must be an externally owned
+%% account, and that is a fact about the fork.
+%%
+%% There is no constant here, which is unusual for this module and deliberate: EIP-3607
+%% adds a *refusal*, not a price, and a function that answered a number would invite
+%% exactly the arithmetic the rule does not do.
+-spec sender_must_be_eoa(atom()) -> boolean().
+sender_must_be_eoa(Fork) when is_atom(Fork) ->
+    at_least(Fork, london);
+sender_must_be_eoa(_Fork) ->
+    true.
 
 %% EIP-2929's "SSTORE changes", which is two instructions and the node did one of them.
 %%

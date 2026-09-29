@@ -586,6 +586,27 @@ run_tx(Fork, Tx, Entry, Post) ->
 %% manufacture matches, and a manufactured conformance match is the one artefact in
 %% this project that would make every other number here a lie.
 expect_rejection(Fork, Tx, Entry, Expected) ->
+    %% The base fee is `none` here, and that is **wrong** -- see below -- but changing it
+    %% was measured and is a net regression, so it is recorded rather than landed.
+    %%
+    %% `merge_base_fee(Base, none) -> Base' reads `none' as "use the fork's default and do
+    %% not derive", so this path hands the validator a base fee the fixture never stated
+    %% while the execution path hands it the derived one: **the two paths disagree about
+    %% the same fixture's header field.** `cancun/eip4844_blobs/test_invalid_normal_gas'
+    %% is the one entry that shows it -- a blob transaction with `maxFeePerGas = 6`
+    %% against a stated `currentBaseFee = 7`, which every client rejects as underpriced,
+    %% accepted here because the fork's default was lower.
+    %%
+    %% Passing `derived_base_fee(Entry, #{}, Tx)' fixes that entry and **loses nine
+    %% overall**: matches 1,728 -> 1,719, `rejection_mismatch' 1,975 -> 1,985. Twelve
+    %% entries move to `rejection_mismatch' as `{unmapped, fee_too_low}', because with the
+    %% stated base fee the *fee* check now fires before the rule those fixtures are
+    %% about, and `fee_too_low' has no mapping. So the base fee is wrong here and fixing
+    %% it exposes a **check-ordering** question that is a separate piece of work: whether
+    %% `fee_ceiling_ok/4' should run before the structural rules, and how a transaction
+    %% that is invalid for several reasons should be reported. Landing the base-fee fix
+    %% without answering that would trade 1 real match for 12 nameless ones, which is the
+    %% manufactured-conformance direction this project refuses to move in.
     Block = block(Fork, Entry, none),
     State = state_for(Entry, #{}),
     case eth_tx:validate(Tx, validation_ctx(Block, State)) of
@@ -642,6 +663,16 @@ exception_code(Other) ->
 %% whose whole answer is a fork comparison, so it can only mean a type that
 %% postdates the fork -- but which type is not in the error, so the type is threaded
 %% through from the transaction and rendered into the fixture's own vocabulary.
+%%
+%% `initcode_size_exceeded' and `sender_not_eoa' are the two rules this node
+%% **implemented** in response to this table, and that is a different relationship from
+%% the rest of it. Everywhere else the corpus named a rule and the node had one under
+%% another name; here the corpus named a rule the node did not have at all, and the name
+%% is the same on both sides because the rule is the same. Adding the clause is part of
+%% implementing the rule: without it the eight EIP-3607 entries and the six EIP-3860
+%% entries would have moved from `expected_rejection_not_raised' to `rejection_mismatch',
+%% which is to say the node would have started refusing for the right reason and been
+%% recorded as refusing for the wrong one.
 node_exception(tx_type_pre_fork, eip2930) -> <<"TYPE_1_TX_PRE_FORK">>;
 node_exception(tx_type_pre_fork, eip1559) -> <<"TYPE_2_TX_PRE_FORK">>;
 node_exception(tx_type_pre_fork, eip4844) -> <<"TYPE_3_TX_PRE_FORK">>;
@@ -650,6 +681,14 @@ node_exception(tx_type_pre_fork, Type) -> {unmapped_type, Type};
 node_exception(empty_auth_list, eip7702) -> <<"TYPE_4_EMPTY_AUTHORIZATION_LIST">>;
 node_exception(unsupported_type, _Type) -> <<"TX_TYPE_UNSUPPORTED">>;
 node_exception(intrinsic_gas, _Type) -> <<"INTRINSIC_GAS">>;
+node_exception(initcode_size_exceeded, _Type) -> <<"INITCODE_SIZE_EXCEEDED">>;
+node_exception(sender_not_eoa, _Type) -> <<"SENDER_NOT_EOA">>;
+%% A type-4 transaction with maxPriorityFeePerGas above maxFeePerGas reaches this as
+%% `invalid_fee', which is what `fee_fields_ok/4' has always thrown for a *fee-field*
+%% problem. The corpus names the specific condition rather than the category, and here
+%% the node and the corpus are describing the same rule, so the mapping is an identity
+%% in substance and not a rename.
+node_exception(invalid_fee, eip7702) -> <<"PRIORITY_GREATER_THAN_MAX_FEE_PER_GAS">>;
 node_exception(calldata_floor, _Type) -> <<"GASLIMIT_TOO_LOW">>;
 node_exception(nonce_too_low, _Type) -> <<"NONCE_TOO_LOW">>;
 node_exception(nonce_too_high, _Type) -> <<"NONCE_TOO_HIGH">>;
@@ -969,7 +1008,12 @@ validation_ctx(Block, State) ->
       chain_id => eth_fork_schedule:chain_id(),
       fork => fork_of_block(Block),
       balance_of => fun(A) -> {ok, eth_state:balance(State, A)} end,
-      nonce_of => fun(A) -> {ok, eth_state:nonce(State, A)} end}.
+      nonce_of => fun(A) -> {ok, eth_state:nonce(State, A)} end,
+      %% EIP-3607 reads the sender's **code**. Without this reader the rule cannot fire
+      %% at all: `eth_tx:validate/2' treats an absent `code_of' as "cannot answer", and
+      %% the eight `SENDER_NOT_EOA' fixtures would keep reporting
+      %% `expected_rejection_not_raised' while the rule looked implemented.
+      code_of => fun(A) -> {ok, eth_state:code(State, A)} end}.
 
 %% The base fee as `eth_block:base_fee_of/1' reads it: `undefined' for a block
 %% that has none, and 0 for one at London or later where 0 is a real figure.

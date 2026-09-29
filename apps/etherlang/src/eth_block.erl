@@ -583,6 +583,14 @@ validation_ctx(Block, State, BaseFee, GasLimit) ->
       end,
       nonce_of => fun(Address) ->
           {ok, maps:get(nonce, eth_state:account(State, Address), 0)}
+      end,
+      %% EIP-3607 needs the sender's **code**, not its balance or nonce, and a context
+      %% that carried only those two would let a transaction from a contract through
+      %% every check in `eth_tx:validate/2'. This is the admission path -- a block's own
+      %% transactions -- so the omission here would have made the rule a fixture-only
+      %% improvement while the node still imported such a transaction from a peer.
+      code_of => fun(Address) ->
+          {ok, maps:get(code, eth_state:account(State, Address), <<>>)}
       end}.
 
 %% The frame's own outcome, with "this node cannot price this" kept separate.

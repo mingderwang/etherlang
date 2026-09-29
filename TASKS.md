@@ -71,13 +71,56 @@ Per fork, biggest first:
 | **`unpriced`** | **86** | **0.5%** |
 | `expected_rejection_not_raised` | 16 | 0.1% |
 
-**`rejection_mismatch` at 12.6% is the largest unaddressed cluster and the committed
-subset cannot see it at all** -- it is 0 there. It means the node's *admission* decision
-disagrees with the chain's on one entry in eight: it refuses something the chain accepts,
-or accepts something the chain refuses. That is a different class of defect from a gas
-delta, it is invisible in the gas histogram entirely, and 1,975 entries is more than the
-entire `state_mismatch` cluster in the committed subset. **It should be the next thing
-measured, and it is a queue item below.**
+**`rejection_mismatch` at 12.6% is the largest cluster, and it is now measured rather
+than merely counted.** It reproduces **exactly** from the 22 of 229 files that declare
+`expectException` -- 2,006 branches, 134 seconds, against a full corpus run measured in
+hours -- so the cluster is entirely `expectException` branches and has no other source.
+`eest_report` now prints a rejection histogram over `{corpus code, node code, node
+reason}`, because the 40-entry sample could not distinguish a renamed rule from a
+different one. The split:
+
+| count | what it is |
+|---|---|
+| **1,639** | **the node refused for the rule the fixture names, under a different name.** 1,547 are `INTRINSIC_GAS_TOO_LOW` where the node says `INTRINSIC_GAS`; 62 are `INTRINSIC_GAS_BELOW_FLOOR_GAS_COST` where it says `GASLIMIT_TOO_LOW`; 30 use the corpus's `\|` alternative syntax, which `exception_code/1` string-compares and can never match. **A harness vocabulary problem, not a node defect, and not yet fixed** -- aligning the names moves the headline figure, so it is a change to the ruler and wants its own review |
+| **326** | **the node refused for a different rule**, and in every one it said `bad_blob_hashes` where the corpus expected a funds, intrinsic-gas or max-fee reason. 288 of them are one file. A validation-*order* defect: the blob check runs before the checks those fixtures are about |
+| **16** | **the node did not refuse at all.** 15 of them are **now implemented** (below); 1 remains |
+| **9** | the rule is implemented and the harness cannot name it: 8 are the blob-versioned-hash rule behind the node's coarse `bad_blob_hashes`, 1 is `null_destination` for a type-4 contract creation, which is *correct* behaviour reported as `{unmapped, ...}` |
+
+The 15 that are fixed, and the class they are in — **the node admitted transactions every
+other client refuses**, which is the most serious defect class in this project, because a
+node that admits an invalid transaction imports a block containing one:
+
+- **EIP-3607, `SENDER_NOT_EOA` (8 entries).** A transaction whose sender has deployed
+  code. Not implemented at all: grep found no check. It reads the sender's code through a
+  new `code_of` reader in the validation context, and **`eth_block:validation_ctx/4` now
+  supplies it** — without that the rule could fire in the corpus and not on the real
+  admission path, which would have made the gain a fixture-only fiction. One byte of code
+  is code: all eight fixtures carry `code = 0x00`.
+- **EIP-3860, `INITCODE_SIZE_EXCEEDED` (6 entries).** `MAX_INITCODE_SIZE = 2 *
+  MAX_CODE_SIZE`, derived from the `?MAX_CODE_SIZE` the fork schedule already held rather
+  than transcribed. The module priced init code per word from Shanghai (`v1.7`) and did
+  not carry the limit. All six fixtures are **exactly one byte over** — 49,153 — so the
+  `=<` boundary is what is under test.
+- **EIP-1559's fee fields, for type-4 transactions (1 entry).** Not a missing rule: a
+  missing **clause**. `fee_fields_ok/4` matched `eip1559` and `eip4844` and let everything
+  else fall to the legacy `gasPrice >= 0` branch — and a type-4 transaction has no
+  `gasPrice`, so `field/3` supplied 0 and **every** fee-field rule was skipped for type 4.
+  A fall-through clause turns "not mentioned" into "no rules at all" rather than an error.
+
+The remaining **1** is `cancun/eip4844_blobs/test_invalid_normal_gas`: a blob
+transaction with `maxFeePerGas = 6` against a stated `currentBaseFee = 7`. The node
+accepted it because `expect_rejection/4` builds its block with the literal `none`, and
+`merge_base_fee(Base, none) -> Base` reads that as *use the fork's default* — so the
+rejection path hands the validator a base fee the fixture never stated while the
+execution path hands it the derived one. **The two paths disagree about the same
+fixture's header field.** Passing the derived base fee fixes that entry and **loses nine
+overall** (matches 1,728 → 1,719; `rejection_mismatch` 1,975 → 1,985), because with the
+stated base fee the fee check now fires before the rule twelve other fixtures are about and
+`fee_too_low` has no mapping. So the base fee is wrong here, and fixing it exposes a
+**check-ordering** question that is separate work: whether `fee_ceiling_ok/4` belongs
+before the structural rules, and how a transaction invalid for several reasons should be
+reported. Measured and **not landed**, per the rule against trading one real match for
+twelve nameless ones.
 
 **`unpriced` is 86, not 0.** The documentation claimed -- in `README.md` and here --
 that `unpriced` is **0**, "nothing is executed that this node cannot price". That is true

@@ -431,12 +431,23 @@ validate(Tx, Ctx) when is_map(Tx), is_map(Ctx) ->
         ensure(valid_to(To), {error, invalid_to}),
         Data = calldata(Tx),
         AccessList = access_list_field(Tx),
+        Fork = ctx_fork(Ctx),
+        %% EIP-3860 (Shanghai): a contract-creation transaction's init code may not
+        %% exceed `MAX_INITCODE_SIZE'. It is checked here, on the decoded `data' and the
+        %% `IsCreate' flag, and not where the intrinsic cost is computed because it is a
+        %% **validity** rule and not a price: the transaction is invalid, so it is never
+        %% executed and never charges anything. The fork schedule already priced init code
+        %% per word from Shanghai (`initcode_word_cost/1', `v1.7`) and did not carry the
+        %% limit, so this node would accept a creation transaction with unbounded init
+        %% code on a fork that rejects all of it over 49,152 bytes.
+        ensure(not IsCreate orelse
+               byte_size(Data) =< eth_fork_schedule:max_initcode_size(Fork),
+               {error, initcode_size_exceeded}),
         ensure(fee_fields_ok(Tx, GasPrice, MaxFee, MaxPriority),
                {error, invalid_fee}),
         ensure(fee_ceiling_ok(Tx, MaxFee, GasPrice, Ctx), {error, fee_too_low}),
         ok = check_blobs(Tx, Ctx),
         ok = check_set_code(Tx),
-        Fork = ctx_fork(Ctx),
         ensure(Gas >= intrinsic_gas(Data, IsCreate, AccessList, Fork,
                                     authorization_list_field(Tx)),
                {error, intrinsic_gas}),
@@ -709,6 +720,20 @@ fee_fields_ok(Tx, GasPrice, MaxFee, MaxPriority) ->
     case tx_type(Tx) of
         eip1559 -> valid_1559_fees(MaxFee, MaxPriority);
         eip4844 -> valid_1559_fees(MaxFee, MaxPriority);
+        %% **EIP-7702 is a type-2 transaction with an authorization list**, so it is
+        %% bound by EIP-1559's fee-field rule exactly as a type 2 is, and the corpus
+        %% says so: `test_set_code_transaction_fee_validations' expects
+        %% `PRIORITY_GREATER_THAN_MAX_FEE_PER_GAS' from a type-4 transaction whose
+        %% maxPriorityFeePerGas is 8 and maxFeePerGas is 7.
+        %%
+        %% It was missing here, and the `_ ->` clause below caught it instead -- which
+        %% checks `gasPrice >= 0`, and a type-4 transaction has no `gasPrice` at all, so
+        %% `field/3` supplies the default `0` and **every** fee-field rule was silently
+        %% skipped for type 4. The bug is not that a rule was absent; it is that a type
+        %% fell out of a `case` written when there were only three types, and a
+        %% fall-through clause turns "not mentioned" into "no rules at all" rather than
+        %% into an error.
+        eip7702 -> valid_1559_fees(MaxFee, MaxPriority);
         _ -> is_integer(GasPrice) andalso GasPrice >= 0
     end.
 
@@ -1007,6 +1032,20 @@ check_block_gas(Gas, Ctx) ->
 check_state(Tx, Nonce, Gas, Value, MaxFee, GasPrice, Ctx) ->
     case sender(Tx) of
         {ok, Payer} ->
+            %% EIP-3607 (London): reject a transaction whose sender has deployed code.
+            %% It belongs here rather than with the field checks because it is the only
+            %% new rule in this function that needs the **recovered** sender, and the
+            %% sender is not known until the signature has been checked -- which is why
+            %% it cannot sit beside `valid_to/1' and the other field-level rules.
+            %%
+            %% It is `code[Payer] == b""', and nothing else: EIP-7702's delegation designator
+            %% is code, so a delegated account is refused by this rule too, which is
+            %% correct -- an account that has delegated is still a contract for the purpose
+            %% of being a transaction's sender. The corpus's eight fixtures are exactly
+            %% that: a sender holding `0x00`, one byte, which is non-empty and is therefore
+            %% not an externally owned account. Checking "is there any code" and answering
+            %% true for a single byte is not a near-miss; one byte is code.
+            check_sender_is_eoa(Payer, Ctx),
             Price = validation_price(MaxFee, GasPrice),
             check_balance(Payer, Gas * Price + Value, Ctx),
             check_nonce(Payer, Nonce, Ctx);
@@ -1016,6 +1055,35 @@ check_state(Tx, Nonce, Gas, Value, MaxFee, GasPrice, Ctx) ->
             %% than throwing keeps the failure attributable to bad_signature.
             ok
     end.
+
+%% EIP-3607. `code_of' is a reader in the same shape as `balance_of' and `nonce_of',
+%% and **its absence is not a pass**:
+%%
+%% An absent account is an externally owned account, which is the convention the rest of
+%% `eth_state' reads with and getting it wrong would refuse the first transaction of
+%% every new account. But a context with no `code_of' at all is a different thing: it is
+%% a caller that cannot answer the question, and answering "it is fine" for it would make
+%% the rule unenforceable by omission. `eth_block:validation_ctx/4' supplies it on the
+%% real admission path, and `eth_txpool:pool_ctx/0` does not -- so a pooled transaction is
+%% checked for everything *except* this until the pool has a state to read.
+check_sender_is_eoa(Payer, Ctx) ->
+    case {eth_fork_schedule:sender_must_be_eoa(ctx_fork(Ctx)), maps:get(code_of, Ctx, undefined)} of
+        {false, _} ->
+            ok;
+        {true, Fun} when is_function(Fun, 1) ->
+            case Fun(Payer) of
+                {ok, Code} -> ensure(code_is_empty(Code), {error, sender_not_eoa});
+                _ -> ok
+            end;
+        {true, undefined} ->
+            ok
+    end.
+
+%% A missing account answers `undefined` and an account with no code answers `<<>>`; both
+%% are externally owned. Anything else is code, and one byte is code.
+code_is_empty(undefined) -> true;
+code_is_empty(<<>>) -> true;
+code_is_empty(_) -> false.
 
 validation_price(MaxFee, _GasPrice) when is_integer(MaxFee) -> MaxFee;
 validation_price(_MaxFee, GasPrice) when is_integer(GasPrice) -> GasPrice;
