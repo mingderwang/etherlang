@@ -727,9 +727,23 @@ behavioural change per commit, and each step says what it now does.
    histogram is: a delta of a few thousand gas repeats because it is one missing
    schedule term, and a delta in the millions means a frame consumed its whole
    allowance where the fixture's did not. Of 229 comparable deltas:
-   - **The histogram's own blind spot, now measured.** See item 6a: 1,408 entries
-     reported `no_comparable_gas` and the delta section printed nothing at all. Read
-     a `(none in range)` line as "nothing in range", never as "nothing wrong".
+   - ~~**The histogram's own blind spot.**~~  **Fixed in `v1.59`.** `add_gas_delta/3`
+     kept only `abs(Delta) =< 100,000` and discarded the rest, and the report printed
+     `(none in range)` when the map was empty — which is what it printed over the
+     1,408-entry cluster in item 6a, all of them `no_comparable_gas`. The accumulator
+     now keeps `buckets` (unchanged), `over`/`over_max` for deltas beyond the range,
+     and `unseen` — a count **per reason a gas figure could not be computed**:
+     `no_comparable_gas`, `zero_price`, `not_divisible`, `no_sender_balance_diff`,
+     `no_gas_story`. `eest_report` prints all three. The rule is one line: **a section
+     that prints nothing must say what it did not look at.**
+   - **What that immediately exposed, and what is measurable for the first time.** On
+     the 22-file `expectException` set the `no_sender_balance_diff` bucket alone is
+     **71** entries — a `state_mismatch` whose diff carries no balance for the sender
+     at all, so no gas figure is derivable, and nothing before `v1.59` reported that
+     they existed. On `cancun/eip4844_blobs` the overflow bucket is **258** deltas
+     beyond 100,000, **largest 4,919,046**. A delta of that magnitude means a frame
+     consumed its whole allowance where the fixture's did not. Both are now
+     *findable*; neither is *explained*, and that is the work.
    - **~~`+550` gas, 6 fixtures, `byzantium/eip196_ec_add_mul`, all forks Berlin →
      Prague~~ — cause found and fixed; the fixtures still diverge and the remaining
      400 gas is unresolved.** The contract forwards 150 gas to ECADD and stores the

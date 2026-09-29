@@ -98,7 +98,7 @@ print_rejects(Rejects) ->
 rejection_line({Expected, Got, Reason}) ->
     lists:flatten(io_lib:format("~p  ->  ~p  (~p)", [Expected, Got, Reason])).
 
-%% The schedule-sized deltas.
+%% The schedule-sized deltas, **and what this section did not look at.**
 %%
 %% A delta of a few thousand gas names a constant -- 2,500 is EIP-2929's cold
 %% account, 2,100 its cold slot, 2,900 an SSTORE_RESET_GAS, 100 a warm read -- and
@@ -107,13 +107,63 @@ rejection_line({Expected, Got, Reason}) ->
 %% which says that something is wrong and nothing about which rule, and there are
 %% far too many of those to put in the same list: the first version of this
 %% histogram did, and the constants vanished under them.
-print_gas(Buckets) ->
-    io:format("~n--- schedule-sized gas deltas (positive = this node spent more) ---~n"),
-    Sorted = lists:reverse(lists:sort(maps:to_list(Buckets))),
+%%
+%% **The second half is the one that matters**, and it exists because the first half
+%% printed `(none in range)' over a corpus containing the largest single divergence
+%% this repository has produced. Those 1,408 entries were all
+%% `no_comparable_gas' -- a delta between two unknowns, because those fixtures set
+%% `maxPriorityFeePerGas = 0' against a base fee of 7, so the effective price *is*
+%% the base fee and no balance difference encodes a gas cost -- and an instrument
+%% that buckets the cases it can compute and discards the rest is indistinguishable,
+%% in its output, from an instrument reporting nothing wrong. Deltas beyond the
+%% range were dropped the same way, and a magnitude in the hundreds of thousands is
+%% itself a finding.
+print_gas(Gas) ->
+    io:format("~n--- gas deltas (positive = this node spent more) ---~n"),
+    Sorted = lists:reverse(lists:sort(maps:to_list(maps:get(buckets, Gas)))),
     case Sorted of
-        [] -> io:format("    (none in range)~n");
+        [] -> io:format("    (none within the schedule-sized range, -"
+                        "-/+100,000 gas)~n");
         _ -> [io:format("    ~10w gas   x~w~n", [D, N]) || {D, N} <- Sorted]
-    end.
+    end,
+    print_over(Gas),
+    print_unseen(Gas).
+
+%% Deltas too large to sit beside the schedule-sized ones. Counted, with the maximum
+%% kept, rather than dropped: a delta in the hundreds of thousands means a frame
+%% consumed its whole allowance where the fixture's did not, and that is a
+%% statement about the node even though it names no rule.
+print_over(#{over := 0}) ->
+    ok;
+print_over(#{over := N, over_max := M}) ->
+    io:format("  beyond the range:~n"),
+    io:format("    ~10w deltas over 100,000 gas, largest ~w~n", [N, M]),
+    ok.
+
+%% The divergences this section **cannot** put a number on, per reason. Printed even
+%% when the in-range table above it is full, because a full table of computable
+%% deltas says nothing about the entries that have none.
+print_unseen(#{unseen := U}) when map_size(U) =:= 0 ->
+    ok;
+print_unseen(#{unseen := U}) ->
+    io:format("  no comparable gas figure, by reason -- these are divergences this "
+              "table cannot size:~n"),
+    [io:format("    ~10w  ~s~n", [N, why(R)])
+     || {R, N} <- lists:reverse(lists:sort(maps:to_list(U)))],
+    ok.
+
+why(no_comparable_gas) ->
+    "one side produced a gas figure and the other did not";
+why(zero_price) ->
+    "the effective gas price is 0, so no balance difference encodes a gas cost";
+why(not_divisible) ->
+    "the balance difference is not a whole multiple of the effective price";
+why(no_sender_balance_diff) ->
+    "the diff carries no balance for the sender";
+why(no_gas_story) ->
+    "no gas story was produced for this state mismatch";
+why(Other) ->
+    io_lib:format("~p", [Other]).
 
 %% A bounded sample of the divergences. The bound is the point: this is a summary
 %% of a corpus that does not fit in memory, and a report that tried to hold all of

@@ -149,7 +149,8 @@ report_progress(_Acc, _Every, _T0) ->
 initial_survey(N, Every) ->
     #{files => N, files_done => 0, every => Every, total => 0,
       tally => maps:from_list([{O, 0} || O <- outcomes()]),
-      by_fork => #{}, gas => #{}, rejects => #{}, sample => [], sample_limit => 40}.
+      by_fork => #{}, gas => empty_gas(), rejects => #{}, sample => [],
+      sample_limit => 40}.
 
 %% Fold one file's results in. Reversed so the accumulated list stays cheap.
 file_survey(File, Acc) ->
@@ -197,14 +198,67 @@ survey_one({Key, Outcome, Detail, _File} = R, Acc) ->
            end,
     Acc2.
 
-%% Only deltas in the schedule-sized range are histogrammed. The whole-allowance
-%% ones -- a frame that burned its limit against a fixture that did not -- say
-%% that something is wrong and nothing about which rule, and there are thousands of
-%% them; keeping them drowns the ones that name a constant.
+%% The gas deltas, and -- the part that matters -- **what this section cannot see.**
+%%
+%% It used to keep only `abs(Delta) =< 100000' and drop everything else on the
+%% floor, and the report then printed `(none in range)' when the map was empty. That
+%% reads as "no gas defects", and for the largest single divergence this repository
+%% produced it read exactly that way: `cancun/eip4844_blobs/test_sufficient_balance_blob_tx'
+%% and `test_blob_gas_subtraction_tx` are **1,408 entries** whose sender balance was
+%% wrong by exactly `6 * GAS_PER_BLOB`, and every one of them reported
+%% `no_comparable_gas` because those fixtures set `maxPriorityFeePerGas = 0` against
+%% a base fee of 7 -- the effective price *is* the base fee, so the sender's net gas
+%% cost is zero and the balance-inversion method that recovers a gas figure has
+%% nothing to divide. A delta between two unknowns is a third unknown, and the
+%% section dropped it.
+%%
+%% So the accumulator now keeps four things rather than one map:
+%%
+%%   * `buckets' -- the in-range integer deltas, unchanged, because they name a
+%%     constant and the histogram of them is the useful part.
+%%   * `over' / `over_max' -- deltas beyond the range, counted, with the largest
+%%     recorded. A magnitude this large is itself the finding (a delta in the
+%%     hundreds of thousands means a frame burned its allowance where the fixture's
+%%     did not), so discarding it discarded the signal.
+%%   * `unseen' -- a count per *reason the figure is unavailable*, so "the gas story
+%%     could not be computed" is a number with a cause rather than an absence:
+%%     `unavailable' (the diff carries no sender balance), `zero_price',
+%%     `not_divisible', and `no_comparable_gas' (one side produced a figure and the
+%%     other did not).
+%%
+%% The report prints all of it. The rule is one line long and it is the point of the
+%% whole change: **a section that prints nothing must say what it did not look at.**
 add_gas_delta(G, Outcome, #{gas := #{delta := D}})
   when is_integer(D), Outcome =:= state_mismatch, abs(D) =< 100000 ->
-    maps:update_with(D, fun(N) -> N + 1 end, 1, G);
+    G#{buckets := maps:update_with(D, fun(N) -> N + 1 end, 1, maps:get(buckets, G))};
+add_gas_delta(G, Outcome, #{gas := #{delta := D}})
+  when is_integer(D), Outcome =:= state_mismatch ->
+    %% Beyond the range, and therefore *counted*. Not bucketed: the buckets are the
+    %% schedule-sized ones and a 918,145 in the same table as a -2,100 would make
+    %% the table unreadable rather than informative.
+    G#{over := maps:get(over, G) + 1,
+       over_max := max(maps:get(over_max, G), abs(D))};
+add_gas_delta(G, state_mismatch, #{gas := #{delta := no_comparable_gas}}) ->
+    count_unseen(G, no_comparable_gas);
+add_gas_delta(G, state_mismatch, #{gas := #{delta := no_gas_at_zero_price}}) ->
+    count_unseen(G, zero_price);
+add_gas_delta(G, state_mismatch, #{gas := #{delta := no_gas_not_divisible}}) ->
+    count_unseen(G, not_divisible);
+add_gas_delta(G, state_mismatch, #{gas := unavailable}) ->
+    count_unseen(G, no_sender_balance_diff);
+add_gas_delta(G, state_mismatch, _Detail) ->
+    %% A `state_mismatch' with no gas story at all. Its own bucket, because "the
+    %% comparison produced no narrative" and "the narrative exists and says nothing"
+    %% are different and only one of them is a bug in this function.
+    count_unseen(G, no_gas_story);
 add_gas_delta(G, _Outcome, _Detail) -> G.
+
+count_unseen(G, Why) ->
+    U = maps:get(unseen, G),
+    G#{unseen := maps:update_with(Why, fun(N) -> N + 1 end, 1, U)}.
+
+empty_gas() ->
+    #{buckets => #{}, over => 0, over_max => 0, unseen => #{}}.
 
 %% **The rejection histogram: `{expected code, code the node named, its own reason}`.**
 %%

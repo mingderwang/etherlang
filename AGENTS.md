@@ -848,6 +848,38 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
     selects a *value* deserves more suspicion than one that selects a *rule*, because
     the first produces a plausible answer and the second produces an error.
 
+- **A bounded histogram that prints nothing is indistinguishable from a bounded
+  histogram over an empty set, and the difference hid this repository's largest
+  divergence.** `add_gas_delta/3` kept only `abs(Delta) =< 100,000` and discarded
+  everything else, and `eest_report:print_gas/1` printed `(none in range)` when the
+  map was empty. That is what it printed over `cancun/eip4844_blobs/
+  test_sufficient_balance_blob_tx` and `test_blob_gas_subtraction_tx` — **1,408
+  entries**, every one of them the sender's balance wrong by exactly `6 *
+  GAS_PER_BLOB`, the largest single divergence this node has produced. All 1,408
+  reported `no_comparable_gas`, because those fixtures set `maxPriorityFeePerGas = 0`
+  against a base fee of 7, so the effective price *is* the base fee, the sender's net
+  gas cost is zero, and the balance-inversion method that recovers a gas figure has
+  nothing to divide. A delta between two unknowns is a third unknown, and the section
+  dropped it.
+  - Fixed in `v1.59`: the accumulator keeps `buckets` (unchanged), `over`/`over_max`
+    for deltas beyond the range, and `unseen` — a count **per reason a figure could
+    not be computed**. The report prints all three, and the rule it now follows is one
+    line: **a section that prints nothing must say what it did not look at.** The
+    `unseen` block prints whether or not the in-range table is full, because a full
+    table of computable deltas says nothing about the entries that have none.
+  - It worked immediately, and found two things that had been invisible: **71** entries
+    on the 22-file set whose diff carries *no balance for the sender at all* — a
+    category that previously did not exist as a number, because the absence of a gas
+    story and the absence of a balance diff printed alike — and **258** deltas beyond
+    100,000 on `cancun/eip4844_blobs`, **largest 4,919,046**.
+  - The general form, and it generalises past histograms: **an instrument that
+    filters its input is a measurement of the filter, and the filter is chosen for
+    legibility.** The range was chosen so the constants would be visible, which was
+    right; the drop was silent, which was not. A dropped value and a zero value print
+    the same way, and only one of them means "nothing is wrong". Same shape as §5's "an
+    unobservable long-running unit is indistinguishable from a dead one" and as
+    `fork_unreachable`: **absence of evidence, printed as evidence of absence.**
+
 - **A table-driven test's rows can each be failing for the wrong reason, and only one
   of them will be.** The fee-field table above needed five hand-written signing
   preimages, and the `eip7702` row's recovered a *different address from the key that
