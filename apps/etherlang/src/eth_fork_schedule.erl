@@ -12,9 +12,13 @@
           fork_schedule/1,
           fork_at/3,
           configured_network/0,
+          network_of/1,
+          validate_network/1,
           chain_id/0,
           chain_id/1,
           configured_fork/0,
+          fork_of/1,
+          validate_fork/1,
           at_least/2,
           opcode_exists/2,
           base_fee/2,
@@ -179,23 +183,64 @@
 %% ETH_NETWORK selects the network (default sepolia, matching the default
 %% upstream). ETH_FORK pins the rules outright and is the escape hatch for
 %% private or development networks that are not in the table below.
+%%
+%% **Both of these used to answer a default for a name they did not recognise, and the
+%% two answers were not the same kind of thing.** `ETH_NETWORK` fell back to `sepolia'
+%% after a `logger:warning` -- emitted from *here*, so on every one of the thirteen call
+%% sites, which is a log line that repeats rather than a report. `ETH_FORK' fell back to
+%% `cancun' with nothing at all, from a table of twenty-four names, so `ETH_FORK=shangai'
+%% gave a node running Shanghai rules that had never said so.
+%%
+%% A name is a setting like any other, and the failure is the same one the rest of the
+%% configuration had: the operator asked for something, the node is doing something else,
+%% and there is no point in the lifecycle at which the difference surfaces. The names
+%% stay here -- this is the only list of them -- and the *refusal* is
+%% `validate_network/0' and `validate_fork/0', which `eth_config_settings:validate/0'
+%% calls and `etherlang_app:start/2' acts on. `network_of/1' and `fork_of/1' are the
+%% one place a name becomes an atom; everything below them is a fallback whose only
+%% remaining job is to keep a unit test from crashing on a name it made up.
 
 configured_network() ->
     case os:getenv("ETH_NETWORK") of
         false -> sepolia;
         "" -> sepolia;
-        Value -> parse_network(Value)
+        Value ->
+            case network_of(Value) of
+                {ok, Net} -> Net;
+                error -> sepolia
+            end
     end.
 
-parse_network(Value) ->
+%% `{ok, Network}' or `error`. `error' means this node has no schedule for the name, which
+%% is not the same as "not a network": a private network is a legitimate reason to set
+%% ETH_FORK, and the answer for one of those is that this node cannot validate it.
+network_of(Value) ->
     case string:lowercase(string:trim(Value)) of
-        "sepolia" -> sepolia;
-        "mainnet" -> mainnet;
-        "1" -> mainnet;
-        "11155111" -> sepolia;
-        Other ->
-            logger:warning("unknown ETH_NETWORK ~p, falling back to sepolia", [Other]),
-            sepolia
+        "sepolia" -> {ok, sepolia};
+        "mainnet" -> {ok, mainnet};
+        "1" -> {ok, mainnet};
+        "11155111" -> {ok, sepolia};
+        _ -> error
+    end.
+
+%% Takes the value rather than reading the environment. A predicate that ignores the
+%% argument it was handed and goes and reads one itself is how a test ends up asserting
+%% about the ambient environment instead of about the value in front of it.
+validate_network(Value) ->
+    case string:trim(Value) of
+        "" -> ok;
+        _ ->
+            case network_of(Value) of
+                {ok, _} -> ok;
+                error ->
+                    {error, io_lib:format(
+                               "~ts is not a network this node has a fork table for; "
+                               "it knows mainnet (1) and sepolia (11155111). Falling back "
+                               "to sepolia would silently change the chain id, which is "
+                               "part of the signing preimage of every transaction, so a "
+                               "typo here is a different node rather than a failed one",
+                               [string:trim(Value)])}
+            end
     end.
 
 %% The chain id of the configured network, from configuration rather than from a
@@ -215,11 +260,69 @@ chain_id(sepolia) -> 11155111.
 %% module. It is *not* consulted for a known network: silently overriding a
 %% real activation point would be how a node ends up applying the wrong fork
 %% rules, so ETH_FORK only applies where fork_schedule/1 has no data.
+%%
+%% **The default is `cancun', and the network default is `sepolia'.** Those are two
+%% hand-picked answers that happen to agree -- Cancun is the right fork for Sepolia
+%% today -- and a reader should not have to know that to trust the defaults. Nothing
+%% derives one from the other, and nothing pins the pair; see
+%% `eth_fork_schedule_tests' for the pin.
 configured_fork() ->
     case os:getenv("ETH_FORK") of
         false -> cancun;
         "" -> cancun;
-        Value -> parse_fork(Value)
+        Value ->
+            case fork_of(Value) of
+                {ok, Fork} -> Fork;
+                error -> cancun
+            end
+    end.
+
+%% `{ok, Fork}' or `error'. The single place a name becomes a fork atom, and the only
+%% copy of the twenty-four names -- so `validate_fork/0' below and the fallback above
+%% cannot disagree about what is a name.
+fork_of(Value) ->
+    case string:lowercase(string:trim(Value)) of
+        "frontier" -> {ok, frontier};
+        "homestead" -> {ok, homestead};
+        "dao" -> {ok, dao};
+        "tangerine" -> {ok, tangerine};
+        "spurious_dragon" -> {ok, spurious_dragon};
+        "byzantium" -> {ok, byzantium};
+        "constantinople" -> {ok, constantinople};
+        "petersburg" -> {ok, petersburg};
+        "istanbul" -> {ok, istanbul};
+        "muir_glacier" -> {ok, muir_glacier};
+        "berlin" -> {ok, berlin};
+        "london" -> {ok, london};
+        "arrow_glacier" -> {ok, arrow_glacier};
+        "gray_glacier" -> {ok, gray_glacier};
+        "merge" -> {ok, merge};
+        "paris" -> {ok, paris};
+        "shanghai" -> {ok, shanghai};
+        "cancun" -> {ok, cancun};
+        "deneb" -> {ok, deneb};
+        "prague" -> {ok, prague};
+        "osaka" -> {ok, osaka};
+        "bpo1" -> {ok, bpo1};
+        "bpo2" -> {ok, bpo2};
+        "amsterdam" -> {ok, amsterdam};
+        _ -> error
+    end.
+
+validate_fork(Value) ->
+    case string:trim(Value) of
+        "" -> ok;
+        _ ->
+            case fork_of(Value) of
+                {ok, _} -> ok;
+                error ->
+                    {error, io_lib:format(
+                               "~ts is not a fork this node knows the gas schedule for; "
+                               "falling back to cancun would run a different set of rules "
+                               "with nothing anywhere saying so, which is a node that "
+                               "reports valid blocks and rejects them",
+                               [string:trim(Value)])}
+            end
     end.
 
 %% Activation points, ascending. Block-numbered and timestamped forks are kept
@@ -407,35 +510,6 @@ highest_ranked(Forks) ->
 %% operation. fork_at/3 is current_fork/3 under a clearer name.
 fork_at(Network, BlockNumber, BlockTimestamp) ->
     current_fork(Network, BlockNumber, BlockTimestamp).
-
-parse_fork(Value) ->
-    case string:lowercase(string:trim(Value)) of
-        "frontier" -> frontier;
-        "homestead" -> homestead;
-        "dao" -> dao;
-        "tangerine" -> tangerine;
-        "spurious_dragon" -> spurious_dragon;
-        "byzantium" -> byzantium;
-        "constantinople" -> constantinople;
-        "petersburg" -> petersburg;
-        "istanbul" -> istanbul;
-        "muir_glacier" -> muir_glacier;
-        "berlin" -> berlin;
-        "london" -> london;
-        "arrow_glacier" -> arrow_glacier;
-        "gray_glacier" -> gray_glacier;
-        "merge" -> merge;
-        "paris" -> paris;
-        "shanghai" -> shanghai;
-        "cancun" -> cancun;
-        "deneb" -> deneb;
-        "prague" -> prague;
-        "osaka" -> osaka;
-        "bpo1" -> bpo1;
-        "bpo2" -> bpo2;
-        "amsterdam" -> amsterdam;
-        _ -> cancun
-    end.
 
 %% Ranks must agree with activation order, because highest_ranked/1 resolves
 %% two concurrently active forks (a block-numbered one and a timestamped one)

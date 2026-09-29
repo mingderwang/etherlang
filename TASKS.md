@@ -1451,7 +1451,29 @@ Recorded because the documentation claimed otherwise, and because each of these 
 - [ ] **Logging** — structured JSON logging, log rotation
 - [ ] **Health check** — `/health` endpoint for orchestration
 - [ ] **Graceful shutdown** — clean state dump, peer disconnection
-- [ ] **Configuration validation** — validate config at startup
+- [x] **Configuration validation** — `eth_config_settings:validate/0` checks all 32
+  environment variables against a per-kind parser and `etherlang_app:start/2` **refuses
+  to start** on any of them, naming the variable, the value as written, and why. The
+  accessors are unchanged and still fall back, on purpose: a test that sets a nonsense
+  variable should not take the suite down, and the fallback is what a library function
+  owes its caller. The gate belongs where "start the node" is a decision.
+  **Five real defects, all silent, none of them a crash:**
+  - **`int_env/3` answered the *default* for a value it could not parse.** `CHAIN_RETENTION=abc` gave a node retaining 2048 blocks, and nothing anywhere said the setting had been ignored. The same was true of every one of the 32.
+  - **`listen_ip/0` ranged over the **first** octet only.** `1.999.1.1` passed it and produced the tuple `{1,999,1,1}`, which `inet:parse_address/1` answers `einval` for — so the malformed bind reached `cowboy` and failed there, as a *listener* error, which says nothing about a setting. `parse_ip/1` used `list_to_integer/1` and checked nothing at all. Both halves are gone: there is now one implementation, `eth_config_settings:ip4/1`, and `eth_config` holds no second copy of the decision to disagree with it.
+  - **`RPC_LISTEN_IP=999.1.1.1` silently became loopback.** An operator who asked to expose the JSON-RPC and mistyped the address got an unreachable node, which is the safe direction by luck rather than by design. The fallback is still there — the accessor is a lookup, not a gate — and `validate/0` now reports it so the node refuses to start.
+  - **`ETH_NETWORK` and `ETH_FORK` fell back to a default for an unrecognised name**, and neither fallback was the same kind of thing. The network fell back to `sepolia` behind a `logger:warning` emitted from *inside* `configured_network/0`, a function with thirteen call sites, so it was a repeating log line rather than a report. The fork fell back to `cancun` **with nothing at all**, out of a table of twenty-four names, so `ETH_FORK=shangai` produced a node running Shanghai rules that had never said so. The names stay in `eth_fork_schedule`, which is the only list of them; `network_of/1` and `fork_of/1` are now the one place a name becomes an atom, and `validate/0` refuses.
+  - **The module header claimed an application-environment source that never existed.** `str_env/3` is `str_env(Env, _Key, Default)` with the key argument underscored and unused, so the "then from the application environment" in the header was a fiction and a reader checking `sys.config` would have found nothing.
+  Also checked and left alone: the `ETH_FORK` default (`cancun`) and the `ETH_NETWORK`
+  default (`sepolia`) are two hand-picked answers that happen to agree today. Nothing
+  derives one from the other; that is recorded, not fixed, because deriving it would
+  mean this node choosing which fork a network is on.
+  Four settings are **warnings** rather than refusals, because the node is correct in
+  each and the operator may have meant it: a bind on `0.0.0.0` without an API key,
+  discv4 and RLPx both enabled on their shared default port 30303, and a
+  `CHAIN_RETENTION` below `BODY_WINDOW`. Refusing to boot an operator out of a
+  configuration they chose on purpose is a worse answer than saying so once.
+  **The accessors' own header still documents the old behaviour nowhere**, so a reader
+  of `eth_config` is told the defaults fall back and that `validate/0` is the gate.
 - [ ] **Upgrade path** — zero-downtime upgrade support
 - [ ] **Documentation** — complete deployment guide, architecture guide
 - [ ] **Security audit** — third-party security review of execution engine

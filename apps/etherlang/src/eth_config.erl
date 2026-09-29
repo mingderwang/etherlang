@@ -2,8 +2,21 @@
 
 -compile(nowarn_unused_function).
 
-%% Runtime configuration for the node. Values are read from OS environment
-%% variables first, then from the application environment, then defaults.
+%% Runtime configuration for the node. Values are read from **OS environment
+%% variables**, and from nothing else.
+%%
+%% **The application environment was never a source and is not one now.** This header said
+%% "from OS environment variables first, then from the application environment, then
+%% defaults" for as long as the sentence existed, and `str_env/3' is
+%% `str_env(Env, _Key, Default)' with the key argument underscored and unused -- so the
+%% second source it described was a fiction, and a reader checking a value in
+%% `sys.config` would have found nothing there.
+%%
+%% A variable set to something unusable is answered with its **default**, silently, and
+%% one that parses to a nonsense value is answered as written -- a negative retention
+%% included. That is what `eth_config_settings:validate/0' is for, and
+%% `etherlang_app:start/2' calls it and refuses to start on a problem.
+%%
 %% Environment variables (all optional):
 %%   UPSTREAM_RPC_URL   - upstream Ethereum JSON-RPC endpoint
 %%   RPC_LISTEN_PORT    - local JSON-RPC HTTP port
@@ -67,12 +80,27 @@ listen_port() -> int_env("RPC_LISTEN_PORT", listen_port, ?DEF_PORT).
 
 %% Bind address as an inet ip tuple. Defaults to loopback so the endpoint is
 %% never exposed to the network unless the operator opts in via RPC_LISTEN_IP.
+%% The guard that used to be here checked `A' alone:
+%%
+%%     {A, B, C, D} when is_integer(A), A >= 0, A =< 255 -> {A, B, C, D};
+%%
+%% which is the wrong half of an address. `1.999.1.1' passed it, and the tuple it
+%% returned was one `inet:parse_address/1' answers `einval' for, so the malformed bind
+%% reached the listener and failed there -- in `cowboy`'s start-up, as a listener error,
+%% which says nothing about a configuration value. And the *other* half of the failure
+%% was silent: `999.1.1.1' did not pass, so `listen_ip/0' answered loopback. An operator
+%% who asked to expose the JSON-RPC and mistyped the address got a node that is not
+%% reachable, and nothing anywhere said so.
+%%
+%% There is no guard now, because `eth_config_settings:ip4/1' has already decided
+%% whether this is an address and answered a valid tuple or `error'. A second
+%% implementation of that decision here is how the two halves disagreed in the first
+%% place. The refusal for a value that is not an address is `validate/0', called by
+%% `etherlang_app:start/2'.
 listen_ip() ->
-    case parse_ip(str_env("RPC_LISTEN_IP", listen_ip, ?DEF_LISTEN_IP)) of
-        {A, B, C, D} when is_integer(A), A >= 0, A =< 255 ->
-            {A, B, C, D};
-        _ ->
-            {127, 0, 0, 1}
+    case eth_config_settings:ip4(str_env("RPC_LISTEN_IP", listen_ip, ?DEF_LISTEN_IP)) of
+        {ok, {A, B, C, D}} -> {A, B, C, D};
+        error -> {127, 0, 0, 1}
     end.
 
 max_batch() -> int_env("RPC_MAX_BATCH", max_batch, ?DEF_MAX_BATCH).
@@ -193,12 +221,3 @@ int_env(Env, Key, Default) ->
 parse_hex(Hex) ->
     try eth_hex:decode(Hex) catch _:_ -> latest end.
 
-parse_ip(Str) ->
-    case string:split(Str, ".", all) of
-        [A, B, C, D] ->
-            try {list_to_integer(A), list_to_integer(B),
-                 list_to_integer(C), list_to_integer(D)}
-            catch _:_ -> error
-            end;
-        _ -> error
-    end.

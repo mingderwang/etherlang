@@ -66,8 +66,8 @@ beacon, validators, or block production).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**746 tests, green**).
-* **Status** — v0.7.0; eunit green (746 tests) and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**811 tests, green**).
+* **Status** — v0.7.0; eunit green (811 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -497,7 +497,7 @@ Full integration with consensus clients.
 - [ ] **Logging** — structured JSON logging, log rotation
 - [ ] **Health check** — `/health` endpoint for orchestration
 - [ ] **Graceful shutdown** — clean state dump, peer disconnection
-- [ ] **Configuration validation** — validate config at startup
+- [x] **Configuration validation** — all 32 environment variables are checked at startup against a per-kind parser, and a bad one **refuses the boot** with the variable, the value as written, and why. Five silent defects fixed: `int_env/3` answered the *default* for an unparseable value (`CHAIN_RETENTION=abc` silently retained 2048 blocks); `listen_ip/0` ranged over the **first** octet only, so `1.999.1.1` produced `{1,999,1,1}` — a tuple `inet` answers `einval` for, which reached `cowboy` and failed there as a *listener* error; `RPC_LISTEN_IP=999.1.1.1` silently became loopback, so an operator asking to expose the RPC got an unreachable node; `ETH_NETWORK` and `ETH_FORK` fell back to a default for an unrecognised name, `ETH_FORK` with no log at all; and the module header claimed an application-environment source that never existed (`str_env/3`'s key argument is underscored and unused). The accessors keep their fallback deliberately — a test setting a nonsense variable should not take the suite down, and the gate belongs where "start the node" is a decision. See `TASKS.md` Phase 9.
 - [ ] **Upgrade path** — zero-downtime upgrade support
 - [ ] **Documentation** — complete deployment guide, architecture guide
 - [ ] **Security audit** — third-party security review of execution engine
@@ -830,6 +830,33 @@ All settings are environment variables (see `eth_config`):
 | `TX_POOL_MAX` | `1024` | max pooled transactions |
 | `TX_POOL_PER_SENDER` | `16` | max pooled transactions per sender |
 | `STATE_SYNC_ENABLED` | `false` | run the snap state-heal worker |
+| `ENGINE_PORT` | `8551` | Engine API listener port |
+| `RPC_API_KEY` | `` | if set, required on every JSON-RPC request |
+| `ETH_NETWORK` | `sepolia` | `sepolia`/`11155111` or `mainnet`/`1`; picks the fork table and chain id |
+| `ETH_FORK` | `cancun` | pins the rules outright, for networks with no schedule here |
+
+**All 32 are validated at startup, and a bad one refuses the boot.**
+`eth_config_settings:validate/0` checks each against its kind and
+`etherlang_app:start/2` returns `{error, {invalid_configuration, Problems}}` rather than
+starting, naming the variable, the value as written, and why:
+
+```
+$ CHAIN_RETENTION=abc ./bin/etherlang start
+refusing to start: configuration is not usable
+problems => ["CHAIN_RETENTION=abc -- not a number"]
+```
+
+This is a change in behaviour, and it was the point. Before it, an unparseable value was
+answered with the **default** and a nonsensical one was answered **as written**:
+`CHAIN_RETENTION=abc` retained 2048 blocks with nothing anywhere saying the setting had
+been ignored, and `CHAIN_RETENTION=-5` retained −5 of them and used it. `ETH_NETWORK` and
+`ETH_FORK` fell back to a default for an unrecognised name, the fork with no log at all,
+so `ETH_FORK=shangai` gave a node running Shanghai rules that had never said so.
+
+Four configurations are **warnings** rather than refusals, because the node is correct in
+each and the operator may have meant it: a bind on `0.0.0.0` with no `RPC_API_KEY`,
+discv4 and RLPx both enabled on their shared default port `30303`, and a
+`CHAIN_RETENTION` below `BODY_WINDOW`.
 
 ## Local JSON-RPC methods
 

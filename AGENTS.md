@@ -79,17 +79,25 @@ depends on execution order, suspect the build before you suspect the code.
 
 ## 3. Architecture
 
-48 modules in `apps/etherlang/src` (13,527 lines of code), 51 test modules in
-`apps/etherlang/test` (10,903), and 746 eunit tests. **These counts drift and this
+49 modules in `apps/etherlang/src` (13,806 lines of code), 52 test modules in
+`apps/etherlang/test` (11,148), and 811 eunit tests. **These counts drift and this
 one had drifted** -- it said 47 and 44 for several commits after it stopped being
 true, which is the same defect as a stale conformance figure: a number in the
 architecture section that a reader will use as a measure of size and that no longer
 describes the tree. Re-derive it with `git ls-files` rather than editing it by hand.
+
 Every stateful module is a `gen_server` registered under its own module name;
 the tree is in `etherlang_sup`. The rest are pure or stateless (`eth_rlp`,
 `eth_keccak`, `eth_hex`, `eth_word`, `eth_fork_schedule`, `eth_evm`, …) — keep
 new logic out of the `gen_server`s where it can be pure, because that is what
 makes it testable without holding state.
+
+"Lines of code" above is **non-blank and non-comment** lines, and the definition is
+stated because it did not produce the number the previous version of this sentence
+gave: 13,527 and 10,903 are not reproducible from any obvious definition — dropping
+attribute lines, `-include`s or `-export`s was each checked — so they were stale
+before this change rather than differently measured. A figure nobody can reproduce
+is not a measurement, and the fix for that is the definition, not the number.
 
 ### The singletons that matter
 
@@ -397,6 +405,25 @@ Frequently touched: `UPSTREAM_RPC_URL`, `ETH_NETWORK`, `ETH_FORK`, `DATA_DIR`,
 `CHAIN_RETENTION` (2048), `BODY_WINDOW`, `ETH_START_BLOCK`, `DISCV4_ENABLED`,
 `RLPX_ENABLED`, `STATE_SYNC_ENABLED`, `EVM_ETH_CALL`, `VERIFY_HEADERS`.
 
+**The OS environment is the only source.** The module header used to say "then from the
+application environment", and `str_env/3` is `str_env(Env, _Key, Default)` with the key
+argument underscored and unused — the second source never existed.
+
+**All 32 are validated at startup, and a bad one refuses the boot.**
+`eth_config_settings:validate/0` checks each against a per-kind parser, and
+`etherlang_app:start/2` returns `{error, {invalid_configuration, Problems}}` rather than
+starting, naming the variable, the value as written, and why. Before this, an
+unparseable value was answered with the **default** and a nonsensical one was answered
+**as written**: `CHAIN_RETENTION=abc` retained 2048 blocks silently, and
+`CHAIN_RETENTION=-5` retained −5 of them and used it.
+
+Adding a setting means adding it to `settings/0`. The test
+`every_variable_eth_config_reads_is_in_the_table_test` in `eth_config_tests` scans the
+source for the string literals `eth_config` reads and fails if one is not in the table,
+so an unvalidated setting is a test failure rather than a thing nobody notices.
+`ETH_NETWORK` and `ETH_FORK` are in the table but their rules are `eth_fork_schedule`'s,
+which holds the only list of names.
+
 Do not add a default to `config/sys.config`; it is empty on purpose.
 
 ---
@@ -618,6 +645,45 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
   from a hung worker. The tell that it was not hung was `ps` showing CPU time climbing at
   104%. Report on a *time* interval as well as a count -- a long-running unit that cannot
   be observed is indistinguishable from a dead one.
+
+- **An error is a value, and a list of the right length is not a list of the right
+  things.** `eth_config_settings:ip4/1` checked four octets by building
+  `[octet(X) || X <- [A, B, C, D]]` and matching `[N1, N2, N3, N4]`, with `octet/1`
+  answering the atom `not_an_octet` on failure. That is **wrong for every bad address**:
+  `[1, not_an_octet, 1, 1]` is a four-element list, so it matched with the error atom
+  bound to `N2`, the `_ -> error` clause was unreachable, and `ip4("1.999.1.1")` answered
+  `{ok, {1, not_an_octet, 1, 1}}` -- a tuple with an **atom where an octet belongs**,
+  which the caller destructured into `{A, B, C, D}` and returned as a bind address. The
+  right arity is not a check on the right *types*, which is exactly what an untagged
+  element in the list defeats, and nothing warns about it: the pattern `[N1, N2, N3, N4]`
+  really does match, so the `_ ->` clause is statically dead rather than statically
+  unreachable and the compiler has nothing to say. The tell was a probe that disagreed
+  with a derivation doable on paper. Hence `{ok, N} | error` and an explicit
+  `lists:all/2`.
+
+- **`re:run/3` returns the first match, not all of them.** Measured here: a subject with
+  three quoted tokens gives `[<<"AAA">>]` by default and `[[<<"AAA">>], [<<"BBB">>],
+  [<<"CCC">>]]` with the `global` option, which is the opposite of what the default
+  suggests at a glance. A test written to check "every environment variable `eth_config`
+  reads is in the validation table" scanned the source with `re:run/3` and found **one**
+  variable out of thirty-one -- so the assertion "nothing is unchecked" was satisfied by
+  a scan that had checked almost nothing. It is the worst shape of a passing test: the
+  property is a universal claim, the measurement was one example, and the failure mode is
+  silence. Split on the delimiter and take the odd-indexed tokens instead, and assert the
+  scan found a plausible *number* of things, so a scan that finds nothing cannot pass.
+
+- **A test that calls `start/2` to observe a gate decision boots the node.** To find out
+  whether the new configuration gate lets a *legal* configuration through, the first
+  version called `etherlang_app:start/2` -- which opened `eth_mpt` under the un-scoped
+  `DATA_DIR` (so `./data/mpt_state.dets`), generated a JWT secret into `./data`, and
+  bound 8545 and 8551. The test passed. It was the AGENTS.md §10a `DATA_DIR` trap, hit
+  by a test that meant to observe a decision. The refusal test alone does not catch this,
+  because it returns before anything starts, and a negative test is satisfied by a gate
+  that refuses everything. So the answer has its own function: `check_config/0` is the
+  decision, `start/2` is the work, and both directions of the gate are tested against
+  the first. The control for the negative case is then a **filesystem** observation --
+  `jwt.hex` does not exist afterwards -- because that is what distinguishes "refused"
+  from "refused after starting".
 
 ## 11. Known dead code
 
