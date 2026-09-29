@@ -648,6 +648,181 @@ the_sender_is_charged_the_block_price_not_its_own_cap_test() ->
     ?assertEqual(131072, Charged)
   end).
 
+%% ---------------------------------------------------------------------------
+%% Every type bids its own fee field
+%% ---------------------------------------------------------------------------
+
+%% **Every transaction type is compared against the fee field it actually carries.**
+%%
+%% `fee_ceiling_ok/4` chose between `maxFeePerGas` and the legacy `gasPrice` with a
+%% `case tx_type(Tx) of`. Two of the five types were listed when it was written, a
+%% third was added later, and a type that falls out lands on the legacy `gasPrice` --
+%% which for a type-2-family transaction is a field it does not have, so `field/3`
+%% supplies `0` and the transaction is refused as underpriced against **any** base fee
+%% above zero. `eip7702` fell out this way, and the corpus had **72** entries on it:
+%% 47 `INTRINSIC_GAS_TOO_LOW`, 14 `INTRINSIC_GAS_BELOW_FLOOR_GAS_COST`, 8
+%% `SENDER_NOT_EOA` and 3 type-4 well-formedness cases -- every one of them a
+%% transaction whose sender offered exactly the base fee and was refused for it.
+%%
+%% `fee_fields_ok/4` had the identical missing clause and `v1.54` fixed it there,
+%% with a comment explaining that a fall-through clause turns "not mentioned" into
+%% "no rules at all". The neighbouring function was not re-read. This test is the
+%% re-read: it is **table-driven over the five types**, so a sixth added later fails
+%% here rather than inheriting the legacy branch.
+%%
+%% What makes it a check rather than a restatement:
+%%
+%%   * The cap is set to **exactly** the base fee, so the rule under test is `>=`
+%%     and not `>`. A `fee_ceiling_ok/4` that compared against the wrong field would
+%%     see `0` and refuse; one that compared nothing would accept both.
+%%   * Each type is asked again **one wei below**, and must be refused with exactly
+%%     `{error, fee_too_low}`. Without that second half the test would pass for a
+%%     `fee_ceiling_ok/4` that never compared anything -- which is the shape of a
+%%     test that asserts a rule exists only by observing its absence.
+%%   * **Every type is genuinely signed**, for all five wire formats. The alternative
+%%     -- leaning on the fact that the ceiling check currently runs before the
+%%     signature check -- would have made this test depend on the *order* of
+%%     `validate/2`, and reordering that order is the next piece of work. A test
+%%     that breaks for a good reason is still a test that breaks.
+every_transaction_type_bids_its_own_fee_field_test() ->
+    Priv = eth_secp256k1:generate_key(),
+    Sender = addr_of(Priv),
+    Base = 7,
+    lists:foreach(
+      fun(Type) ->
+        lists:foreach(
+          fun(Cap) ->
+            Tx = sign_type(Type, Cap, Base, Priv),
+            %% Comfortably funded, so the *only* rule under test is the fee
+            %% ceiling. A balance at the exact threshold would add a second rule to
+            %% every row of the table, and for the blob type that threshold moves
+            %% with the cap -- a different test entirely, and one
+            %% `sender_must_be_able_to_pay_for_its_blobs_test' already makes.
+            Ctx = ctx(Sender, 1000000000000000000,
+                      #{base_fee => Base, fork => prague, blob_base_fee => 1}),
+            case Cap of
+                Base -> ?assertEqual(ok, eth_tx:validate(Tx, Ctx));
+                _ -> ?assertEqual({error, fee_too_low}, eth_tx:validate(Tx, Ctx))
+            end
+          end, [Base, Base - 1])
+      end, [legacy, eip2930, eip1559, eip4844, eip7702]).
+
+%% A real signed transaction of each of the five wire formats, with the cap in the
+%% field that format actually carries.
+%%
+%% **The signing preimage is derived from the node's own encoder, not written out
+%% here.** The first version of this table hand-wrote a preimage per type, and the
+%% `eip7702` row recovered a different address from the key that signed it -- so the
+%% table could not tell a wrong fee rule from a wrong preimage, and four of five rows
+%% were passing for the wrong reason. That is this repository's `?PROBE` trap one
+%% level up: **a fixture whose identity comes from a second hand-written copy of the
+%% thing under test is a test of the copy.**
+%%
+%% So the preimage is read out of `eth_tx:to_rlp/1`: the typed formats are
+%% `EIP-2718` payloads whose full encoding is the preimage with three signature
+%% items appended, so encoding with a placeholder signature, splitting the last three
+%% RLP items off, and hashing what remains gives exactly what the node signs. The
+%% existing `blob_tx_sighash_excludes_signature_test' already uses that identity; it
+%% is applied to all four typed formats here.
+%%
+%% **The legacy format is the exception and has to be written out.** EIP-155 puts the
+%% chain id in `v`, so the legacy preimage is
+%% `[nonce, gasPrice, gas, to, value, data, chainId, 0, 0]` while the encoding is
+%% `[nonce, gasPrice, gas, to, value, data, v, r, s]` -- the last three *slots* hold
+%% different things, so "split the last three off" would leave `v` in the preimage.
+%% A hand-written preimage is therefore unavoidable for exactly one format, and it is
+%% commented as such.
+sign_type(Type, Cap, _Base, Priv) ->
+    Gas = 100000,
+    Common = #{<<"nonce">> => <<"0x0">>, <<"gas">> => eth_hex:encode_int(Gas),
+               <<"value">> => <<"0x0">>, <<"input">> => <<"0x">>,
+               <<"to">> => to_hex(test_address(1))},
+    Tx0 = with_fee_fields(Type, (base_tx(Common))#{<<"type">> => type_hex(Type)}, Cap),
+    {Digest, _Rec} = case Type of
+        legacy ->
+            {eth_keccak:hash(eth_rlp:encode(
+                                [0, Cap, Gas, test_address(1), 0, <<>>,
+                                 ?CHAIN_ID, 0, 0])), 0};
+        _ ->
+            preimage_digest(Tx0)
+    end,
+    {R, S, RecId} = eth_secp256k1:sign(Digest, Priv),
+    %% The legacy `v` carries the chain id *and* the recovery id; a typed `v` is
+    %% the recovery id alone. That difference is the whole reason a single shared
+    %% signer cannot be assumed correct across the five formats.
+    V = case Type of
+            legacy -> 35 + ?CHAIN_ID * 2 + RecId;
+            _ -> RecId
+        end,
+    with_fee_fields(Type,
+                    Tx0#{<<"v">> => eth_hex:encode_int(V),
+                         <<"r">> => eth_hex:encode_int(R),
+                         <<"s">> => eth_hex:encode_int(S)},
+                    Cap).
+
+%% The signing preimage, read out of the node's own encoder: the full encoding of a
+%% typed transaction is the preimage with `v`, `r` and `s` appended, so removing the
+%% last three RLP items leaves precisely what gets hashed. Returns `{Digest, Rec}`
+%% with `Rec = 0` because the recovery id is not knowable before signing and is
+%% substituted by the caller's own `v`.
+preimage_digest(Tx) ->
+    {ok, <<TypeByte, Rest/binary>>} = eth_tx:to_rlp(Tx),
+    {ok, Items, <<>>} = rlp_items(Rest),
+    {Preimage, Sig} = lists:split(length(Items) - 3, Items),
+    ?assertEqual(3, length(Sig)),
+    {eth_keccak:hash(<<TypeByte, (eth_rlp:encode(Preimage))/binary>>), 0}.
+
+rlp_items(Rest) ->
+    {ok, Fields, Tail} = eth_rlp:decode(Rest),
+    {ok, Fields, Tail}.
+
+%% The fee fields each wire format actually carries. This is the thing the test is
+%% about, so it is stated as a table rather than as a `case' buried in the signer:
+%% `legacy` and `eip2930` have no `maxFeePerGas` at all, and a map that carried one
+%% anyway would be refused by `eth_tx:from_rlp/1' rather than by the rule under test.
+with_fee_fields(Type, Tx, Cap) ->
+    case Type of
+        legacy -> Tx#{<<"gasPrice">> => eth_hex:encode_int(Cap)};
+        eip2930 -> Tx#{<<"gasPrice">> => eth_hex:encode_int(Cap),
+                       <<"accessList">> => []};
+        eip1559 -> Tx#{<<"maxPriorityFeePerGas">> => <<"0x0">>,
+                       <<"maxFeePerGas">> => eth_hex:encode_int(Cap)};
+        eip4844 -> Tx#{<<"maxPriorityFeePerGas">> => <<"0x0">>,
+                       <<"maxFeePerGas">> => eth_hex:encode_int(Cap),
+                       <<"maxFeePerBlobGas">> => eth_hex:encode_int(Cap),
+                       <<"blobVersionedHashes">> => [bin0x(versioned_hash(1))]};
+        eip7702 -> Tx#{<<"maxPriorityFeePerGas">> => <<"0x0">>,
+                       <<"maxFeePerGas">> => eth_hex:encode_int(Cap),
+                       <<"authorizationList">> => [auth_map()]}
+    end.
+
+type_hex(legacy) -> <<"0x0">>;
+type_hex(eip2930) -> <<"0x1">>;
+type_hex(eip1559) -> <<"0x2">>;
+type_hex(eip4844) -> <<"0x3">>;
+type_hex(eip7702) -> <<"0x4">>.
+
+%% One EIP-7702 authorization, in the **map** form the runner and JSON-RPC supply.
+%% The chain id is 0 ("any chain") and the nonce 1, which EIP-7702 requires for the
+%% first authorization a given nonce may use.
+auth_map() ->
+    #{<<"chainId">> => <<"0x0">>, <<"address">> => to_hex(test_address(2)),
+      <<"nonce">> => <<"0x1">>, <<"yParity">> => <<"0x0">>,
+      <<"r">> => <<"0x1">>, <<"s">> => <<"0x1">>}.
+
+%% The **list** form of the same authorization is not written out anywhere in this
+%% module, and that is deliberate. It used to be, and it was wrong: a hand-written
+%% preimage is a second copy of the thing under test, and the row that used one
+%% recovered a different address from the key that signed it. The preimage now comes
+%% from `eth_tx:to_rlp/1' via `preimage_digest/1' for every typed format.
+%%
+%% One thing that shape did teach, and which is worth recording: an authorization is
+%% a **list**, not a tuple, because `eth_rlp:encode/1' has no clause for a tuple. The
+%% version that wrote `{0, 1, 1, 0, 0, <<1:256>>}` died with `function_clause` from
+%% `eth_rlp:encode/1'` -- an error naming the encoder rather than the rule under
+%% test, which is what a probe with its assertions removed always looks like.
+
+
 corpus_blob_fee_signature_test() ->
     with_ctx(fun() ->
         Priv = eth_secp256k1:generate_key(),

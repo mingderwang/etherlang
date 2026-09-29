@@ -79,8 +79,8 @@ depends on execution order, suspect the build before you suspect the code.
 
 ## 3. Architecture
 
-50 modules in `apps/etherlang/src` (13,973 lines of code), 57 test modules in
-`apps/etherlang/test` (12,262), and 886 eunit tests. **These counts drift and this
+50 modules in `apps/etherlang/src` (13,974 lines of code), 57 test modules in
+`apps/etherlang/test` (12,337), and 887 eunit tests. **These counts drift and this
 one had drifted** -- it said 47 and 44 for several commits after it stopped being
 true, which is the same defect as a stale conformance figure: a number in the
 architecture section that a reader will use as a measure of size and that no longer
@@ -509,6 +509,7 @@ is worse than none. It is now two tables.
 | A precompile's return data | EIP-211 | `v1.41`. Seven sites, one of which a `grep finish_call(` cannot find. |
 | EIP-4844's blob fee was never charged | EIP-4844 | **Fixed (`v1.55`)**, +5 tests, **1,408 corpus entries**, +4 on the committed subset. `eth_fork_schedule:blob_gas_price/1` and `blob_base_fee/2` were correct and had exactly two consumers — the `BLOBBASEFEE` opcode's environment and the `maxFeePerBlobGas` admission floor. The *settlement* path had no reference to blob gas pricing at all: the node computed the price, checked the transaction against it, and then never charged it, so every blob transaction's sender kept `total_blob_gas * price` wei the chain has burned. This is a consensus defect with an economic consequence, not a conformance figure. `eth_block:blob_fee/2` now buys it in `begin_transaction/8`, next to the gas, and **no arm of `settle_gas/9` returns it** — the EIP says the burn happens "before transaction execution" and is "not refunded in case of transaction failure", and the corpus's storage diffs are what prove the ordering: a contract doing `ORIGIN BALANCE SSTORE` stores the in-frame balance, so a node that charged the fee after the frame gets the number wrong twice. |
 | EIP-4844's blob *validity* rules: one fabricated, two absent | EIP-4844 | **Fixed (`v1.56`)**, +5 tests. Three rules in the same EIP, all wrong, none of them visible in the tally. **(i)** `valid_versioned_hashes/1` required the hash's 31-byte remainder to be non-zero. **EIP-4844 has no such rule** — its `validate_block` says only "there must be at least one blob" and "all versioned blob hashes must start with `VERSIONED_HASH_VERSION_KZG`" — and whether the remainder is zero is a question about a 48-byte commitment the transaction does not carry, so the execution layer cannot answer it. The clause refused **1,827** corpus branches. **(ii)** `check_state/7` computed `max_total_fee` as `gas * maxFeePerGas + value`, omitting the EIP's `+= get_total_blob_gas(tx) * tx.max_fee_per_blob_gas`, so a sender who could not pay for its blobs was admitted — the 288-entry `INSUFFICIENT_ACCOUNT_FUNDS` cluster. **(iii)** `check_blobs/2` implemented the `maxFeePerBlobGas >= blob_base_fee` floor correctly and **could not fire**: no caller passed `blob_base_fee`, so the `undefined` branch was taken on every call and the `ensure/2` was dead — EIP-3607's shape exactly. Removing (i) is what made (ii) and (iii) *observable*: the fabricated clause had been answering `bad_blob_hashes` for all three, and all 322 now refuse for the right rule. The headline does not move (see the vocabulary boundary), and 4 entries stopped refusing for the wrong reason and now do not refuse at all — the per-block blob gas limit and the check-ordering question, both recorded in `TASKS.md`. |
+| A transaction type that fell out of a `case` on the fee field | EIP-1559 / EIP-7702 | **Fixed (`v1.57`)**, +1 table-driven test over all five wire formats. `fee_ceiling_ok/4` chose the ceiling with `case tx_type(Tx) of eip1559 -> MaxFee; eip4844 -> MaxFee; _ -> GasPrice end`, and `eip7702` was absent — so a type-4 transaction, which has **no `gasPrice` field**, fell to the legacy branch and read `field/3`'s default of `0`, and against a correct base fee every type-4 transaction was refused as underpriced *by its own cap*. **72 corpus entries**: 47 `INTRINSIC_GAS_TOO_LOW`, 14 `INTRINSIC_GAS_BELOW_FLOOR_GAS_COST`, 8 `SENDER_NOT_EOA`, 3 type-4 well-formedness. `fee_fields_ok/4` had the identical clause and `v1.54` fixed it there without re-reading its neighbour. The `case` on an enum that selects a *value* is more dangerous than one that selects a *rule*: a missing rule raises, a missing value answers plausibly. |
 
 ### The originals, kept because the reasoning is the point
 
@@ -810,6 +811,69 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
   is satisfied by a caller that refuses everything, so `v1.56`'s
   `the_block_admission_path_enforces_the_blob_base_fee_test` asserts the refusal
   **and** that the same block is accepted when the sender bids the block's price.
+
+- **A missing clause in a `case` that selects a *value* is a wrong number, and it is
+  indistinguishable from an ordering bug by its symptom.** `fee_ceiling_ok/4` picked
+  the fee ceiling with `case tx_type(Tx) of eip1559 -> MaxFee; eip4844 -> MaxFee; _ ->
+  GasPrice end`, and `eip7702` was not in it. A type-4 transaction has **no `gasPrice`
+  field at all**, so the `_` branch read `field/3`'s default of `0`, and against a
+  correct base fee of 7 every type-4 transaction was refused as underpriced *by its own
+  cap of 7*. That is **72 corpus entries** — 47 `INTRINSIC_GAS_TOO_LOW`, 14
+  `INTRINSIC_GAS_BELOW_FLOOR_GAS_COST`, 8 `SENDER_NOT_EOA`, 3 type-4 well-formedness —
+  and not one of them was about fees.
+  - `fee_fields_ok/4` had the **identical** missing clause, and `v1.54` fixed it there
+    with a comment explaining that a fall-through clause turns "not mentioned" into "no
+    rules at all". The neighbouring function was not re-read. `v1.57` adds
+    `every_transaction_type_bids_its_own_fee_field_test`, which is **table-driven over
+    all five wire formats** and asks each at exactly the base fee and one wei below —
+    so a sixth type added later fails there instead of inheriting the legacy branch.
+  - **The symptom said "ordering".** `fee_ceiling_ok/4` does run *before* the
+    intrinsic-gas check, which is not the reference implementation's order, and the
+    corpus's reason histogram said `INTRINSIC_GAS_TOO_LOW -> fee_too_low` for twelve
+    entries. A note was written recording this as a **check-ordering** defect with a
+    "−9 matches, measured, not landed" experiment attached — and that note was wrong.
+    The measurement was sound; the diagnosis was not, and it was recorded with the same
+    authority as the number. With the clause added, supplying the fixture's stated base
+    fee is **exactly neutral** (matches 1,784, `state_mismatch` 122,
+    `rejection_mismatch` 1,974 either way) and the ordering question has no evidence
+    behind it at all.
+  - So the general form is two rules, and they compound. First: **a fee check that
+    fires on a wrong value looks exactly like a fee check that fires too early**, and
+    the difference is visible only by asking *what value it compared*, not *when*.
+    Second: **a rejected experiment's diagnosis has to be re-tested when the code it
+    blamed changes.** This is the second time this repository has written a
+    reproducible number next to an uncheckable story — the other is §10a's fabricated
+    non-zero clause, pinned by a test that argued for it. A `case` on an enum that
+    selects a *value* deserves more suspicion than one that selects a *rule*, because
+    the first produces a plausible answer and the second produces an error.
+
+- **A table-driven test's rows can each be failing for the wrong reason, and only one
+  of them will be.** The fee-field table above needed five hand-written signing
+  preimages, and the `eip7702` row's recovered a *different address from the key that
+  signed it* — so the table could not distinguish a wrong fee rule from a wrong
+  preimage, and four rows were passing for the wrong reason. The `eip4844` row failed
+  first, on a versioned hash written as `0x01...` in the preimage where the node signs
+  the raw 32 bytes: a 66-byte RLP string instead of a 32-byte one, so a different
+  digest. It is now derived from `eth_tx:to_rlp/1` by splitting the last three RLP
+  items, which is the identity `blob_tx_sighash_excludes_signature_test` already
+  asserts, applied to all four typed formats. **The legacy format is the one exception
+  and must be written out** — EIP-155 puts the chain id in `v`, so the legacy preimage
+  and the legacy encoding disagree in their last three *slots*. The general form: **a
+  fixture's identity must come from the system under test, not from a second copy of
+  it written beside the test.** A hand-written preimage is a reimplementation of
+  `eth_tx:sighash/1`, and the two will differ quietly, at the rate at which the two
+  differ at all — which is to say, rarely enough to look like it works.
+
+- **A row's precondition borrowed from a sibling row is a row that fails for the wrong
+  reason.** The same table used 21,000 gas for every type, which is exactly the
+  intrinsic cost of a plain call and **below** the floor for a type-4 transaction, whose
+  intrinsic includes EIP-7702's 25,000 per authorization. The `eip7702` row therefore
+  failed with `{error, intrinsic_gas}` — a correct answer to a correct rule that was
+  not the one under test. It is worth stating plainly because the failure is a *valid*
+  result: a test that reports a real rule is not obviously wrong, and the only thing
+  that catches it is noticing that the number in the assertion was copied from
+  somewhere else. Where a table's rows differ in their preconditions, the precondition
+  belongs in the row.
 
 ## 11. Known dead code
 

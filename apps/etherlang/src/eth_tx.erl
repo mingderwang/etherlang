@@ -749,6 +749,31 @@ fee_ceiling_ok(Tx, MaxFee, GasPrice, Ctx) ->
             Ceiling = case tx_type(Tx) of
                 eip1559 -> MaxFee;
                 eip4844 -> MaxFee;
+                %% **EIP-7702 is a type-2 transaction with an authorization list.**
+                %% It was missing here, and the `_ ->` clause caught it instead --
+                %% which reads the legacy `gasPrice`, and a type-4 transaction has no
+                %% `gasPrice` field at all, so `field/3` supplies `0`. So every
+                %% type-4 transaction was refused as underpriced against **any** base
+                %% fee above zero.
+                %%
+                %% This is the identical defect `fee_fields_ok/4' had, three functions
+                %% above, fixed in `v1.54`: a `case` written when there were three
+                %% transaction types, a fourth fell out of it, and a fall-through
+                %% clause turned "not mentioned" into a **different rule** rather than
+                %% into an error. The v1.54 comment says exactly that, and the
+                %% neighbouring function was not re-read. The corpus had **72**
+                %% entries sitting on it -- 47 `INTRINSIC_GAS_TOO_LOW`, 14
+                %% `INTRINSIC_GAS_BELOW_FLOOR_GAS_COST`, 8 `SENDER_NOT_EOA` and 3
+                %% type-4 well-formedness cases -- each refused as underpriced
+                %% because its sender offered 7 against a base fee of 7.
+                %%
+                %% So the general form, and it is the second time this repository has
+                %% paid it: **when a `case` on a transaction type selects a *value*
+                %% rather than a rule, a missing clause is a wrong number, not a
+                %% missing check** -- and a missing check is loud while a wrong number
+                %% is silent. The test that catches the class is
+                %% `every_transaction_type_bids_its_own_fee_field_test'.
+                eip7702 -> MaxFee;
                 _ -> GasPrice
             end,
             is_integer(Ceiling) andalso Ceiling >= BaseFee;

@@ -66,8 +66,8 @@ beacon, validators, or block production).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**886 tests, green**).
-* **Status** — v0.7.0; eunit green (886 tests) and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**887 tests, green**).
+* **Status** — v0.7.0; eunit green (887 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -610,6 +610,30 @@ Where the work actually stands:
     *names* still differ — that is the vocabulary boundary, not a fix — and 4 entries stopped being refused
     for the wrong reason and are now not refused at all: `MAX_BLOB_GAS_PER_BLOCK` is unenforced, and the
     validator checks fees before structure. Both are in `TASKS.md` with their derivations.
+  - **One transaction type was falling out of a `case` and reading a fee field it does not
+    have.** `fee_ceiling_ok/4` chose the ceiling with `case tx_type(Tx) of eip1559 -> MaxFee;
+    eip4844 -> MaxFee; _ -> GasPrice end`, and `eip7702` was not in the list. A type-4
+    transaction has **no `gasPrice` field**, so the `_` branch read `field/3`'s default of
+    `0` — and against a correct base fee of 7, every type-4 transaction was refused as
+    underpriced *by its own cap of 7*. That is **72 corpus entries**: 47
+    `INTRINSIC_GAS_TOO_LOW`, 14 `INTRINSIC_GAS_BELOW_FLOOR_GAS_COST`, 8 `SENDER_NOT_EOA` and
+    3 type-4 well-formedness cases, none of which was about fees. `fee_fields_ok/4` had the
+    **identical** missing clause and `v1.54` fixed it there, with a comment explaining that
+    a fall-through clause turns "not mentioned" into "no rules at all"; the neighbouring
+    function was not re-read. The new test is table-driven over **all five wire formats**,
+    each asked at exactly the base fee and one wei below, so a sixth type added later fails
+    there instead of inheriting the legacy branch.
+    The interesting part is how long it read as something else. The reason histogram said
+    `INTRINSIC_GAS_TOO_LOW -> fee_too_low`, and `fee_ceiling_ok/4` *does* run before the
+    intrinsic-gas check, so a note was written recording this as a **check-ordering** defect,
+    with a "−9 matches, measured, not landed" experiment attached. **That note was wrong.**
+    The measurement was sound; the diagnosis was not, and it carried the same authority as
+    the number. With the clause present, supplying the fixture's stated base fee is
+    **exactly neutral** — matches 1,784, `state_mismatch` 122, `rejection_mismatch` 1,974
+    either way — and the ordering question has no evidence behind it at all, so it is closed
+    as unsupported rather than acted on. A fee check that fires on a **wrong value** looks
+    exactly like a fee check that fires **too early**; the difference is visible only by
+    asking what value it compared, not when.
   - **The committed subset is the easiest 2% of the material, and it should never be quoted as the conformance figure.** It is the *smallest* file in each suite. Measured against the **229 non-`static` files that `execution-spec-tests` ships** — 15,660 entries — this node matches **6,786 of them, 43.3%**, with one fork per fresh VM. The gap is not a regression; it is what "the smallest file in each suite" was worth all along. `TASKS.md` has the per-fork table, the outcome breakdown and the gas histogram.
   - **`unpriced` is 0 on the subset and 86 on the corpus.** The claim "nothing is executed that this node cannot price" was true of the 266 entries it was measured on and false of the corpus, and it was written as a property of the node. 86 entries execute something this node cannot price, so they commit no state root; the remaining ~2,400 `static/` files are legacy VMTests and were not run at all.
     Five missing prices have been found and fixed since, all five by the corpus rather than by a test, and all five on the create, store and access paths. The fifth was **EIP-3651's warm coinbase**: the transaction-start warm set was seeded with the sender, `to` and the precompiles, and not with the address that receives the block reward and the transaction fees, so every direct payment to the miner was charged `COLD_ACCOUNT_ACCESS_COST` on first touch -- a uniform **+2,500** on twelve fixtures, and 2,500 is `2,600 - 100` exactly. A fifth defect was not in that list at all, because it was in the **runner**: `eth_state:new/2` rewrites every `{store, A, S}` overlay key through `eth_state:slot_key/1`, and the comparison read the slot back under the un-normalised key, so **every storage read on the way back returned zero** and a node that stored `1` was reported as having stored nothing. Twenty-one fixtures were being scored on a comparison that could not see storage: **the code-deposit cost was never charged at all** (`G_codedeposit`, 200 per byte, so a create deployed code of any size for free and never went out of gas on a deposit it could not pay — the size cap was a bare `byte_size(Code) =< 24576` guard, a predicate with no price behind it, applied at every fork including the eight before EIP-170 introduced it); **EIP-170's size cap was a constant rather than a fork fact** (`infinity` below Spurious Dragon); and **EIP-2929's "additional" `COLD_SLOAD_COST` on `SSTORE` was missing** — the EIP has two halves, the EIP-2200 parameter rewrites *and* an extra 2,100 for a slot not in `accessed_storage_keys`, and the node had the first, so every *first* touch of a slot cost 2,100 too little while every second touch was right; and **EIP-2929's transaction-start warm set was never seeded** (its own text: "`accessed_addresses` is initialized to include the `tx.sender`, `tx.to` ... and the set of all precompiles"), so the transaction's own recipient, its own sender and every precompile were each charged `COLD_ACCOUNT_ACCESS_COST` on first touch — a uniform +2,500 on twenty-four fixtures, and 2,500 is `2,600 − 100` exactly. The gas figure is recovered from the balances the way a state test

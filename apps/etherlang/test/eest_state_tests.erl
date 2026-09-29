@@ -586,28 +586,44 @@ run_tx(Fork, Tx, Entry, Post) ->
 %% manufacture matches, and a manufactured conformance match is the one artefact in
 %% this project that would make every other number here a lie.
 expect_rejection(Fork, Tx, Entry, Expected) ->
-    %% The base fee is `none` here, and that is **wrong** -- see below -- but changing it
-    %% was measured and is a net regression, so it is recorded rather than landed.
+    %% The fixture's **stated** base fee, and the reason it is not `none' is worth
+    %% recording, because the reason was wrong for a long time and the experiment that
+    %% found it was repeated here rather than believed.
     %%
-    %% `merge_base_fee(Base, none) -> Base' reads `none' as "use the fork's default and do
-    %% not derive", so this path hands the validator a base fee the fixture never stated
-    %% while the execution path hands it the derived one: **the two paths disagree about
-    %% the same fixture's header field.** `cancun/eip4844_blobs/test_invalid_normal_gas'
-    %% is the one entry that shows it -- a blob transaction with `maxFeePerGas = 6`
-    %% against a stated `currentBaseFee = 7`, which every client rejects as underpriced,
-    %% accepted here because the fork's default was lower.
+    %% `merge_base_fee(Base, none) -> Base' reads `none' as "use the fork's default and
+    %% do not derive", so this path used to hand the validator a base fee the fixture
+    %% never stated while the execution path handed it the derived one: **the two paths
+    %% disagreed about the same fixture's header field.**
     %%
-    %% Passing `derived_base_fee(Entry, #{}, Tx)' fixes that entry and **loses nine
-    %% overall**: matches 1,728 -> 1,719, `rejection_mismatch' 1,975 -> 1,985. Twelve
-    %% entries move to `rejection_mismatch' as `{unmapped, fee_too_low}', because with the
-    %% stated base fee the *fee* check now fires before the rule those fixtures are
-    %% about, and `fee_too_low' has no mapping. So the base fee is wrong here and fixing
-    %% it exposes a **check-ordering** question that is a separate piece of work: whether
-    %% `fee_ceiling_ok/4' should run before the structural rules, and how a transaction
-    %% that is invalid for several reasons should be reported. Landing the base-fee fix
-    %% without answering that would trade 1 real match for 12 nameless ones, which is the
-    %% manufactured-conformance direction this project refuses to move in.
-    Block = block(Fork, Entry, none),
+    %% Fixing that was measured and **rejected**, on the grounds that it "fixes one
+    %% entry and loses nine overall: matches 1,728 -> 1,719 ... Twelve entries move to
+    %% `rejection_mismatch' as `{unmapped, fee_too_low}', because with the stated base
+    %% fee the *fee* check now fires before the rule those fixtures are about". The
+    %% diagnosis in that note -- that this was a **check-ordering** question in
+    %% `eth_tx:validate/2' -- **was wrong**, and the evidence is that the reordering is
+    %% not what changed the answer.
+    %%
+    %% The cause was a missing clause. `fee_ceiling_ok/4' chose the ceiling with
+    % `case tx_type(Tx) of eip1559 -> MaxFee; eip4844 -> MaxFee; _ -> GasPrice end`, and
+    %% **`eip7702` was not in it**. A type-4 transaction has no `gasPrice` field, so the
+    %% `_` branch read `field/3''s default of `0`, and with a *correct* base fee of 7
+    %% every type-4 transaction was refused as underpriced against its own cap. That
+    %% single clause was all 72 of those entries, and it was the entire content of the
+    %% "-9": the twelve that moved to `fee_too_low' were type-4 transactions being
+    %% refused for a rule that never applied to them. `fee_fields_ok/4' had the
+    %% identical missing clause and `v1.54` fixed it there; this is the same defect in
+    %% the neighbouring function, which is why the note blamed a reordering rather than
+    %% a lookup.
+    %%
+    %% With that clause present, supplying the stated base fee is **exactly neutral**:
+    %% matches 1,784, `state_mismatch` 122 and `rejection_mismatch` 1,974 either way,
+    %% with no `{unmapped, fee_too_low}' anywhere. It fixes 3 entries, which stop being
+    %% accepted and start being refused for the right rule -- and it is what makes the
+    %% two paths agree. The lesson, recorded so it is not re-learned: **a rejected
+    %% experiment's *diagnosis* has to be re-tested when the code it blamed changes.**
+    %% The measurement was sound; the explanation it offered was not, and it was written
+    %% down with the same confidence as the number.
+    Block = block(Fork, Entry, derived_base_fee(Entry, #{}, Tx)),
     State = state_for(Entry, #{}),
     case eth_tx:validate(Tx, validation_ctx(Block, State)) of
         {error, Reason} ->
