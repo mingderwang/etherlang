@@ -66,8 +66,8 @@ beacon, validators, or block production).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**881 tests, green**).
-* **Status** — v0.7.0; eunit green (881 tests) and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**886 tests, green**).
+* **Status** — v0.7.0; eunit green (886 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -592,6 +592,24 @@ Where the work actually stands:
     a gas number has nothing to divide, and all 1,408 reported `no_comparable_gas`. The gas histogram
     buckets `abs(Delta) =< 100000` and printed `(none in range)` — which is what "this instrument can
     see nothing" reads like. It still cannot overflow that bucket; see `TASKS.md` item 6a.
+  - **The same EIP had three wrong validity rules, and the tally showed none of them.** `eth_tx:valid_versioned_hashes/1`
+    required a blob versioned hash's 31-byte remainder to be **non-zero**, "a zero hash would commit to
+    nothing". EIP-4844 says no such thing — its `validate_block` states the whole rule as *non-empty* and
+    *version byte `0x01`* — and the execution layer cannot answer the question at all, because the remainder
+    is `sha256(commitment)[1:]` over a 48-byte commitment the transaction does not carry. The corpus is not
+    ambiguous about it: **1,502 transactions carrying `0x01 || 31 zero bytes` are expected to execute**, 325
+    are expected to be rejected for *other* reasons, and 1,827 carry one — which is every type-3 transaction
+    in the corpus. That fabricated clause was answering `bad_blob_hashes` for **1,827** branches, and behind
+    it were two rules this node genuinely lacked: `max_total_fee` omitted the EIP's
+    `+= get_total_blob_gas(tx) * tx.max_fee_per_blob_gas`, so a sender who could not pay for its blobs was
+    admitted (288 entries, and the arithmetic is exact for 288 of 288); and the
+    `maxFeePerBlobGas >= blob_base_fee` floor was implemented correctly and **could not fire at all**, because
+    no caller passed a `blob_base_fee` and the `undefined` branch was taken on every call in the program.
+    **A check that fires early and wrongly does not merely add noise; it deletes the information about
+    everything behind it.** All 322 now refuse for the right rule. The headline does not move, because the
+    *names* still differ — that is the vocabulary boundary, not a fix — and 4 entries stopped being refused
+    for the wrong reason and are now not refused at all: `MAX_BLOB_GAS_PER_BLOCK` is unenforced, and the
+    validator checks fees before structure. Both are in `TASKS.md` with their derivations.
   - **The committed subset is the easiest 2% of the material, and it should never be quoted as the conformance figure.** It is the *smallest* file in each suite. Measured against the **229 non-`static` files that `execution-spec-tests` ships** — 15,660 entries — this node matches **6,786 of them, 43.3%**, with one fork per fresh VM. The gap is not a regression; it is what "the smallest file in each suite" was worth all along. `TASKS.md` has the per-fork table, the outcome breakdown and the gas histogram.
   - **`unpriced` is 0 on the subset and 86 on the corpus.** The claim "nothing is executed that this node cannot price" was true of the 266 entries it was measured on and false of the corpus, and it was written as a property of the node. 86 entries execute something this node cannot price, so they commit no state root; the remaining ~2,400 `static/` files are legacy VMTests and were not run at all.
     Five missing prices have been found and fixed since, all five by the corpus rather than by a test, and all five on the create, store and access paths. The fifth was **EIP-3651's warm coinbase**: the transaction-start warm set was seeded with the sender, `to` and the precompiles, and not with the address that receives the block reward and the transaction fees, so every direct payment to the miner was charged `COLD_ACCOUNT_ACCESS_COST` on first touch -- a uniform **+2,500** on twelve fixtures, and 2,500 is `2,600 - 100` exactly. A fifth defect was not in that list at all, because it was in the **runner**: `eth_state:new/2` rewrites every `{store, A, S}` overlay key through `eth_state:slot_key/1`, and the comparison read the slot back under the un-normalised key, so **every storage read on the way back returned zero** and a node that stored `1` was reported as having stored nothing. Twenty-one fixtures were being scored on a comparison that could not see storage: **the code-deposit cost was never charged at all** (`G_codedeposit`, 200 per byte, so a create deployed code of any size for free and never went out of gas on a deposit it could not pay — the size cap was a bare `byte_size(Code) =< 24576` guard, a predicate with no price behind it, applied at every fork including the eight before EIP-170 introduced it); **EIP-170's size cap was a constant rather than a fork fact** (`infinity` below Spurious Dragon); and **EIP-2929's "additional" `COLD_SLOAD_COST` on `SSTORE` was missing** — the EIP has two halves, the EIP-2200 parameter rewrites *and* an extra 2,100 for a slot not in `accessed_storage_keys`, and the node had the first, so every *first* touch of a slot cost 2,100 too little while every second touch was right; and **EIP-2929's transaction-start warm set was never seeded** (its own text: "`accessed_addresses` is initialized to include the `tx.sender`, `tx.to` ... and the set of all precompiles"), so the transaction's own recipient, its own sender and every precompile were each charged `COLD_ACCOUNT_ACCESS_COST` on first touch — a uniform +2,500 on twenty-four fixtures, and 2,500 is `2,600 − 100` exactly. The gas figure is recovered from the balances the way a state test

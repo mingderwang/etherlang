@@ -117,20 +117,41 @@ node that admits an invalid transaction imports a block containing one:
   `gasPrice`, so `field/3` supplied 0 and **every** fee-field rule was skipped for type 4.
   A fall-through clause turns "not mentioned" into "no rules at all" rather than an error.
 
-The remaining **1** is `cancun/eip4844_blobs/test_invalid_normal_gas`: a blob
-transaction with `maxFeePerGas = 6` against a stated `currentBaseFee = 7`. The node
-accepted it because `expect_rejection/4` builds its block with the literal `none`, and
+The remaining **3** are all `INSUFFICIENT_MAX_FEE_PER_GAS`, and all three are
+`maxFeePerGas = 6` against a stated `currentBaseFee = 7` — two in
+`cancun/eip4844_blobs/test_invalid_normal_gas` and one in
+`prague/eip7702_set_code_tx/test_set_code_transaction_fee_validations`. The node
+accepts them because `expect_rejection/4` builds its block with the literal `none`, and
 `merge_base_fee(Base, none) -> Base` reads that as *use the fork's default* — so the
 rejection path hands the validator a base fee the fixture never stated while the
 execution path hands it the derived one. **The two paths disagree about the same
-fixture's header field.** Passing the derived base fee fixes that entry and **loses nine
-overall** (matches 1,728 → 1,719; `rejection_mismatch` 1,975 → 1,985), because with the
-stated base fee the fee check now fires before the rule twelve other fixtures are about and
-`fee_too_low` has no mapping. So the base fee is wrong here, and fixing it exposes a
-**check-ordering** question that is separate work: whether `fee_ceiling_ok/4` belongs
-before the structural rules, and how a transaction invalid for several reasons should be
-reported. Measured and **not landed**, per the rule against trading one real match for
-twelve nameless ones.
+fixture's header field.**
+
+Supplying the derived base fee is **correct** and is still a net loss on the tally.
+The figure has been **re-measured**, because the earlier one was taken before the
+EIP-4844 work and had drifted: matches 1,784 → 1,775 (**−9**), `rejection_mismatch`
+1,971 → 1,980. With the stated base fee all three of these entries refuse for the
+right reason — `{unmapped, fee_too_low}` — and twelve other fixtures move to the same
+place, because with the real base fee `fee_ceiling_ok/4` fires *before* the rule those
+twelve are about, and `fee_too_low` has no mapping.
+
+Measured and **not landed**, and not primarily because of the tally. Two reasons, and
+the second is the one that matters:
+
+1. It trades 3 real matches for 12 nameless ones. Mapping `fee_too_low` to
+   `INSUFFICIENT_MAX_FEE_PER_GAS` would move the number the wrong way *honestly*,
+   which is worse than moving it the wrong way dishonestly: for those twelve the
+   node's answer is a **different rule** from the one the fixture names, and the
+   vocabulary table is precisely the one place where a rename is indistinguishable
+   from a fix.
+2. **The defect is the node's, not the harness's.** `fee_ceiling_ok/4` runs before
+   `check_blobs/2`, `check_set_code/2` and the intrinsic gas check, so a transaction
+   invalid for several reasons is reported as underpriced. The yellow paper's order is
+   the other way round — its fee condition follows the value/balance and structural
+   conditions — so the node's *ordering* is wrong too, and the harness has been
+   faithfully reporting a node defect as a harness defect. That is real work:
+   reorder `eth_tx:validate/2` first, then supply the stated base fee. Touching the
+   runner first would paper over the ordering question with a one-word change.
 
 **`unpriced` is 86, not 0.** The documentation claimed -- in `README.md` and here --
 that `unpriced` is **0**, "nothing is executed that this node cannot price". That is true
@@ -584,6 +605,82 @@ behavioural change per commit, and each step says what it now does.
      than folded in. `eth_block_builder` does compute its own `excess_blob_gas` from
      `payloadAttributes`, so the field a locally built block carries is right; it is
      the *transactions'* contribution that is missing.
+6b. **~~EIP-4844's blob transaction *validity*.~~  Closed in `v1.56`** — three rules
+   in one EIP, all wrong, and **none of them visible in the tally** until the first
+   was removed.
+   - **(i) A fabricated rule.** `eth_tx:valid_versioned_hashes/1` required a versioned
+     hash's 31-byte remainder to be non-zero, on the reasoning that "a zero hash would
+     commit to nothing". EIP-4844 says no such thing. Its `validate_block` states the
+     whole rule — `assert len(tx.blob_versioned_hashes) > 0` and
+     `assert h[0] == VERSIONED_HASH_VERSION_KZG` — and the remainder is
+     `sha256(commitment)[1:]` over a 48-byte commitment the transaction does not carry,
+     so **the execution layer cannot answer the question even in principle**. This is
+     §4.2 in its purest form: a consensus constant invented here and pinned by a test
+     that argued for it in a comment.
+   - The corpus settles it without appeal. Across the whole `state_tests` corpus,
+     **1,502 transactions carrying `0x01 || 31 zero bytes` are expected to SUCCEED**
+     and 325 to be rejected, across 9 files — and 1,827 carry one, which is **every
+     type-3 transaction the corpus has**. The 325 rejections name other rules
+     (`INSUFFICIENT_ACCOUNT_FUNDS`, `INTRINSIC_GAS_TOO_LOW`, ...), never this one.
+   - **(ii) `max_total_fee` omitted the blob term.** EIP-4844 modifies the balance
+     rule: `max_total_fee = tx.gas * tx.max_fee_per_gas` and, for a blob transaction,
+     `+= get_total_blob_gas(tx) * tx.max_fee_per_blob_gas`. The node computed the first
+     line only, so a sender who could not pay for its blobs was admitted. The
+     arithmetic is exact: for all **288** entries in
+     `cancun/eip4844_blobs/test_insufficient_balance_blob_tx` (144 Cancun + 144
+     Prague), `balance < gasLimit * maxFee + value` is **false**; adding the blob term
+     makes it true for **288 of 288**.
+   - **(iii) The blob base fee floor could not fire.** `check_blobs/2` implemented
+     `maxFeePerBlobGas >= get_base_fee_per_blob_gas(block.header)` correctly, reading
+     the price from the context — and **no caller passed one**. The `undefined` branch
+     was taken on every call in the program and the `ensure/2` below it was dead code.
+     EIP-3607's shape, exactly: a rule present, correct, and unreachable. The four
+     `INSUFFICIENT_MAX_FEE_PER_BLOB_GAS` fixtures bid 1 wei per blob gas against
+     `currentExcessBlobGas = 0x240000` (2,359,296), where the Cancun curve gives 2.
+   - **The lesson is the part worth keeping.** Rule (i) fired *before* (ii) and (iii)
+     and answered `bad_blob_hashes` for all of them, so **322 entries were refused for
+     a reason that does not exist and every one of them was a case of a rule the node
+     genuinely lacked**. A check that fires early and wrongly does not merely add
+     noise — it deletes the information about everything behind it. Fixing the
+     fabricated one first is right even though it exposed the other two as outright
+     failures, and the exposure is the point: 322 wrong reasons became 322 right
+     reasons, and 4 refusals became non-refusals that are now named below.
+   - **The headline did not move and that is the point.** All 322 remain
+     `rejection_mismatch`, because the *names* still differ —
+     `insufficient_balance` against the corpus's `INSUFFICIENT_ACCOUNT_FUNDS`. They
+     are now right reasons under different names, which is the vocabulary boundary,
+     not a fix and not a failure. `rejection_mismatch` 1,975 → 1,971,
+     `expected_rejection_not_raised` 1 → 5, `match` unchanged at 1,784, `state_mismatch`
+     unchanged at 122. Zero fixtures that used to match now fail.
+   - **Open as a direct result — the per-block blob gas limit.** EIP-4844 also
+     requires `blob_gas_used <= MAX_BLOB_GAS_PER_BLOCK` (786,432 = 6 blobs), and this
+     node has **no such check**, so the 2
+     `TYPE_3_TX_MAX_BLOB_GAS_ALLOWANCE_EXCEEDED` fixtures (7 and 9 hashes) are now
+     admitted where they used to be refused for the wrong reason. The rule is
+     *cumulative over a block*, so it needs the block's accumulated blob gas, and
+     **that is not a one-line change**: `eth_block:from_payload/1` puts the payload's
+     **declared** `blobGasUsed` in the record, so accumulating into
+     `Block#block.blob_gas_used` during execution would double-count on the
+     `finalize/1` path. The design question — where the running total lives, and what
+     it is initialised from on a block that arrived with a declared value — has to be
+     answered before the check is. Recorded, not guessed. (It is the same
+     `blobGasUsed` commitment named in item 6a, seen from the admission side.)
+   - 5 tests, 6 injections, all shown to bite: restoring the non-zero clause, zeroing
+     the blob term, dropping `GAS_PER_BLOB` from the balance term, adding the blob
+     term to *every* transaction, hardcoding the context's price to the floor, and
+     making `blob_base_fee/1` a second derivation that always answers 1. The last two
+     fail only the tests that own those two claims, which is what they are for.
+6c. **Reorder `eth_tx:validate/2` so the fee conditions come last.** The yellow
+   paper's transaction validity puts the fee condition after the value, balance and
+   structural conditions; this node runs `fee_ceiling_ok/4` before `check_blobs/2`,
+   `check_set_code/2` and the intrinsic gas check. A transaction invalid for several
+   reasons is therefore reported as underpriced, and the conformance runner's
+   `fee_too_low` has no vocabulary mapping for exactly that reason. **This is what
+   makes the harness's base-fee bug above look like a harness bug**: supplying the
+   fixture's stated base fee is correct, and it costs 9 matches not because it is
+   wrong but because the node then answers with a rule the corpus did not name. Fix
+   the order first, supply the base fee second.
+
 7. **The divergence fingerprints**  *(next, and these are concrete)*. The tally says
    `state_mismatch` 249 times, which is not a work list. `eest_report`'s gas-delta
    histogram is: a delta of a few thousand gas repeats because it is one missing

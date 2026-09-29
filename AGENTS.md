@@ -79,8 +79,8 @@ depends on execution order, suspect the build before you suspect the code.
 
 ## 3. Architecture
 
-50 modules in `apps/etherlang/src` (13,956 lines of code), 57 test modules in
-`apps/etherlang/test` (12,141), and 881 eunit tests. **These counts drift and this
+50 modules in `apps/etherlang/src` (13,973 lines of code), 57 test modules in
+`apps/etherlang/test` (12,262), and 886 eunit tests. **These counts drift and this
 one had drifted** -- it said 47 and 44 for several commits after it stopped being
 true, which is the same defect as a stale conformance figure: a number in the
 architecture section that a reader will use as a measure of size and that no longer
@@ -508,6 +508,7 @@ is worse than none. It is now two tables.
 | Pre-Berlin `SSTORE` at every other fork | EIP-2200 | The flat rule with EIP-2200's inherited figures; `SLOAD_GAS` fork-selected 50/200/800 by EIP-150 and EIP-1884. |
 | A precompile's return data | EIP-211 | `v1.41`. Seven sites, one of which a `grep finish_call(` cannot find. |
 | EIP-4844's blob fee was never charged | EIP-4844 | **Fixed (`v1.55`)**, +5 tests, **1,408 corpus entries**, +4 on the committed subset. `eth_fork_schedule:blob_gas_price/1` and `blob_base_fee/2` were correct and had exactly two consumers — the `BLOBBASEFEE` opcode's environment and the `maxFeePerBlobGas` admission floor. The *settlement* path had no reference to blob gas pricing at all: the node computed the price, checked the transaction against it, and then never charged it, so every blob transaction's sender kept `total_blob_gas * price` wei the chain has burned. This is a consensus defect with an economic consequence, not a conformance figure. `eth_block:blob_fee/2` now buys it in `begin_transaction/8`, next to the gas, and **no arm of `settle_gas/9` returns it** — the EIP says the burn happens "before transaction execution" and is "not refunded in case of transaction failure", and the corpus's storage diffs are what prove the ordering: a contract doing `ORIGIN BALANCE SSTORE` stores the in-frame balance, so a node that charged the fee after the frame gets the number wrong twice. |
+| EIP-4844's blob *validity* rules: one fabricated, two absent | EIP-4844 | **Fixed (`v1.56`)**, +5 tests. Three rules in the same EIP, all wrong, none of them visible in the tally. **(i)** `valid_versioned_hashes/1` required the hash's 31-byte remainder to be non-zero. **EIP-4844 has no such rule** — its `validate_block` says only "there must be at least one blob" and "all versioned blob hashes must start with `VERSIONED_HASH_VERSION_KZG`" — and whether the remainder is zero is a question about a 48-byte commitment the transaction does not carry, so the execution layer cannot answer it. The clause refused **1,827** corpus branches. **(ii)** `check_state/7` computed `max_total_fee` as `gas * maxFeePerGas + value`, omitting the EIP's `+= get_total_blob_gas(tx) * tx.max_fee_per_blob_gas`, so a sender who could not pay for its blobs was admitted — the 288-entry `INSUFFICIENT_ACCOUNT_FUNDS` cluster. **(iii)** `check_blobs/2` implemented the `maxFeePerBlobGas >= blob_base_fee` floor correctly and **could not fire**: no caller passed `blob_base_fee`, so the `undefined` branch was taken on every call and the `ensure/2` was dead — EIP-3607's shape exactly. Removing (i) is what made (ii) and (iii) *observable*: the fabricated clause had been answering `bad_blob_hashes` for all three, and all 322 now refuse for the right rule. The headline does not move (see the vocabulary boundary), and 4 entries stopped refusing for the wrong reason and now do not refuse at all — the per-block blob gas limit and the check-ordering question, both recorded in `TASKS.md`. |
 
 ### The originals, kept because the reasoning is the point
 
@@ -771,6 +772,44 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
   that prints nothing is indistinguishable from a bounded histogram over an empty set,
   and §5's claim that an unobservable long-running unit is a dead one is the same
   shape. The diffs were always printed; it was the summary that was quiet.
+
+- **A fabricated check hides the real ones behind it, and its victims are all
+  attributed to it.** `eth_tx:valid_versioned_hashes/1` required a blob versioned
+  hash's 31-byte remainder to be non-zero, "a zero hash would commit to nothing".
+  EIP-4844 says no such thing, and the execution layer cannot answer the question
+  anyway — the remainder is `sha256(commitment)[1:]` over a 48-byte commitment the
+  transaction does not carry. The clause answered `bad_blob_hashes` for **1,827**
+  corpus branches: the 288 blob-balance entries, all 34 check-ordering entries, and
+  the 4 underbid-blob-fee entries. So **322 entries were refused for a reason that
+  does not exist, and every one of them was a case of a rule the node genuinely
+  lacked** — the missing `max_total_fee` blob term and the unreachable
+  `maxFeePerBlobGas` floor were both real, and neither was visible, because a rule
+  further down `check_blobs/2` had already answered. The general form: **a check
+  that fires early and wrongly does not merely add noise, it deletes the
+  information about everything behind it.** When three rules are wrong in the same
+  place, ask which one fires first, because that is the one that has been hiding the
+  other two — and the one to fix first is the *fabricated* one, even though fixing
+  it exposes the others as outright failures. That is the trade: 322 wrong reasons
+  become 322 right reasons and 4 refusals disappear, and the 4 are then named rather
+  than masked.
+
+- **A rule that reads a value nobody passes is not a lenient rule, it is a dead
+  one — and its own comment says so without noticing.** `check_blobs/2` documented
+  "when the caller cannot supply it the floor is not checked rather than guessed",
+  and the sentence was read as prudence. The fact was that *no caller could supply
+  it*: `eth_block:validation_ctx/4' had no `blob_base_fee` key and neither did the
+  conformance runner, so `maps:get(blob_base_fee, Ctx, undefined)` took the
+  `undefined` branch on every call in the program and the `ensure/2` below it never
+  executed. The comment described a design decision; the code had an omission. This
+  is the EIP-3607 lesson from §10's own table, and the shape is worth stating as a
+  general rule: **when a function is careful about a missing input, check whether
+  anything supplies it** — a careful clause is very often a disclaimer written
+  around a hole. The test that finds it is not a unit test of the function, which
+  passes perfectly, but a test through the *production* caller, because only that
+  caller shows the omission. A negative test on its own is worse than none here: it
+  is satisfied by a caller that refuses everything, so `v1.56`'s
+  `the_block_admission_path_enforces_the_blob_base_fee_test` asserts the refusal
+  **and** that the same block is accepted when the sender bids the block's price.
 
 ## 11. Known dead code
 

@@ -1024,7 +1024,15 @@ validation_ctx(Block, State) ->
       %% at all: `eth_tx:validate/2' treats an absent `code_of' as "cannot answer", and
       %% the eight `SENDER_NOT_EOA' fixtures would keep reporting
       %% `expected_rejection_not_raised' while the rule looked implemented.
-      code_of => fun(A) -> {ok, eth_state:code(State, A)} end}.
+      code_of => fun(A) -> {ok, eth_state:code(State, A)} end,
+      %% EIP-4844's blob base fee floor, and the reason four
+      %% `INSUFFICIENT_MAX_FEE_PER_BLOB_GAS` fixtures were `expected_rejection_not_raised`:
+      %% `eth_tx:check_blobs/2' reads this from the context, and no caller passed it,
+      %% so the rule was unreachable on the harness as well as in production. Taken
+      %% from `eth_block:blob_base_fee/1' -- **the same function the node charges
+      %% at** -- rather than recomputed here, because a harness that derives a
+      %% consensus constant a second time is how the two drift apart silently.
+      blob_base_fee => eth_block:blob_base_fee(Block)}.
 
 %% The base fee as `eth_block:base_fee_of/1' reads it: `undefined' for a block
 %% that has none, and 0 for one at London or later where 0 is a real figure.

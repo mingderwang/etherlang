@@ -1242,11 +1242,17 @@ a_type_three_transaction_is_rejected_before_cancun_test() ->
              <<"type">> => <<"0x3">>,
              <<"maxFeePerBlobGas">> => <<"0x3b9aca00">>,
              <<"blobVersionedHashes">> =>
-                 %% A versioned hash whose 31-byte remainder is *not* all zeros.
-                 %% `valid_versioned_hashes/1' rejects an all-zero remainder
+                 %% A well-formed versioned hash. The obvious placeholder --
+                 %% `<<16#01, 0:248>>` -- is what the corpus itself uses in 1,502
+                 %% transactions it expects to succeed, and what EIP-4844's
+                 %% `validate_block` accepts, so it is used here too. An earlier
+                 %% version of this fixture wrote `<<16#01, 1:248>>` and explained
+                 %% it: "`valid_versioned_hashes/1` rejects an all-zero remainder
                  %% explicitly, so the obvious placeholder fails here -- and for a
-                 %% real reason rather than a formatting one.
-                 [<<16#01, 1:248>>]},
+                 %% real reason rather than a formatting one". That reason was
+                 %% fabricated; the clause is gone, and the fixture works again
+                 %% with the hash the chain actually accepts.
+                 [<<16#01, 0:248>>]},
     ?assertEqual({error, tx_type_pre_fork},
                  eth_tx:validate(Tx, ctx_at(london, Tx))),
     ?assertEqual(ok, eth_tx:validate(Tx, ctx_at(cancun, Tx))).

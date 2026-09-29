@@ -766,6 +766,25 @@ fee_ceiling_ok(Tx, MaxFee, GasPrice, Ctx) ->
 %%     not purchasable. That price comes from the context because it depends on
 %%     the parent block's excess blob gas; when the caller cannot supply it the
 %%     floor is not checked rather than guessed.
+%%
+%% **And the price was supplied by nobody, so that third rule could not fire.**
+%% The sentence above said "when the caller cannot supply it the floor is not
+%% checked rather than guessed", and it turned out no caller could: neither
+%% `eth_block:validation_ctx/4' -- the admission path for a block's own
+%% transactions -- nor the conformance runner passed a `blob_base_fee' key, so
+%% `maps:get(blob_base_fee, Ctx, undefined)' took the `undefined' branch on
+%% **every** call and the `ensure/2' below it was dead code. This is EIP-3607's
+%% shape exactly: a rule present, correct, and unreachable, with fixtures that
+%% would have caught it reporting `INSUFFICIENT_MAX_FEE_PER_BLOB_GAS' as a reason
+%% this node never gave. Those fixtures set `maxFeePerBlobGas = 1' against
+%% `currentExcessBlobGas = 0x240000' (2,359,296), where the Cancun curve gives a
+%% blob base fee of **2** -- so the sender underbid and the node let it through.
+%%
+%% The price is not guessed here. It comes from the context because it is a
+%% property of the block being built, and the only thing that computes it is
+%% `eth_block:blob_base_fee/1' -- the same function `eth_block:blob_fee/2' charges
+%% at, so the price a transaction is *checked* against and the price it is
+%% *charged* cannot come from two different derivations.
 check_blobs(Tx, Ctx) ->
     case tx_type(Tx) of
         eip4844 ->
@@ -1047,7 +1066,7 @@ check_state(Tx, Nonce, Gas, Value, MaxFee, GasPrice, Ctx) ->
             %% true for a single byte is not a near-miss; one byte is code.
             check_sender_is_eoa(Payer, Ctx),
             Price = validation_price(MaxFee, GasPrice),
-            check_balance(Payer, Gas * Price + Value, Ctx),
+            check_balance(Payer, Gas * Price + Value + blob_gas_term(Tx), Ctx),
             check_nonce(Payer, Nonce, Ctx);
         _ ->
             %% valid_signature/1 has already rejected a transaction whose sender
@@ -1088,6 +1107,54 @@ code_is_empty(_) -> false.
 validation_price(MaxFee, _GasPrice) when is_integer(MaxFee) -> MaxFee;
 validation_price(_MaxFee, GasPrice) when is_integer(GasPrice) -> GasPrice;
 validation_price(_, _) -> 0.
+
+%% EIP-4844's second half of the sufficient-balance rule. `validate_block' says:
+%%
+%%     # modify the check for sufficient balance
+%%     max_total_fee = tx.gas * tx.max_fee_per_gas
+%%     if get_tx_type(tx) == BLOB_TX_TYPE:
+%%         max_total_fee += get_total_blob_gas(tx) * tx.max_fee_per_blob_gas
+%%     assert signer(tx).balance >= max_total_fee
+%%
+%% **The `max_total_fee` modification was absent**, so the balance check was
+%% `gas * maxFeePerGas + value` for every transaction including blob ones. A sender
+%% who could not pay for the blobs was admitted, and the corpus names this exactly:
+%% the 288 `INSUFFICIENT_ACCOUNT_FUNDS` entries in
+%% `cancun/eip4844_blobs/test_insufficient_balance_blob_tx` (144 Cancun + 144
+%% Prague).
+%%
+%% The arithmetic is exact, which is what makes this a derivation rather than a
+%% guess. For every one of the 288, `balance < gasLimit * maxFee + value` is
+%% **false** -- the sender could pay the gas, so the node admitted it. Adding
+%% `total_blob_gas * maxFeePerBlobGas` makes the inequality true for **288 of
+%% 288**. There is no third reading.
+%%
+%% It is the sender's **cap**, `max_fee_per_blob_gas`, and not the block's blob base
+%% fee, because this is a *validity* check and the EIP's own text says `assert
+%% tx.max_fee_per_blob_gas >= get_base_fee_per_blob_gas(block.header)` separately --
+%% the sender must be able to cover the worst case it agreed to pay, and the two
+%% numbers are different rules. `eth_block:blob_fee/2' then *charges* the block
+%% price; this checks the cap. Conflating them would either over-refuse (charging
+%% the cap) or under-refuse (checking the block price, which moves every block).
+blob_gas_term(Tx) ->
+    case tx_type(Tx) of
+        eip4844 ->
+            case field(Tx, <<"maxFeePerBlobGas">>) of
+                Cap when is_integer(Cap) ->
+                    length(blob_versioned_hashes(Tx))
+                        * eth_fork_schedule:blob_gas_per_blob() * Cap;
+                _ ->
+                    %% No cap. `check_blobs/2' refuses this as `invalid_blob_fee',
+                    %% and a transaction that cannot state what it will pay for its
+                    %% blobs has no blob term to add -- so this contributes 0 and the
+                    %% *other* rule is the one that reports it. Adding a term from an
+                    %% absent field would mean refusing twice, once for each reason,
+                    %% and the corpus expects one.
+                    0
+            end;
+        _ ->
+            0
+    end.
 
 check_balance(Payer, Total, Ctx) ->
     case maps:get(balance_of, Ctx, undefined) of
@@ -1208,17 +1275,49 @@ blob_versioned_hash(H) when is_integer(H), H >= 0 ->
 blob_versioned_hash(_) ->
     <<>>.
 
-%% EIP-4844 validity for the versioned hashes themselves. A blob transaction
-%% must reference at least one blob, and every referenced hash must be exactly
-%% 32 bytes, carry the KZG-commitment version byte, and be non-zero -- a
-%% zero hash would commit to nothing. The blob *gas* price floor is a separate
-%% rule that depends on the block, and lives in the block builder.
+%% EIP-4844 validity for the versioned hashes themselves. A blob transaction must
+%% reference at least one blob, and every referenced hash must be exactly 32 bytes
+%% carrying the KZG-commitment version byte.
+%%
+%% ## The non-zero remainder clause was fabricated, and it over-refused the corpus.
+%%
+%% This function also required `Rest =/= <<0:248>>', on the reasoning that "a zero
+%% hash would commit to nothing". **EIP-4844 contains no such rule.** Its
+%% `validate_block' says, in full:
+%%
+%%     # there must be at least one blob
+%%     assert len(tx.blob_versioned_hashes) > 0
+%%     # all versioned blob hashes must start with VERSIONED_HASH_VERSION_KZG
+%%     for h in tx.blob_versioned_hashes:
+%%         assert h[0] == VERSIONED_HASH_VERSION_KZG
+%%
+%% A versioned hash is `VERSIONED_HASH_VERSION_KZG + sha256(commitment)[1:]` -- the
+%% version byte *replaces* the digest's first byte, so the remaining 31 bytes are
+%% whatever the commitment hashes to. Whether that is zero is a question about a
+%% 48-byte commitment the transaction does not carry, and **the execution layer
+%% cannot answer it.** The clause was not a weaker version of the rule; it was a
+%% different rule, invented here, and it refused transactions the chain accepts.
+%%
+%% The corpus settles it without argument. Across the whole `state_tests' corpus,
+%% **1,502 transactions carrying `0x01 || 31 zero bytes` are expected to SUCCEED**
+%% and 325 are expected to be rejected, in 9 files -- and 1,827 in total carry one,
+%% which is every type-3 transaction the corpus has. A hash the corpus treats as
+%% valid in 1,502 places cannot be one this node is entitled to refuse. And the
+%% 325 rejections name *other* rules (`INSUFFICIENT_ACCOUNT_FUNDS`,
+%% `INTRINSIC_GAS_TOO_LOW`, ...) -- not this one. The EIP names no exception for an
+%% all-zero hash, so there is no fourth reading.
+%%
+%% What it cost: the node answered `bad_blob_hashes' for **1,827** corpus branches,
+%% which is the whole of the 288-entry blob cluster and all 34 of the
+%% check-ordering mismatches, in every case for the wrong reason. Two of them --
+%% `TYPE_3_TX_INVALID_BLOB_VERSIONED_HASH' -- are the *version byte* check below,
+%% which is the EIP's rule and is what the corpus means.
 valid_versioned_hashes(Tx) ->
     Hashes = blob_versioned_hashes(Tx),
     Hashes =/= [] andalso
     lists:all(fun
                   (<<?VERSIONED_HASH_KZG, Rest/binary>>) when byte_size(Rest) =:= 31 ->
-                      Rest =/= <<0:248>>;
+                      true;
                   (_) ->
                       false
               end, Hashes).

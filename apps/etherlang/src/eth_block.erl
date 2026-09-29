@@ -44,6 +44,12 @@
           %% See is_mismatch_verdict/1 for why that decision cannot be made by
           %% pattern-matching those reasons from outside.
           is_mismatch_verdict/1,
+          %% Exported so the conformance runner hands `eth_tx:validate/2' the same
+          %% blob base fee this module charges at, rather than re-deriving it in
+          %% the harness. Two derivations of a consensus constant is the mistake
+          %% `eth_evm:base_cost/1' was deleted for, and a harness is exactly where
+          %% it would hide.
+          blob_base_fee/1,
           from_json/1,
           from_payload/1,
           payload_block_hash/1,
@@ -591,7 +597,15 @@ validation_ctx(Block, State, BaseFee, GasLimit) ->
       %% improvement while the node still imported such a transaction from a peer.
       code_of => fun(Address) ->
           {ok, maps:get(code, eth_state:account(State, Address), <<>>)}
-      end}.
+      end,
+      %% EIP-4844: "ensure that the user was willing to at least pay the current
+      %% blob base fee". The price is this block's own `blob_base_fee/1' -- the
+      %% same function `blob_fee/2' charges at -- and it is supplied here because
+      %% `eth_tx:check_blobs/2' reads it from the context rather than from the
+      %% block, and **no caller was passing it**, so the rule could not fire on
+      %% any transaction including this node's own blocks. A rule nobody can
+      %% reach is not a rule; see the EIP-3607 note above for the same shape.
+      blob_base_fee => blob_base_fee(Block)}.
 
 %% The frame's own outcome, with "this node cannot price this" kept separate.
 %%
@@ -875,17 +889,34 @@ begin_transaction(State, Sender, Target, Value, GasLimit, IsCreate,
 %% It is **not** part of `gasUsed'. The receipt's `gasUsed` is normal gas only,
 %% and the base fee burn must not be levied on blob gas, so the charge is a
 %% balance movement and nothing here touches the block's `gas_used'.
-blob_fee(#block{excess_blob_gas = Excess}, Tx) ->
+blob_fee(#block{} = Block, Tx) ->
     case eth_tx:tx_type(Tx) of
         eip4844 ->
             Blobs = length(eth_tx:blob_versioned_hashes(Tx)),
             Blobs * eth_fork_schedule:blob_gas_per_blob()
-                * eth_fork_schedule:blob_gas_price(Excess);
+                * blob_base_fee(Block);
         _ ->
             %% No blobs, no charge. A transaction of any other type has no
             %% `blob_versioned_hashes' field to read, and the EIP prices only blobs.
             0
     end.
+
+%% `get_base_fee_per_blob_gas(header)', as **one** function.
+%%
+%% EIP-4844 uses this figure in two places that must not come from two
+%% derivations: `calc_blob_fee/2' **charges** the sender at it, and
+%% `validate_block' **requires** `tx.max_fee_per_blob_gas >= it'. A node that
+%% checked against one price and charged another would admit a transaction it
+%% then charges more than the sender agreed to, or the reverse. So the price is
+%% computed here, once, and `validation_ctx/4' hands *this* value to
+%% `eth_tx:check_blobs/2' -- which is why the floor check could fire at all
+%% before `v1.56`; nothing was passing it one.
+%%
+%% Exported because the conformance runner builds a block and must hand the
+%% validator the same figure, and re-deriving it in the test would be the
+%% second-copy mistake `eth_evm:base_cost/1' was deleted for.
+blob_base_fee(#block{excess_blob_gas = Excess}) ->
+    eth_fork_schedule:blob_gas_price(Excess).
 
 %% The blob fee is a straight debit with no arm on any path that could undo it.
 %% It is spelled as its own function rather than folded into `buy_gas/5' so that

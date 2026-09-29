@@ -113,18 +113,39 @@ versioned_hash_test() ->
                    #{<<"blobVersionedHashes">> => [bin0x(Hash)]})).
 
 %% Validity: non-empty, 32 bytes, KZG version byte, non-zero.
+%% **A versioned hash's 31-byte remainder may be zero.**
+%%
+%% This test asserted the opposite -- "?assertNot(... [<<1, 0:248>>])" -- with the
+%% comment "All-zero remainder commits to nothing", and the clause it pinned is not
+%% in EIP-4844. The EIP's `validate_block' states the whole rule: the list must be
+%% non-empty and `h[0] == VERSIONED_HASH_VERSION_KZG'. Whether the remainder is zero
+%% is a question about a 48-byte commitment the transaction does not carry, so the
+%% execution layer cannot answer it and the specification does not ask it to.
+%%
+%% The corpus is not a matter of opinion: **1,502 transactions carrying
+%% `0x01 || 31 zero bytes' are expected to succeed**, against 325 expected to be
+%% rejected, and 1,827 carry one -- which is every type-3 transaction it has. A hash
+%% valid in 1,502 places is not one this node may refuse. Corrected rather than
+%% deleted, because the test's real subject -- the version byte, the length, and the
+%% empty list -- is exactly what EIP-4844 does require, and those three are what a
+%% change to this function must not break.
 versioned_hash_validity_test() ->
     Good = #{<<"blobVersionedHashes">> => [bin0x(versioned_hash(1))]},
     ?assert(eth_tx:valid_versioned_hashes(Good)),
+    %% The corpus's own placeholder: a real, accepted, well-formed versioned hash.
+    Zero = bin0x(<<1, (binary:copy(<<0>>, 31))/binary>>),
+    ?assert(eth_tx:valid_versioned_hashes(
+              #{<<"blobVersionedHashes">> => [Zero]})),
     ?assertNot(eth_tx:valid_versioned_hashes(#{})),
     ?assertNot(eth_tx:valid_versioned_hashes(
                  #{<<"blobVersionedHashes">> => []})),
-    %% Wrong version byte.
+    %% Wrong version byte. This is the EIP's own rule and the corpus's
+    %% TYPE_3_TX_INVALID_BLOB_VERSIONED_HASH, whose fixtures are version-0x00 and
+    %% version-0x02 hashes -- never an all-zero *remainder*.
     ?assertNot(eth_tx:valid_versioned_hashes(
                  #{<<"blobVersionedHashes">> => [<<2, (binary:copy(<<0>>, 31))/binary>>]})),
-    %% All-zero remainder commits to nothing.
     ?assertNot(eth_tx:valid_versioned_hashes(
-                 #{<<"blobVersionedHashes">> => [<<1, (binary:copy(<<0>>, 31))/binary>>]})),
+                 #{<<"blobVersionedHashes">> => [<<0, (binary:copy(<<0>>, 31))/binary>>]})),
     %% Too short.
     ?assertNot(eth_tx:valid_versioned_hashes(
                  #{<<"blobVersionedHashes">> => [<<1, 2, 3>>]})).
@@ -439,6 +460,194 @@ blob_fee_is_not_refunded_when_the_transaction_fails_test() ->
 %% which is why the diff also appeared under `{store, _, <<"0x0">>, _, _}` and why
 %% it looked like a second, independent gas defect. It was one missing debit seen
 %% twice. Asserting the slot as well is what keeps that reading honest.
+%% ---------------------------------------------------------------------------
+%% Admission: the two validity rules the corpus names and this node had neither
+%% ---------------------------------------------------------------------------
+
+%% **A sender who cannot pay for the blobs is refused.**
+%%
+%% EIP-4844's `validate_block` modifies the sufficient-balance rule:
+%%
+%%     max_total_fee = tx.gas * tx.max_fee_per_gas
+%%     if get_tx_type(tx) == BLOB_TX_TYPE:
+%%         max_total_fee += get_total_blob_gas(tx) * tx.max_fee_per_blob_gas
+%%     assert signer(tx).balance >= max_total_fee
+%%
+%% The modification was **absent**, so the check was `gas * maxFeePerGas + value`
+%% for every transaction including blob ones. That is the 288-entry
+%% `INSUFFICIENT_ACCOUNT_FUNDS` cluster in
+%% `cancun/eip4844_blobs/test_insufficient_balance_blob_tx` (144 Cancun + 144
+%% Prague), and the arithmetic is exact: for every one of the 288,
+%% `balance < gasLimit * maxFee + value` is **false** -- the sender could pay the
+%% gas, so the node admitted a transaction the chain rejects.
+%%
+%% The boundary is asserted as two balances on either side of the figure, because
+%% one side alone cannot tell a check from a constant: a sender one wei short is
+%% refused and a sender exactly able to pay is not.
+sender_must_be_able_to_pay_for_its_blobs_test() ->
+    Priv = eth_secp256k1:generate_key(),
+    Sender = addr_of(Priv),
+    Tx = sign(base_tx(#{<<"blobVersionedHashes">> => [bin0x(versioned_hash(1))],
+                        <<"maxFeePerBlobGas">> => eth_hex:encode_int(7),
+                        <<"gas">> => eth_hex:encode_int(21000),
+                        <<"maxFeePerGas">> => eth_hex:encode_int(7),
+                        <<"value">> => eth_hex:encode_int(0),
+                        <<"input">> => <<"0x">>}), Priv),
+    GasTerm = 21000 * 7,
+    BlobTerm = 131072 * 7,
+    ok = eth_tx:validate(Tx, ctx(Sender, GasTerm + BlobTerm, #{blob_base_fee => 1})),
+    ?assertEqual({error, insufficient_balance},
+                 eth_tx:validate(Tx, ctx(Sender, GasTerm + BlobTerm - 1, #{blob_base_fee => 1}))),
+    ?assertEqual({error, insufficient_balance},
+                 eth_tx:validate(Tx, ctx(Sender, GasTerm, #{blob_base_fee => 1}))).
+
+%% **A 1559 transaction -- same fee fields, no blobs -- is charged no blob term.**
+%% The control for the test above, and it is the sharpest available one: a 1559
+%% transaction is identical to a blob transaction in every field the gas term
+%% reads (`gas', `maxFeePerGas', `value'), and differs only in having no
+%% `blobVersionedHashes'. So if `blob_gas_term/1' answered a non-zero figure for
+%% any transaction with a `maxFeePerGas', this fails. A *legacy* transaction would
+%% have been the weaker control, because it also has no `maxFeePerGas' and so
+%% changes two things at once.
+%%
+%% Without this half the test above is satisfiable by a node that adds a blob term
+%% to everything, which would refuse a large class of ordinary transactions and
+%% look correct here.
+a_1559_transaction_owes_no_blob_gas_test() ->
+    Priv = eth_secp256k1:generate_key(),
+    Sender = addr_of(Priv),
+    Fields = #{<<"type">> => <<"0x2">>,
+               <<"maxPriorityFeePerGas">> => eth_hex:encode_int(0),
+               <<"maxFeePerGas">> => eth_hex:encode_int(7),
+               <<"gas">> => eth_hex:encode_int(21000),
+               <<"value">> => eth_hex:encode_int(0),
+               <<"input">> => <<"0x">>},
+    Tx = sign(base_tx(Fields), Priv),
+    ok = eth_tx:validate(Tx, ctx(Sender, 21000 * 7, #{fork => cancun})),
+    ?assertEqual({error, insufficient_balance},
+                 eth_tx:validate(Tx, ctx(Sender, 21000 * 7 - 1, #{fork => cancun}))).
+
+%% **The block admission path supplies the blob base fee, and the floor fires.**
+%%
+%% EIP-4844: "ensure that the user was willing to at least pay the current blob
+%% base fee", i.e. `assert tx.max_fee_per_blob_gas >= get_base_fee_per_blob_gas
+%% (block.header)`.
+%%
+%% `eth_tx:check_blobs/2` implemented exactly that, reading the price from the
+%% validation context, and its comment said "when the caller cannot supply it the
+%% floor is not checked rather than guessed". **No caller could supply it.**
+%% `eth_block:validation_ctx/4' -- the context a block's own transactions are
+%% validated against -- had no `blob_base_fee' key, so the `undefined' branch was
+%% taken on every call and the `ensure/2' below it was dead. That is EIP-3607's
+%% shape: a rule present, correct, and unreachable. The four
+%% `INSUFFICIENT_MAX_FEE_PER_BLOB_GAS` fixtures set `maxFeePerBlobGas = 1` against
+%% `currentExcessBlobGas = 0x240000` = 2,359,296, where the Cancun curve gives a
+%% blob base fee of 2, so the sender underbid by one wei per blob gas and this node
+%% let the transaction in.
+%%
+%% This goes through **`eth_block:finalize/1`**, not through a hand-built context,
+%% because a rule only the harness can reach is a fixture-only improvement: with
+%% the key missing, `eth_tx:validate/2` still answers correctly for a caller who
+%% supplies it, and only the real path shows that nobody does. The positive
+%% control is on the same path, because a negative test is satisfied by a gate
+%% that refuses everything -- and `finalize/1` refusing this block must be
+%% distinguishable from `finalize/1` refusing every block.
+the_block_admission_path_enforces_the_blob_base_fee_test() ->
+    eth_test_util:finalize_ctx(fun() ->
+        Priv = eth_secp256k1:generate_key(),
+        Sender = addr_of(Priv),
+        %% 2,359,296 of excess blob gas: the Cancun curve prices that at 2, which
+        %% is the corpus's own figure for `test_invalid_tx_max_fee_per_blob_gas_state'.
+        Excess = 16#240000,
+        ?assertEqual(2, eth_block:blob_base_fee(block_with_excess(Excess))),
+        Underbid = sign(base_tx(#{<<"blobVersionedHashes">> => [bin0x(versioned_hash(1))],
+                                  <<"maxFeePerBlobGas">> => eth_hex:encode_int(1),
+                                  <<"gas">> => eth_hex:encode_int(21000),
+                                  <<"maxFeePerGas">> => eth_hex:encode_int(7),
+                                  <<"value">> => eth_hex:encode_int(0),
+                                  <<"input">> => <<"0x">>}), Priv),
+        ok = eth_mpt:put_account(Sender, 1000000 * ?GWEI, 0, eth_keccak:hash(<<>>)),
+        Parent = store_parent_with(Sender, 1000000 * ?GWEI),
+        Under = block_with_excess(Excess, Parent, [Underbid]),
+
+        ?assertEqual({error, {invalid_transaction, 0, blob_fee_too_low}},
+                     eth_block:finalize(Under)),
+
+        %% **The control: the same block with the sender bidding the block's price.**
+        %% If `finalize/1` refused every blob block, the assertion above would pass
+        %% and mean nothing.
+        Ok = sign(base_tx(#{<<"blobVersionedHashes">> => [bin0x(versioned_hash(1))],
+                            <<"maxFeePerBlobGas">> => eth_hex:encode_int(2),
+                            <<"gas">> => eth_hex:encode_int(21000),
+                            <<"maxFeePerGas">> => eth_hex:encode_int(7),
+                            <<"value">> => eth_hex:encode_int(0),
+                            <<"input">> => <<"0x">>}), Priv),
+        {ok, _Finalized, _V} =
+            eth_block:finalize(block_with_excess(Excess, Parent, [Ok]))
+    end).
+
+%% The check and the charge must read one price. EIP-4844 uses
+%% `get_base_fee_per_blob_gas(header)` twice -- once to *require*
+%% `max_fee_per_blob_gas >= price` and once inside `calc_blob_fee` to *charge* the
+%% sender -- and a node that checked against one figure and charged another would
+%% admit a transaction it then charges more than the sender agreed to. This is the
+%% assertion that they are the same function, not two derivations that happen to
+%% agree today.
+the_price_checked_against_is_the_price_charged_test() ->
+  with_ctx(fun() ->
+    Priv = eth_secp256k1:generate_key(),
+    Sender = addr_of(Priv),
+    Start = 1000000 * ?GWEI,
+    Excess = 16#240000,
+    Price = eth_block:blob_base_fee(block_with_excess(Excess)),
+    Hashes = [bin0x(versioned_hash(1))],
+    Fields = #{<<"blobVersionedHashes">> => Hashes,
+               %% One wei under the block's price: refused, so the check can fire.
+               <<"maxFeePerBlobGas">> => eth_hex:encode_int(Price - 1),
+               <<"gas">> => eth_hex:encode_int(100000),
+               <<"maxFeePerGas">> => eth_hex:encode_int(?GWEI),
+               <<"value">> => eth_hex:encode_int(0),
+               <<"input">> => <<"0x">>},
+    ok = eth_mpt:put_account(Sender, Start, 0, eth_keccak:hash(<<>>)),
+    Block = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))
+                #block{excess_blob_gas = Excess, base_fee_per_gas = ?GWEI,
+                       miner = ?MINER},
+    {Block1, State1} = eth_block:run_transaction(
+                         Block, sign(base_tx(Fields), Priv),
+                         eth_state:new(0, #{}), ?GWEI, 1000000),
+    [Receipt] = eth_block:receipts(Block1),
+    Charged = Start - eth_state:balance(State1, Sender)
+              - (maps:get(<<"gasUsed">>, Receipt) * ?GWEI),
+    ?assertEqual(131072 * Price, Charged)
+  end).
+
+%% **The node charges the blob fee at the block's price, not at the sender's cap.**
+%% The distinction is the whole of the previous test's claim, stated as a number:
+%% a sender offering 1 gwei per blob gas on a block priced at 1 wei is debited
+%% 131,072 wei, not 131,072 gwei. Both are "the blob fee"; only one is the EIP's.
+the_sender_is_charged_the_block_price_not_its_own_cap_test() ->
+  with_ctx(fun() ->
+    Priv = eth_secp256k1:generate_key(),
+    Sender = addr_of(Priv),
+    Start = 1000000000 * ?GWEI,
+    ok = eth_mpt:put_account(Sender, Start, 0, eth_keccak:hash(<<>>)),
+    Block = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))
+                #block{excess_blob_gas = 0, base_fee_per_gas = ?GWEI, miner = ?MINER},
+    Tx = sign(base_tx(#{<<"blobVersionedHashes">> => [bin0x(versioned_hash(1))],
+                        %% A cap of 1 gwei against a block priced at 1 wei.
+                        <<"maxFeePerBlobGas">> => eth_hex:encode_int(?GWEI),
+                        <<"gas">> => eth_hex:encode_int(100000),
+                        <<"maxFeePerGas">> => eth_hex:encode_int(?GWEI),
+                        <<"value">> => eth_hex:encode_int(0),
+                        <<"input">> => <<"0x">>}), Priv),
+    {Block1, State1} = eth_block:run_transaction(Block, Tx, eth_state:new(0, #{}),
+                                                 ?GWEI, 1000000),
+    [Receipt] = eth_block:receipts(Block1),
+    Charged = Start - eth_state:balance(State1, Sender)
+              - (maps:get(<<"gasUsed">>, Receipt) * ?GWEI),
+    ?assertEqual(131072, Charged)
+  end).
+
 corpus_blob_fee_signature_test() ->
     with_ctx(fun() ->
         Priv = eth_secp256k1:generate_key(),
@@ -545,6 +754,36 @@ with_ctx(Fun) ->
 
 addr_of(Priv) ->
     binary:part(eth_keccak:hash(eth_secp256k1:node_id(Priv)), 12, 20).
+
+%% A validation context with a balance reader and a blob base fee, which is what
+%% the two rules under test ask for. `blob_base_fee => 1` unless a test says
+%% otherwise, because 1 is the floor and a rule that only fires above the floor
+%% needs a test that puts it there.
+ctx(Sender, Balance, Extra) ->
+    maps:merge(#{chain_id => ?CHAIN_ID, base_fee => 0, fork => cancun,
+                 balance_of => fun(A) when A =:= Sender -> {ok, Balance};
+                                  (_) -> {ok, 0}
+                              end,
+                 blob_base_fee => 1}, Extra).
+
+%% A Cancun block carrying only an `excess_blob_gas`, for the tests that ask
+%% `eth_block:blob_base_fee/1' a price question.
+block_with_excess(Excess) ->
+    (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))#block{excess_blob_gas = Excess}.
+
+block_with_excess(Excess, Parent, Txs) ->
+    (block_with_excess(Excess))#block{parent_hash = Parent, transactions = Txs,
+                                     base_fee_per_gas = 7, gas_limit = 30000000,
+                                     miner = ?MINER}.
+
+%% A parent block the local trie actually holds, so `finalize/1' is entitled to
+%% execute rather than answer `{unverified, state_not_local}'. `eth_test_util:
+%% store_parent/1' takes the root the MPT must be holding, and the funding has to
+%% be in the trie *before* the root is taken -- which is why this is a function
+%% rather than a call after the fact.
+store_parent_with(Sender, Balance) ->
+    ok = eth_mpt:put_account(Sender, Balance, 0, eth_keccak:hash(<<>>)),
+    eth_test_util:store_parent(eth_mpt:state_root()).
 
 %% `eth_mpt:clear/0' is a `gen_server:call/2', so it exits when the process is
 %% not up. The `after' clause must not raise: an exception there **replaces** the
