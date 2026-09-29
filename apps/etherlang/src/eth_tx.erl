@@ -820,6 +820,35 @@ check_blobs(Tx, Ctx) ->
                 undefined -> ok;
                 Price when is_integer(Price) ->
                     ensure(MaxFeePerBlobGas >= Price, {error, blob_fee_too_low})
+            end,
+            %% EIP-4844's per-block cap, from the same `validate_block':
+            %%
+            %%     # ensure that the total blob gas spent is at most equal to the limit
+            %%     assert blob_gas_used <= MAX_BLOB_GAS_PER_BLOCK
+            %%
+            %% `blob_gas_used' there is accumulated across the block's transactions,
+            %% so `blob_gas_used' in the context is the total **before** this one and
+            %% this transaction's own contribution is added here. It is the *cumulative*
+            %% condition and not a per-transaction one: 786,432 is six blobs, and a
+            %% block may carry six in one transaction or three in each of two.
+            %%
+            %% **It was absent**, and its absence is what the two
+            %% `TYPE_3_TX_MAX_BLOB_GAS_ALLOWANCE_EXCEEDED` fixtures measure -- one
+            %% with 7 versioned hashes and one with 9, so 917,504 and 1,179,648 blob
+            %% gas against a limit of 786,432. A block carrying either is invalid and
+            %% this node admitted it.
+            %%
+            %% An absent `blob_gas_used` in the context means the total is unknown,
+            %% and an unknown total cannot clear a maximum, so the check is skipped
+            %% rather than assumed -- the same direction as the blob base fee above,
+            %% and for the same reason. Both are now supplied by
+            %% `eth_block:validation_ctx/5' on the admission path.
+            case maps:get(blob_gas_used, Ctx, undefined) of
+                undefined -> ok;
+                Used when is_integer(Used) ->
+                    ensure(Used + blob_gas_of(Tx)
+                           =< eth_fork_schedule:max_blob_gas_per_block(),
+                           {error, blob_gas_allowance_exceeded})
             end;
         _ ->
             ok
@@ -1133,6 +1162,18 @@ validation_price(MaxFee, _GasPrice) when is_integer(MaxFee) -> MaxFee;
 validation_price(_MaxFee, GasPrice) when is_integer(GasPrice) -> GasPrice;
 validation_price(_, _) -> 0.
 
+%% A transaction's own blob gas, as a **gas quantity**: `GAS_PER_BLOB` per versioned
+%% hash, zero for a transaction of any other type. EIP-4844's
+%% `get_total_blob_gas(tx)`.
+%%
+%% This is the same product `eth_block:blob_fee/2' turns into a wei amount by
+%% multiplying by the block's blob base fee. It is defined here rather than imported
+%% because it is used by two rules in *this* module -- the per-block cap and the
+%% balance rule below -- and neither should have to ask another module for a divisor
+%% that happens to be 1 at the floor.
+blob_gas_of(Tx) ->
+    length(blob_versioned_hashes(Tx)) * eth_fork_schedule:blob_gas_per_blob().
+
 %% EIP-4844's second half of the sufficient-balance rule. `validate_block' says:
 %%
 %%     # modify the check for sufficient balance
@@ -1166,8 +1207,7 @@ blob_gas_term(Tx) ->
         eip4844 ->
             case field(Tx, <<"maxFeePerBlobGas">>) of
                 Cap when is_integer(Cap) ->
-                    length(blob_versioned_hashes(Tx))
-                        * eth_fork_schedule:blob_gas_per_blob() * Cap;
+                    blob_gas_of(Tx) * Cap;
                 _ ->
                     %% No cap. `check_blobs/2' refuses this as `invalid_blob_fee',
                     %% and a transaction that cannot state what it will pay for its

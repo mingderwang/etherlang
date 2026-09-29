@@ -619,12 +619,27 @@ behavioural change per commit, and each step says what it now does.
      injections, all shown to bite: charging nothing, crediting it back, reading the
      price off the wrong excess, charging per blob rather than per blob gas, and
      charging it *after* the frame. The last fails exactly one test.
-   - **Still open, and unchanged by this:** the block header's `blobGasUsed` is not
-     accumulated by this node, so a block's `blobGasUsed` commitment is not checked
-     against its own transactions. A separate gap from the charge; recorded rather
-     than folded in. `eth_block_builder` does compute its own `excess_blob_gas` from
-     `payloadAttributes`, so the field a locally built block carries is right; it is
-     the *transactions'* contribution that is missing.
+   - **The per-block cap (`MAX_BLOB_GAS_PER_BLOCK`) was missing too, and is fixed in
+     `v1.58`.** EIP-4844 requires `blob_gas_used <= 786432` over the whole block and
+     this node had no such check, so the 2
+     `TYPE_3_TX_MAX_BLOB_GAS_ALLOWANCE_EXCEEDED` fixtures (7 and 9 versioned hashes)
+     were admitted. `expected_rejection_not_raised` on this set is now **0**.
+     - It is a **cumulative** condition and cannot be a per-transaction one: a 4-blob
+       transaction followed by a 3-blob one is an invalid block whose transactions are
+       each valid. So the total is threaded through `eth_block:execute_transactions/6`
+       into the validation context.
+     - **The total is an argument and not `Block#block.blob_gas_used`,** because on
+       an imported payload that field holds the block's *declared* header value.
+       Writing an executed total into it would put a recomputed number under a key
+       named after a header field, which is AGENTS.md §4.1's one prohibition. The
+       limit ("may this block carry this much") and the commitment ("does this
+       block's header tell the truth") are two questions and must not share a value.
+     - **Still open, and a different gap:** the header's `blobGasUsed` is not *checked*
+       against the executed total. It is plumbed (`eth_block:from_payload/1` decodes
+       it, `payload_roots/2` puts it in the header RLP) and nothing compares it with
+       what the block's transactions actually consumed. `eth_block_builder` states
+       `blob_gas_used = 0` and admits no type-3 transaction, so a locally built block
+       is right by construction.
 6b. **~~EIP-4844's blob transaction *validity*.~~  Closed in `v1.56`** — three rules
    in one EIP, all wrong, and **none of them visible in the tally** until the first
    was removed.

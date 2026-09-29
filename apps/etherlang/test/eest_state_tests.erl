@@ -1048,7 +1048,15 @@ validation_ctx(Block, State) ->
       %% from `eth_block:blob_base_fee/1' -- **the same function the node charges
       %% at** -- rather than recomputed here, because a harness that derives a
       %% consensus constant a second time is how the two drift apart silently.
-      blob_base_fee => eth_block:blob_base_fee(Block)}.
+      blob_base_fee => eth_block:blob_base_fee(Block),
+      %% EIP-4844's per-block cap, cumulative. A state test's block holds exactly
+      %% one transaction, so the total before this one is 0 -- which is the whole
+      %% reason the condition cannot be tested from this harness alone: the
+      %% cumulative part needs two blob transactions in one block, and a state test
+      %% has no way to express that. The single-transaction case is still worth
+      %% supplying, because it is the one the corpus can ask about, and
+      %% `eth_4844_tests` covers the accumulation on the real admission path.
+      blob_gas_used => 0}.
 
 %% The base fee as `eth_block:base_fee_of/1' reads it: `undefined' for a block
 %% that has none, and 0 for one at London or later where 0 is a real figure.

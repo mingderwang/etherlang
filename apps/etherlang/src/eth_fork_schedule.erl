@@ -25,7 +25,7 @@
           base_fee/3,
           base_fee_delta/2,
           burn_base_fee/2,
-          blob_gas_per_blob/0,
+          blob_gas_per_blob/0, max_blob_gas_per_block/0,
           excess_blob_gas/2,
           blob_base_fee/2,
           blob_gas_price/1,
@@ -782,8 +782,22 @@ burn_base_fee(BaseFee, GasUsed) when is_integer(BaseFee), is_integer(GasUsed) ->
 -define(BLOB_GASPRICE_UPDATE_FRACTION, 3338477).
 -define(MIN_BLOB_GASPRICE, 1).
 -define(TARGET_BLOB_GAS_PER_BLOCK, 393216).
+%% EIP-4844's parameters table: `MAX_BLOB_GAS_PER_BLOCK | 786432'. The EIP's
+%% rationale says the same number as six blobs, and it is exactly
+%% `6 * blob_gas_per_blob/0' -- written as the product rather than transcribed,
+%% because a second literal for a figure that is another figure times six is a
+%% second thing that can drift.
+-define(MAX_BLOB_GAS_PER_BLOCK, 6 * 131072).
 
 blob_gas_per_blob() -> 131072.
+
+%% EIP-4844: "ensure that the total blob gas spent is at most equal to the limit",
+%% over the whole block. **Not a per-transaction condition**, and that distinction is
+%% the rule: a 4-blob transaction followed by a 3-blob one makes an invalid block
+%% whose transactions are each individually valid, so no per-transaction check can
+%% enforce it and a check written per transaction would be a different rule wearing
+%% the same name.
+max_blob_gas_per_block() -> ?MAX_BLOB_GAS_PER_BLOCK.
 
 %% Excess blob gas carried into this block: the parent's excess plus the gas
 %% its blobs consumed, less the per-block target, floored at zero.

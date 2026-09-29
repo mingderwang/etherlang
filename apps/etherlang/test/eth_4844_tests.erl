@@ -649,6 +649,192 @@ the_sender_is_charged_the_block_price_not_its_own_cap_test() ->
   end).
 
 %% ---------------------------------------------------------------------------
+%% The per-block blob gas cap
+%% ---------------------------------------------------------------------------
+
+%% EIP-4844's parameters table states `MAX_BLOB_GAS_PER_BLOCK = 786432`, and the
+%% EIP's rationale says the same number as six blobs. It is written as the product
+%% `6 * GAS_PER_BLOB` rather than transcribed, and this asserts both facts: the
+%% figure the node uses, and that it is the six blobs the EIP says it is.
+%%
+%% A *per-transaction* cap would be a different rule with the same name, which is
+%% why the two tests below take different shapes: one is a single transaction at the
+%% boundary, and one is two transactions of four blobs each. The second is the only
+%% one that tests the rule as the EIP states it.
+max_blob_gas_per_block_is_six_blobs_test() ->
+    ?assertEqual(786432, eth_fork_schedule:max_blob_gas_per_block()),
+    ?assertEqual(6 * eth_fork_schedule:blob_gas_per_blob(),
+                 eth_fork_schedule:max_blob_gas_per_block()).
+
+%% **Six blobs in one transaction is the limit and seven is over it.**
+%%
+%% EIP-4844: "ensure that the total blob gas spent is at most equal to the limit".
+%% Asserted at the boundary in both directions, because a cap checked with `=<`
+%% where the specification means `<` and vice versa is indistinguishable from a cap
+%% that is simply absent on the fixtures the corpus happens to contain -- and the
+%% corpus's two are 7 and 9 hashes, so both are comfortably over and neither can
+%% see the boundary.
+six_blobs_are_admitted_and_seven_are_refused_test() ->
+    lists:foreach(
+      fun(N) ->
+        R = eth_tx:validate(blob_tx_with(N), empty_cap_ctx()),
+        %% `N =< 6' and not `N =:= 6'. The first version wrote `case N of 6 -> ok; _
+        %% -> error end' over the list `[5, 6, 7]', so **5 fell into the error
+        %% branch** and the test failed against a node that was right. A boundary
+        %% test written as an enumeration of the boundary value is a test that will
+        %% reject everything below it; the relation is what is being asserted, and
+        %% 786,432 = 6 * GAS_PER_BLOB is why the relation is 6.
+        case N =< 6 of
+            true -> ?assertEqual(ok, R);
+            false -> ?assertEqual({error, blob_gas_allowance_exceeded}, R)
+        end
+      end, [5, 6, 7]).
+
+%% **The cap is cumulative, and no per-transaction check can enforce it.**
+%%
+%% Two transactions of four blobs each: 4 * 131,072 = 524,288 apiece, so **each is
+%% valid on its own** and the block reaches 1,048,576 against a limit of 786,432.
+%% The second transaction must be refused, and a cap that checked only the
+%% transaction's own blob count would admit it -- which is the whole difference
+%% between EIP-4844's rule and a rule that shares its name.
+%%
+%% This goes through **`eth_block:finalize/1` with two transactions in one block**,
+%% because that is the only way to express it: the conformance runner builds a
+%% single-transaction block per fixture, so `validation_ctx/2` there is always handed
+%% a total of 0 and a state test **cannot** ask this question at all. A rule the
+%% corpus cannot test and the harness cannot express has to be pinned by hand, and
+%% saying that is the reason this test exists rather than the corpus's absence.
+%%
+%% Nonces 0 and 1, so the second transaction is checked against the state the first
+%% left, which is the other half of "cumulative over the block".
+the_per_block_cap_accumulates_across_transactions_test() ->
+    eth_test_util:finalize_ctx(fun() ->
+        Priv = eth_secp256k1:generate_key(),
+        Sender = addr_of(Priv),
+        FourBlobs = [bin0x(versioned_hash(I)) || I <- lists:seq(1, 4)],
+        Fields = #{<<"blobVersionedHashes">> => FourBlobs,
+                   <<"maxFeePerBlobGas">> => eth_hex:encode_int(?GWEI),
+                   <<"maxPriorityFeePerGas">> => eth_hex:encode_int(0),
+                   <<"maxFeePerGas">> => eth_hex:encode_int(?GWEI),
+                   <<"value">> => eth_hex:encode_int(0),
+                   <<"gas">> => eth_hex:encode_int(100000),
+                   <<"to">> => to_hex(test_address(1)),
+                   <<"input">> => <<"0x">>},
+        Tx = fun(Nonce) ->
+                 sign(base_tx(Fields#{<<"nonce">> => eth_hex:encode_int(Nonce)}), Priv)
+         end,
+        ThreeBlobs = [bin0x(versioned_hash(I)) || I <- lists:seq(1, 3)],
+        OkFields = Fields#{<<"blobVersionedHashes">> => ThreeBlobs},
+        %% **A fresh parent for every `finalize/1`.** `finalize_against/5' refuses to
+        %% execute unless the local trie *holds* the parent, which it asks by
+        %% comparing `eth_mpt:state_root/0' with the parent's declared root -- and
+        %% executing a Cancun block runs `process_history/4`, which writes the history
+        %% contract's storage into the trie and so **moves that root**. So the first
+        %% `finalize/1` in a context invalidates the parent for the second, and the
+        %% second answers `{unverified, state_not_local}' without validating
+        %% anything. The first version of this test reused one parent for three
+        %% blocks and read that verdict as a disagreement about blob gas.
+        Parent = store_parent_with(Sender, 1000000 * ?GWEI),
+        %% Re-seed the trie to the parent's root without re-appending the block.
+        %% `store_parent/1' appends at height 0, so a second call is a duplicate and
+        %% the chain's canonical lookup answers `{missing_parent, _}' -- which is what
+        %% the version before this one got, having replaced the `re-seed` with a
+        %% second `store_parent_with/2'. The seeded root is deterministic, so
+        %% clearing and re-seeding restores exactly the state the parent declares.
+        Reseed = fun() ->
+                     ok = eth_mpt:clear(),
+                     ok = eth_mpt:put_account(Sender, 1000000 * ?GWEI, 0,
+                                              eth_keccak:hash(<<>>)),
+                     ok
+                 end,
+        %% **The control first.** Two three-blob transactions reach 786,432 exactly:
+        %% at the limit, and admitted. Without it, a `finalize/1` that refused
+        %% everything would satisfy the assertions below, and a negative test
+        %% satisfied by a blanket refusal is the failure mode this repository has
+        %% already paid for twice.
+        {ok, _F, _V} = eth_block:finalize(
+                          block_with_excess(0, Parent,
+                                            [sign(base_tx(OkFields#{<<"nonce">> => <<"0x0">>}), Priv),
+                                             sign(base_tx(OkFields#{<<"nonce">> => <<"0x1">>}), Priv)])),
+        %% Now four blobs each: 1,048,576 against 786,432, so the second is refused.
+        ok = Reseed(),
+        ?assertEqual({error, {invalid_transaction, 1, blob_gas_allowance_exceeded}},
+                     eth_block:finalize(block_with_excess(0, Parent, [Tx(0), Tx(1)]))),
+        %% And **four blobs alone is fine** -- 524,288 against a limit of 786,432 --
+        %% which is the other half of the claim. The refusal above is therefore the
+        %% *block's* total and not either transaction's own count, and that is the only
+        %% thing distinguishing this rule from a per-transaction one.
+        ok = Reseed(),
+        ?assertMatch({ok, _, _}, eth_block:finalize(
+                     block_with_excess(0, Parent, [sign(base_tx(Fields), Priv)]))),
+
+        %% **Three transactions, not two.** The pair above already distinguishes
+        %% "per-block" from "per-transaction", and an injection of a *per-transaction*
+        %% cap fails it. It does **not** distinguish a running total from "the previous
+        %% transaction's total", because with two transactions those are the same
+        %% number -- and the injection that drops the history
+        %% (`Next = blob_gas_of(Tx)' instead of `BlobGasUsed + blob_gas_of(Tx)') passed
+        %% all 28 tests. This is §10a's "a test that quietly stops measuring" in its
+        %% purest form: the test was green and the defect was live.
+        %%
+        %% Three transactions of three blobs each separates them. Two of them reach
+        %% 3 + 3 = 6 blobs -- exactly the cap -- and are admitted, which is the control
+        %% and the boundary in one. The third takes the block to 9 and must be
+        %% refused, and a total that forgot the first transaction would see 3 and
+        %% admit it.
+        ok = Reseed(),
+        Three = fun(N) -> base_tx(OkFields#{<<"nonce">> => eth_hex:encode_int(N)}) end,
+        ?assertEqual({error, {invalid_transaction, 2, blob_gas_allowance_exceeded}},
+                     eth_block:finalize(block_with_excess(0, Parent,
+                                                          [sign(Three(0), Priv),
+                                                           sign(Three(1), Priv),
+                                                           sign(Three(2), Priv)])))
+    end).
+
+%% A block whose blob gas fits is admitted -- the same control, stated once, with
+%% the arithmetic written out rather than left implicit in a loop above.
+a_block_at_the_cap_is_admitted_test() ->
+    ?assertEqual(ok, eth_tx:validate(blob_tx_with(6), empty_cap_ctx())),
+    %% A block that already holds five blobs refuses the same six, because the cap is
+    %% the block's total and not this transaction's own count: 5 + 6 = 11 blobs
+    %% against a limit of 6. The first version of this test put the "five" in the
+    %% *transaction* helper instead of in the context, where it did nothing -- the
+    %% helper builds one transaction and the block's total is the context's business,
+    %% so the assertion was reading a block that held nothing and was asking for six,
+    %% which is exactly at the cap. A dead argument in a fixture is a test that
+    %% passes for the wrong reason.
+    ?assertEqual({error, blob_gas_allowance_exceeded},
+                 eth_tx:validate(blob_tx_with(6), cap_ctx(5))),
+    ?assertEqual(ok, eth_tx:validate(blob_tx_with(1), cap_ctx(5))),
+    %% And the boundary on the *far* side: five already spent leaves room for exactly
+    %% one more, and not for two.
+    ?assertEqual(ok, eth_tx:validate(blob_tx_with(1), cap_ctx(5))),
+    ?assertEqual({error, blob_gas_allowance_exceeded},
+                 eth_tx:validate(blob_tx_with(2), cap_ctx(5))).
+
+%% A blob transaction carrying N versioned hashes. The block's *prior* blob gas is the
+%% context's business, not this helper's, and the two were confused once -- see
+%% `a_block_at_the_cap_is_admitted_test'.
+blob_tx_with(N) ->
+    Priv = eth_secp256k1:generate_key(),
+    sign(base_tx(#{<<"blobVersionedHashes">> =>
+                      [bin0x(versioned_hash(I)) || I <- lists:seq(1, N)],
+                   <<"maxFeePerBlobGas">> => eth_hex:encode_int(1),
+                   <<"maxPriorityFeePerGas">> => <<"0x0">>,
+                   <<"maxFeePerGas">> => eth_hex:encode_int(1),
+                   <<"value">> => eth_hex:encode_int(0),
+                   <<"gas">> => eth_hex:encode_int(100000),
+                   <<"input">> => <<"0x">>}), Priv).
+
+%% A context for a block that has already admitted `Used` blobs' worth of blob gas.
+%% An `empty' one is the single-transaction case, which is all a state test can ask.
+cap_ctx(Used) ->
+    #{chain_id => ?CHAIN_ID, base_fee => 0, fork => cancun,
+      blob_base_fee => 1, blob_gas_used => Used * eth_fork_schedule:blob_gas_per_blob()}.
+
+empty_cap_ctx() -> cap_ctx(0).
+
+%% ---------------------------------------------------------------------------
 %% Every type bids its own fee field
 %% ---------------------------------------------------------------------------
 

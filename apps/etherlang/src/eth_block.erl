@@ -357,7 +357,7 @@ finalize_against(Block, ParentRoot, Txs, GasLimit, BaseFee) ->
                                   Block#block.parent_beacon_block_root,
                                   StateH, Fork),
                 case execute_transactions(Block, Txs, State0,
-                                           BaseFee, GasLimit) of
+                                           BaseFee, GasLimit, 0) of
                     {error, _} = Invalid ->
                         %% A block whose body contains a transaction that is not
                         %% valid is not a block, so there is nothing to report a
@@ -551,20 +551,39 @@ commitments(#block{} = Block, Root) ->
 %% The checks are in eth_tx:validate/2, the same function the block builder and
 %% the transaction pool use, so there is one answer to "is this transaction
 %% valid" rather than three that can disagree about intrinsic gas.
-execute_transactions(Block, [], State, _BF, _GL) ->
+execute_transactions(Block, [], State, _BF, _GL, _BlobGasUsed) ->
     {ok, Block, State};
 execute_transactions(#block{base_fee_per_gas = BaseFee, gas_limit = GL} = Block,
-                 [Tx | Rest], State, _BF, GL) ->
+                 [Tx | Rest], State, _BF, GL, BlobGasUsed) ->
     Index = length(Block#block.receipts),
-    case eth_tx:validate(Tx, validation_ctx(Block, State, BaseFee, GL)) of
+    case eth_tx:validate(Tx, validation_ctx(Block, State, BaseFee, GL, BlobGasUsed)) of
         {error, Reason} ->
             {error, {invalid_transaction, Index, Reason}};
         ok ->
             case run_transaction(Block, Tx, State, BaseFee, GL) of
                 {error, _} = Err -> Err;
                 {Block1, State1} ->
-                    execute_transactions(Block1, Rest, State1, BaseFee, GL)
+                    %% EIP-4844's per-block cap is **cumulative**, so the total has
+                    %% to be carried forward rather than read off the block. The two
+                    %% corpus fixtures that need this carry 7 and 9 versioned hashes,
+                    %% and a *per-transaction* check would not catch either: a
+                    %% 4-blob transaction followed by a 3-blob one is an invalid block
+                    %% whose transactions are each valid.
+                    Next = BlobGasUsed + blob_gas_of(Tx),
+                    execute_transactions(Block1, Rest, State1, BaseFee, GL, Next)
             end
+    end.
+
+%% A transaction's own blob gas: `GAS_PER_BLOB * len(blob_versioned_hashes)`, zero for
+%% a transaction of any other type. The same arithmetic as `blob_fee/2' divided by the
+%% price, and deliberately **not** shared with it: that one is a wei amount and this
+%% one is a gas quantity, so a helper deriving one from the other would divide by a
+%% price that is 1 only at the floor.
+blob_gas_of(Tx) ->
+    case eth_tx:tx_type(Tx) of
+        eip4844 -> length(eth_tx:blob_versioned_hashes(Tx))
+                      * eth_fork_schedule:blob_gas_per_blob();
+        _ -> 0
     end.
 
 %% What validity needs that the transaction does not carry. The base fee and gas
@@ -574,7 +593,7 @@ execute_transactions(#block{base_fee_per_gas = BaseFee, gas_limit = GL} = Block,
 %% against, which is the state as of *this* point in the block rather than its
 %% start, so a block whose second transaction spends the first one's balance
 %% sees the reduced balance.
-validation_ctx(Block, State, BaseFee, GasLimit) ->
+validation_ctx(Block, State, BaseFee, GasLimit, BlobGasUsed) ->
     #{base_fee => BaseFee,
       gas_limit => GasLimit,
       gas_used => Block#block.gas_used,
@@ -605,7 +624,16 @@ validation_ctx(Block, State, BaseFee, GasLimit) ->
       %% block, and **no caller was passing it**, so the rule could not fire on
       %% any transaction including this node's own blocks. A rule nobody can
       %% reach is not a rule; see the EIP-3607 note above for the same shape.
-      blob_base_fee => blob_base_fee(Block)}.
+      blob_base_fee => blob_base_fee(Block),
+      %% EIP-4844's per-block cap, cumulative, so the context carries the running
+      %% total. It is an argument rather than `Block#block.blob_gas_used' because
+      %% that field holds the block's **declared** header value on an imported
+      %% payload: writing an executed total into it would put a recomputed number
+      %% under a key named after a header field, which is the one thing AGENTS.md
+      %% 4.1 exists to prevent. The limit and the commitment are two questions --
+      %% "may this block carry this much" and "does this block's header tell the
+      %% truth" -- and they must not share a stored value.
+      blob_gas_used => BlobGasUsed}.
 
 %% The frame's own outcome, with "this node cannot price this" kept separate.
 %%
