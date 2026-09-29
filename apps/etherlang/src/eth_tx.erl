@@ -15,6 +15,8 @@
 -export([
            calldata/1,to_rlp/1, from_rlp/1, tx_root/1, sender/1,
          blob_versioned_hashes/1, valid_versioned_hashes/1,
+         authorization_list/1, authorization_authority/1,
+         delegation_indicator/1, is_delegation_indicator/1,
          blob_hashes_present/1, blob_hashes_well_formed/1,
          validate/1, validate/2, intrinsic_gas/1, intrinsic_gas/2, tx_type/1,
          %% **Exported for the frame, not for a test.** EIP-2930: "The address and
@@ -30,6 +32,10 @@
 %% The first byte of every versioned hash, per EIP-4844. Only the KZG-commitment
 %% variant is defined, so a transaction carrying anything else is invalid.
 -define(VERSIONED_HASH_KZG, 16#01).
+%% EIP-7702's `MAGIC`, the domain separator on the authorization signing preimage.
+%% It is a different digest from the transaction's own type byte on purpose: a
+%% signature over an authorization must be useless for anything else.
+-define(SET_CODE_MAGIC, 16#05).
 -define(SECP256K1_N, 16#FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141).
 
 %% Encode a JSON-RPC transaction map to wire bytes (type prefix included
@@ -237,6 +243,77 @@ authorization_list(Tx) ->
         L when is_list(L) -> [authorization_tuple(A) || A <- L];
         _ -> []
     end.
+
+%% EIP-7702's delegation indicator: `0xef0100 || address`, 23 bytes.
+%%
+%% The EIP calls the first byte a use of the banned opcode `0xef` (EIP-3541): a
+%% contract that *returned* code starting with `0xef` is not deployable, so the
+%% prefix cannot be produced by a create and cannot collide with real code. That is
+%% why it is a usable marker, and why `is_delegation_indicator/1` is a length test
+%% as well as a prefix test.
+%%
+%% The special case is the zero address: EIP-7702 step 8 says "If `address` is
+%% `0x0000000000000000000000000000000000000000`, do not write the delegation
+%% indicator. Clear the account's code" -- so a user can restore an EOA to a plain
+%% account, which is the EIP's "Clearing delegation indicators" section. That is why
+%% the zero address is *not* a designator for address zero, and why
+%% `delegation_indicator/1` here is never asked to build one.
+-define(DELEGATION_PREFIX, <<16#EF, 16#01, 16#00>>).
+
+delegation_indicator(Address) when is_binary(Address), byte_size(Address) =:= 20 ->
+    <<?DELEGATION_PREFIX/binary, Address/binary>>;
+delegation_indicator(Address) -> delegation_indicator(eth_state:address(Address)).
+
+is_delegation_indicator(Code) when is_binary(Code), byte_size(Code) =:= 23 ->
+    binary:part(Code, 0, 3) =:= ?DELEGATION_PREFIX;
+is_delegation_indicator(_) -> false.
+
+%% EIP-7702 step 3, in full:
+%%
+%%     Let `authority = ecrecover(msg, y_parity, r, s)`.
+%%         Where `msg = keccak(MAGIC || rlp([chain_id, address, nonce]))`.
+%%     Verify `s` is less than or equal to `secp256k1n/2`, as specified in EIP-2.
+%%
+%% The `0x05` is the EIP's `MAGIC`, and it exists to domain-separate this signing
+%% preimage from every other thing a key is asked to sign. It is a different digest
+%% from the transaction's own, and a preimage from the delegation is **not** a valid
+%% authorization for anything else.
+%%
+%% **The high-\`s' check is not optional**, and the reason is worth stating exactly
+%% because the obvious statement of it is wrong. \`ecrecover\` accepts \`s <= n\`, and
+%% \`(r, n - s)\` is a *valid* signature over the same message with the same key --
+%% that is EIP-2's subject: one signed message, two acceptable signatures. But the
+%% high-\`s' form does **not** recover the same authority. Measured on this node:
+%% for a key whose low-\`s' form recovers to \`0x5050a4f4...\`, the \`n - s\` form
+%% recovers to a different public key, for either value of \`v\`.
+%%
+%% That is the problem here, and it is sharper than malleability. Recovery maps a
+%% signature to an *account*. If both forms were accepted, the same authorization --
+%% same chain, same address, same nonce -- would designate **a different account**
+%% depending only on which of two equivalent signatures carried it, so a delegation
+%% could be silently redirected by relaying a tuple nobody chose. Exactly one of
+%% \`s\` and \`n - s\` is low, so the low-\`s\' rule is what makes the designation a
+%% function of the tuple rather than of the signature.
+%%
+%% The tuple arrives already normalised by `authorization_tuple/1' -- chain id, nonce,
+%% y-parity, r and s as integers, address as 20 raw bytes -- because that is the
+%% shape `from_rlp/1' produces and the shape the signing preimage needs. Re-decoding
+%% here would be a second parse of a field this module has already normalised.
+authorization_authority([ChainId, Address, Nonce, YParity, R, S] = _Tuple)
+  when is_integer(ChainId), is_binary(Address), is_integer(Nonce),
+       is_integer(YParity), is_integer(R), is_integer(S) ->
+    case eth_secp256k1:s_is_low(S) of
+        false ->
+            error;
+        true ->
+            Preimage = <<?SET_CODE_MAGIC, (eth_rlp:encode([ChainId, Address, Nonce]))/binary>>,
+            case eth_secp256k1:recover(eth_keccak:hash(Preimage), R, S, YParity) of
+                {ok, Pub} -> {ok, binary:part(eth_keccak:hash(Pub), 12, 20)};
+                _ -> error
+            end
+    end;
+authorization_authority(_) ->
+    error.
 
 authorization_tuple(A) when is_map(A) ->
     %% `auth_address/1`, not `addr/1'. `addr/1' reads the key `<<"to">'`, which is

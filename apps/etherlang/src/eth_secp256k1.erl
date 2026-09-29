@@ -4,12 +4,25 @@
 %% recovery from (digest, R, S, V). Pure Erlang; only used on the low-rate
 %% discovery packet path, not in block sync.
 
--export([generate_key/0, node_id/1, sign/2, recover/4]).
-
+-export([generate_key/0, node_id/1, sign/2, recover/4, s_is_low/1]).
 -define(P, 16#FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F).
 -define(N, 16#FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141).
 -define(GX, 16#79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798).
 -define(GY, 16#483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8).
+
+%% EIP-2: a signature is only recoverable in the low-`s' form, `s =< n/2'. A
+%% high-`s' recovers to the *same address* -- that is what makes a signature
+%% malleable, and why the rule exists -- so a validator that omits it accepts two
+%% distinct signatures for one authorization.
+%%
+%% It lives here rather than at the call site because `?N' lives here, and a second
+%% copy of the secp256k1 group order in a module that does not own it is a consensus
+%% constant with two homes. `sign/2' below already normalises `s' on the way out;
+%% `recover/4' does not, because recovering a high-`s' is a well-defined operation
+%% and refusing it is a *policy* of the caller, which is EIP-2's and EIP-7702's
+%% rather than the primitive's. So the primitive is honest and the check is named.
+s_is_low(S) when is_integer(S) -> S =< ?N div 2;
+s_is_low(_) -> false.
 
 %% Fresh private key as a 32-byte binary, in [1, N-1].
 generate_key() ->

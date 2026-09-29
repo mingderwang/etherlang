@@ -31,13 +31,13 @@
 
 **229 of the 235 non-`static` files, 15,660 entries: 6,786 match — 43.3%.** This is the
 number the documentation had been carrying as "never measured", and it is **less than
-half** the 84.2% the committed 25-file subset reports. Both numbers are true and the gap
+half** the 85.0% the committed 25-file subset reports. Both numbers are true and the gap
 between them is the most useful thing in this section.
 
 **Why the subset flatters.** The committed subset was chosen by a rule -- *the smallest
 file in each suite* -- to keep it under 150 KB per fixture. The smallest file in a suite
 is the one with the fewest entries and the least state, so the subset is systematically
-the easiest material. 25 files, 266 entries, 84.2%. 229 files, 15,660 entries, 43.3%.
+the easiest material. 25 files, 266 entries, 85.0%. 229 files, 15,660 entries, 43.3%.
 **The subset measures that the fixes work; the corpus measures what is still broken.**
 
 Per fork, biggest first:
@@ -332,7 +332,7 @@ from a fresh VM, one fork per process.
 
 ## The queue, re-derived
 
-**Re-measured after `v1.55`, from the committed corpus: 224 of 266 match, 3 are
+**Re-measured after `v1.62`, from the committed corpus: 226 of 266 match, 3 are
 `fork_unreachable`, and 43 are `state_mismatch`. `crash`, `unpriced`,
 `sender_mismatch` and `expected_rejection_not_raised` are all 0.**
 
@@ -472,8 +472,15 @@ implemented, so none of the 12/4/2/1 fixtures in those files is a missing opcode
   another client. See the "What compatible means here" table.
 - **The full-corpus figure** (2,681 files) has still never been measured. The 5.6-hour
   run was killed. No number is claimed.
-- **EIP-7702's state transition** — named, not done; 3 fixtures execute a type-4
-  transaction as though it carried no authorizations.
+- ~~**EIP-7702's state transition** — named, not done; 3 fixtures execute a type-4
+  transaction as though it carried no authorizations.~~ **Done (`v1.62`).** The
+  authorization list is applied: authority recovery, the seven per-tuple validity
+  steps, `0xef0100 || address` (or a **clear** for the zero address), and the
+  authority's nonce bump, applied after the sender's increment and **not rolled
+  back** on a revert. `prague/eip7702_set_code_tx` 54/80 -> **69/80**,
+  `state_mismatch` 26 -> 11. **Two parts of EIP-7702 remain open and are listed
+  under "What to do next, in order" below**: the `PER_EMPTY_ACCOUNT_COST` refund,
+  and EIP-3607's relaxation plus following a delegation in the EVM.
 - **Pre-Berlin `SSTORE` at Constantinople** (EIP-1283) — named, not done, and
   unreachable by block number on mainnet.
 
@@ -529,8 +536,12 @@ behavioural change per commit, and each step says what it now does.
 5. ~~**EEST conformance work.**~~  **Done as far as it can be, and the answer is
    bad.** `apps/etherlang/test/eest_state_tests.erl` runs the `execution-spec-tests`
    `state_tests` corpus against this node's state transition and classifies every
-   entry. **224 of 266 committed entries match — 84.2% — and the figure is
+   entry. **226 of 266 committed entries match — 85.0% — and the figure is
    reproducible**, identical per entry from a fresh VM and from inside the suite.
+   (`v1.62` moved it 224 -> 226, from EIP-7702's authorization state transition;
+   the previous figures here and at "Re-measured after `v1.55`" are updated in the
+   same change as the number they describe, which is the only thing that keeps
+   them from being the second thing to forget.)
    (This paragraph said 78 of 266 for several commits after it had stopped being
    true; the live figure is at "Re-measured after `v1.47`" above, and a second copy
    of a number that drifts is a second thing to forget to update.)
@@ -560,23 +571,50 @@ behavioural change per commit, and each step says what it now does.
        zero-length authorization list is invalid, and — because the outer fields
        follow EIP-4844's semantics — a null destination is invalid, which is a
        change from every earlier type and is checked for type 4 only.
-     - **What is NOT implemented is the state transition, and this is the open gap.**
-       EIP-7702 writes `0xef0100 || address` into each authority's code, makes every
-       code-executing operation load and follow that delegation, stops after the
-       first hop so a chain of delegations cannot loop, treats a precompile target
-       as empty code, charges `PER_AUTH_BASE_COST` (12,500) per tuple as a
-       *processing* cost, and relaxes EIP-3607 so such an account may originate a
-       transaction. None of that is here. A type-4 transaction is priced, validated
-       and executed as though it carried no authorizations at all, so the corpus's
-       three type-4 execution entries land in `state_mismatch` — the correct verdict,
-       and a more informative one than the `tx_decode_failed` they replace.
+     - **The state transition is now implemented (`v1.62`); the rest of the EIP is
+       not, and the difference is worth stating precisely** because "EIP-7702 is
+       implemented" and "a type-4 transaction executes" are now both true and
+       neither means the feature works.
+       - **Done:** for each tuple in order, recover the authority over
+         `keccak(0x05 || rlp([chain_id, address, nonce]))` with EIP-2's `s =< n/2`
+         enforced; check the chain id is 0 or this chain's; check the nonce is below
+         `2**64 - 1`; require the authority's code to be empty or already a
+         delegation; require its nonce to match; write `0xef0100 || address`, or
+         **clear the code** when `address` is the zero address; increment the
+         authority's nonce. Any failure skips that tuple and continues with the
+         next. Applied after the sender's nonce increment and before the frame, so
+         it is **not rolled back** when execution reverts — which is the EIP's own
+         wording and the opposite of the intuitive reading.
+       - **Still open, and named rather than folded in:**
+         1. The `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` = 12,500 refund per
+            **non-empty** authority. Not implemented deliberately: the EIP adds it to
+            the *global refund counter*, and EIP-3529 caps the **combined** refund at
+            `gasUsed / 5`, but `eth_evm:run/5` applies that cap inside the frame and
+            returns only the capped figure — so the transaction layer cannot cap a
+            sum it cannot see, and charging it on top would **over**-refund. The
+            corpus cannot show this: every authority in the type-4 fixtures is absent
+            from the pre-state, hence empty, hence no refund due.
+         2. **EIP-3607 is not relaxed.** The node still refuses a transaction whose
+            sender holds *any* code, a valid delegation indicator included, so a
+            delegated EOA cannot yet originate a transaction — and the corpus has
+            `test_set_code_from_account_with_non_delegating_code.json` expecting
+            `SENDER_NOT_EOA`, with no counterpart asserting the delegating case is
+            allowed.
+         3. **The EVM does not follow a delegation.** No code-executing operation
+            loads the code a designator points at, so a delegated account does not
+            execute its delegate; there is no first-hop limit either, so nothing yet
+            prevents a chain of delegations from looping. This is the *point* of the
+            EIP, and its absence is why item 2 above is the one to do next.
+       - So the corpus's type-4 execution entries now land in `state_mismatch` for a
+         narrower reason: the accounts exist and carry the right shape, and the
+         delegation does not run.
    - What the corpus found, immediately and without any new code being written for
      it: the node **accepted a type-2 (EIP-1559) transaction at a pre-London fork**,
      which the specification rejects — 5 entries, and the worst kind of divergence
      because it is a validator that admits something invalid. **Fixed and verified**;
      see the entry below. And it **cannot decode an EIP-7702 (type 4) transaction at
-     all**, 4 entries — **now implemented; the state transition is not**, see the
-     entry above.
+     all**, 4 entries — decode, signing, pricing, validation **and now the state
+     transition are implemented**; the EVM's half is not, see the entry above.
    - `eth_block:run_transaction/5` is now exported for the runner. It was already
      the function `finalize_against/5` calls, so this is not a test-only export; it
      is one transaction's effects, and `finalize/1` cannot serve the runner because
@@ -733,6 +771,22 @@ behavioural change per commit, and each step says what it now does.
      term to *every* transaction, hardcoding the context's price to the floor, and
      making `blob_base_fee/1` a second derivation that always answers 1. The last two
      fail only the tests that own those two claims, which is what they are for.
+6b. **EIP-7702: make the EVM follow a delegation, and relax EIP-3607.** Ordered
+   before 6c because it is the larger of the two and because it is the part that
+   makes the feature mean anything — `v1.62` writes the designator and nothing
+   reads it. Three pieces, and they belong in one commit because each is
+   untestable without the others: a code-executing operation (`CALL`,
+   `CALLCODE`, `DELEGATECALL`, `STATICCALL`, and a transaction's own destination)
+   loads the code the designator names **or** the designator itself if that
+   account's code is not a delegation, with a **first-hop limit** so a chain of
+   delegations cannot loop; a delegation whose target is a precompile is treated
+   as **empty code**, not as a jump into it; and EIP-3607's "sender must be an
+   EOA" must accept an account whose code *is* a valid designator, which the
+   corpus already has a negative half of
+   (`test_set_code_from_account_with_non_delegating_code.json` expects
+   `SENDER_NOT_EOA`) and no positive half of. **Read the EIP for the hop limit's
+   exact form before writing it** — it is the rule most likely to be got subtly
+   wrong and least likely to be caught by a fixture that does not exist.
 6c. ~~**Reorder `eth_tx:validate/2` so the fee conditions come last.**~~  **Closed
    as unsupported by evidence, in `v1.57`.** The premise was the note above: that
    `fee_ceiling_ok/4` running before `check_blobs/2` and the intrinsic gas check
@@ -1377,7 +1431,7 @@ they are not forgotten rather than worked on prematurely.
   - Lighthouse requires both methods, so "Lighthouse-compatible" is not currently true of the engine surface
 - [ ] **`engine_notifyHeaders`** — absent (see the Beacon requests item under Phase 3). The clause does not appear in any per-fork file of the `execution-apis` repository (`paris`, `shanghai`, `cancun`, `prague`, `osaka`, `amsterdam`, `bogota`, `common`); only the V2 `getPayloadBodiesBy*` methods appear under those names. Its shape would have to be guessed, so it is left undone rather than invented
 - [x] **Block authoring** — `payloadAttributes` are read, `forkchoiceUpdated` returns a `payloadId`, and `getPayload` returns a real block. This item said "no `payloadAttributes` handling, so `forkchoiceUpdated` can never return a `payloadId` and the node cannot build a block for the CL", which was true when written and stopped being true when `eth_block_builder` was added to the supervisor's child list; the box outlived the sentence. The builder was rewritten rather than switched on, because the dead version assembled a block with its own header constants, three of which were wrong in ways already found and fixed in `eth_block`, and discarded every `payloadAttributes` field.
-  **The block it builds is still not the block the network would build.** Its state root does not match the network's, for the reasons in item 7 — the same gas-schedule divergences that hold the conformance tally at 224 of 266 rather than all of it. So the item is closed as *wiring* and the divergence is tracked where it can be seen, not here.
+  **The block it builds is still not the block the network would build.** Its state root does not match the network's, for the reasons in item 7 — the same gas-schedule divergences that hold the conformance tally at 226 of 266 rather than all of it. So the item is closed as *wiring* and the divergence is tracked where it can be seen, not here.
 
 ### What the engine could not do before this pass
 
@@ -1785,7 +1839,7 @@ Recorded because the documentation claimed otherwise, and because each of these 
 - [ ] **Performance benchmarks** — block processing speed, state access latency
 - [x] **Conformance tests** — `eest_state_tests.erl` runs the `execution-spec-tests`
   `state_tests` corpus. **Started, and the first measurement is about 2%**
-  (78 of 266 committed entries at the first measurement, 224 of 266 now; see "What
+  (78 of 266 committed entries at the first measurement, 226 of 266 now; see "What
   to do next" item 5 for the number, the real defects it found, and the two harness
   bugs that made the figure irreproducible until they were fixed). The
   Ethereum Foundation's own `ethereum/tests` block-level suites and EEST's

@@ -718,6 +718,23 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     State0 = begin_transaction(State, Sender, Target, Value,
                                 GasLimitTx, IsCreate, EffectiveGasPrice,
                                 blob_fee(Block, Tx)),
+    %% EIP-7702: "The authorization list is processed before the execution portion
+    %% of the transaction begins, but after the sender's nonce is incremented."
+    %% `begin_transaction/8' is what increments the sender's nonce, so this sits
+    %% immediately after it and immediately before the frame -- which is the only
+    %% placement that is both "after the nonce" and "before the execution".
+    %%
+    %% **And it is here that the EIP's one surprise lives**, which is worth stating
+    %% because the obvious implementation gets it backwards: "if transaction execution
+    %% results in failure (e.g. any exceptional condition or code reverting), the
+    %% processed delegation indicators is *not rolled back*."
+    %%
+    %% That falls out of where this call sits. A revert restores the state the frame
+    %% started from, and the frame starts from `State0` -- which is *after* the
+    %% authorizations. So the delegations survive a revert without any special case
+    %% here, and putting this call *inside* the frame's starting state instead would
+    %% roll them back and diverge on exactly the transactions that fail.
+    StateAuth = process_authorizations(State0, Tx, fork(Block)),
     %% The EVM runs with what the intrinsic cost left, never the full limit.
     EvmGas = max(0, GasLimitTx - Intrinsic),
     %% The EVM reads its message and environment through atom keys (s_msg/3,
@@ -792,7 +809,7 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     %% produced. Pricing the pre-Berlin SSTORE is the real fix and is still open
     %% (TASKS.md) -- but until it is done, refusing is the honest answer and executing
     %% wrongly is not.
-    case run_frame(Code, Msg, State0, Env, EvmGas) of
+    case run_frame(Code, Msg, StateAuth, Env, EvmGas) of
         {error, {unpriced, What}} ->
             {error, {unpriced, What}};
         {Result, Output, GasLeft, StateRun, Logs} ->
@@ -945,6 +962,91 @@ blob_fee(#block{} = Block, Tx) ->
 %% second-copy mistake `eth_evm:base_cost/1' was deleted for.
 blob_base_fee(#block{excess_blob_gas = Excess}) ->
     eth_fork_schedule:blob_gas_price(Excess).
+
+%% EIP-7702's authorization list, as a state transition.
+%%
+%% For each `[chain_id, address, nonce, y_parity, r, s]` tuple, in order:
+%%
+%%   1. the chain id is 0 or this chain's;
+%%   2. the nonce is below `2**64 - 1`;
+%%   3. the authority is recovered, and `s` is in EIP-2's low form;
+%%   4. the authority's code is empty or already a delegation indicator;
+%%   5. the authority's nonce equals the tuple's;
+%%   6. the code becomes `0xef0100 || address` -- or is **cleared** when `address`
+%%      is the zero address, which is the EIP's "restore an EOA" case;
+%%   7. the authority's nonce increases by one.
+%%
+%% **A failure at any step skips that tuple and continues with the next**, and that is
+%% the whole of "If any step above fails, immediately stop processing the tuple and
+%% continue to the next tuple in the list." It is written as a `try' around the seven
+%% steps for exactly that reason: a per-step error would have to decide, at each
+%% step, whether to continue -- and the EIP's rule is uniform, so encoding it once as
+%% "this tuple either applies entirely or not at all" is both shorter and the shape
+%% the specification actually has.
+%%
+%% ## This was absent entirely.
+%%
+%% The node priced a type-4 transaction for its authorizations
+%% (`eth_tx:set_code_gas/2', 25,000 each) and validated the two *structural* rules
+%% (`eth_tx:check_set_code/1': a non-empty list, a non-null destination) -- and then
+%% executed it **as though it carried no authorizations at all**, which is what
+%% AGENTS.md's open-items table has said for some time. The corpus found it as the
+%% largest single shape in the `state_mismatch` cluster: **1,005 nonce and 1,002 code
+%% divergences and not one storage write**, on
+%% `prague/eip7623_increase_calldata_cost/test_transaction_validity_type_4.json`,
+%% whose 84 entries carry type-4 transactions with authorization lists. The signature
+%% is exactly a delegation -- 23 bytes of code written, nonce bumped, no storage
+%% touched -- and the arithmetic confirms it: those fixtures carry 10 authorizations
+%% and the expected post-state has 10 accounts holding
+%% `0xef0100000000000000000000000000000000000000NN`, one per tuple, in order.
+process_authorizations(State, Tx, Fork) ->
+    case eth_tx:tx_type(Tx) of
+        eip7702 -> apply_authorizations(State, eth_tx:authorization_list(Tx), Fork);
+        _ -> State
+    end.
+
+apply_authorizations(State, [], _Fork) -> State;
+apply_authorizations(State, [Tuple | Rest], Fork) ->
+    case apply_authorization(State, Tuple, Fork) of
+        {ok, S1} -> apply_authorizations(S1, Rest, Fork);
+        skipped -> apply_authorizations(State, Rest, Fork)
+    end.
+
+apply_authorization(State, Tuple, _Fork) ->
+    %% No step here is fork-gated, and that is not an oversight: a type-4
+    %% transaction cannot be valid before Prague -- `eth_fork_schedule:
+    %% tx_type_available/2' refuses the type at an earlier fork -- so this function
+    %% is unreachable for a pre-Prague block. `Fork' is therefore carried for a
+    %% future fork-gated step rather than omitted and re-added at every call site.
+    try
+        [ChainId, Address, Nonce, _YParity, _R, _S] = Tuple,
+        ChainIdId = eth_fork_schedule:chain_id(),
+        true = (ChainId =:= 0 orelse ChainId =:= ChainIdId),
+        true = (Nonce < ((1 bsl 64) - 1)),
+        {ok, Authority} = eth_tx:authorization_authority(Tuple),
+        Code = eth_state:code(State, Authority),
+        %% Step 5: "Verify the code of `authority` is empty or already delegated."
+        %% An authority with *real* code is skipped, so a delegation can never
+        %% overwrite a contract. That is also why the node's EIP-3607 check and this
+        %% one agree: an account that is not an EOA and not delegated is not a
+        %% delegation target either.
+        true = (Code =:= <<>> orelse eth_tx:is_delegation_indicator(Code)),
+        true = (eth_state:nonce(State, Authority) =:= Nonce),
+        S1 = case Address of
+                 %% Step 6's exception: delegating to the zero address CLEARS the
+                 %% code, restoring the account to a plain EOA. Writing
+                 %% `0xef0100 || 0x00..00' instead would leave a delegation that
+                 %% points at nothing, which the EIP's rationale explicitly wants to
+                 %% be expressible.
+                 <<0:160>> -> eth_state:set_code(State, Authority, <<>>);
+                 _ -> eth_state:set_code(State, Authority,
+                                         eth_tx:delegation_indicator(Address))
+             end,
+        {ok, eth_state:set_nonce(S1, Authority, Nonce + 1)}
+    catch
+        %% Every step's failure, uniformly, because the EIP says they are uniform.
+        _:_ -> skipped
+    end.
 
 %% The blob fee is a straight debit with no arm on any path that could undo it.
 %% It is spelled as its own function rather than folded into `buy_gas/5' so that

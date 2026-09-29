@@ -79,8 +79,8 @@ depends on execution order, suspect the build before you suspect the code.
 
 ## 3. Architecture
 
-50 modules in `apps/etherlang/src` (13,992 lines of code), 57 test modules in
-`apps/etherlang/test` (12,416), and 891 eunit tests. **These counts drift and this
+50 modules in `apps/etherlang/src` (14,054 lines of code), 58 test modules in
+`apps/etherlang/test` (12,796), and 907 eunit tests. **These counts drift and this
 one had drifted** -- it said 47 and 44 for several commits after it stopped being
 true, which is the same defect as a stale conformance figure: a number in the
 architecture section that a reader will use as a measure of size and that no longer
@@ -487,7 +487,8 @@ is worse than none. It is now two tables.
 | `TERMINAL_BLOCK_HASH` | EIP-3675 | Chain-config data, not in the EIP. Carried and echoed, **never checked** against a post-Merge block's difficulty. |
 | Pre-Berlin `SSTORE` **at Constantinople** | EIP-1283 | The only fork still refused. EIP-1283 replaced the rule and Petersburg reverted it, so a single figure would be right for two spans and wrong at the third -- and wrong *only* at Constantinople is never noticed. Unreachable by block number on mainnet. |
 | A warm-set entry keyed on a value the frame cannot name | EIP-2929/3651 | `initial_access/3` warms `coinbase` from the **Env** with `maps:get/3`, so an Env that omits it warms nothing. `maps:get/2` would have warmed `undefined`. `v1.45`. |
-| EIP-7702's state transition | EIP-7702 | A type-4 transaction is priced, validated and executed as though it carried **no** authorizations. Decode, sender recovery and both validity rules are done. |
+| EIP-7702's `PER_EMPTY_ACCOUNT_COST` **refund** | EIP-7702 | A type-4 transaction's authorizations are **applied** (`v1.62`) but not **refunded**: step 7 adds `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` = 12,500 to the global refund counter for each **non-empty** authority, so a delegation by an account that already exists under-refunds by 12,500 per tuple. **Not implemented deliberately, and the reason is structural:** the EIP says the *global refund counter*, and EIP-3529 caps the **combined** refund at `gasUsed / 5` -- but `eth_evm:run/5` applies that cap **inside** the frame and returns only the capped figure, so the transaction layer cannot cap a sum it cannot see. Charging it on top would over-refund by up to 12,500 per non-empty authority, which is a consensus divergence, and is why this is a named gap rather than a missing line. The corpus does not exercise it: every authority in the type-4 fixtures is **absent from the pre-state**, hence empty, hence no refund due -- verified, not assumed. |
+| EIP-3607's relaxation, and following a delegation | EIP-7702 / EIP-3607 | The node still refuses a transaction whose sender holds **any** code, including a valid delegation indicator, and the EVM does not load the code a designator points at. So a delegated EOA cannot yet originate a transaction and a delegated account does not yet execute its delegate. **Both are real and neither is a subtlety:** the EIP's "Transaction origination" section replaces EIP-3607's rule, and the whole point of the feature is that the delegation *runs*. Named here so the applied-state transition is not read as a working EIP-7702. |
 | `eth_createAccessList` | — | The one genuinely absent JSON-RPC method. |
 | `eth_tx:intrinsic_gas/1` takes no fork | — | Falls back to the operator's `ETH_FORK` pin. Correct for pool admission, where no block exists; **wrong** for `eth_call`, `estimateGas` and block execution, which must use `intrinsic_gas/2`. Not a gap so much as a hazard: it is a one-argument function that answers correctly in the one place nobody calls it wrongly. |
 
@@ -495,6 +496,7 @@ is worse than none. It is now two tables.
 
 | Item | Which EIP | Where it ended |
 |------|-----------|----------------|
+| EIP-7702's authorization list was never applied | EIP-7702 | **Fixed (`v1.62`)**, +16 tests, 13 injections. A type-4 transaction was **priced** for its authorizations (25,000 each) and **validated** structurally (a non-empty list, a non-null destination) and then executed **as though it carried none**: no authority recovery, no `0xef0100` designator, no nonce bump anywhere in `src/`. `grep` for `0xef0100`, `0x05` and `designator` found nothing, which is what the open-items table had been saying. **The corpus found it as the largest shape in the `state_mismatch` cluster** -- and the shape is what named it: 1,005 nonce and 1,002 code divergences and **not one storage write**, on `prague/eip7623_increase_calldata_cost/test_transaction_validity_type_4.json`, whose 84 entries carry 10 authorization tuples apiece. A delegation is 23 bytes of code written and a nonce bumped and nothing else, and `v1.61`'s shape histogram is what made the number 10-for-10 rather than a guess. `eth_block:process_authorizations/3` now applies the EIP's seven steps per tuple, in order, skipping a tuple that fails any of them. **Measured:** `prague/eip7702_set_code_tx` 54 of 80 (67.5%) -> **69 of 80 (86.3%)**, `state_mismatch` 26 -> 11; the 22-file validity set 3,760 -> **3,831 of 3,884 (98.6%)**, `state_mismatch` 122 -> **51**; the committed subset 224 -> **226 of 266 (85.0%)**. Two EIP clauses were read rather than assumed, and **one of them is the opposite of what intuition says**: "if transaction execution results in failure ... the processed delegation indicators is *not rolled back*." That falls out of *where* the call sits -- after `begin_transaction/8`'s nonce increment and before the frame, so the frame's revert restores to a state that already carries the delegations. Putting it inside the frame's starting state rolls them back and diverges on exactly the failing transactions, and injection 8 is that mistake. The other is EIP-2's `s =< n/2`, which `eth_secp256k1:recover/4` did **not** enforce: it checks `s < n` and recovers happily, so a validator without the check accepts a malleated tuple. Two gaps remain open and are named in the table above rather than folded in: the `PER_EMPTY_ACCOUNT_COST` refund, and EIP-3607's relaxation. |
 | EIP-196: an invalid point answered `unsupported` | EIP-196 | **Fixed (`v1.44`).** Note what the corpus could not tell us: the tally did **not** move, because the committed fixtures only ever call ECADD with *empty* input (valid -- the point at infinity) or with gas they cannot afford (so the precompile never runs). Nothing in the corpus exercises an invalid ECADD. The severity was not in a gas figure at all: `unsupported` is a halt, and `eth_block:run_transaction/5` turns a halt into a **refusal to produce the block**, so a mainnet contract doing a real curve operation would have made this node reject its block. `ECADD`/`ECMUL` now answer `{failed, {ecadd, not_on_curve}}` and `{failed, {ecmul, not_on_curve}}`, with the two EIP invalidity conditions -- off the curve, and a coordinate at or above `p` -- told apart. |
 | EIP-150's stipend: one figure where the spec has two | EIP-150 | **Fixed (`v1.47`)**, +6 fixtures, zero regressions. `child_gas/4` returned `min(request + stipend, cap)` for both roles. The spec's `MessageCallGas` has two: `cost = gas + extra_gas` (**no stipend**) and `sub_call = gas + stipend`. So the clamp belongs on the **pre-stipend** figure, and the insufficient-balance refund returns `sub_call` -- a `CALL` that cannot cover its value hands the caller 2,300 gas it never paid for, and a frame can finish with more gas than it started with. The old form swallowed the stipend into the cap whenever the cap binds, which is every `GAS`-forwarding call. The child legitimately holding more than the parent has left is **specified**, not an overflow: the stipend is a gift. |
 | EIP-2930's access list: priced, never applied | EIP-2930 | **Fixed (`v1.46`)**, +8 fixtures, zero regressions. The list was charged for and ignored, so a declared access was paid for twice -- once in the intrinsic and again as a cold access on every use. `eth_block` now puts `eth_tx:access_list_field/1` on the Msg -- the *same function* `validate/2` priced, so the list that is charged for and the list that is applied cannot disagree -- and `initial_access/3` seeds the warm sets, converting each slot to the interpreter's **word**. |
@@ -668,9 +670,9 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
 
 - **The committed conformance subset is the smallest file in each suite, so it is the
   easiest 2% of the corpus, and quoting it as "the conformance figure" overstates the
-  node by roughly 40 points.** Measured: 224 of 266 entries on the committed subset
-  (84.2%), **6,786 of 15,660 on the 229 non-`static` files** (43.3%), one fork per fresh
-  VM. Both are true; they are different measurements. The subset is a **regression
+  node by roughly 40 points.** Measured: 226 of 266 entries on the committed subset
+  (85.0%, `v1.62`), **6,786 of 15,660 on the 229 non-`static` files** (43.3%, pre-`v1.55`
+  and not re-run), one fork per fresh VM. Both are true; they are different measurements. The subset is a **regression
   gate** -- it is small, pinned, and has a clean per-entry attribution -- and it is good
   at that. It is not a quality claim, and §5's "the committed subset is what CI runs"
   should be read as *what CI gates on*, not *how good the node is*. The `unpriced` claim
@@ -938,6 +940,84 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
   that catches it is noticing that the number in the assertion was copied from
   somewhere else. Where a table's rows differ in their preconditions, the precondition
   belongs in the row.
+
+- **A comment documenting a trap does not immunise the code beneath it.** The
+  byte-width trap -- a hex literal wider than its segment's default 8-bit integer
+  width truncates silently -- is written out in full in `eth_7702_tests.erl`,
+  immediately above a `-define(MINER, <<16#c0de:160>>)` that gets it right, and
+  **two lines below it `?TO`, `?DELEGATE` and `?OTHER` were all written the wrong
+  way.** Five instances in one commit, three of them in the file that explains it:
+  a 32-byte key literal became `<<1>>` and raised `function_clause` in
+  `eth_secp256k1:node_id/1`; three 20-byte addresses became `<<1>>` and raised in
+  `eth_state:hv/1` four frames away; and -- the sharpest one -- a *program*
+  literal `<<16#6000, 16#6000, 16#fd>>` became `<<0,0,253>>`, silently deleting
+  both `PUSH1` opcodes, so a test named "survives a reverting transaction" was
+  running `STOP; STOP; REVERT` and **succeeding**. The general form: **a
+  documented trap is still a trap, and the comment's presence is not evidence
+  about the code under it.** The only thing that caught these was a probe whose
+  answer disagreed with `byte_size/1` arithmetic doable on paper -- and the fix
+  that sticks is to *assert the length*, because `<<16#6000, 16#6000, 16#fd>>`
+  compiles, runs, and is three bytes.
+
+- **A test for rule N is only about rule N if every other rule passes.**
+  `an_authorization_whose_nonce_is_too_large_is_skipped_test` names EIP-7702's
+  step 2, `Verify the nonce is less than 2**64 - 1`. The injection that deleted
+  the check **failed nothing**, because the fixture's authority sat at nonce 0
+  while its tuple claimed `2**64 - 1` -- so the tuple was skipped by step 5, the
+  nonce *match*, one rule later. The test was real, it was green, and it was
+  about a different rule than its name. Its control was wrong in the mirror image:
+  the same authority at 0, signing at `2**64 - 2`, is *also* skipped, for the
+  same reason, so neither half of the boundary pair could see the limit. The fix
+  is two fixtures one nonce apart in which **the account holds the nonce its
+  tuple names**, so the limit is the only thing that differs. This is §10a's "a
+  row's precondition borrowed from a sibling row" with a sharper edge: there, a
+  row failed for the wrong reason and said so; here, *both* rows did, and the
+  injection is what noticed.
+
+- **"Malleable, therefore harmless" is a wrong reading of a signature rule.**
+  EIP-2's `s =< n/2` is usually explained as malleability, and the natural gloss
+  -- "`n - s` recovers to the same address" -- is **false**. Measured on this
+  node: for a key whose low-`s` form recovers to `0x5050a4f4...`, the `n - s` form
+  recovers to a *different* public key, for either parity, because recovery
+  returns `-Q`. So the rule is not there to stop two signatures for one message;
+  it is there because **recovery maps a signature to an account**, and without it
+  the same authorization -- same chain, address and nonce -- would designate a
+  different account depending only on which equivalent signature relayed it. The
+  general form: **a security property inherits the wrong justification when the
+  mechanism is described rather than derived**, and here the wrong justification
+  is the one that makes the rule sound optional. It also went straight into a
+  code comment, and had to be taken back out.
+
+- **A destination with no code cannot revert, so a test that needs a revert must
+  put code there.** `the_delegation_survives_a_reverting_transaction_test` sent
+  `PUSH1 0 PUSH1 0 REVERT` as *calldata* to an account with no code. A call to a
+  codeless account returns success without executing anything, so the calldata
+  never ran and the transaction **succeeded** -- the assertion `status == 0`
+  failed by accident rather than for a reason. This is worse than a wrong
+  precondition, because a test whose *name* and *precondition* disagree cannot be
+  trusted at all: nothing about it says which one is lying. The control beside it
+  now differs in exactly one byte (`STOP` vs `REVERT`) at the same destination,
+  with code, so the two runs are the same fixture with one opcode changed.
+
+- **The verdict classifier in an injection harness is part of the experiment.**
+  Nine correct injections were reported as `BUILD-BROKEN (proves nothing)`
+  because the script keyed "build failed" on the string `"Compiling"`, which
+  `rebar3` prints on *every* run. The counts underneath were right and the
+  verdict was a lie, in the one direction that hides evidence. A harness that
+  reports its own conclusions needs the same scepticism as the code it
+  interrogates, and the cheap check is to read one line of its own output
+  against one known-good run before believing the other thirteen.
+
+- **A regex over a file that repeats its own vocabulary deletes call sites.**
+  Rewriting a block of `-define`s, the script used `(?=set_code_tx)` as its
+  end-of-block lookahead -- and `set_code_tx(` appears in *every test body*, so
+  the lookahead matched the first call site rather than the definition, with
+  `re.search` taking the first of the several identical anchors. The edit removed
+  the entire test section of a new test module, and the compiler reported it as
+  twelve "function unused" warnings, which read like a different problem
+  entirely. The general form: **a lookahead that is satisfied by a call is not a
+  lookahead on a definition**, and the same sentence is a general form of "a
+  filter is a measurement of the filter".
 
 ## 11. Known dead code
 

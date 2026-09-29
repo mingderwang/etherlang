@@ -159,7 +159,7 @@ etherlang_app (application)
    └─ eth_rpc_server     (gen_server) — cowboy on :8545, plus :8551 for Engine
 ```
 
-50 modules in `apps/etherlang/src`, 57 test modules alongside. Every stateful
+50 modules in `apps/etherlang/src`, 58 test modules alongside. Every stateful
 module is a `gen_server` registered under its own name. The rest are pure or
 stateless — `eth_rlp`, `eth_keccak`, `eth_hex`, `eth_word`, `eth_trie`,
 `eth_fork_schedule`, `eth_evm`, and the rest of that list.
@@ -408,6 +408,30 @@ which needed any new code to surface:
   specification rejects — a validator admitting something invalid, which is the
   worst category there is;
 - `eth_tx:from_rlp/1` **has no clause for an EIP-7702 (type 4) transaction**.
+
+**EIP-7702 is now half-implemented, and which half matters.** Decoding, signing,
+pricing, validation **and the authorization state transition** are done: for each
+tuple, recover the authority over `keccak(0x05 || rlp([chain_id, address, nonce]))`
+with EIP-2's `s =< n/2` enforced, apply the EIP's validity steps, write
+`0xef0100 || address` — or *clear* the code, for the zero address — and bump the
+authority's nonce, after the sender's increment and **not rolled back** on a revert.
+**Two things are not done, and between them they mean the feature does not work:**
+
+1. **The EVM does not follow a delegation.** No code-executing operation loads the
+   code a designator names, so a delegated account does not execute its delegate.
+   There is no first-hop limit either, so nothing yet prevents a chain of
+   delegations from looping.
+2. **EIP-3607 is not relaxed.** A transaction whose sender holds *any* code is
+   refused, a valid delegation indicator included, so a delegated EOA cannot
+   originate a transaction at all.
+
+A third, smaller: the `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` refund (12,500
+per **non-empty** authority) is not charged. The EIP adds it to the *global refund
+counter*, and EIP-3529 caps the **combined** refund at `gasUsed / 5` — but
+`eth_evm:run/5` applies that cap inside the frame and returns only the capped
+figure, so the transaction layer cannot cap a sum it cannot see. Charging it on top
+would over-refund, which is a consensus divergence, so it is a named gap rather
+than a missing line.
 
 **The figure is reproducible, and getting it there was two harness bugs.** It
 drifted at first — 5, 6, 7 and 2 across runs of identical code — for two

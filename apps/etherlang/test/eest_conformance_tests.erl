@@ -208,8 +208,13 @@
 %% too high because `eth_block' never deducted the blob fee. Pinned rather than
 %% re-derived, like every other figure here: a *regression* to 220 would mean the
 %% charge had been removed, and the count is the only thing that would notice.
--define(EXPECTED, #{match => 224,
-                    state_mismatch => 39,
+%% 224 -> 226, and `state_mismatch' 39 -> 37, from EIP-7702's authorization
+%% state transition (`v1.62'): two of the committed subset's entries carry a
+%% delegation the node was pricing, validating and then not applying. Both moved
+%% the same two entries, so the pair is the boundary of the change and nothing
+%% else in the subset moved -- which is what makes the pin worth keeping.
+-define(EXPECTED, #{match => 226,
+                    state_mismatch => 37,
                     unpriced => 0,
                     tx_decode_failed => 0,
                     tx_roundtrip_mismatch => 0,
