@@ -333,11 +333,13 @@ pair(Blocks) ->
 %% handler takes.
 
 blob_tx_without_hashes_is_refused_at_admission_test() ->
-    ?assertEqual({error, bad_blob_hashes}, admit(blob_tx(#{<<"blobVersionedHashes">> => []}))).
+    %% `zero_blobs' rather than the `bad_blob_hashes' this asserted before `v1.60`
+    %% split it. See `eth_4844_tests:blob_tx_without_hashes_rejected_test'.
+    ?assertEqual({error, zero_blobs}, admit(blob_tx(#{<<"blobVersionedHashes">> => []}))).
 
 %% The commitments are well formed here, so the only thing wrong is the missing
 %% fee. eth_tx checks the hashes first, so leaving them out as well would report
-%% bad_blob_hashes and this case would pass for the wrong reason.
+%% `zero_blobs' and this case would pass for the wrong reason.
 blob_tx_without_blob_fee_is_refused_at_admission_test() ->
     ?assertEqual({error, invalid_blob_fee},
                  admit(blob_tx(#{<<"maxFeePerBlobGas">> => absent,
@@ -347,7 +349,11 @@ blob_tx_without_blob_fee_is_refused_at_admission_test() ->
 %% hash is a 32-byte KZG commitment hash with the 0x01 version byte on top, so a
 %% leading 0x02 is not one.
 blob_tx_with_a_malformed_commitment_is_refused_test() ->
-    ?assertEqual({error, bad_blob_hashes},
+    %% `invalid_blob_hash' and not `zero_blobs', and not the shared `bad_blob_hashes'
+    %% this used to assert: the list is non-empty, so it is the *version byte* that is
+    %% wrong, which is the EIP's other assert. Two fixtures that both said
+    %% "bad_blob_hashes" were one fixture that could not tell them apart.
+    ?assertEqual({error, invalid_blob_hash},
                  admit(blob_tx(#{<<"blobVersionedHashes">> => [bin0x(<<2, 0:248>>)]}))).
 
 %% A well-formed one is admitted, so the rules above are discriminating rather

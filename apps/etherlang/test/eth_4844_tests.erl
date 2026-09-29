@@ -228,7 +228,13 @@ blob_tx_fee_floor_test() ->
 
 blob_tx_without_hashes_rejected_test() ->
     Tx = sign(base_tx(#{<<"maxFeePerBlobGas">> => <<"0x3b9aca00">>})),
-    ?assertEqual({error, bad_blob_hashes},
+    %% `zero_blobs' and not `bad_blob_hashes'. EIP-4844's `validate_block' states
+    %% "there must be at least one blob" and "all versioned blob hashes must start
+    %% with VERSIONED_HASH_VERSION_KZG" as two separate asserts, and `v1.60` split the
+    %% single reason this test used to pin into the two the EIP names. A transaction
+    %% carrying no blobs and a transaction carrying a malformed hash fail different
+    %% conditions, and a caller deciding what to say to a user cannot use one answer.
+    ?assertEqual({error, zero_blobs},
                  eth_block_builder:validate_transaction(Tx, #{chain_id => ?CHAIN_ID})).
 
 blob_tx_without_blob_fee_rejected_test() ->

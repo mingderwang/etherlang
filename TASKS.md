@@ -60,15 +60,24 @@ Per fork, biggest first:
 `istanbul` (6 files, 4 MB, all `test_blake2b*` gas-limit sweeps) was still running at
 45 minutes of CPU when this was written and is **excluded**; it is 1.3% of the files.
 
-> **This table predates `v1.55` and no full-corpus run has been repeated since.** The
-> EIP-4844 blob-fee fix (item 6a) fixed **1,408 entries**, all at Cancun and Prague, so
-> the `cancun` and `prague` rows here are known to be understated and the total of
-> 6,786 is known to be too low. The figure is **not** restated from the delta, because
-> the delta was measured on the 22-file `expectException` set (+56 matches there), not
-> on the corpus, and quoting 6,842 would be arithmetic dressed as a measurement. The
-> full run is a developer step; until it is repeated, treat every figure in this table
-> as "at the time it was taken" and check the date. The committed subset **has** been
-> re-measured and is 224 of 266.
+> **This table predates `v1.55` and no full-corpus run has been repeated since, and it
+> is now stale in two separately-measured ways.** Both are recorded rather than
+> corrected, because the correction would be arithmetic dressed as a measurement.
+>
+> 1. **The EIP-4844 blob-fee fix (item 6a) fixed 1,408 entries**, all at Cancun and
+>    Prague, so those two rows are understated. Measured on the 22-file set as +56.
+> 2. **The rejection vocabulary (`v1.60`) moved `rejection_mismatch` to 0** on the
+>    22-file set, from 1,974. Corpus-wide that row was 1,975 entries, so the corpus
+>    total would rise by roughly that much.
+>
+> Adding them would give ~8,770, and **that number is not written here as a result.**
+> The two deltas were measured on 22 files that declare `expectException`; the
+> corpus-wide row was 1,975 across the whole run. Multiplying one by the other is not a
+> measurement. The full run is a developer step; until it is repeated, treat every
+> figure in this table as "at the time it was taken" and check the date. **The
+> committed subset has been re-measured and is unchanged at 224 of 266 (84.2%)** — it
+> never had a `rejection_mismatch`, so the vocabulary change did not touch it, which is
+> itself the most useful single fact about how the two figures relate.
 
 ### The outcome breakdown is the more useful number than the percentage
 
@@ -117,61 +126,80 @@ node that admits an invalid transaction imports a block containing one:
   `gasPrice`, so `field/3` supplied 0 and **every** fee-field rule was skipped for type 4.
   A fall-through clause turns "not mentioned" into "no rules at all" rather than an error.
 
-### The `expected_rejection_not_raised` count is now 2, and the note that explained the last 3 was wrong
+### `rejection_mismatch` is 0 on the 22-file set, and that is a measurement change, not progress
 
-The last three were `INSUFFICIENT_MAX_FEE_PER_GAS`: `maxFeePerGas = 6` against a
-stated `currentBaseFee = 7`, refused-as-nothing because `expect_rejection/4` built its
-block with the literal `none` and `merge_base_fee(Base, none) -> Base` read that as
-*use the fork's default* — so the rejection path handed the validator a base fee the
-fixture never stated while the execution path handed it the derived one. **The two
-paths disagreed about the same fixture's header field.**
+**Read this section before quoting any conformance number.** The cluster went
+`rejection_mismatch` 1,974 → **0**, `match` 1,784 → **3,760** (45.9% → 96.8%) on the
+22 files that declare `expectException`. **The node's behaviour is unchanged.** Not one
+refusal differs, except that one reason was split into the two conditions EIP-4844
+names. What changed is that the runner was asking the wrong question for 1,974 entries.
 
-Supplying the fixture's stated base fee had been measured and **rejected** here, on
-the grounds that it "fixes one entry and loses nine overall ... Twelve entries move to
-`rejection_mismatch` as `{unmapped, fee_too_low}`, because with the stated base fee the
-*fee* check now fires before the rule those fixtures are about". That diagnosis named a
-**check-ordering** question in `eth_tx:validate/2`.
+The cluster was classified before anything was changed, into the three categories that
+can own a rejection mismatch, and the split closes exactly:
 
-**It was wrong, and the reason it was wrong is the more useful finding.** The cause was
-a missing clause. `fee_ceiling_ok/4` chose the ceiling with
+| category | count | owner | what fixed it |
+|---|---|---|---|
+| **A. Behavioural / implementation gaps** | **0** | — | — |
+| **B1. Error-vocabulary** — same rule, different string | 1,933 | the runner's table | `v1.60` |
+| **B2. Error-vocabulary** — the node conflated two of EIP-4844's asserts into one reason | 10 | the node | `v1.60` |
+| **C. Test/reporting** — the harness could not express the outcome at all | 31 | the runner | `v1.60` |
+| | **1,974** | | |
 
-    case tx_type(Tx) of
-        eip1559 -> MaxFee;
-        eip4844 -> MaxFee;
-        _       -> GasPrice
-    end
+**Category A being zero is the whole finding.** Every one of the 1,974 was a refusal
+the corpus asked for, produced by the rule the corpus names. It was 98.4% measurement
+and 1.6% harness, and not one behavioural gap. The two *real* gaps in the bucket were
+outside it: the 2 `expected_rejection_not_raised` entries, which were a missing rule and
+were fixed in `v1.58` (`MAX_BLOB_GAS_PER_BLOCK`).
 
-and **`eip7702` was not in it**. A type-4 transaction has no `gasPrice` field, so the
-`_` branch read `field/3`'s default of `0`, and against a correct base fee of 7 every
-type-4 transaction was refused as underpriced *by its own cap*. That one clause was all
-**72** of the corpus entries that would have been affected — the 47
-`INTRINSIC_GAS_TOO_LOW`, the 14 `INTRINSIC_GAS_BELOW_FLOOR_GAS_COST`, the 8
-`SENDER_NOT_EOA` and the 3 type-4 well-formedness cases — and it was the entire
-content of the "-9". The twelve that moved to `fee_too_low` were type-4 transactions
-being refused for a rule that never applied to them.
+Three things were wrong, and only the third needed the node:
 
-`fee_fields_ok/4` had the **identical** missing clause and `v1.54` fixed it there, with
-a comment explaining that a fall-through clause turns "not mentioned" into "no rules at
-all". The neighbouring function was not re-read, and the resulting corpus signature —
-"the fee check fires before the rule those fixtures are about" — was read as an
-ordering problem rather than as a lookup. **It is indistinguishable from an ordering
-problem by its symptom.** A fee check that fires on a *wrong value* looks exactly like
-a fee check that fires *too early*, and the difference is only visible by asking what
-value it compared.
+- **The table's names were wrong in ten of eleven clauses.** It said `INTRINSIC_GAS`
+  where the corpus says `INTRINSIC_GAS_TOO_LOW`, `GASLIMIT_TOO_LOW` for
+  `INTRINSIC_GAS_BELOW_FLOOR_GAS_COST`, `BLOB_GAS_PRICE_TOO_LOW` for
+  `INSUFFICIENT_MAX_FEE_PER_BLOB_GAS`, and it carried a clause for
+  **`insufficient_funds`, a reason `eth_tx:validate/2` never throws** — the node says
+  `insufficient_balance`. So one clause was dead and the rest were answering a question
+  nobody asked. The comment above the table claimed "every code below is one the corpus
+  has actually asked for". **That claim was false**, and the fix is to derive the list
+  rather than assert it: the corpus has exactly **18** distinct `expectException` codes
+  and they are now printed in the comment with their measured counts.
+- **`|` alternatives were unreachable.** `exception_code/1` returned the whole
+  `"A|B"` string and compared it with `=:=`, so those 31 entries could never match
+  anything — including the answer the node actually gives. `exception_codes/1` now
+  splits, strips the namespace per alternative, and the comparison is membership. A
+  fixture offering alternatives is saying "this transaction is invalid and the test does
+  not distinguish which rule caught it", and the node's answer is one of them.
+- **The node conflated two of EIP-4844's asserts.** `bad_blob_hashes` covered both
+  "there must be at least one blob" and "all versioned blob hashes must start with
+  `VERSIONED_HASH_VERSION_KZG`", and the corpus names them separately. Split into
+  `zero_blobs` and `invalid_blob_hash`.
 
-With the clause present, supplying the stated base fee is **exactly neutral**: matches
-1,784, `state_mismatch` 122, `rejection_mismatch` 1,974, with no `{unmapped,
-fee_too_low}` anywhere. It fixes the last 3, which stop being accepted and start being
-refused for the right rule, and it is what makes the two paths agree. Both landed
-together in `v1.57`.
+**That the mapping cannot manufacture matches is measured, not asserted.** The obvious
+risk of a vocabulary table is that a wrong clause invents conformance, so it was
+injected: mapping EIP-7623's `calldata_floor` to `INTRINSIC_GAS_TOO_LOW` instead of
+`INTRINSIC_GAS_BELOW_FLOOR_GAS_COST` **loses 76 matches and invents none**
+(`rejection_mismatch` 0 → 76, `match` 3,760 → 3,684). A wrong mapping is strictly
+costly, which is the property that makes this a safe change to make. Two further
+injections: reverting the `|` split costs 33, and reconflating the two EIP asserts costs
+exactly the predicted 10.
 
-The general form, and it is the second time this repository has written down a measured
-number with a confident and wrong explanation beside it: **a rejected experiment's
-diagnosis has to be re-tested when the code it blamed changes.** The measurement was
-sound and the reasoning was not, and the note recorded them with equal authority. The
-other instance is item 6a's fabricated non-zero clause, which was pinned by a test that
-argued for it — in both cases the *number* was reproducible and the *story* was not
-checkable.
+**What this does not change.** The committed 266-entry subset is **unchanged at 224 of
+266 (84.2%)**, because it never had a `rejection_mismatch` — its `?EXPECTED` pin reads
+`rejection_mismatch => 0` and still does. The 96.8% is a property of the 22-file
+`expectException` set and **must not be quoted as a conformance figure for this node**.
+The full-corpus per-fork table at the top of this file is now stale in a specific and
+predictable way: its `rejection_mismatch` row (1,975, 12.6%) is that vocabulary, so the
+corpus total of 6,786 would rise by roughly that amount. **It has not been re-run, and
+the figure is not restated from the delta**, because the delta was measured on 22 files
+and arithmetic dressed as a measurement is the thing this file exists to prevent. The
+full run is a developer step.
+
+**And the reporting defects were never in this cluster.** The gas histogram's blind
+spot — item 7, fixed in `v1.59` — was hiding 1,408 entries in `state_mismatch`, a
+different bucket entirely. `rejection_mismatch` was the *well-instrumented* cluster;
+`state_mismatch` was the dark one, and it is 6,434 entries corpus-wide. Fixing the
+ruler did not touch it, which is the reason the headline moved by 1,974 and the largest
+real cluster by 0.
 
 **`unpriced` is 86, not 0.** The documentation claimed -- in `README.md` and here --
 that `unpriced` is **0**, "nothing is executed that this node cannot price". That is true

@@ -639,6 +639,38 @@ Where the work actually stands:
     Five missing prices have been found and fixed since, all five by the corpus rather than by a test, and all five on the create, store and access paths. The fifth was **EIP-3651's warm coinbase**: the transaction-start warm set was seeded with the sender, `to` and the precompiles, and not with the address that receives the block reward and the transaction fees, so every direct payment to the miner was charged `COLD_ACCOUNT_ACCESS_COST` on first touch -- a uniform **+2,500** on twelve fixtures, and 2,500 is `2,600 - 100` exactly. A fifth defect was not in that list at all, because it was in the **runner**: `eth_state:new/2` rewrites every `{store, A, S}` overlay key through `eth_state:slot_key/1`, and the comparison read the slot back under the un-normalised key, so **every storage read on the way back returned zero** and a node that stored `1` was reported as having stored nothing. Twenty-one fixtures were being scored on a comparison that could not see storage: **the code-deposit cost was never charged at all** (`G_codedeposit`, 200 per byte, so a create deployed code of any size for free and never went out of gas on a deposit it could not pay — the size cap was a bare `byte_size(Code) =< 24576` guard, a predicate with no price behind it, applied at every fork including the eight before EIP-170 introduced it); **EIP-170's size cap was a constant rather than a fork fact** (`infinity` below Spurious Dragon); and **EIP-2929's "additional" `COLD_SLOAD_COST` on `SSTORE` was missing** — the EIP has two halves, the EIP-2200 parameter rewrites *and* an extra 2,100 for a slot not in `accessed_storage_keys`, and the node had the first, so every *first* touch of a slot cost 2,100 too little while every second touch was right; and **EIP-2929's transaction-start warm set was never seeded** (its own text: "`accessed_addresses` is initialized to include the `tx.sender`, `tx.to` ... and the set of all precompiles"), so the transaction's own recipient, its own sender and every precompile were each charged `COLD_ACCOUNT_ACCESS_COST` on first touch — a uniform +2,500 on twenty-four fixtures, and 2,500 is `2,600 − 100` exactly. The gas figure is recovered from the balances the way a state test
     encodes it, so a divergence reads as a gas number rather than as a wei difference — the first fixture looked
     at reported `45,247` gas, which is EIP-2929's cold account charge and about sixteen times that.
+  - **The largest cluster in the corpus was a measurement defect, and fixing it moved
+    the headline by 1,974 while changing no behaviour.** On the 22 files that declare
+    `expectException`, `rejection_mismatch` went **1,974 → 0** and `match` 1,784 → 3,760.
+    Not one refusal differs: the node refuses for exactly the reasons it did. The runner
+    was comparing against strings that were not the corpus's, in three separate ways.
+    (i) The `node_exception/2` vocabulary table's names were wrong in **ten of its eleven
+    clauses** — `INTRINSIC_GAS` for `INTRINSIC_GAS_TOO_LOW`, `GASLIMIT_TOO_LOW` for
+    `INTRINSIC_GAS_BELOW_FLOOR_GAS_COST` — and one clause was for **`insufficient_funds`,
+    a reason `eth_tx:validate/2` never throws** (the node says `insufficient_balance`), so
+    it was dead. The comment above the table claimed every code in it had been asked for
+    by a fixture; that claim was false, and the fix is to derive the list — the corpus has
+    exactly **18** distinct `expectException` codes, now printed in the comment with their
+    measured counts. (ii) `exception_code/1` returned the whole `"A|B"` string and compared
+    it with `=:=`, so the **31** fixtures offering alternatives could never match anything,
+    including the answer the node actually gives; a fixture offering alternatives is saying
+    "invalid, and the test does not distinguish which rule caught it". (iii) The node
+    conflated two of EIP-4844's asserts into one reason.
+    Classified **before** anything was changed, because a ruler change needs its
+    categories fixed first: **behavioural gaps 0**, vocabulary 1,943, harness 31. The two
+    *real* gaps in the bucket were outside it — the 2 `expected_rejection_not_raised`
+    entries, a missing rule, fixed in the same stretch.
+    That a wrong clause **cannot manufacture a match** is measured rather than asserted:
+    mapping EIP-7623's floor to the wrong code *loses* 76 matches and invents none
+    (`rejection_mismatch` 0 → 76). A wrong mapping is strictly costly, which is what makes
+    this safe to do.
+    **The committed 266-entry subset is unchanged at 224 of 266 (84.2%)**, because it never
+    had a `rejection_mismatch` at all. That is the single most useful fact about how the
+    two figures relate: the 22-file set was where the *vocabulary* was wrong, and the
+    committed subset was always clean of it. **The 96.8% is a property of those 22 files
+    and is not a conformance figure for this node** — the corpus-wide `state_mismatch`
+    cluster of 6,434 is untouched by any of this, and the full-corpus per-fork table in
+    `TASKS.md` is annotated as stale rather than restated from the delta.
   - A **rejection is checked by reason, not merely counted.** `rejection_mismatch` used to mean "the validator
     said no" with the reason discarded, so a node that refused a pre-fork type-2 transaction for entirely the
     wrong reason scored the same as one that refused it for the reason the fixture names — a refusal proves

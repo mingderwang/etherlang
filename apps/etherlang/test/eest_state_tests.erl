@@ -686,86 +686,171 @@ expect_rejection(Fork, Tx, Entry, Expected) ->
             %% mapping that derived the expected type from the expectation would
             %% compare the expectation with itself.
             Got = node_exception(Reason, eth_tx:tx_type(Tx)),
-            Want = exception_code(Expected),
-            case Want =:= Got of
-                true -> {?MATCH, {rejected, Want}};
-                false -> {?REJECT_MISMATCH, #{expected => Want, got => Got,
+            Want = exception_codes(Expected),
+            case lists:member(Got, Want) of
+                true -> {?MATCH, {rejected, hd(Want)}};
+                false -> {?REJECT_MISMATCH, #{expected => join(Want), got => Got,
                                               reason => Reason}}
             end;
         ok ->
-            {?REJECT_NOT_RAISED, #{expected => exception_code(Expected)}}
+            {?REJECT_NOT_RAISED, #{expected => join(exception_codes(Expected))}}
     end.
 
-%% The fixture's code, reduced to the name the specification gives it:
-%% `"TransactionException.TYPE_2_TX_PRE_FORK"' -> `TYPE_2_TX_PRE_FORK'.
+%% The set of codes that would satisfy the fixture.
 %%
-%% `TransactionException' is dropped and that is not a loosening of the comparison.
+%% **A fixture may name more than one acceptable reason, and it says so with `|`.**
+%% `cancun/eip3860_initcode/test_contract_creating_tx` and its siblings write
+%% `"INTRINSIC_GAS_TOO_LOW|INTRINSIC_GAS_BELOW_FLOOR_GAS_COST"`, meaning the
+%% transaction is invalid and the test does not distinguish which of the two rules
+%% caught it. The previous `exception_code/1` returned that whole string and compared
+%% it with `=:=`, so it could **never** match anything -- 31 corpus entries were
+%% unreachable by construction, and the alternative a node does give is not
+%% acceptable either, because the fixture is deliberately ambiguous.
+%%
+%% So the code is split on `|`, the namespace is stripped from each alternative, and
+%% the comparison is membership. Both halves matter: a list of one is the common case
+%% and must behave exactly as the string comparison did.
+%%
+%% `TransactionException` is dropped and that is not a loosening of the comparison.
 %% It is the namespace a *transaction* rule lives in, and every code
-%% `eth_tx:validate/2' can raise belongs to it, so keeping it would mean this
-%% function compared the fixture's namespace against the node's vocabulary and
-%% nothing could ever match -- the first version did exactly that and reported five
-%% correct refusals as five mismatches.
+%% `eth_tx:validate/2' can raise belongs to it, so keeping it would mean this function
+%% compared the fixture's namespace against the node's vocabulary and nothing could
+%% ever match -- the first version did exactly that and reported five correct
+%% refusals as five mismatches.
 %%
-%% `BlockchainException' is a different vocabulary and is **kept**: a block-level
+%% `BlockchainException` is a different vocabulary and is **kept**: a block-level
 %% failure is not a transaction rule, so a fixture expecting one can never be
 %% satisfied by a validator's answer, and saying so is better than matching it
 %% loosely. Codes this node has no mapping for come back as `{unmapped, Reason}' and
 %% land in `rejection_mismatch', so an unmapped code costs a match rather than
 %% buying one.
-exception_code(<<"TransactionException.", Code/binary>>) -> Code;
-exception_code(Expected) when is_binary(Expected) -> Expected;
-exception_code(Other) ->
-    Other.
+%%
+%% A **list** is accepted as well as a string, because `expectException` is a list in
+%% some corpus revisions and a runner that only reads the string form reports those
+%% files as "no expectation stated" -- which runs the transaction instead of
+%% refusing it, and turns a rejection test into a state test. Every `expectException`
+%% in *this* corpus revision is a string (2,006 of them, measured), so the list clause
+%% is currently unexercised; it is here because the alternative is a runner that
+%% silently changes meaning when the corpus is updated.
+exception_codes(Expected) when is_binary(Expected) ->
+    [strip_ns(Alt) || Alt <- binary:split(Expected, <<"|">>, [global])];
+exception_codes(Expected) when is_list(Expected) ->
+    lists:usort(lists:append([exception_codes(E) || E <- Expected]));
+exception_codes(Other) ->
+    [Other].
+
+strip_ns(<<"TransactionException.", Code/binary>>) -> Code;
+strip_ns(Code) -> Code.
+
+join(Codes) ->
+    iolist_to_binary(lists:join(<<" | ">>, Codes)).
 
 %% The code this node would be raising for a given validator error, given the
 %% transaction's type.
 %%
-%% Every code below is one the corpus has actually asked for. That is the rule, and
-%% it is why the list is short: a code invented from the EIP's prose rather than
-%% read off a fixture would be a guess about the corpus's vocabulary, and a wrong
-%% guess here is a *manufactured conformance match*. The type-4 null-destination
-%% rule is implemented (`eth_tx:check_set_code/1') and deliberately absent from this
-%% table, because no committed fixture asks for its code. Until one does it reports
-%% as unmapped, which costs a match -- the correct direction to be wrong in.
+%% **Every clause below is one of the eighteen codes the corpus actually uses, and
+%% nothing else is in this table.** That is the rule, and it is why the list is
+%% exactly eighteen entries and not eighteen plus a few plausible ones: a code
+%% invented from an EIP's prose rather than read off a fixture is a guess about the
+%% corpus's vocabulary, and a wrong guess here is a **manufactured conformance match**
+%% -- the one artefact in this project that would make every other number here a lie.
+%% The eighteen were read off the corpus, not remembered:
 %%
-%% Each clause is here because the error is raised for that reason and no other.
-%% `tx_type_pre_fork' is a single `eth_fork_schedule:tx_type_available/2' call,
-%% whose whole answer is a fork comparison, so it can only mean a type that
-%% postdates the fork -- but which type is not in the error, so the type is threaded
-%% through from the transaction and rendered into the fixture's own vocabulary.
+%%     INTRINSIC_GAS_TOO_LOW 1591        TYPE_3_TX_PRE_FORK 2
+%%     INSUFFICIENT_ACCOUNT_FUNDS 288     TYPE_3_TX_MAX_BLOB_GAS_ALLOWANCE_EXCEEDED 2
+%%     INTRINSIC_GAS_BELOW_FLOOR_GAS_COST 106   TYPE_3_TX_BLOB_COUNT_EXCEEDED 2
+%%     TYPE_3_TX_INVALID_BLOB_VERSIONED_HASH 8   TYPE_4_TX_PRE_FORK 2
+%%     SENDER_NOT_EOA 8                  PRIORITY_GREATER_THAN_MAX_FEE_PER_GAS 1
+%%     INITCODE_SIZE_EXCEEDED 6          TYPE_4_EMPTY_AUTHORIZATION_LIST 1
+%%     TYPE_2_TX_PRE_FORK 6              TYPE_4_TX_CONTRACT_CREATION 1
+%%     TYPE_1_TX_PRE_FORK 5
+%%     INSUFFICIENT_MAX_FEE_PER_BLOB_GAS 4     TYPE_3_TX_ZERO_BLOBS 3
+%%     INSUFFICIENT_MAX_FEE_PER_GAS 3
 %%
-%% `initcode_size_exceeded' and `sender_not_eoa' are the two rules this node
-%% **implemented** in response to this table, and that is a different relationship from
-%% the rest of it. Everywhere else the corpus named a rule and the node had one under
-%% another name; here the corpus named a rule the node did not have at all, and the name
-%% is the same on both sides because the rule is the same. Adding the clause is part of
-%% implementing the rule: without it the eight EIP-3607 entries and the six EIP-3860
-%% entries would have moved from `expected_rejection_not_raised' to `rejection_mismatch',
-%% which is to say the node would have started refusing for the right reason and been
-%% recorded as refusing for the wrong one.
+%% (counts are entry counts over the whole non-`static` corpus, so an entry
+%% applicable at three forks is counted three times.)
+%%
+%% ## Ten of the eleven clauses this table used to have were misnamed.
+%%
+%% They were written with plausible names and never checked against a fixture, which
+%% is the same failure as §3's `eth_kzg` comment and this file's own claim that "every
+%% code below is one the corpus has actually asked for" -- a claim that was false. The
+%% table said `INTRINSIC_GAS` where the corpus says `INTRINSIC_GAS_TOO_LOW`,
+%% `GASLIMIT_TOO_LOW` for `INTRINSIC_GAS_BELOW_FLOOR_GAS_COST`,
+%% `BLOB_GAS_PRICE_TOO_LOW` for `INSUFFICIENT_MAX_FEE_PER_BLOB_GAS`, and it carried a
+%% clause for **`insufficient_funds`, a reason `eth_tx:validate/2` never throws** -- the
+%% node says `insufficient_balance`. So one clause was dead and the rest were
+%% answering a question nobody asked.
+%%
+%% ## The rule for adding a clause: the node's condition and the corpus's name must be
+%% the same condition.
+%%
+%% That is checkable, and each of these was checked against the rule the corpus
+%% implements rather than against the name:
+%%
+%%   * `intrinsic_gas` -- EELS raises when `intrinsic_gas > tx.gas`; the node's
+%%     `ensure(Gas >= intrinsic_gas(...))` is the same condition restated.
+%%   * `insufficient_balance` -- EELS raises when `balance < max_gas_fee + value`;
+%%     the node's `check_balance/3` is the same, with EIP-4844's blob term folded
+%%     into `max_gas_fee` where EIP-4844 puts it.
+%%   * `calldata_floor` -- EIP-7623's `gasLimit < 21000 + 10 * tokens`; the node's
+%%     `eth_fork_schedule:calldata_floor/2` computes that figure.
+%%   * `fee_too_low` and `blob_fee_too_low` -- EELS' `InsufficientMaxFeePerGasError`
+%%     and `InsufficientMaxFeePerBlobGasError`, i.e. the cap is below the block's
+%%     price.
+%%   * `null_destination` for a type-4 transaction -- EELS'
+%%     `TransactionTypeContractCreationError`, raised on exactly the condition
+%%     `check_set_code/1' checks.
+%%   * `zero_blobs` and `invalid_blob_hash` -- EIP-4844's two separate asserts, which
+%%     `v1.57` split out of the single `bad_blob_hashes` this table used to carry.
+%%
+%% `MAX_BLOB_GAS_PER_BLOCK` is EIP-4844's `assert blob_gas_used <=
+%% MAX_BLOB_GAS_PER_BLOCK`, implemented in `v1.58`. The corpus offers **two** names for
+%% it -- `TYPE_3_TX_MAX_BLOB_GAS_ALLOWANCE_EXCEEDED' and `TYPE_3_TX_BLOB_COUNT_EXCEEDED' --
+%% and offers them as an `|' alternative, which is `exception_codes/1''s way of saying
+%% "this transaction is invalid and the test does not distinguish which name you give
+%% the condition". One clause answering either name is accepted by membership, and the
+%% node's reason names the EIP's own assert.
+%%
+%% **This clause was deliberately absent, and the reason for its absence went stale.**
+%% It was written when the node had no such rule at all, and the note said so: "the
+%% node has no such rule, so no answer it can give would be for that reason. They stay
+%% unmapped and cost a match, which is the correct direction to be wrong in." That was
+%% correct then. `v1.58` implemented the rule, and leaving the note would have been a
+%% **justification outliving its subject** -- the same defect as a stale conformance
+%% figure, and this table's own first version, which was wrong in ten of eleven clauses
+%% and said otherwise in a comment. A comment asserting *why* something is absent is
+%% still a claim about the present and has to be re-checked when the code changes.
 node_exception(tx_type_pre_fork, eip2930) -> <<"TYPE_1_TX_PRE_FORK">>;
 node_exception(tx_type_pre_fork, eip1559) -> <<"TYPE_2_TX_PRE_FORK">>;
 node_exception(tx_type_pre_fork, eip4844) -> <<"TYPE_3_TX_PRE_FORK">>;
 node_exception(tx_type_pre_fork, eip7702) -> <<"TYPE_4_TX_PRE_FORK">>;
 node_exception(tx_type_pre_fork, Type) -> {unmapped_type, Type};
 node_exception(empty_auth_list, eip7702) -> <<"TYPE_4_EMPTY_AUTHORIZATION_LIST">>;
+node_exception(null_destination, eip7702) -> <<"TYPE_4_TX_CONTRACT_CREATION">>;
 node_exception(unsupported_type, _Type) -> <<"TX_TYPE_UNSUPPORTED">>;
-node_exception(intrinsic_gas, _Type) -> <<"INTRINSIC_GAS">>;
+node_exception(intrinsic_gas, _Type) -> <<"INTRINSIC_GAS_TOO_LOW">>;
+node_exception(calldata_floor, _Type) -> <<"INTRINSIC_GAS_BELOW_FLOOR_GAS_COST">>;
 node_exception(initcode_size_exceeded, _Type) -> <<"INITCODE_SIZE_EXCEEDED">>;
 node_exception(sender_not_eoa, _Type) -> <<"SENDER_NOT_EOA">>;
+node_exception(nonce_too_low, _Type) -> <<"NONCE_TOO_LOW">>;
+node_exception(nonce_too_high, _Type) -> <<"NONCE_TOO_HIGH">>;
+node_exception(bad_chain_id, _Type) -> <<"CHAIN_ID_MISMATCH">>;
+node_exception(insufficient_balance, _Type) -> <<"INSUFFICIENT_ACCOUNT_FUNDS">>;
+node_exception(fee_too_low, eip1559) -> <<"INSUFFICIENT_MAX_FEE_PER_GAS">>;
+node_exception(fee_too_low, eip4844) -> <<"INSUFFICIENT_MAX_FEE_PER_GAS">>;
+node_exception(fee_too_low, eip7702) -> <<"INSUFFICIENT_MAX_FEE_PER_GAS">>;
+node_exception(blob_fee_too_low, _Type) -> <<"INSUFFICIENT_MAX_FEE_PER_BLOB_GAS">>;
+node_exception(blob_gas_allowance_exceeded, _Type) ->
+    <<"TYPE_3_TX_MAX_BLOB_GAS_ALLOWANCE_EXCEEDED">>;
+node_exception(zero_blobs, _Type) -> <<"TYPE_3_TX_ZERO_BLOBS">>;
+node_exception(invalid_blob_hash, _Type) -> <<"TYPE_3_TX_INVALID_BLOB_VERSIONED_HASH">>;
 %% A type-4 transaction with maxPriorityFeePerGas above maxFeePerGas reaches this as
 %% `invalid_fee', which is what `fee_fields_ok/4' has always thrown for a *fee-field*
 %% problem. The corpus names the specific condition rather than the category, and here
 %% the node and the corpus are describing the same rule, so the mapping is an identity
 %% in substance and not a rename.
 node_exception(invalid_fee, eip7702) -> <<"PRIORITY_GREATER_THAN_MAX_FEE_PER_GAS">>;
-node_exception(calldata_floor, _Type) -> <<"GASLIMIT_TOO_LOW">>;
-node_exception(nonce_too_low, _Type) -> <<"NONCE_TOO_LOW">>;
-node_exception(nonce_too_high, _Type) -> <<"NONCE_TOO_HIGH">>;
-node_exception(insufficient_funds, _Type) -> <<"INSUFFICIENT_BALANCE">>;
-node_exception(bad_chain_id, _Type) -> <<"CHAIN_ID_MISMATCH">>;
-node_exception(blob_fee_too_low, _Type) -> <<"BLOB_GAS_PRICE_TOO_LOW">>;
-node_exception(bad_blob_hashes, _Type) -> <<"INVALID_BLOBS">>;
 node_exception(Reason, _Type) -> {unmapped, Reason}.
 
 %% The block the transaction executes in.

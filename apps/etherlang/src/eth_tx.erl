@@ -15,6 +15,7 @@
 -export([
            calldata/1,to_rlp/1, from_rlp/1, tx_root/1, sender/1,
          blob_versioned_hashes/1, valid_versioned_hashes/1,
+         blob_hashes_present/1, blob_hashes_well_formed/1,
          validate/1, validate/2, intrinsic_gas/1, intrinsic_gas/2, tx_type/1,
          %% **Exported for the frame, not for a test.** EIP-2930: "The address and
          %% storage keys would be immediately loaded into the accessed_addresses and
@@ -813,7 +814,27 @@ fee_ceiling_ok(Tx, MaxFee, GasPrice, Ctx) ->
 check_blobs(Tx, Ctx) ->
     case tx_type(Tx) of
         eip4844 ->
-            ensure(valid_versioned_hashes(Tx), {error, bad_blob_hashes}),
+            %% EIP-4844's `validate_block' states these as **two separate asserts**,
+            %% and they are now two separate refusals:
+            %%
+            %%     # there must be at least one blob
+            %%     assert len(tx.blob_versioned_hashes) > 0
+            %%     # all versioned blob hashes must start with VERSIONED_HASH_VERSION_KZG
+            %%     for h in tx.blob_versioned_hashes:
+            %%         assert h[0] == VERSIONED_HASH_VERSION_KZG
+            %%
+            %% They were one reason -- `bad_blob_hashes' -- for every failure of
+            %% either, so "this transaction carries no blobs at all" and "this
+            %% transaction carries a hash that is not a versioned KZG hash" were
+            %% indistinguishable to every caller, and the corpus names them
+            %% separately (`TYPE_3_TX_ZERO_BLOBS' and
+            %% `TYPE_3_TX_INVALID_BLOB_VERSIONED_HASH'). The split is justified by the
+            %% EIP's own two asserts, not by the corpus: a transaction with an empty
+            %% list and a transaction with a version byte of 0x02 fail different
+            %% conditions, and a caller deciding what to tell a user cannot use one
+            %% answer for both.
+            ensure(blob_hashes_present(Tx), {error, zero_blobs}),
+            ensure(blob_hashes_well_formed(Tx), {error, invalid_blob_hash}),
             MaxFeePerBlobGas = field(Tx, <<"maxFeePerBlobGas">>),
             ensure(is_integer(MaxFeePerBlobGas), {error, invalid_blob_fee}),
             case maps:get(blob_base_fee, Ctx, undefined) of
@@ -1378,14 +1399,25 @@ blob_versioned_hash(_) ->
 %% `TYPE_3_TX_INVALID_BLOB_VERSIONED_HASH' -- are the *version byte* check below,
 %% which is the EIP's rule and is what the corpus means.
 valid_versioned_hashes(Tx) ->
-    Hashes = blob_versioned_hashes(Tx),
-    Hashes =/= [] andalso
+    blob_hashes_present(Tx) andalso blob_hashes_well_formed(Tx).
+
+%% "there must be at least one blob" -- EIP-4844's first blob assert, and its own
+%% refusal. It was previously folded into `valid_versioned_hashes/1' and so shared
+%% one reason with the version-byte check below.
+blob_hashes_present(Tx) ->
+    blob_versioned_hashes(Tx) =/= [].
+
+%% "all versioned blob hashes must start with VERSIONED_HASH_VERSION_KZG" -- the
+%% EIP's second assert. The 32-byte length is implied rather than stated: a
+%% `blob_versioned_hashes/1' entry that is not 32 bytes normalises to something that
+%% cannot carry the version byte, so it fails here.
+blob_hashes_well_formed(Tx) ->
     lists:all(fun
-                  (<<?VERSIONED_HASH_KZG, Rest/binary>>) when byte_size(Rest) =:= 31 ->
+                  (<<?VERSIONED_HASH_KZG, _Rest/binary>>) ->
                       true;
                   (_) ->
                       false
-              end, Hashes).
+              end, blob_versioned_hashes(Tx)).
 
 hex_bytes(<<"0x", Rest/binary>>) -> hex_bytes(Rest);
 hex_bytes(<<"0X", Rest/binary>>) -> hex_bytes(Rest);
