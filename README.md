@@ -66,8 +66,8 @@ beacon, validators, or block production).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**819 tests, green**).
-* **Status** — v0.7.0; eunit green (819 tests) and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**859 tests, green**).
+* **Status** — v0.7.0; eunit green (859 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -482,7 +482,7 @@ Full integration with consensus clients.
   - State transition tests
   - Transaction tests
   - VM tests
-- [ ] **Property-based tests** — property-based testing of EVM execution
+- [x] **Property-based tests** — `eth_prop.erl`, a harness in plain Erlang and eunit with **no dependency added**, and 40 properties over `eth_word`'s 256-bit arithmetic. Green on five seeds; `ETH_PROP_SEED=<n>` re-runs with another. The seed is reported on every failure, and a property returns `{false, GotVsWant}` rather than a bare `false` — a counterexample reported without its arithmetic cannot be told from a wrong test. Every property is an identity rather than a restatement: `addmod/3` is *defined* as `(A+B) rem N`, so what is asserted is that the result is **congruent** to A+B modulo N and is a valid word for every modulus including zero. Nine properties were false as first written and in every case the code was right — the comparisons return 1/0 and not booleans, `shl/2` is `(Value, Shift)` and the reverse of the paper's notation, `shr(shl(X,S),S) = X` needs its no-bits-lost precondition, transitivity is an implication and not a biconditional — so each is kept as a comment. See `TASKS.md` Phase 8.
 - [ ] **Fuzz testing** — fuzz the EVM interpreter for edge cases
 - [ ] **Differential testing** — run same block through etherlang and geth, compare outputs
 - [ ] **Performance benchmarks** — block processing speed, state access latency

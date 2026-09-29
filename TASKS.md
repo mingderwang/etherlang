@@ -1420,7 +1420,54 @@ Recorded because the documentation claimed otherwise, and because each of these 
   - The remaining `free_port/0` callers (`eth_mock_node`, `eth_call_tests`, `eth_rpc_server_tests`, `eth_txpool_tests`, `eth_peer_tests`, `eth_statesync_tests`, `eth_receipt_tests`, `eth_engine_tests`) each make **one** bind and are not converted here. If one of them ever reports `eaddrinuse`, it is the same race
 - [ ] **Foundry tests** — `forge test` with `--rpc-url` pointing to etherlang; contract deployment, execution, opcode regression tests
 - [ ] **Geth test vectors** — run geth's test suite: block execution, state transition, transaction, VM tests. Partly superseded by the EEST state tests above, which are *generated from* that corpus; its block-level suites are not covered by them
-- [ ] **Property-based tests** — property-based testing of EVM execution
+- [x] **Property-based tests** — `eth_prop.erl`, a property harness in plain Erlang and
+  eunit with **no dependency added**, and `eth_word_properties_tests.erl`: 40 properties
+  over the EVM's 256-bit arithmetic. Green on five seeds (default, 1, 7, 4242, 99991);
+  `ETH_PROP_SEED=<n>` re-runs with another. Three properties of the harness itself, each
+  because of a way a property test fails *silently*:
+  - **The seed is reported on every failure.** A property test that finds a counterexample
+    once and cannot reproduce it is not a test, it is a rumour.
+  - **A property returns `{false, GotVsWant}`, never a bare `false`.** One of these
+    reported a counterexample that, run by hand against the module, *passed* — so either
+    the report or the arithmetic was wrong and the message could not say which. A property
+    that returns what it got and what it wanted settles it in the failure itself. That is
+    what found the defect below.
+  - **The generator is biased to boundaries** (0, 1, 2^255, 2^256-1, the powers of two,
+    every shift around 0 and 256). **It is recorded as unproven**: an injection removing it
+    caught nothing, which is expected — an algebraic identity holds for all inputs or none,
+    so uniform words test it completely. It is kept as insurance for a future property
+    whose failure region *is* narrow.
+  **Every property is an identity, not a restatement.** `addmod/3` is *defined* as
+  `(A+B) rem N`, so asserting that would survive replacing the module with a comment; what
+  is asserted is that the result is **congruent** to A+B modulo N, is a valid word, and is
+  a valid word for every modulus including zero. Nine properties were false as first
+  written and **in every case the code was right**; each is kept as a comment because each
+  is one somebody will reach for:
+  - `lt/gt/eq/iszero` return **1 or 0**, not `true`/`false` — that is the yellow paper's convention and `bool/1` is `bool(true) -> 1; bool(false) -> 0`. So `lt(A,A) =:= false` fails, and `lt(A,B) =:= not gt(B,A)` fails twice over.
+  - `eth_word:shl/2` is **`shl(Value, Shift)`** — the reverse of the paper's `SHL(shift, value)`. The interpreter is right (`shift_op/3` pops Amount then Value and calls `Fun(Value, Amount)`), so only the notation traps. A probe written against the paper produced **six** confident failures from this one.
+  - `shr(shl(X,S),S) = X` is **false in general** — a left shift destroys everything above bit `255-S'` — and `shl(shr(X,S),S) = X` is false because a right shift discards the low S bits. Each needs its precondition stated, and stating it is what makes the property informative.
+  - Transitivity is the **implication** `(A<B ∧ B<C) → A<C`, not the biconditional: `A<C` holds without the antecedent (A=0, B=2, C=1). The biconditional is false for ordinary integers.
+  - `lt(A,B) + gt(B,A) = 1` is false — `gt(B,A)` *is* `lt(A,B)`, so the sum is `2*lt(A,B)`. And `lt(A,B) + gt(A,B) = 1` is false when `A =:= B`. Only `lt + gt + eq = 1` survives.
+  - `signextend(0, X)` is the identity only when **`X < 128`**, not merely when bit 7 is clear: with `X = 2^200` the correct answer is `0`.
+  - `signed/1` and `unsigned/1` are **not** inverses; only `unsigned(signed(X)) = X` holds.
+  - `to_bytes/1` is **big**-endian.
+  - `addmod(A,B,M) = addmod(A,B,2M)` is false: congruent modulo M is not equal.
+  **A consensus-critical macro is a single token, and this is why.**
+  `-define(MASK, 16#FFFF…FF)` in `eth_word` is a hex literal on purpose. Rewritten as the
+  obvious `(1 bsl 256) - 1`, `X band ?MASK` becomes `(X band (1 bsl 256)) - 1` — `band`
+  binds tighter than `-` — which is **`-1`** for every word. Nine of `eth_word`'s functions
+  use it that way, and an injection doing exactly that rewrite fails **23 of the 40
+  properties**. `shl(1, 0)` answering 0 would read as an off-by-one in the shift.
+  This module made the identical mistake in its own `?MASK` and the signextend cross-check
+  caught it, reporting `want => -1, got => 22657, as => 22657, mask => 2^256-1` — a "want"
+  not derivable from the inputs by any arithmetic, which is what said the *harness* was wrong
+  rather than the module. The cross-check is now an independent derivation (low N bits as a
+  signed integer via `rem`/`-`, then one mask) rather than a second copy of the module's
+  `bor`/`bxor`, which is the tautology the file's own header warns about and which the
+  first version of it was.
+  **Fuzzing, differential testing and geth vectors are still open**, and the corpus
+  (`execution-spec-tests`, 6,786 of 15,660) does more for EVM correctness than any of
+  them; this covers the arithmetic the corpus reaches only indirectly.
 - [ ] **Fuzz testing** — fuzz the EVM interpreter for edge cases
 - [ ] **Differential testing** — run same block through etherlang and geth, compare outputs
 - [ ] **Performance benchmarks** — block processing speed, state access latency

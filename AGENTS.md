@@ -79,8 +79,8 @@ depends on execution order, suspect the build before you suspect the code.
 
 ## 3. Architecture
 
-50 modules in `apps/etherlang/src` (13,904 lines of code), 54 test modules in
-`apps/etherlang/test` (11,337), and 819 eunit tests. **These counts drift and this
+50 modules in `apps/etherlang/src` (13,904 lines of code), 56 test modules in
+`apps/etherlang/test` (11,748), and 859 eunit tests. **These counts drift and this
 one had drifted** -- it said 47 and 44 for several commits after it stopped being
 true, which is the same defect as a stale conformance figure: a number in the
 architecture section that a reader will use as a measure of size and that no longer
@@ -330,6 +330,20 @@ what it does now, and what the symptom was — concretely, with the values.
   blame the code.
 - **EUnit truncates assertion values.** For full diagnostics, write to a file
   from a temporary probe and read it with the shell.
+- **Property tests (`eth_prop.erl`).** Fixed seed unless `ETH_PROP_SEED` says otherwise,
+  and the seed is reported on every failure -- a counterexample you cannot reproduce is not
+  a test, it is a rumour. A property returns `{false, GotVsWant}` rather than a bare
+  `false`, so the failure carries its own arithmetic; one that reported a bare `false`
+  produced a counterexample that, run by hand, *passed*, and there was no way to tell from
+  the message whether the report or the arithmetic was wrong.
+- When writing one, assert an **identity**, not a restatement of the implementation.
+  `addmod(A,B,N)` is *defined* as `(A+B) rem N`, so asserting that would survive deleting
+  the module; what is worth asserting is that the result is **congruent** to A+B modulo N,
+  is a valid word, and is a valid word for every modulus including zero. Nine properties in
+  `eth_word_properties_tests` were false as first written and the code was right in every
+  case, so they are kept as comments. **Treat a property failure as a question about the
+  property first** -- that ordering is what found all nine, and assuming the code is wrong
+  is what produced six false "the EVM is broken" reports from one probe.
 - Fixtures must be **independent** of the code under test. A payload whose
   transactions you re-encoded with this repo's own codec makes the transactions
   root and block hash checks circular. `publicnode`'s `eth_getBlockByNumber`
@@ -589,6 +603,27 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
   a caller supplying `data` means it. `eth_tx:calldata/1` states the rule because getting
   it wrong makes a test that *adds* `data` to a map already carrying an empty `input`
   fail for a reason that is not the one under test.
+
+- **A macro whose body is an expression is not atomic, and `band` binds tighter than
+  `-`.** `eth_word`'s `?MASK` is `16#FFFF…FF` -- a single token, with no operators for
+  precedence to reorder. Written the obvious way, as `(1 bsl 256) - 1`, then
+  `X band ?MASK` parses as `(X band (1 bsl 256)) - 1`, because `band` is a tighter-binding
+  word operator than `-`. For any word below 2^256 that is **`-1`**. Nine of `eth_word`'s
+  functions use `?MASK` exactly this way (`add/2`, `sub/2`, `mul/2`, `mask/1`, `shl/2`,
+  `unsigned/1`, `exp/2`, `signextend/2`), so "simplifying" that one line to arithmetic
+  corrupts all of them at once, and `shl(1, 0)` answering 0 reads as an off-by-one in the
+  shift rather than as a macro. An injection doing precisely that rewrite fails **23 of the
+  40 `eth_word` properties**.
+  This repository then made the identical mistake in a *test* module's `?MASK`, and the
+  symptom is the part worth keeping: the failure reported `want => -1, got => 22657,
+  as => 22657, mask => 2^256-1` -- a "want" that **cannot be derived from the inputs by any
+  arithmetic**. Run by hand, the property *passed*. So the rule that actually diagnosed it
+  was not "check the numbers" but **"a result no arithmetic can produce means the
+  expression is not what you think it is."** That is the `PROBE` trap again, one level up:
+  a plausible wrong answer to a question about your own code.
+  The general form: **wrap an expression macro's whole body in parentheses, or write it as a
+  single token.** `?MASK` is not the only thing that can go wrong this way -- any macro used
+  beside a word operator is suspect.
 
 - **A comparison between two paths can be exactly zero for a reason that is not the one
   under test, and the tell is in the forks.** Fixing EIP-150's stipend took three
