@@ -103,11 +103,8 @@ initial_access(Msg, Env, Fork) ->
 %% sets; this can be done using the following logic (which doubles as a
 %% specification-in-code of validation of the RLP-decoded access list)."
 %%
-%% The **addresses** were already warm: the frame's own `address` is the transaction's
-%% recipient, and a list naming any other address adds only that address. The **storage
-%% keys** are the whole of it -- a `(address, key)` pair the list declared is warm from
-%% the first instruction, so the `SLOAD` that reads it costs 100 rather than 2,100. That
-%% is the EIP's entire purpose, and it was not happening.
+%% Both halves matter and **the address half was the one that was missing** -- see the
+%% note at the foot of this comment.
 %%
 %% **The slot is converted to an integer here, and that is load-bearing.** `SLOAD` and
 %% `SSTORE` both `pop` the slot off the stack -- where it is a word -- and hand it
@@ -122,10 +119,35 @@ initial_access(Msg, Env, Fork) ->
 %% `{Address, [Slot]}` with **raw** 20- and 32-byte binaries. A malformed list cannot
 %% reach here: `access_list_field/1` throws and `eth_tx:validate/2' calls it before any
 %% frame runs, so the clause below is a fallback rather than a validator.
+%% The comment above used to say: "The **addresses** were already warm: the frame's
+%% own `address' is the transaction's recipient, and a list naming any other address
+%% adds only that address." **That is not a justification, it is a non-sequitur with
+%% a period at the end of it** -- the frame's address being warm says nothing about
+%% any *other* address, and so nothing about the ones the list names. The code below
+%% it seeded only `{warm_store, ...}`, so every access-list address was charged its
+%% 2,400 of intrinsic gas and then re-charged 2,600 as a cold account access on
+%% first use.
+%%
+%% The EIP has no such ambiguity. Its own specification-in-code does **both**:
+%%
+%%     accessed_addresses.add(address)
+%%     gas_cost += ACCESS_LIST_ADDRESS_COST
+%%
+%% -- and its motivation names what the address half buys, which is the half that was
+%% missing: "in the actual execution, the **SLOAD and EXT\*** opcodes would only cost
+%% 100 gas". The `EXT\*** is an *account* access, so warming the storage keys alone
+%% left every one of them at 2,600.
+%%
+%% **Measured**, by a test written for EIP-7702 and not for this: an EIP-7702
+%% resolution of a *warm* delegate costs 100, so the test warmed the delegate through
+%% an access list -- and the "warm" arm came out **2,400 more** than the cold one. The
+%% 2,400 is the list's own price. The list had warmed nothing at all. See
+%% `AGENTS.md` §10a, and `TASKS.md` item 6d.
 access_list_access(Msg, Warmed) ->
     case maps:get(access_list, Msg, []) of
         L when is_list(L) ->
-            lists:foldl(fun({Addr, Slots}, Acc) ->
+            lists:foldl(fun({Addr, Slots}, Acc0) ->
+                                Acc = Acc0#{{warm_account, Addr} => true},
                                 lists:foldl(fun(Slot, A) ->
                                                     A#{{warm_store, Addr,
                                                         binary:decode_unsigned(Slot)}
