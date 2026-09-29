@@ -671,6 +671,24 @@ Where the work actually stands:
     and is not a conformance figure for this node** — the corpus-wide `state_mismatch`
     cluster of 6,434 is untouched by any of this, and the full-corpus per-fork table in
     `TASKS.md` is annotated as stale rather than restated from the delta.
+  - **`state_mismatch` was not a work list, and the reason was that the only instrument
+    for it was a gas histogram.** A divergence in a storage slot or a nonce has no gas
+    figure to recover — and those were exactly the entries the gas section could not
+    size, so they had no category either. **71 of the 122** on the 22-file set were in
+    that position. The report now counts the **shape of the diff** in the diffs' own
+    vocabulary, and it separates two clusters that had been sharing one number:
+
+    | set | entries | nonce | code | balance | storage |
+    |---|---|---|---|---|---|
+    | 22-file `expectException` | 122 | **1,005** | **1,002** | 91 | **0** |
+    | `cancun/eip4844_blobs` | 275 | 8 | **0** | 544 | **1,063** |
+
+    The validity set is **CREATE lifecycle** — code not deployed, nonces not bumped, and
+    not one storage write. The blob set is **execution and settlement** — 1,063 storage
+    writes of the *wrong value* and not one code divergence. Same outcome name, opposite
+    owners. Storage is split into "the fixture says zero" (a write the node did not make)
+    and "wrong value" because those are a missing effect and a wrong effect.
+    Adding a section moves no conformance number; it makes the largest cluster legible.
   - A **rejection is checked by reason, not merely counted.** `rejection_mismatch` used to mean "the validator
     said no" with the reason discarded, so a node that refused a pre-fork type-2 transaction for entirely the
     wrong reason scored the same as one that refused it for the reason the fixture names — a refusal proves

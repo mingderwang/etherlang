@@ -764,14 +764,41 @@ behavioural change per commit, and each step says what it now does.
      `no_comparable_gas`, `zero_price`, `not_divisible`, `no_sender_balance_diff`,
      `no_gas_story`. `eest_report` prints all three. The rule is one line: **a section
      that prints nothing must say what it did not look at.**
-   - **What that immediately exposed, and what is measurable for the first time.** On
-     the 22-file `expectException` set the `no_sender_balance_diff` bucket alone is
-     **71** entries — a `state_mismatch` whose diff carries no balance for the sender
-     at all, so no gas figure is derivable, and nothing before `v1.59` reported that
-     they existed. On `cancun/eip4844_blobs` the overflow bucket is **258** deltas
-     beyond 100,000, **largest 4,919,046**. A delta of that magnitude means a frame
-     consumed its whole allowance where the fixture's did not. Both are now
-     *findable*; neither is *explained*, and that is the work.
+   - **What that immediately exposed.** On the 22-file `expectException` set the
+     `no_sender_balance_diff` bucket alone is **71** entries — a `state_mismatch` whose
+     diff carries no balance for the sender at all, so no gas figure is derivable, and
+     nothing before `v1.59` reported that they existed. On `cancun/eip4844_blobs` the
+     overflow bucket is **258** deltas beyond 100,000, **largest 4,919,046**. Both are
+     now *findable*; neither is *explained*.
+   - ~~**And the tally is still not a work list.**~~  **Fixed in `v1.61`.** Counting
+     those 71 was necessary and not sufficient: a divergence in a *storage slot* or a
+     *nonce* has no gas figure to recover, so the gas instrument structurally cannot
+     decompose the largest cluster, and `TASKS.md` item 7 has said "the tally says
+     `state_mismatch` 249 times, which is not a work list" for a long time.
+     `v1.61` counts the **shape of the diff** — in the diffs' own vocabulary, since the
+     comparison already builds them as typed terms:
+     `balance` (settlement), `storage` (execution, split into *the fixture says zero*
+     = a write the node did not make, and *wrong value*), `nonce` and `code`
+     (transaction lifecycle, and both together is a CREATE).
+   - **What that says, on the two sets measured.** The counts are per diverging field
+     and an entry can count in several, so they exceed the entry count:
+
+     | set | entries | nonce | code | balance | storage |
+     |---|---|---|---|---|---|
+     | 22-file `expectException` | 122 | **1,005** | **1,002** | 91 | **0** |
+     | `cancun/eip4844_blobs` | 275 | 8 | **0** | 544 | **1,063** |
+
+     The two sets are **disjoint in shape**, which is the finding: the validity set is
+     *CREATE lifecycle* — code not deployed and nonces not bumped, and not one storage
+     write — and the blob set is *execution and settlement*, 1,063 storage writes of the
+     **wrong value** and not one code divergence. So "the largest cluster" was two
+     clusters wearing one number, and the cheapest lead is the 91 balance diffs on the
+     validity set, because a balance with no code and no storage alongside it is a
+     settlement defect and nothing else.
+   - **Still open, and the largest unattributed figure in the repository:** the
+     **4,919,046** overflow delta on `cancun/eip4844_blobs`, and its 257 siblings. A
+     delta of that magnitude means a frame consumed its whole allowance where the
+     fixture's did not. `v1.61` does not explain it; it makes it visible.
    - **~~`+550` gas, 6 fixtures, `byzantium/eip196_ec_add_mul`, all forks Berlin →
      Prague~~ — cause found and fixed; the fixtures still diverge and the remaining
      400 gas is unresolved.** The contract forwards 150 gas to ECADD and stores the

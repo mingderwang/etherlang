@@ -149,8 +149,8 @@ report_progress(_Acc, _Every, _T0) ->
 initial_survey(N, Every) ->
     #{files => N, files_done => 0, every => Every, total => 0,
       tally => maps:from_list([{O, 0} || O <- outcomes()]),
-      by_fork => #{}, gas => empty_gas(), rejects => #{}, sample => [],
-      sample_limit => 40}.
+      by_fork => #{}, gas => empty_gas(), shapes => #{}, rejects => #{},
+      sample => [], sample_limit => 40}.
 
 %% Fold one file's results in. Reversed so the accumulated list stays cheap.
 file_survey(File, Acc) ->
@@ -158,8 +158,8 @@ file_survey(File, Acc) ->
     maps:update_with(files_done, fun(N) -> N + 1 end, 1, Acc1).
 
 survey_one({Key, Outcome, Detail, _File} = R, Acc) ->
-    #{total := T, tally := Tl, by_fork := Bf, gas := G, rejects := Rj, sample := S,
-      sample_limit := Lim} = Acc,
+    #{total := T, tally := Tl, by_fork := Bf, gas := G, shapes := Sh,
+      rejects := Rj, sample := S, sample_limit := Lim} = Acc,
     Fork = fork_of_key(Key),
     Acc1 = Acc#{total => T + 1,
                 tally => maps:update_with(Outcome, fun(N) -> N + 1 end, 1, Tl),
@@ -191,6 +191,7 @@ survey_one({Key, Outcome, Detail, _File} = R, Acc) ->
                                            fun(L) -> [{Outcome, 1} | L] end,
                                            [], Bf),
                 gas => add_gas_delta(G, Outcome, Detail),
+                shapes => add_divergence_shape(Sh, Outcome, Detail),
                 rejects => add_reject_reason(Rj, Outcome, Detail)},
     Acc2 = case Outcome =:= match orelse length(S) >= Lim of
                true -> Acc1;
@@ -259,6 +260,49 @@ count_unseen(G, Why) ->
 
 empty_gas() ->
     #{buckets => #{}, over => 0, over_max => 0, unseen => #{}}.
+
+%% **The divergence shapes: what actually differs, in the vocabulary of the
+%% difference.**
+%%
+%% `state_mismatch' is the corpus's largest cluster and the tally's least useful
+%% number, and `TASKS.md` item 7 has said so for a long time: "the tally says
+%% `state_mismatch' 249 times, which is not a work list." The gas histogram is not
+%% enough, because a divergence in a *storage slot* or a *nonce* has no gas figure to
+%% recover at all -- and those entries were exactly the ones the gas section could not
+%% size. **71 of the 122** on the 22-file set have no sender balance diff at all, so
+%% there was no gas number to print and no classification either.
+%%
+%% So the shape is counted directly, from the diffs the comparison already builds, in
+%% the diffs' own vocabulary: `balance', `nonce', `code', and `storage'. A count of
+%% how many entries diverge in *each* of them, so the cluster decomposes into
+%% `balance' (a settlement problem), `storage' (an execution problem), `nonce' and
+%% `code' (a transaction-lifecycle problem), and `code+nonce' (a CREATE).
+%%
+%% Storage is split further, because two different defects produce the same
+%% `{store, ...}' diff: `fixture_says_zero' is a write the node did **not** make
+%% (or one it made and then reverted), and `wrong_value' is a write of the wrong
+%% number. The first is a missing effect and the second is a wrong effect, and they
+%% have nothing in common beyond both being a slot.
+%%
+%% This adds a section. It changes no outcome, and it moves no conformance number --
+%% which is the point: it makes the largest cluster legible without touching the ruler.
+add_divergence_shape(Shapes, state_mismatch, #{diffs := Diffs}) ->
+    %% `lists:foldl/3', not `maps:fold/3'. The diffs are a **list** of tuples and the
+    %% accumulator is the map, and reaching for the map version is a reflex that costs
+    %% a `badarg' whose first argument is the whole diff list -- so the error message
+    %% turns out to be a readable dump of one entry's divergence, which is an accident
+    %% and not a design.
+    lists:foldl(fun add_shape/2, Shapes, Diffs);
+add_divergence_shape(Shapes, _Outcome, _Detail) -> Shapes.
+
+add_shape({addr, _A, {Name, _Want, _Got}}, Acc) ->
+    bump(Name, Acc);
+add_shape({store, _A, _Slot, 0, _Got}, Acc) ->
+    bump(storage_fixture_says_zero, Acc);
+add_shape({store, _A, _Slot, _Want, _Got}, Acc) ->
+    bump(storage_wrong_value, Acc).
+
+bump(What, Acc) -> maps:update_with(What, fun(N) -> N + 1 end, 1, Acc).
 
 %% **The rejection histogram: `{expected code, code the node named, its own reason}`.**
 %%

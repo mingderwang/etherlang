@@ -881,6 +881,36 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
     unobservable long-running unit is indistinguishable from a dead one" and as
     `fork_unreachable`: **absence of evidence, printed as evidence of absence.**
 
+- **A tally is not a work list, and an instrument built around one quantity cannot make
+  it one.** `state_mismatch` is the corpus's largest cluster and its least useful
+  number, and this file said so for a long time: "the tally says `state_mismatch` 249
+  times, which is not a work list." The obvious instrument to reach for is a gas
+  histogram, and that is the wrong one — **a divergence in a storage slot or a nonce
+  has no gas figure to recover**, so the entries the gas section cannot size are exactly
+  the entries that most need classifying. On the 22-file set that is **71 of 122**, and
+  they were invisible in both directions: no gas number and no category.
+  - `v1.61` counts the **shape of the diff**, in the vocabulary the comparison already
+    builds them in — `{addr, A, {balance|nonce|code, W, G}}` and `{store, A, Slot, W, G}`
+    — so it adds no new parse. Storage is split because two unrelated defects produce
+    the same `{store, ...}` diff: *the fixture says zero* is a write the node did **not**
+    make, and *wrong value* is a write of the wrong number. A missing effect and a wrong
+    effect have nothing in common beyond both being a slot.
+  - It separated two clusters that had been sharing one number. The 22-file validity set
+    is **1,005 nonce and 1,002 code with zero storage** — CREATE lifecycle: code not
+    deployed, nonces not bumped, not one storage write. `cancun/eip4844_blobs` is
+    **1,063 wrong-value storage and zero code** — execution and settlement. Same
+    outcome name, opposite owners, and nothing but the shapes said so.
+  - The general form: **an instrument built around one quantity classifies only what
+    that quantity can measure.** A gas histogram around `abs(Delta) =< 100,000` cannot
+    tell a balance problem from a nonce problem, so the fix is not a wider bucket — it is
+    a second question asked of the same data. The shape is not a summary of the diff,
+    it is a projection onto a different axis, and the axis is what makes it a work list.
+  - And the arithmetic trap in writing it: `Diffs` is a **list**, and `maps:fold/3` over
+    it raises `badarg` with the entire diff list as the first argument — so the crash
+    message is a readable dump of one entry's divergence. That is an accident, and it is
+    also the second time in two commits that the cheapest way to see the data was a
+    malformed call (the other was `re:run/3` returning the first match).
+
 - **A table-driven test's rows can each be failing for the wrong reason, and only one
   of them will be.** The fee-field table above needed five hand-written signing
   preimages, and the `eip7702` row's recovered a *different address from the key that

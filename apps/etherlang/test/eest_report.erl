@@ -52,6 +52,7 @@ print(Dir, S, Ms) ->
     print_tally(Tally),
     print_by_fork(maps:get(by_fork, S)),
     print_gas(maps:get(gas, S)),
+    print_shapes(maps:get(shapes, S)),
     print_rejects(maps:get(rejects, S, #{})),
     print_sample(maps:get(sample, S)).
 
@@ -97,6 +98,46 @@ print_rejects(Rejects) ->
 %% that a row exists.
 rejection_line({Expected, Got, Reason}) ->
     lists:flatten(io_lib:format("~p  ->  ~p  (~p)", [Expected, Got, Reason])).
+
+%% **What actually differs**, in the vocabulary of the difference.
+%%
+%% `state_mismatch' is the corpus's largest cluster and the tally's least useful number,
+%% and the gas histogram cannot decompose it: a divergence in a storage slot or a nonce
+%% has no gas figure to recover, so those entries were the ones the gas section could
+%% not even size -- **71 of the 122** on the 22-file `expectException` set carry no
+%% sender balance diff at all. Counting the shape of the diff is what turns the number
+%% into a work list, and it separates the four things that can be wrong by *which*:
+%%
+%%   * `balance' -- a settlement problem: the node moved the wrong amount of wei.
+%%   * `storage' -- an execution problem: the EVM's frame produced the wrong state.
+%%   * `nonce' and `code' -- a transaction-lifecycle problem, and both together is
+%%     almost always a CREATE the node did not perform.
+%%
+%% Storage is split because two unrelated defects produce the same `{store, ...}' diff:
+%% `fixture_says_zero' is a write the node did **not** make, and `wrong_value' is a
+%% write of the wrong number. A missing effect and a wrong effect have nothing in common
+%% beyond both being a slot.
+print_shapes(Shapes) when map_size(Shapes) =:= 0 ->
+    ok;
+print_shapes(Shapes) ->
+    io:format("~n--- what differs, per diverging field (a state_mismatch entry can "
+              "count in several) ---~n"),
+    [io:format("    ~10w  ~s~n", [N, shape_of(What)])
+     || {What, N} <- lists:reverse(lists:sort(maps:to_list(Shapes)))],
+    ok.
+
+shape_of(balance) ->
+    "balance -- a settlement problem: the wrong number of wei moved";
+shape_of(nonce) ->
+    "nonce -- the transaction was applied the wrong number of times, or not at all";
+shape_of(code) ->
+    "code -- a deployment or selfdestruct the node got wrong";
+shape_of(storage_fixture_says_zero) ->
+    "storage, fixture says 0 -- a write the node did NOT make";
+shape_of(storage_wrong_value) ->
+    "storage, fixture says non-zero -- a write of the WRONG value";
+shape_of(Other) ->
+    io_lib:format("~p", [Other]).
 
 %% The schedule-sized deltas, **and what this section did not look at.**
 %%
