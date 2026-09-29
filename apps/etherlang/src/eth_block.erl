@@ -674,7 +674,8 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     %% from the same sender cannot validate, because the account nonce never
     %% moves; without the gas purchase the coinbase is never credited.
     State0 = begin_transaction(State, Sender, Target, Value,
-                                GasLimitTx, IsCreate, EffectiveGasPrice),
+                                GasLimitTx, IsCreate, EffectiveGasPrice,
+                                blob_fee(Block, Tx)),
     %% The EVM runs with what the intrinsic cost left, never the full limit.
     EvmGas = max(0, GasLimitTx - Intrinsic),
     %% The EVM reads its message and environment through atom keys (s_msg/3,
@@ -807,13 +808,92 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
 %% cap that was never needed. That is why an over-paying 1559 sender is not
 %% refunded the cap.
 begin_transaction(State, Sender, Target, Value, GasLimit, IsCreate,
-                  EffectivePrice) ->
+                  EffectivePrice, BlobFee) ->
     S1 = buy_gas(State, Sender, GasLimit, EffectivePrice),
-    S2 = eth_state:set_nonce(S1, Sender, eth_state:nonce(S1, Sender) + 1),
+    %% EIP-4844: "The actual `blob_fee' as calculated via `calc_blob_fee' is
+    %% deducted from the sender balance before transaction execution and burned,
+    %% and is not refunded in case of transaction failure." So it is bought here,
+    %% next to the gas, and **no arm of `settle_gas/9' returns it** -- not on
+    %% success, not on a revert, not on an exceptional halt.
+    S2 = buy_blob_gas(S1, Sender, BlobFee),
+    S3 = eth_state:set_nonce(S2, Sender, eth_state:nonce(S2, Sender) + 1),
     case IsCreate of
-        true -> S2;
-        false -> transfer(S2, Sender, Target, Value)
+        true -> S3;
+        false -> transfer(S3, Sender, Target, Value)
     end.
+
+%% EIP-4844's `calc_blob_fee(header, tx)':
+%%
+%%     def calc_blob_fee(header, tx) -> int:
+%%         return get_total_blob_gas(tx) * get_base_fee_per_blob_gas(header)
+%%
+%%     def get_total_blob_gas(tx) -> int:
+%%         return GAS_PER_BLOB * len(tx.blob_versioned_hashes)
+%%
+%%     def get_base_fee_per_blob_gas(header) -> int:
+%%         return fake_exponential(
+%%             MIN_BASE_FEE_PER_BLOB_GAS,
+%%             header.excess_blob_gas,
+%%             BLOB_BASE_FEE_UPDATE_FRACTION
+%%         )
+%%
+%% The header argument is **this block's own** `excess_blob_gas', not its parent's.
+%% That is what the EIP's own text says, and it is also the only reading that makes
+%% the two consumers agree: the excess carried *into* a block is
+%% `calc_excess_blob_gas(parent)' = `parent.excess + parent.blob_gas_used - TARGET',
+%% so `blob_gas_price/1' on the block's own field answers the price of this
+%% block's blobs. Passing the parent's pair instead -- `eth_fork_schedule:
+%% blob_base_fee/2' -- would price the parent's blobs a second time, off by one
+%% block.
+%%
+%% ## This was absent, and the corpus found it as the largest single divergence.
+%%
+%% `eth_fork_schedule:blob_gas_price/1' and `blob_base_fee/2' were correct and
+%% had exactly two consumers: `eth_call.erl:409' (the `BLOBBASEFEE' opcode's
+%% environment) and `eth_tx.erl:775' (the `maxFeePerBlobGas' admission floor). The
+%% *settlement* path -- this module -- had no reference to blob gas pricing at
+%% all. The node computed the right price, checked the transaction against it, and
+%% then never charged it, so every blob transaction's sender kept
+%% `total_blob_gas * price` wei that the chain has already burned.
+%%
+%% The corpus signature is unusually clean:
+%%
+%%   * `cancun/eip4844_blobs/test_sufficient_balance_blob_tx' -- 1,152 branches,
+%%     and `test_blob_gas_subtraction_tx' -- 256, i.e. **1,408 entries**, all
+%%     `state_mismatch' with one diff shape: the sender's balance too high by
+%%     exactly `total_blob_gas * price`.
+%%   * Every one of those fixtures carries 6 versioned hashes, so
+%%     `total_blob_gas` is `6 * 131072` = **786,432**, `env.currentExcessBlobGas`
+%%     is `0x0e0000` = 917,504, and `blob_gas_price(917504)` is **1** -- so the
+%%     discrepancy is 786,432, which is the whole blob fee and nothing else.
+%%
+%% That is a *consensus* defect with an economic consequence rather than a
+%% conformance figure: a node that does not charge for blobs will accept work
+%% every other client pays for, and diverges on the sender's balance in every
+%% block containing a blob transaction.
+%%
+%% It is **not** part of `gasUsed'. The receipt's `gasUsed` is normal gas only,
+%% and the base fee burn must not be levied on blob gas, so the charge is a
+%% balance movement and nothing here touches the block's `gas_used'.
+blob_fee(#block{excess_blob_gas = Excess}, Tx) ->
+    case eth_tx:tx_type(Tx) of
+        eip4844 ->
+            Blobs = length(eth_tx:blob_versioned_hashes(Tx)),
+            Blobs * eth_fork_schedule:blob_gas_per_blob()
+                * eth_fork_schedule:blob_gas_price(Excess);
+        _ ->
+            %% No blobs, no charge. A transaction of any other type has no
+            %% `blob_versioned_hashes' field to read, and the EIP prices only blobs.
+            0
+    end.
+
+%% The blob fee is a straight debit with no arm on any path that could undo it.
+%% It is spelled as its own function rather than folded into `buy_gas/5' so that
+%% the one-way-ness is visible: there is no `settle_blob_gas' anywhere in this
+%% module, and a grep for it is the check that a refund has not been added.
+buy_blob_gas(State, _Sender, 0) -> State;
+buy_blob_gas(State, Sender, BlobFee) ->
+    eth_state:set_balance(State, Sender, eth_state:balance(State, Sender) - BlobFee).
 
 %% Install the code a creation returned. Only a successful frame deploys: a
 %% reverted or failed init code leaves nothing behind at the new address, which

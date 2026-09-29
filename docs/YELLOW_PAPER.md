@@ -586,6 +586,7 @@ Do not "fix" these by guessing. Each is in `TASKS.md`.
 | Item | Why |
 |---|---|
 | `eth_kzg:blob_to_kzg_commitment/1` | Needs the `g1_lin` derivation; no local blob fixture, and the EIP-4844 vector fetch 404'd. |
+| A block's `blobGasUsed` is not accumulated from its own transactions | The **charge** is implemented (`v1.55`): `eth_block:blob_fee/2` buys `total_blob_gas * blob_base_fee` from the sender before the frame, and nothing refunds it, as EIP-4844 requires. The **header commitment** is a separate thing and is absent — nothing adds up the blob gas a block's transactions consumed, so a block's `blobGasUsed` is not checked against its own body. `eth_block_builder` does compute its own `excess_blob_gas` from `payloadAttributes`, so the field a locally built block carries is right; it is the transactions' contribution that is missing. Recorded rather than folded into the charge, because a commitment that is not checked is a different defect from a charge that is not made. |
 | EIP-7685 `requestsHash` | Hashing rule sourced, but the EIP does not fix the header field position, and without EIP-7251 there are no requests. |
 | `TERMINAL_BLOCK_HASH` (EIP-3675) | Chain-config data, not in the EIP. Carried and echoed, never checked against a post-Merge block's difficulty. |
 | Per-fork gas *pricing* | A refactor of the charging path, not a substitution. See §7.2. |

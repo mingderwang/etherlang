@@ -79,8 +79,8 @@ depends on execution order, suspect the build before you suspect the code.
 
 ## 3. Architecture
 
-50 modules in `apps/etherlang/src` (13,942 lines of code), 57 test modules in
-`apps/etherlang/test` (11,937), and 876 eunit tests. **These counts drift and this
+50 modules in `apps/etherlang/src` (13,956 lines of code), 57 test modules in
+`apps/etherlang/test` (12,141), and 881 eunit tests. **These counts drift and this
 one had drifted** -- it said 47 and 44 for several commits after it stopped being
 true, which is the same defect as a stale conformance figure: a number in the
 architecture section that a reader will use as a measure of size and that no longer
@@ -507,6 +507,7 @@ is worse than none. It is now two tables.
 | EIP-150's 63/64 rule and the 2300 stipend | EIP-150 | Both fork-gated (Tangerine Whistle and later; zero before), and the stipend's *position* is now the specification's rather than a reading. See the row above. |
 | Pre-Berlin `SSTORE` at every other fork | EIP-2200 | The flat rule with EIP-2200's inherited figures; `SLOAD_GAS` fork-selected 50/200/800 by EIP-150 and EIP-1884. |
 | A precompile's return data | EIP-211 | `v1.41`. Seven sites, one of which a `grep finish_call(` cannot find. |
+| EIP-4844's blob fee was never charged | EIP-4844 | **Fixed (`v1.55`)**, +5 tests, **1,408 corpus entries**, +4 on the committed subset. `eth_fork_schedule:blob_gas_price/1` and `blob_base_fee/2` were correct and had exactly two consumers — the `BLOBBASEFEE` opcode's environment and the `maxFeePerBlobGas` admission floor. The *settlement* path had no reference to blob gas pricing at all: the node computed the price, checked the transaction against it, and then never charged it, so every blob transaction's sender kept `total_blob_gas * price` wei the chain has burned. This is a consensus defect with an economic consequence, not a conformance figure. `eth_block:blob_fee/2` now buys it in `begin_transaction/8`, next to the gas, and **no arm of `settle_gas/9` returns it** — the EIP says the burn happens "before transaction execution" and is "not refunded in case of transaction failure", and the corpus's storage diffs are what prove the ordering: a contract doing `ORIGIN BALANCE SSTORE` stores the in-frame balance, so a node that charged the fee after the frame gets the number wrong twice. |
 
 ### The originals, kept because the reasoning is the point
 
@@ -663,8 +664,8 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
 
 - **The committed conformance subset is the smallest file in each suite, so it is the
   easiest 2% of the corpus, and quoting it as "the conformance figure" overstates the
-  node by roughly 40 points.** Measured: 220 of 266 entries on the committed subset
-  (82.7%), **6,786 of 15,660 on the 229 non-`static` files** (43.3%), one fork per fresh
+  node by roughly 40 points.** Measured: 224 of 266 entries on the committed subset
+  (84.2%), **6,786 of 15,660 on the 229 non-`static` files** (43.3%), one fork per fresh
   VM. Both are true; they are different measurements. The subset is a **regression
   gate** -- it is small, pinned, and has a clean per-entry attribution -- and it is good
   at that. It is not a quality claim, and §5's "the committed subset is what CI runs"
@@ -719,6 +720,57 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
   the first. The control for the negative case is then a **filesystem** observation --
   `jwt.hex` does not exist afterwards -- because that is what distinguishes "refused"
   from "refused after starting".
+
+- **A function that draws its own key will happily sign with a key the test did not
+  fund the account for, and the symptom is a balance that never moves.** `eth_4844_tests:
+  sign/1` drew a fresh `eth_secp256k1:generate_key/0` on every call. Five settlement
+  tests funded `addr_of(Priv)` and then signed with `sign/1`, so the transaction's
+  recovered sender was a *different* account from the one under test. Nothing crashed
+  and nothing looked wrong: the receipt was right, the gas was right, the block was
+  built -- and the balance asserted on came back **exactly as it started**, because it
+  was an account nobody transacted from. A delta of zero reads as "the node charged
+  nothing", which is exactly the bug under test, so the test was arguing with itself.
+  `sign/2` exists so a test that owns a key can sign with it. The general form: **a
+  fixture's identity has to come from the test, not from the helper**, and a helper
+  that generates one is a helper that can disagree with the fixture without saying so.
+  Compare §10a's `base_source` rule -- a resource shared by two things needs to be
+  scoped by something that differs between them.
+
+- **A 20-nibble hex literal in a 1-byte segment is 1 byte, silently.** Three of the
+  five tests wrote `<<16#1000000000000000000000000000000000000001>>` for a destination
+  address. A hex constant too wide for the segment's default 8-bit width is truncated,
+  so all three produced `<<1>>`. The node accepted that as a destination and
+  `eth_state:address/1'` then pushed a 1-byte binary onto its *second* clause -- the one
+  for `0x...` strings -- and ran `hex_to_bin/1` over it, which raised
+  `function_clause` from `hv/1`, four frames away, naming neither the literal nor the
+  field. The same literal at `<<16#c0de:160>>` is fine. It is §10a's byte-width trap
+  again, in a form that compiles and runs: nothing is malformed, the number is just
+  wrong, and the failure is somewhere the reader is not looking. The tell is the
+  *distance* between the literal and the error.
+
+- **Two state diffs of the same size are one defect, and the second one is the first
+  one read back.** The 1,408 `state_mismatch` entries in
+  `cancun/eip4844_blobs/test_sufficient_balance_blob_tx` and
+  `test_blob_gas_subtraction_tx` diverged on the sender's balance *and* on two storage
+  slots, all three by exactly 786,432, and it read as a gas problem and a state problem.
+  The fixture's code is `0x3231600055...` -- `ORIGIN BALANCE PUSH1 0 SSTORE` -- so slot 0
+  *is* the sender's balance as the frame saw it. The node never deducted EIP-4844's
+  blob fee, and a contract that stores `BALANCE` stored the pre-deduction number. The
+  general form: **when several diffs share a magnitude, they share a cause**, and
+  decoding the fixture's bytecode is cheaper than modelling the EVM. The 786,432 also
+  decomposes exactly: six versioned hashes at `GAS_PER_BLOB` = 131,072.
+
+- **A report's histogram with a range cannot report the biggest cluster in the corpus.**
+  `add_gas_delta/4` buckets `abs(Delta) =< 100000`, and every entry in the blob-fee
+  cluster reported `no_comparable_gas` -- these fixtures set
+  `maxPriorityFeePerGas = 0` against `currentBaseFee = 7`, so the effective price is the
+  base fee, the sender's net is `gasUsed * (price - baseFee) = 0`, and the
+  balance-inversion method that recovers a gas figure from a balance difference has
+  nothing to divide. The section printed `(none in range)` for 1,408 entries: not "no
+  gas defects", but "no gas defects *this instrument can see*". A bounded histogram
+  that prints nothing is indistinguishable from a bounded histogram over an empty set,
+  and §5's claim that an unobservable long-running unit is a dead one is the same
+  shape. The diffs were always printed; it was the summary that was quiet.
 
 ## 11. Known dead code
 

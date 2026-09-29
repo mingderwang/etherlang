@@ -31,13 +31,13 @@
 
 **229 of the 235 non-`static` files, 15,660 entries: 6,786 match — 43.3%.** This is the
 number the documentation had been carrying as "never measured", and it is **less than
-half** the 82.7% the committed 25-file subset reports. Both numbers are true and the gap
+half** the 84.2% the committed 25-file subset reports. Both numbers are true and the gap
 between them is the most useful thing in this section.
 
 **Why the subset flatters.** The committed subset was chosen by a rule -- *the smallest
 file in each suite* -- to keep it under 150 KB per fixture. The smallest file in a suite
 is the one with the fewest entries and the least state, so the subset is systematically
-the easiest material. 25 files, 266 entries, 82.7%. 229 files, 15,660 entries, 43.3%.
+the easiest material. 25 files, 266 entries, 84.2%. 229 files, 15,660 entries, 43.3%.
 **The subset measures that the fixes work; the corpus measures what is still broken.**
 
 Per fork, biggest first:
@@ -59,6 +59,16 @@ Per fork, biggest first:
 
 `istanbul` (6 files, 4 MB, all `test_blake2b*` gas-limit sweeps) was still running at
 45 minutes of CPU when this was written and is **excluded**; it is 1.3% of the files.
+
+> **This table predates `v1.55` and no full-corpus run has been repeated since.** The
+> EIP-4844 blob-fee fix (item 6a) fixed **1,408 entries**, all at Cancun and Prague, so
+> the `cancun` and `prague` rows here are known to be understated and the total of
+> 6,786 is known to be too low. The figure is **not** restated from the delta, because
+> the delta was measured on the 22-file `expectException` set (+56 matches there), not
+> on the corpus, and quoting 6,842 would be arithmetic dressed as a measurement. The
+> full run is a developer step; until it is repeated, treat every figure in this table
+> as "at the time it was taken" and check the date. The committed subset **has** been
+> re-measured and is 224 of 266.
 
 ### The outcome breakdown is the more useful number than the percentage
 
@@ -253,7 +263,7 @@ from a fresh VM, one fork per process.
 
 ## The queue, re-derived
 
-**Re-measured after `v1.47`, from the committed corpus: 220 of 266 match, 3 are
+**Re-measured after `v1.55`, from the committed corpus: 224 of 266 match, 3 are
 `fork_unreachable`, and 43 are `state_mismatch`. `crash`, `unpriced`,
 `sender_mismatch` and `expected_rejection_not_raised` are all 0.**
 
@@ -450,7 +460,7 @@ behavioural change per commit, and each step says what it now does.
 5. ~~**EEST conformance work.**~~  **Done as far as it can be, and the answer is
    bad.** `apps/etherlang/test/eest_state_tests.erl` runs the `execution-spec-tests`
    `state_tests` corpus against this node's state transition and classifies every
-   entry. **220 of 266 committed entries match — 82.7% — and the figure is
+   entry. **224 of 266 committed entries match — 84.2% — and the figure is
    reproducible**, identical per entry from a fresh VM and from inside the suite.
    (This paragraph said 78 of 266 for several commits after it had stopped being
    true; the live figure is at "Re-measured after `v1.47`" above, and a second copy
@@ -525,11 +535,63 @@ behavioural change per commit, and each step says what it now does.
 6. ~~**An isolated state base for the conformance runner.**~~  **Done**, as
    `eth_state:with_base_source/2` and its new `empty` source. See item 5. The tally
    is now assertable and is asserted, exactly and as a bound.
+6a. **~~EIP-4844's blob fee was never charged.~~  Closed in `v1.55`** — the single
+   largest measured divergence in the corpus, and a consensus defect rather than a
+   conformance figure. `eth_fork_schedule:blob_gas_price/1` and `blob_base_fee/2`
+   were correct and had exactly **two** consumers: `eth_call.erl:409` (the
+   `BLOBBASEFEE` opcode's environment) and `eth_tx.erl:775` (the
+   `maxFeePerBlobGas` admission floor). A grep for blob pricing across
+   `apps/etherlang/src` found **no reference in `eth_block.erl` at all** — the
+   settlement path computed nothing. The node priced the transaction, admitted it,
+   and then never took the money.
+   - **1,408 entries**, in two files: `cancun/eip4844_blobs/test_sufficient_balance_blob_tx`
+     (1,152) and `test_blob_gas_subtraction_tx` (256). All 1,408 were
+     `state_mismatch` with **one** diff shape.
+   - The signature is **786,432** on every diff, and it decomposes exactly:
+     `6 * 131,072` = `6 * GAS_PER_BLOB`, the six versioned hashes those fixtures
+     carry. The sender was **too high** by exactly the fee, which is what "not
+     charged" looks like.
+   - The price is **1**, both by this node's own `blob_gas_price(917504)` and by an
+     independent transcription of EIP-4844's `fake_exponential`. So the defect is
+     not the curve — it is that nothing consumes it.
+   - The corpus also reported the same 786,432 on **two storage slots** of the
+     target contract, and that is what made it look like two defects. The
+     fixture's code is `0x3231600055…` = `ORIGIN BALANCE PUSH1 0 SSTORE`, so
+     slot 0 *is* the sender's balance as the frame saw it. One missing debit, read
+     back twice. Decoding the fixture's bytecode was cheaper than modelling the EVM.
+   - **Why it was invisible to the report.** These fixtures set
+     `maxPriorityFeePerGas = 0` against `currentBaseFee = 7`, so the effective price
+     is the base fee and the sender's net gas cost is zero. The gas-delta histogram
+     buckets `abs(Delta) =< 100000` and every one of the 1,408 reported
+     `no_comparable_gas`, so the section printed `(none in range)`. The instrument
+     could not see the largest cluster in the corpus. The diffs were always printed;
+     the *summary* was quiet. **The report's gas histogram needs an overflow bucket
+     before it can be called a summary** — still open, and now known to be
+     load-bearing rather than cosmetic.
+   - Fixed by `eth_block:blob_fee/2`, which buys the fee in `begin_transaction/8`
+     next to the gas, and by no arm of `settle_gas/9` returning it. The EIP: the fee
+     "is deducted from the sender balance **before transaction execution** and
+     burned, and is not refunded in case of transaction failure." Both halves are
+     pinned separately, and the ordering is pinned by a test that asserts the
+     **in-frame** balance — after the whole allowance, before the refund — which is
+     the only way a node charging the right amount at the wrong moment fails. Five
+     injections, all shown to bite: charging nothing, crediting it back, reading the
+     price off the wrong excess, charging per blob rather than per blob gas, and
+     charging it *after* the frame. The last fails exactly one test.
+   - **Still open, and unchanged by this:** the block header's `blobGasUsed` is not
+     accumulated by this node, so a block's `blobGasUsed` commitment is not checked
+     against its own transactions. A separate gap from the charge; recorded rather
+     than folded in. `eth_block_builder` does compute its own `excess_blob_gas` from
+     `payloadAttributes`, so the field a locally built block carries is right; it is
+     the *transactions'* contribution that is missing.
 7. **The divergence fingerprints**  *(next, and these are concrete)*. The tally says
    `state_mismatch` 249 times, which is not a work list. `eest_report`'s gas-delta
    histogram is: a delta of a few thousand gas repeats because it is one missing
    schedule term, and a delta in the millions means a frame consumed its whole
    allowance where the fixture's did not. Of 229 comparable deltas:
+   - **The histogram's own blind spot, now measured.** See item 6a: 1,408 entries
+     reported `no_comparable_gas` and the delta section printed nothing at all. Read
+     a `(none in range)` line as "nothing in range", never as "nothing wrong".
    - **~~`+550` gas, 6 fixtures, `byzantium/eip196_ec_add_mul`, all forks Berlin →
      Prague~~ — cause found and fixed; the fixtures still diverge and the remaining
      400 gas is unresolved.** The contract forwards 150 gas to ECADD and stores the
@@ -1108,7 +1170,7 @@ they are not forgotten rather than worked on prematurely.
   - Lighthouse requires both methods, so "Lighthouse-compatible" is not currently true of the engine surface
 - [ ] **`engine_notifyHeaders`** — absent (see the Beacon requests item under Phase 3). The clause does not appear in any per-fork file of the `execution-apis` repository (`paris`, `shanghai`, `cancun`, `prague`, `osaka`, `amsterdam`, `bogota`, `common`); only the V2 `getPayloadBodiesBy*` methods appear under those names. Its shape would have to be guessed, so it is left undone rather than invented
 - [x] **Block authoring** — `payloadAttributes` are read, `forkchoiceUpdated` returns a `payloadId`, and `getPayload` returns a real block. This item said "no `payloadAttributes` handling, so `forkchoiceUpdated` can never return a `payloadId` and the node cannot build a block for the CL", which was true when written and stopped being true when `eth_block_builder` was added to the supervisor's child list; the box outlived the sentence. The builder was rewritten rather than switched on, because the dead version assembled a block with its own header constants, three of which were wrong in ways already found and fixed in `eth_block`, and discarded every `payloadAttributes` field.
-  **The block it builds is still not the block the network would build.** Its state root does not match the network's, for the reasons in item 7 — the same gas-schedule divergences that hold the conformance tally at 220 of 266 rather than all of it. So the item is closed as *wiring* and the divergence is tracked where it can be seen, not here.
+  **The block it builds is still not the block the network would build.** Its state root does not match the network's, for the reasons in item 7 — the same gas-schedule divergences that hold the conformance tally at 224 of 266 rather than all of it. So the item is closed as *wiring* and the divergence is tracked where it can be seen, not here.
 
 ### What the engine could not do before this pass
 
@@ -1516,7 +1578,7 @@ Recorded because the documentation claimed otherwise, and because each of these 
 - [ ] **Performance benchmarks** — block processing speed, state access latency
 - [x] **Conformance tests** — `eest_state_tests.erl` runs the `execution-spec-tests`
   `state_tests` corpus. **Started, and the first measurement is about 2%**
-  (78 of 266 committed entries at the first measurement, 220 of 266 now; see "What
+  (78 of 266 committed entries at the first measurement, 224 of 266 now; see "What
   to do next" item 5 for the number, the real defects it found, and the two harness
   bugs that made the figure irreproducible until they were fixed). The
   Ethereum Foundation's own `ethereum/tests` block-level suites and EEST's

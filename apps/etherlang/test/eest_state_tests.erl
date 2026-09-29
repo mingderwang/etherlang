@@ -744,6 +744,17 @@ block(Fork, Entry, BaseFee) ->
         total_difficulty = TD,
         gas_limit = int(maps:get(<<"currentGasLimit">>, Env, <<"0x0">>)),
         gas_used = 0,
+        %% EIP-4844's blob base fee is a function of the **block's own**
+        %% `excess_blob_gas', and `eth_block:blob_fee/2' reads it from here. This
+        %% header field was not set at all, so every block the runner built carried
+        %% `eth_block:new/2''s default of 0 -- which happens to price blobs at the
+        %% 1 wei minimum, and which was therefore *right* for any fixture whose
+        %% excess is low enough not to move the curve. `test_sufficient_balance_blob_tx'
+        %% states `currentExcessBlobGas = 0x0e0000' = 917,504, and the curve there is
+        %% also 1, so the omission did not change that file's answer either -- but the
+        %% field is what the EIP names and the harness is what supplies header fields
+        %% to execution, so it is read from `env' like every other one.
+        excess_blob_gas = int(maps:get(<<"currentExcessBlobGas">>, Env, <<"0x0">>)),
         base_fee_per_gas = merge_base_fee(base_fee_for(schedule_fork_at(Number, Timestamp, TD)),
                                                     BaseFee),
         mix_hash = <<0:256>>,

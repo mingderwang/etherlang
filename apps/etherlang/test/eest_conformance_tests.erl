@@ -202,8 +202,14 @@
 %% the frame finishing `result=ok charged0=26006`, and 26,006 is the chain's own figure
 %% for that transaction, so both the gas and the write were right and only the
 %% comparison was wrong. See `overlay_key/1'.
--define(EXPECTED, #{match => 220,
-                    state_mismatch => 43,
+%% 220 -> 224 and 43 -> 39 in the EIP-4844 blob-fee fix. The four are
+%% `cancun/eip4844_blobs/test_sufficient_balance_blob_tx' and
+%% `test_blob_gas_subtraction_tx', whose sender balances were each 786,432 wei
+%% too high because `eth_block' never deducted the blob fee. Pinned rather than
+%% re-derived, like every other figure here: a *regression* to 220 would mean the
+%% charge had been removed, and the count is the only thing that would notice.
+-define(EXPECTED, #{match => 224,
+                    state_mismatch => 39,
                     unpriced => 0,
                     tx_decode_failed => 0,
                     tx_roundtrip_mismatch => 0,

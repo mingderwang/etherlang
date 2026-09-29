@@ -7,9 +7,24 @@
 -module(eth_4844_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("etherlang/include/eth_block.hrl").
 
 -define(CHAIN_ID, 11155111).
 -define(GWEI, 1000000000).
+
+%% A block number past Cancun on every network this repository knows, so
+%% `eth_block:fork_of/1' answers `cancun' and the fork-gated rules -- EIP-3860's
+%% init-code term, EIP-2929's warm set, the BLOBHASH opcode -- are in force. A
+%% number of 1 would answer `frontier' and a blob transaction would be executed
+%% under a schedule that has no blobs in it, which is a different test.
+-define(CANCUN_BLOCK, 3000000).
+%% **Explicitly 160 bits.** Written as `<<16#c0de...01>>` the literal is *one byte*:
+%% a hex constant too wide for the default 8-bit segment is truncated silently, and
+%% a 1-byte `miner' then reaches `eth_state:address/1'` on its second clause, which
+%% runs it through `hex_to_bin/1' as though it were a `0x...' string and raises
+%% `function_clause' from `hv/1' deep inside `eth_state'. The address is not the
+%% thing under test in any of these, so it is built with a width.
+-define(MINER, <<16#c0de:160>>).
 
 %% ---------------------------------------------------------------------------
 %% Wire format
@@ -201,8 +216,370 @@ blob_tx_without_blob_fee_rejected_test() ->
                  eth_block_builder:validate_transaction(Tx, #{chain_id => ?CHAIN_ID})).
 
 %% ---------------------------------------------------------------------------
+%% Settlement: the blob fee is actually charged
+%% ---------------------------------------------------------------------------
+
+%% **A blob transaction's sender is debited the blob fee.**
+%%
+%% EIP-4844: "The actual `blob_fee' as calculated via `calc_blob_fee' is deducted
+%% from the sender balance before transaction execution and burned, and is not
+%% refunded in case of transaction failure."
+%%
+%% `eth_block' had **no reference to blob gas pricing at all**. `blob_gas_price/1'
+%% and `blob_base_fee/2' were correct and had exactly two consumers -- the
+%% `BLOBBASEFEE' opcode's environment and the `maxFeePerBlobGas' admission floor.
+%% So the node computed the right price, checked the transaction against it, and
+%% then never charged it: every blob transaction's sender kept
+%% `total_blob_gas * price` wei the chain has already burned.
+%%
+%% This asserts the sender's whole net movement, not just that *something* was
+%% taken, because "the balance went down" is satisfied by the value transfer and
+%% by the gas purchase. The expected figure is written out from the EIP's own two
+%% functions rather than read from `eth_fork_schedule`, so a change to the price
+%% curve cannot make this pass.
+%%
+%% `want = value + gasUsed * effective_price + 2 * 131072 * 1`, and the control is
+%% the same transaction with no blobs, whose `want` is the same minus the blob
+%% term. A test with no control here would pass if `blob_fee/2' returned 0 and
+%% something else happened to move the balance.
+sender_is_debited_the_blob_fee_test() ->
+    with_ctx(fun() ->
+        Priv = eth_secp256k1:generate_key(),
+        Sender = addr_of(Priv),
+        Start = 1000000 * ?GWEI,
+        ok = eth_mpt:put_account(Sender, Start, 0, eth_keccak:hash(<<>>)),
+        To = test_address(1),
+        Value = 7,
+        Gas = 100000,
+        %% `maxPriorityFeePerGas = 3` against a 1 gwei base fee, so the effective
+        %% price is 1 gwei + 3 and both the gas and the value are non-zero and
+        %% distinguishable in the arithmetic.
+        Block0 = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))
+                    #block{excess_blob_gas = 0, base_fee_per_gas = ?GWEI,
+                           miner = ?MINER},
+        Hashes = [bin0x(versioned_hash(1)), bin0x(versioned_hash(2))],
+        Fields = #{<<"blobVersionedHashes">> => Hashes,
+                   <<"maxFeePerBlobGas">> => eth_hex:encode_int(?GWEI),
+                   <<"value">> => eth_hex:encode_int(Value),
+                   <<"gas">> => eth_hex:encode_int(Gas),
+                   <<"to">> => to_hex(To),
+                   <<"input">> => <<"0x">>},
+        {Block, State1} = eth_block:run_transaction(
+                             Block0, sign(base_tx(Fields), Priv),
+                             eth_state:new(0, #{}), ?GWEI, 1000000),
+        [Receipt] = eth_block:receipts(Block),
+        GasUsed = maps:get(<<"gasUsed">>, Receipt),
+
+        %% The EIP's own arithmetic, written out: no node function in it.
+        BlobFee = 2 * 131072 * 1,
+        Want = Start - Value - (GasUsed * (?GWEI + 3)) - BlobFee,
+        ?assertEqual(Want, eth_state:balance(State1, Sender)),
+
+        %% **The control.** The same transaction without blobs is charged the same
+        %% everything except the blob term. Without this second half the assertion
+        %% above would still pass if the node charged the blob fee *and* the right
+        %% gas, or if it charged a wrong blob fee that happened to cancel.
+        {BlockL, StateL} = eth_block:run_transaction(
+                             Block0, sign(base_tx(legacy_of_fields(Fields)), Priv),
+                             eth_state:new(0, #{}), ?GWEI, 1000000),
+        [ReceiptL] = eth_block:receipts(BlockL),
+        WantL = Start - Value - (maps:get(<<"gasUsed">>, ReceiptL) * (?GWEI + 3)),
+        ?assertEqual(WantL, eth_state:balance(StateL, Sender)),
+        %% The blob run is the one that pays, so its balance is the **lower** of
+        %% the two. Written the other way round the difference is -262,144, which
+        %% is the right magnitude and the wrong sign, and `?assertEqual' says so.
+        ?assertEqual(BlobFee, eth_state:balance(StateL, Sender)
+                                - eth_state:balance(State1, Sender))
+    end).
+
+%% The blob fee scales with the *price*, not only with the blob count. One blob at
+%% the 1 wei minimum is 131,072 wei, which is small enough that a missing term can
+%% hide inside a gas figure; six blobs at a price the curve has actually moved off
+%% its floor is 786,432 wei at price 1 and 90,254,976 at price 115, and no gas
+%% schedule in this repository produces a difference of that shape by accident.
+%%
+%% The price is *derived* from the specification's recurrence, by the same
+%% independent transcription `blob_gas_price_matches_spec_test/0` uses, and only
+%% then asked of the node -- so a node that returned 1 for every excess would fail
+%% here rather than be taken at its word.
+blob_fee_scales_with_the_price_test() ->
+    with_ctx(fun() ->
+        Priv = eth_secp256k1:generate_key(),
+        Sender = addr_of(Priv),
+        Start = 1000000 * ?GWEI,
+        ok = eth_mpt:put_account(Sender, Start, 0, eth_keccak:hash(<<>>)),
+        Excess = 50000000,
+        Price = spec_blob_price(Excess),
+        ?assert(Price > 1),
+        Hashes = [bin0x(versioned_hash(I)) || I <- lists:seq(1, 6)],
+        Block0 = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))
+                    #block{excess_blob_gas = Excess, base_fee_per_gas = ?GWEI,
+                           miner = ?MINER},
+        Tx = sign(base_tx(#{<<"blobVersionedHashes">> => Hashes,
+                            <<"maxFeePerBlobGas">> => eth_hex:encode_int(?GWEI),
+                            <<"value">> => eth_hex:encode_int(0),
+                            <<"gas">> => eth_hex:encode_int(100000),
+                            <<"input">> => <<"0x">>}), Priv),
+        {Block, State1} = eth_block:run_transaction(
+                             Block0, Tx, eth_state:new(0, #{}), ?GWEI, 1000000),
+        [Receipt] = eth_block:receipts(Block),
+        %% `base_tx/1' offers a 3 wei priority fee, so the effective price is
+        %% `min(maxFee, baseFee + 3)' = 1 gwei + 3 and not the base fee. Writing
+        %% `* ?GWEI` here is a 63,000 wei error on 21,000 gas -- small enough to
+        %% look like a rounding difference and large enough to fail.
+        Want = Start - (maps:get(<<"gasUsed">>, Receipt) * (?GWEI + 3))
+                   - 6 * 131072 * Price,
+        ?assertEqual(Want, eth_state:balance(State1, Sender))
+    end).
+
+%% The price comes from the **block's own** `excess_blob_gas', which is what EIP-4844's
+%% `get_base_fee_per_blob_gas(header)' says. Pricing the parent's excess instead
+%% would be a one-block error that is invisible whenever the parent used no more
+%% than the target -- the overwhelming majority of blocks -- and wrong exactly when
+%% the blob market is busy.
+%%
+%% Two blocks, same transaction, one field apart. The first block's excess prices
+%% at the minimum; the second's is far enough up the curve to be visible.
+blob_fee_uses_this_blocks_own_excess_test() ->
+    with_ctx(fun() ->
+        Priv = eth_secp256k1:generate_key(),
+        Sender = addr_of(Priv),
+        Start = 1000000 * ?GWEI,
+        Hashes = [bin0x(versioned_hash(1))],
+        Excess = 50000000,
+        Price = spec_blob_price(Excess),
+        Block0 = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))
+                    #block{excess_blob_gas = Excess, base_fee_per_gas = ?GWEI,
+                           miner = ?MINER},
+        Tx = sign(base_tx(#{<<"blobVersionedHashes">> => Hashes,
+                            <<"maxFeePerBlobGas">> => eth_hex:encode_int(?GWEI),
+                            <<"value">> => eth_hex:encode_int(0),
+                            <<"gas">> => eth_hex:encode_int(100000),
+                            <<"input">> => <<"0x">>}), Priv),
+        ok = eth_mpt:put_account(Sender, Start, 0, eth_keccak:hash(<<>>)),
+        {BlockP, StatePriced} = eth_block:run_transaction(
+                                  Block0, Tx, eth_state:new(0, #{}), ?GWEI, 1000000),
+        [ReceiptP] = eth_block:receipts(BlockP),
+        Priced = Start - eth_state:balance(StatePriced, Sender),
+        ok = eth_mpt:put_account(Sender, Start, 0, eth_keccak:hash(<<>>)),
+        {BlockF, StateFloor} = eth_block:run_transaction(
+                                 Block0#block{excess_blob_gas = 0}, Tx,
+                                 eth_state:new(0, #{}), ?GWEI, 1000000),
+        [ReceiptF] = eth_block:receipts(BlockF),
+        Floor = Start - eth_state:balance(StateFloor, Sender),
+        %% The gas figure is the receipt's, not the 100,000 in the transaction's
+        %% `gas' field. Those differ by 79,000 on a call that runs no code, and
+        %% 79,000 at 1 gwei is 7.9e13 -- an error that reads as a blob-fee
+        %% problem and is not one.
+        GasUsed = maps:get(<<"gasUsed">>, ReceiptP),
+        ?assertEqual(maps:get(<<"gasUsed">>, ReceiptF), GasUsed),
+        ?assertEqual(Floor - 131072, Priced - 131072 * Price),
+        %% The floor really is the floor, and the high-excess figure really is
+        %% higher. Asserted as absolutes so the control above cannot pass on a pair
+        %% of equal-and-wrong numbers.
+        ?assertEqual(131072, Floor - GasUsed * (?GWEI + 3)),
+        ?assert(Priced - GasUsed * (?GWEI + 3) > 131072)
+    end).
+
+%% **The blob fee is burned, not refunded on failure.** The EIP is explicit: "is not
+%% refunded in case of transaction failure", and a blob transaction whose code
+%% reverts is a transaction failure.
+%%
+%% The code is `PUSH1 0; PUSH1 0; REVERT`, which reverts at once, so the whole gas
+%% allowance comes back. If the blob fee were refunded with the gas the sender's
+%% balance would be identical to the no-blob control; it must be lower by exactly
+%% the blob fee.
+blob_fee_is_not_refunded_when_the_transaction_fails_test() ->
+    with_ctx(fun() ->
+        Priv = eth_secp256k1:generate_key(),
+        Sender = addr_of(Priv),
+        Start = 1000000 * ?GWEI,
+        Code = <<16#60, 0, 16#60, 0, 16#FD>>,          % PUSH1 0; PUSH1 0; REVERT
+        To = test_address(2),
+        ok = eth_mpt:put_code(eth_keccak:hash(Code), Code),
+        ok = eth_mpt:put_account(To, 0, 0, eth_keccak:hash(Code)),
+        Block0 = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))
+                    #block{excess_blob_gas = 0, base_fee_per_gas = ?GWEI,
+                           miner = ?MINER},
+        Hashes = [bin0x(versioned_hash(1))],
+        Fields = #{<<"blobVersionedHashes">> => Hashes,
+                   <<"maxFeePerBlobGas">> => eth_hex:encode_int(?GWEI),
+                   <<"value">> => eth_hex:encode_int(0),
+                   <<"gas">> => eth_hex:encode_int(100000),
+                   <<"to">> => to_hex(To),
+                   <<"input">> => <<"0x">>},
+        ok = eth_mpt:put_account(Sender, Start, 0, eth_keccak:hash(<<>>)),
+        {Block, StateBlob} = eth_block:run_transaction(
+                               Block0, sign(base_tx(Fields), Priv),
+                               eth_state:new(0, #{}), ?GWEI, 1000000),
+        [Receipt] = eth_block:receipts(Block),
+        ?assertEqual(0, maps:get(<<"status">>, Receipt)),
+        BlobSpent = Start - eth_state:balance(StateBlob, Sender),
+        ok = eth_mpt:put_account(Sender, Start, 0, eth_keccak:hash(<<>>)),
+        {_B2, StatePlain} = eth_block:run_transaction(
+                               Block0, sign(base_tx(legacy_of_fields(Fields)), Priv),
+                               eth_state:new(0, #{}), ?GWEI, 1000000),
+        ?assertEqual(131072, BlobSpent - (Start - eth_state:balance(StatePlain, Sender)))
+    end).
+
+%% The corpus signature, as a test. `cancun/eip4844_blobs/test_sufficient_balance_blob_tx`
+%% and `test_blob_gas_subtraction_tx` are 1,408 corpus entries that were
+%% `state_mismatch` with one diff shape: the sender's balance too high by exactly
+%% `total_blob_gas * price`. This is that fixture's arithmetic on one entry -- six
+%% blobs, `excessBlobGas = 0x0e0000` = 917,504, price 1 -- so the fix's effect is
+%% pinned without running the corpus.
+%%
+%% The storage half is the same fact read back through the EVM. The fixture's code
+%% is `0x32316000556000600060006000344703325af13231600155`:
+%%
+%%     32 31 60 00 55   ORIGIN BALANCE PUSH1 0 SSTORE
+%%
+%% so slot 0 *is* the sender's balance as the frame saw it. A node that did not
+%% charge the blob fee before the frame ran stored a balance 786,432 too high --
+%% which is why the diff also appeared under `{store, _, <<"0x0">>, _, _}` and why
+%% it looked like a second, independent gas defect. It was one missing debit seen
+%% twice. Asserting the slot as well is what keeps that reading honest.
+corpus_blob_fee_signature_test() ->
+    with_ctx(fun() ->
+        Priv = eth_secp256k1:generate_key(),
+        Sender = addr_of(Priv),
+        Start = 1000000 * ?GWEI,
+        Code = <<16#32, 16#31, 16#60, 0, 16#55, 16#00>>,   % ORIGIN BALANCE; SSTORE
+        To = test_address(3),
+        ok = eth_mpt:put_code(eth_keccak:hash(Code), Code),
+        ok = eth_mpt:put_account(To, 0, 0, eth_keccak:hash(Code)),
+        Excess = 16#0e0000,
+        %% The corpus figure, recomputed from the specification's recurrence rather
+        %% than quoted. 917,504 of excess is not enough to move the curve off its
+        %% 1 wei floor, and the *size* of the excess is what makes this a real
+        %% assertion: the same number with the price curve consulted on the parent's
+        %% excess, or with the excess dropped to 0, gives the same 1, so this does
+        %% not by itself prove the field is read from the right place. That is what
+        %% `blob_fee_uses_this_blocks_own_excess_test/0' is for.
+        ?assertEqual(1, spec_blob_price(Excess)),
+        Block0 = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))
+                    #block{excess_blob_gas = Excess, base_fee_per_gas = 7,
+                           miner = ?MINER},
+        Hashes = [bin0x(versioned_hash(I)) || I <- lists:seq(1, 6)],
+        Fields = #{<<"blobVersionedHashes">> => Hashes,
+                   <<"maxFeePerBlobGas">> => eth_hex:encode_int(1),
+                   <<"maxPriorityFeePerGas">> => <<"0x0">>,
+                   <<"maxFeePerGas">> => eth_hex:encode_int(14),
+                   <<"value">> => eth_hex:encode_int(0),
+                   <<"gas">> => eth_hex:encode_int(500000),
+                   <<"to">> => to_hex(To),
+                   <<"input">> => <<"0x">>},
+        ok = eth_mpt:put_account(Sender, Start, 0, eth_keccak:hash(<<>>)),
+        {Block, State1} = eth_block:run_transaction(
+                             Block0, sign(base_tx(Fields), Priv),
+                             eth_state:new(0, #{}), 7, 30000000),
+        [Receipt] = eth_block:receipts(Block),
+        ?assertEqual(1, maps:get(<<"status">>, Receipt)),
+        %% `min(14, 7 + 0) = 7`: the corpus's effective price, and the reason its
+        %% gas story is `no_comparable_gas' -- the refund is at the base fee, so no
+        %% gas figure is recoverable from the balance difference and the whole
+        %% cluster was invisible to the report's gas histogram.
+        Want = Start - (maps:get(<<"gasUsed">>, Receipt) * 7) - 786432,
+        ?assertEqual(Want, eth_state:balance(State1, Sender)),
+        %% **The storage half of the corpus diff, and the EIP's ordering claim.**
+        %% "The actual `blob_fee' ... is deducted from the sender balance **before
+        %% transaction execution** and burned". Slot 0 holds `BALANCE` as the *frame*
+        %% saw it, so a node that charged the fee after the frame stored a number
+        %% 786,432 too high -- and the divergence then appears under a `{store, ...}`
+        %% key as well as a `{balance, ...}` one, which is what made this look like two
+        %% separate defects in two separate places rather than one missing debit read
+        %% back twice.
+        %%
+        %% The expected figure is the balance **during** the frame, and it is not
+        %% `Want'. `settle_gas/8' runs after the frame and refunds the unused
+        %% allowance, so the sender is only down `gasUsed * price` at the end while
+        %% the frame saw the whole `gasLimit * price` gone. Asserting the final
+        %% balance here would pass on a node that charged the fee at the right moment
+        %% *and* one that charged it at the wrong one, because the two differ by the
+        %% refund and the refund is a gas figure, not a blob figure. Asserted as the
+        %% in-frame balance, the 786,432 is the only thing that can move it.
+        InFrame = Start - 500000 * 7 - 786432,
+        ?assert(InFrame < Want),
+        ?assertEqual(InFrame, eth_state:storage(State1, To, 0))
+    end).
+
+%% ---------------------------------------------------------------------------
 %% Helpers
 %% ---------------------------------------------------------------------------
+
+%% The settlement tests need a real state with a funded sender, so the node has
+%% to be started and `eth_state` pointed at the local trie. This is the same
+%% reference pattern as `eth_finalize_tests:with_ctx/1': `base_source/0` is
+%% process-wide, so it is saved and restored -- a test that changed it and did
+%% not put it back would silently redirect another module's reads for the rest
+%% of the run.
+with_ctx(Fun) ->
+    %% `start_apps/0` returns a bare `ok`, not `{ok, _}`: it ends in
+    %% `ok = application:ensure_all_started(crypto)`'s *value*, and
+    %% `ensure_all_started/1` answers `{ok, Started}` on the first call and a
+    %% **bare `ok`** on every later one. So the match is `_ = ', and matching
+    %% `{ok, _}` makes this helper fail on every test in the module once anything
+    %% else in the suite has started one of the four applications -- which is
+    %% exactly what a full run does and a single-module run does not. The five
+    %% settlement tests were green alone and red in the suite for that reason.
+    _ = eth_test_util:start_apps(),
+    %% `eth_mpt' is started through `start_link/0' rather than
+    %% `application:ensure_all_started/1': there is no `eth_mpt.app' in the tree,
+    %% so the application call answers `{error, {eth_mpt, {"no such file or
+    %% directory", "eth_mpt.app"}}}'. And `start_link/0' on a process that is
+    %% already registered exits the *caller* with `{error, {already_started, Pid}}',
+    %% so the running one is reused -- a full suite starts `eth_mpt' long before
+    %% this module runs.
+    case whereis(eth_mpt) of
+        undefined -> {ok, _} = eth_mpt:start_link();
+        _ -> ok
+    end,
+    ok = clear_mpt(),
+    Previous = eth_state:base_source(),
+    ok = eth_state:set_base_source(mpt),
+    try Fun()
+    after
+        _ = eth_state:set_base_source(Previous),
+        _ = clear_mpt()
+    end.
+
+addr_of(Priv) ->
+    binary:part(eth_keccak:hash(eth_secp256k1:node_id(Priv)), 12, 20).
+
+%% `eth_mpt:clear/0' is a `gen_server:call/2', so it exits when the process is
+%% not up. The `after' clause must not raise: an exception there **replaces** the
+%% test's own result, so a cleanup failure would be reported as the assertion
+%% failing, with the real cause in a clause the reader is not looking at.
+clear_mpt() ->
+    try eth_mpt:clear() catch _:_ -> ok end.
+
+%% An address as JSON-RPC spells it, which is what `eth_block:run_transaction/5'
+%% reads. Built from an integer with an explicit width: the same 20-nibble literal
+%% written as `<<16#1000...01>>' is a **one-byte** binary, because a hex constant
+%% wider than the default 8-bit segment is truncated silently. A truncated
+%% destination is not a wrong balance, it is a `function_clause' from
+%% `eth_state:address/1' -- and it happened in three places here at once.
+test_address(N) -> <<N:160>>.
+
+to_hex(A) when is_binary(A) ->
+    <<"0x", (string:lowercase(binary:encode_hex(A)))/binary>>.
+
+%% The same transaction with the blob fields dropped, i.e. a 1559 transaction
+%% with the identical gas, value, destination and fees. It is the control every
+%% settlement test needs: it is charged the same everything *except* the blob
+%% fee, so the difference between the two runs isolates the blob term exactly.
+%%
+%% It is re-signed rather than de-typed, because a blob transaction's signature
+%% covers its blob fields and dropping them invalidates it.
+%%
+%% The result is an **overlay** for `base_tx/1`, not a whole transaction: the
+%% 1559 fields -- `chainId', `nonce', `maxPriorityFeePerGas', `maxFeePerGas' -- come
+%% from `base_tx/1' and are not in `Fields'. Signing the overlay directly raises
+%% `{badkey, <<"chainId">>}' from inside `preimage_fields/1', so the failure names
+%% a missing field rather than the control that is missing them.
+legacy_of_fields(Fields) ->
+    (maps:without([<<"blobVersionedHashes">>, <<"maxFeePerBlobGas">>], Fields))
+        #{<<"type">> => <<"0x2">>}.
 
 base_tx(Extra) ->
     maps:merge(#{<<"type">> => <<"0x3">>,
@@ -231,29 +608,75 @@ to_int(I) when is_integer(I) -> I.
 %% Sign a blob transaction the same way a wallet would: hash the preimage, sign
 %% it, then attach the signature fields. sign_with/2 also returns the digest
 %% that was signed, so a test can check the preimage itself.
+%%
+%% **`sign/1` draws its own key.** Every *settlement* test here funds an address
+%% derived from a key it generated, and a test that then signs with a *different*
+%% key funds an account nobody transacts from. The symptom is the quietest kind:
+%% the transaction executes perfectly, the receipt is right, the gas is right, and
+%% the balance under test comes back **exactly as it started** -- because it is a
+%% different account that was never touched. Every assertion in that state fails
+%% with a delta of zero, which reads as "the node charged nothing" and points at
+%% `blob_fee/2' rather than at the signer. `sign/2` exists so a test that owns a key
+%% can sign with it, and the two are not interchangeable.
 sign(Tx) ->
-    {Signed, _Digest} = sign_with(Tx, eth_secp256k1:generate_key()),
+    sign(Tx, eth_secp256k1:generate_key()).
+
+sign(Tx, Priv) ->
+    {Signed, _Digest} = sign_with(Tx, Priv),
     Signed.
 
+%% Sign the way a wallet would: hash the preimage under the transaction's own
+%% type byte, sign it, then attach the signature fields. The type byte and the
+%% field list both come from the transaction, so a type-2 control is signed as a
+%% type-2 transaction rather than as a type-3 one with the blob fields dropped --
+%% the latter would not recover a sender, and a test whose control is invalid
+%% measures the control's invalidity.
 sign_with(Tx, Priv) ->
-    Digest = eth_keccak:hash(<<16#03, (eth_rlp:encode(preimage_fields(Tx)))/binary>>),
+    Type = type_byte(Tx),
+    %% `Type/binary', not `Type'. It is already a one-byte binary, and `<<Type,
+    %% ...>>' with a bound that is a binary raises `badarg' -- the trap AGENTS.md
+    %% §5 lists, reached because the helper used to hardcode `16#03'.
+    Body = eth_rlp:encode(preimage_fields(Tx)),
+    Digest = eth_keccak:hash(<<Type/binary, Body/binary>>),
     {R, S, V} = eth_secp256k1:sign(Digest, Priv),
     {Tx#{<<"v">> => eth_hex:encode_int(V),
          <<"r">> => eth_hex:encode_int(R),
          <<"s">> => eth_hex:encode_int(S)}, Digest}.
 
+%% The EIP-2718 type byte, read through `eth_hex' because the field is spelled
+%% `<<"0x3">>' here -- JSON-RPC's minimal-hex form -- and `binary:decode_unsigned/1'
+%% raises `badarg' on the `0x'. It is read rather than assumed so a type-2 control
+%% is signed as a type-2 transaction.
+type_byte(Tx) ->
+    Raw = maps:get(<<"type">>, Tx, <<"0x0">>),
+    case eth_hex:is_hex(Raw) of
+        true -> <<(eth_hex:decode(Raw))>>;
+        false -> <<16#00>>
+    end.
+
 preimage_fields(Tx) ->
-    [q(maps:get(<<"chainId">>, Tx)),
-     q(maps:get(<<"nonce">>, Tx)),
-     q(maps:get(<<"maxPriorityFeePerGas">>, Tx)),
-     q(maps:get(<<"maxFeePerGas">>, Tx)),
-     q(maps:get(<<"gas">>, Tx)),
-     to_bin(maps:get(<<"to">>, Tx)),
-     q(maps:get(<<"value">>, Tx)),
-     to_bin(maps:get(<<"input">>, Tx)),
-     [],
-     q(maps:get(<<"maxFeePerBlobGas">>, Tx, <<"0x0">>)),
-     eth_tx:blob_versioned_hashes(Tx)].
+    Base = [q(maps:get(<<"chainId">>, Tx)),
+            q(maps:get(<<"nonce">>, Tx)),
+            q(maps:get(<<"maxPriorityFeePerGas">>, Tx)),
+            q(maps:get(<<"maxFeePerGas">>, Tx)),
+            q(maps:get(<<"gas">>, Tx)),
+            to_bin(maps:get(<<"to">>, Tx)),
+            q(maps:get(<<"value">>, Tx)),
+            to_bin(maps:get(<<"input">>, Tx)),
+            []],
+    case type_byte(Tx) of
+        <<16#03>> ->
+            %% A **default of 0**, not `maps:get/2`. A blob transaction with no
+            %% `maxFeePerBlobGas' is one of the admission cases this module tests
+            %% (`blob_tx_without_blob_fee_rejected_test'), and reading the field
+            %% before the test has declared it raises `{badkey, ...}' from inside
+            %% the *signer* -- so the fixture under test is never reached and the
+            %% failure names the wrong thing entirely.
+            Base ++ [q(maps:get(<<"maxFeePerBlobGas">>, Tx, <<"0x0">>)),
+                     eth_tx:blob_versioned_hashes(Tx)];
+        _ ->
+            Base
+    end.
 
 q(I) when is_integer(I) -> I;
 q(B) when is_binary(B) -> eth_hex:decode(B).
