@@ -159,7 +159,7 @@ etherlang_app (application)
    └─ eth_rpc_server     (gen_server) — cowboy on :8545, plus :8551 for Engine
 ```
 
-49 modules in `apps/etherlang/src`, 52 test modules alongside. Every stateful
+50 modules in `apps/etherlang/src`, 54 test modules alongside. Every stateful
 module is a `gen_server` registered under its own name. The rest are pure or
 stateless — `eth_rlp`, `eth_keccak`, `eth_hex`, `eth_word`, `eth_trie`,
 `eth_fork_schedule`, `eth_evm`, and the rest of that list.

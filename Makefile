@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 REBAR := $(shell command -v rebar3 2>/dev/null)
 
-.PHONY: all compile test eunit docs rationale edoc-preview clean docker-build docker-test docker-run compose-up compose-down compose-logs bench
+.PHONY: all compile test eunit counts docs rationale edoc-preview clean docker-build docker-test docker-run compose-up compose-down compose-logs bench
 
 all: compile
 
@@ -14,6 +14,14 @@ test: eunit
 eunit:
 	@if [ -n "$(REBAR)" ]; then $(REBAR) eunit; \
 	else echo "rebar3 not installed locally; use 'make docker-test'"; exit 1; fi
+
+## The size figures quoted in README.md, AGENTS.md and TASKS.md. **Run this and paste its
+## output; do not edit the numbers by hand.** The counts drifted three times, and the
+## counting was never the problem -- "lines of code" was undefined and the *procedure*
+## was prose, so two derivations that both looked reasonable disagreed. The definition is
+## in the script, where it can be read and re-run.
+counts:
+	@tools/counts.escript
 
 ## API reference (edoc) into doc/, which is gitignored -- it is a build artifact.
 ##

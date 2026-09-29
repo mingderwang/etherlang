@@ -1449,7 +1449,23 @@ Recorded because the documentation claimed otherwise, and because each of these 
 - [ ] **Release process** — automated versioning, changelog generation
 - [ ] **Monitoring** — Prometheus metrics, Grafana dashboards
 - [ ] **Logging** — structured JSON logging, log rotation
-- [ ] **Health check** — `/health` endpoint for orchestration
+- [x] **Health check** — `GET /health` on the JSON-RPC port. **200** only if every
+  component answered, **503** otherwise, with a body naming which one did not. A health
+  endpoint that cannot say "no" is a decoration, so the probes are real
+  `gen_server:call/3`s with a timeout rather than `is_process_alive/1` checks: a
+  `gen_server` that is alive and wedged — blocked in a DETS write, or in a trie
+  operation — passes a liveness probe and cannot serve a single request, and that is the
+  state an orchestrator most needs to hear about. Reports the configuration verdict, the
+  chain head (number, hash, highest, size), the trie account count, whether sync is
+  running, and the pool's size. **Deliberately not said:**
+  - Not "in sync with the network". `eth_sync:status/1` is reported as the fact it is — `syncing: true` with the three block numbers `eth_syncing` already returns — and is not folded into the verdict. "Synced" is not a health property of a node that does not author blocks.
+  - Not `eth_state:chain_id/0`, which fetches over RPC on first use. A health endpoint that performs a lazy network fetch turns an upstream outage into a restart loop, which is a self-inflicted outage.
+  - No `stateRoot`, or anything else this node would have to recompute. See AGENTS.md §4.1 — a health endpoint is not a place to add a way to get a bare root, and a test asserting the report contains no such field is cheaper than a review comment.
+  - It **bypasses `RPC_API_KEY` and the rate limiter**, because an orchestrator's probe cannot be expected to carry a bearer token and a probe that 401s is a probe that has been ignored. What it discloses is liveness, the head, the pool's size and whether sync is running — none of which is an oracle. A public bind with no API key is already a startup warning; this is a second reason that combination deserves a thought.
+  It is on the **JSON-RPC port, not the Engine API port** — adding it there would bypass the JWT check, which is the one thing that port is for. 8 tests, five of them injections that all still compile. Three defects the tests caught, all invisible to any test that called `report/1` instead of making a real HTTP request:
+  - `status_code/1` read `maps:get(status, ...)` against a `<<"status">>` key — an atom against a binary — so the **503 path** raised `{badkey, status}` and cowboy answered **500**. The endpoint was correct and completely broken at the same time, and only when the node was *unhealthy*, which is the path that matters.
+  - `init/2` returned `cowboy_req:reply/4`'s value instead of `{ok, Req, State}`, so `cowboy_handler:execute/2` raised `{try_clause, Req}` and no response was sent at all. A cowboy handler's `init/2` must **return** the reply's `Req`; the reply is not the return value.
+  - The trie probe was the one component with no seam — it hardcoded the `eth_mpt` singleton — so the all-healthy path could not be tested without opening a DETS file under the un-scoped `DATA_DIR`, the AGENTS.md §10a trap. Its name now comes from the handler options like the other three.
 - [ ] **Graceful shutdown** — clean state dump, peer disconnection
 - [x] **Configuration validation** — `eth_config_settings:validate/0` checks all 32
   environment variables against a per-kind parser and `etherlang_app:start/2` **refuses

@@ -31,11 +31,28 @@ init({Name, Opts}) ->
                     sync => maps:get(sync, Opts, eth_sync),
                     pool => maps:get(pool, Opts, eth_txpool),
                     store => maps:get(store, Opts, eth_statestore),
+                    %% Carried for `/health' only, and named rather than hardcoded there
+                    %% so that the trie probe has the same seam as the other three.
+                    mpt => maps:get(mpt, Opts, eth_mpt),
                     max_batch => MaxBatch,
                     limits => #{tab => Tab, rate => Rate, burst => Burst},
                     api_key => eth_config:api_key()},
+    %% `/health' and `/'. The **order does not matter**, and that was measured rather than
+    %% assumed: reversing these two entries leaves `eth_health_tests' HTTP case green.
+    %% The first draft of this comment claimed the opposite -- that `"/"' is a prefix
+    %% catch-all which would shadow a `/health' route listed after it -- on the strength of
+    %% what cowboy's routing is generally supposed to do. It is not, here: routes match
+    %% exact paths, and any other path 404s, which the same test pins.
+    %%
+    %% So the risk is not reordering. It is changing `"/health'" into something that is
+    %% *not* an exact path -- a prefix or a wildcard -- at which point it would begin
+    %% answering requests meant for the JSON-RPC handler, and the endpoint would keep
+    %% returning 200 while the RPC stopped working. `eth_health_tests` asks for a
+    %% health-shaped body and a JSON-RPC envelope from the same port, which is the pair
+    %% that catches that.
     Dispatch = cowboy_router:compile([{'_',
-                                        [{"/", eth_rpc_handler, HandlerOpts}]}]),
+                                        [{"/health", eth_health_handler, HandlerOpts},
+                                         {"/", eth_rpc_handler, HandlerOpts}]}]),
     case cowboy:start_clear(Name, [{port, Port}, {ip, IP}],
                             #{env => #{dispatch => Dispatch}}) of
         {ok, _} ->

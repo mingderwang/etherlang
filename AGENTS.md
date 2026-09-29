@@ -79,25 +79,25 @@ depends on execution order, suspect the build before you suspect the code.
 
 ## 3. Architecture
 
-49 modules in `apps/etherlang/src` (13,806 lines of code), 52 test modules in
-`apps/etherlang/test` (11,148), and 811 eunit tests. **These counts drift and this
+50 modules in `apps/etherlang/src` (13,904 lines of code), 54 test modules in
+`apps/etherlang/test` (11,337), and 819 eunit tests. **These counts drift and this
 one had drifted** -- it said 47 and 44 for several commits after it stopped being
 true, which is the same defect as a stale conformance figure: a number in the
 architecture section that a reader will use as a measure of size and that no longer
-describes the tree. Re-derive it with `git ls-files` rather than editing it by hand.
+describes the tree. **Run `make counts` and paste its output; do not edit these by
+hand.** The derivation is `tools/counts.escript`, and it is a script because the
+counting was never the problem: "lines of code" was undefined and the *procedure*
+was prose, so two derivations that both looked reasonable gave 13,527 and 13,584,
+and a number nobody can reproduce is not a measurement. "Code" there means
+non-blank and non-comment lines, and nothing else is subtracted -- attribute
+lines, `-include`s and `-export`s are code. Excluding them was tried and yields a
+different number that is no more defensible.
 
 Every stateful module is a `gen_server` registered under its own module name;
 the tree is in `etherlang_sup`. The rest are pure or stateless (`eth_rlp`,
 `eth_keccak`, `eth_hex`, `eth_word`, `eth_fork_schedule`, `eth_evm`, …) — keep
 new logic out of the `gen_server`s where it can be pure, because that is what
 makes it testable without holding state.
-
-"Lines of code" above is **non-blank and non-comment** lines, and the definition is
-stated because it did not produce the number the previous version of this sentence
-gave: 13,527 and 10,903 are not reproducible from any obvious definition — dropping
-attribute lines, `-include`s or `-export`s was each checked — so they were stale
-before this change rather than differently measured. A figure nobody can reproduce
-is not a measurement, and the fix for that is the definition, not the number.
 
 ### The singletons that matter
 

@@ -66,8 +66,8 @@ beacon, validators, or block production).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**811 tests, green**).
-* **Status** — v0.7.0; eunit green (811 tests) and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**819 tests, green**).
+* **Status** — v0.7.0; eunit green (819 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
@@ -495,7 +495,7 @@ Full integration with consensus clients.
 - [ ] **Release process** — automated versioning, changelog generation
 - [ ] **Monitoring** — Prometheus metrics, Grafana dashboards
 - [ ] **Logging** — structured JSON logging, log rotation
-- [ ] **Health check** — `/health` endpoint for orchestration
+- [x] **Health check** — `GET /health` on the JSON-RPC port, **200** if every component answered and **503** if any did not, with a body naming which. Real `gen_server:call/3` probes with a timeout, not `is_process_alive/1`: a server that is alive and wedged passes a liveness probe and cannot serve a request. Reports the configuration verdict, chain head, trie account count, sync state and pool size; deliberately does **not** claim the node is in sync, does not make a lazy RPC call, and carries no `stateRoot`. Bypasses `RPC_API_KEY` and the rate limiter, because a probe that 401s is a probe that has been ignored — nothing it discloses is an oracle. It is on the RPC port, not the Engine port, since adding it there would bypass the JWT check. See `TASKS.md` Phase 9.
 - [ ] **Graceful shutdown** — clean state dump, peer disconnection
 - [x] **Configuration validation** — all 32 environment variables are checked at startup against a per-kind parser, and a bad one **refuses the boot** with the variable, the value as written, and why. Five silent defects fixed: `int_env/3` answered the *default* for an unparseable value (`CHAIN_RETENTION=abc` silently retained 2048 blocks); `listen_ip/0` ranged over the **first** octet only, so `1.999.1.1` produced `{1,999,1,1}` — a tuple `inet` answers `einval` for, which reached `cowboy` and failed there as a *listener* error; `RPC_LISTEN_IP=999.1.1.1` silently became loopback, so an operator asking to expose the RPC got an unreachable node; `ETH_NETWORK` and `ETH_FORK` fell back to a default for an unrecognised name, `ETH_FORK` with no log at all; and the module header claimed an application-environment source that never existed (`str_env/3`'s key argument is underscored and unused). The accessors keep their fallback deliberately — a test setting a nonsense variable should not take the suite down, and the gate belongs where "start the node" is a decision. See `TASKS.md` Phase 9.
 - [ ] **Upgrade path** — zero-downtime upgrade support
@@ -857,6 +857,45 @@ Four configurations are **warnings** rather than refusals, because the node is c
 each and the operator may have meant it: a bind on `0.0.0.0` with no `RPC_API_KEY`,
 discv4 and RLPx both enabled on their shared default port `30303`, and a
 `CHAIN_RETENTION` below `BODY_WINDOW`.
+
+## Health check
+
+`GET /health` on the JSON-RPC port (`8551` is the Engine API port and does **not** serve
+it — putting it there would bypass the JWT check).
+
+```console
+$ curl -s http://127.0.0.1:8545/health | jq .
+{
+  "status": "ok",
+  "checks": {
+    "config": { "ok": true, "problems": [] },
+    "chain":  { "ok": true, "head": "0x1092a0", "headHash": "0xaabb…",
+                "highest": "0x1092a0", "blocks": 2048 },
+    "mpt":    { "ok": true, "accounts": 0 },
+    "pool":   { "ok": true, "pending": 0, "queued": 0, "total": 0 },
+    "sync":   { "ok": true, "syncing": false }
+  }
+}
+```
+
+`200` only if every check answered; `503` otherwise, with `status` naming the ones that
+did not (`"degraded: mpt,sync"`). The probes are real `gen_server:call/3`s with a
+two-second timeout rather than `is_process_alive/1` checks, because a server that is alive
+and **wedged** — blocked in a DETS write, or in a trie operation — passes a liveness
+probe and cannot answer a request at all. That distinction is the whole point of the
+endpoint.
+
+It deliberately does **not** report whether the node is in sync with the network.
+`eth_sync:status/1` is reported as the fact it is, not folded into the verdict: "synced"
+is not a health property of a node that does not author blocks. It also makes no lazy RPC
+call — a health endpoint that fetches turns an upstream outage into a restart loop — and
+carries no `stateRoot` or anything else this node would have to recompute.
+
+`/health` **bypasses `RPC_API_KEY` and the rate limiter**, because an orchestrator's
+probe cannot be expected to carry a bearer token, and a probe that answers 401 is a probe
+that has been ignored. What it discloses — liveness, the head, the pool's size, whether
+sync is running — is not an oracle: nothing here reads a balance, a storage slot or a code
+hash.
 
 ## Local JSON-RPC methods
 
