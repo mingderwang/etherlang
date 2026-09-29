@@ -52,6 +52,7 @@ print(Dir, S, Ms) ->
     print_tally(Tally),
     print_by_fork(maps:get(by_fork, S)),
     print_gas(maps:get(gas, S)),
+    print_rejects(maps:get(rejects, S, #{})),
     print_sample(maps:get(sample, S)).
 
 pct(_, 0) -> 0.0;
@@ -72,6 +73,30 @@ print_by_fork(Bf) ->
                    [binary_to_list(F), N, maps:get(match, T, 0),
                     N - maps:get(match, T, 0)])
      end || {F, L} <- lists:sort(maps:to_list(Bf))].
+
+%% The rejection histogram, in full and unsampled.
+%%
+%% Every distinct `{corpus code, node code, node reason}' triple, with its count, ordered
+%% by count. This is the unit that says whether a `rejection_mismatch' is the node
+%% refusing for the **wrong rule** -- a real defect, and the one this project has to fix
+%% -- or for the **right rule under a different name**, which is the harness's vocabulary
+%% being out of date and is not a defect at all. Those two look identical in a tally and
+%% demand opposite responses, which is why the tally alone could not be worked with.
+print_rejects(Rejects) ->
+    io:format("~n--- rejection reasons (corpus code / node code / node reason) ---~n"),
+    Sorted = lists:reverse(lists:sort([{N, K} || {K, N} <- maps:to_list(Rejects)])),
+    case Sorted of
+        [] -> io:format("    (none)~n");
+        _ -> [io:format("    ~8w  ~s~n", [N, rejection_line(K)]) || {N, K} <- Sorted]
+    end.
+
+%% `~p' for all three, not `~s'. `Got' is a binary for a mapped reason and a **tuple**
+%% `{unmapped, Atom}' for one with no clause -- the last row of the histogram -- and
+%% `io_lib:format("~s", {unmapped, null_destination})' raises `badarg'. So the printer
+%% died on the single most informative row of the table, which is a bad way to discover
+%% that a row exists.
+rejection_line({Expected, Got, Reason}) ->
+    lists:flatten(io_lib:format("~p  ->  ~p  (~p)", [Expected, Got, Reason])).
 
 %% The schedule-sized deltas.
 %%
@@ -102,8 +127,27 @@ print_sample(Sample) ->
              #{gas := #{delta := D}} when is_integer(D) ->
                  io:format("      gas delta ~+w~n", [D]);
              _ -> ok
-         end
+         end,
+         print_reason(Detail)
      end || {Key, O, Detail, File} <- lists:reverse(Sample)].
+
+%% **The reason a rejection diverged, which this report used not to print at all.**
+%%
+%% `rejection_mismatch' is 12.6% of the corpus -- 1,975 entries, the largest single
+%% cluster, and the one AGENTS.md §12 names as the next thing to measure. It was
+%% unattributable because the sample printed the outcome, the file and the key and
+%% nothing else, while the reason lived in the detail map that the printer discarded.
+%% So the largest thing that was wrong with this node could be read off a summary that
+%% said only "this file diverges", which is the report AGENTS.md §10a calls "the kind of
+%% number nobody acts on" -- arrived at by omission rather than by choice.
+%%
+%% This prints the fixture's code, the name the node gave it, and the node's own reason
+%% atom, so the three can be compared. For every other outcome it prints nothing, so the
+%% line count of the report is unchanged where there is nothing to say.
+print_reason(#{expected := Want, got := Got, reason := Reason}) ->
+    io:format("      expected ~s, node said ~s (reason: ~p)~n", [Want, Got, Reason]);
+print_reason(_) ->
+    ok.
 
 short_key(Key) when is_binary(Key), byte_size(Key) > 110 ->
     binary:part(Key, byte_size(Key) - 110, 110);

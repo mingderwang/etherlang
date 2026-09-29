@@ -149,7 +149,7 @@ report_progress(_Acc, _Every, _T0) ->
 initial_survey(N, Every) ->
     #{files => N, files_done => 0, every => Every, total => 0,
       tally => maps:from_list([{O, 0} || O <- outcomes()]),
-      by_fork => #{}, gas => #{}, sample => [], sample_limit => 40}.
+      by_fork => #{}, gas => #{}, rejects => #{}, sample => [], sample_limit => 40}.
 
 %% Fold one file's results in. Reversed so the accumulated list stays cheap.
 file_survey(File, Acc) ->
@@ -157,7 +157,7 @@ file_survey(File, Acc) ->
     maps:update_with(files_done, fun(N) -> N + 1 end, 1, Acc1).
 
 survey_one({Key, Outcome, Detail, _File} = R, Acc) ->
-    #{total := T, tally := Tl, by_fork := Bf, gas := G, sample := S,
+    #{total := T, tally := Tl, by_fork := Bf, gas := G, rejects := Rj, sample := S,
       sample_limit := Lim} = Acc,
     Fork = fork_of_key(Key),
     Acc1 = Acc#{total => T + 1,
@@ -189,7 +189,8 @@ survey_one({Key, Outcome, Detail, _File} = R, Acc) ->
                 by_fork => maps:update_with(Fork,
                                            fun(L) -> [{Outcome, 1} | L] end,
                                            [], Bf),
-                gas => add_gas_delta(G, Outcome, Detail)},
+                gas => add_gas_delta(G, Outcome, Detail),
+                rejects => add_reject_reason(Rj, Outcome, Detail)},
     Acc2 = case Outcome =:= match orelse length(S) >= Lim of
                true -> Acc1;
                false -> Acc1#{sample => [R | S]}
@@ -204,6 +205,30 @@ add_gas_delta(G, Outcome, #{gas := #{delta := D}})
   when is_integer(D), Outcome =:= state_mismatch, abs(D) =< 100000 ->
     maps:update_with(D, fun(N) -> N + 1 end, 1, G);
 add_gas_delta(G, _Outcome, _Detail) -> G.
+
+%% **The rejection histogram: `{expected code, code the node named, its own reason}`.**
+%%
+%% `rejection_mismatch' is the corpus's largest cluster by count and it was, until this,
+%% unmeasurable -- the report printed the outcome, the file and the key, and the reason
+%% lived in a detail map the sample discarded. A 40-entry sample out of 1,975 is a 2%
+%% look, and the question the cluster raises is precisely which *rule* the node and the
+%% corpus disagree about, which a sample cannot answer when one rule accounts for 78% of
+%% it.
+%%
+%% The key is the whole triple, not the outcome: "the corpus says A, the node says B,
+%% for reason R" is the unit that identifies a defect, and collapsing to any one of the
+%% three loses the distinction between a *renamed* rule and a *different* rule. That
+%% distinction is the entire measurement -- measured on the 22 files that declare
+%% `expectException', the largest pair is
+%% `{INTRINSIC_GAS_TOO_LOW, INTRINSIC_GAS, intrinsic_gas}', in which the node refused for
+%% exactly the rule the fixture names and differs only in the name it gave it.
+add_reject_reason(Rj, rejection_mismatch,
+                  #{expected := Want, got := Got, reason := Reason}) ->
+    maps:update_with({Want, Got, Reason}, fun(N) -> N + 1 end, 1, Rj);
+add_reject_reason(Rj, expected_rejection_not_raised, #{expected := Want}) ->
+    maps:update_with({Want, <<"accepted">>, <<"not_refused">>},
+                     fun(N) -> N + 1 end, 1, Rj);
+add_reject_reason(Rj, _Outcome, _Detail) -> Rj.
 
 %% The corpus's files, as a list. Split out because `entries/1' and `survey/1' both
 %% need it and the `**' detail is worth saying once.
