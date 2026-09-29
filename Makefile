@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 REBAR := $(shell command -v rebar3 2>/dev/null)
 
-.PHONY: all compile test eunit docs clean docker-build docker-test docker-run compose-up compose-down compose-logs bench
+.PHONY: all compile test eunit docs rationale edoc-preview clean docker-build docker-test docker-run compose-up compose-down compose-logs bench
 
 all: compile
 
@@ -38,6 +38,21 @@ docs:
 	  io:format("edoc -> doc/ (~p html pages)~n", [length(filelib:wildcard("doc/*.html"))]), \
 	  halt(0).'
 	@echo "open doc/index.html"
+
+## The `%%' comment corpus as navigable HTML. **Not docstrings** -- see
+## apps/etherlang/doc/README.md. 1,029 blocks over 6,133 comment lines.
+rationale:
+	@mkdir -p doc
+	@tools/rationale.escript
+
+## What `make docs` would look like IF the source carried `%% @doc' tags, built into a
+## scratch copy. `apps/etherlang/src` is never written to. This exists to make the
+## argument against doing that for real checkable rather than asserted: **13 of the 48
+## modules cannot be documented by edoc at all**, because a `<` or an unbalanced `' in
+## their comments stops its XML writer.
+## Add --all to tag every block rather than only the `precedes' ones.
+edoc-preview:
+	@tools/edoc_preview.escript $(EDOC_PREVIEW_FLAGS)
 
 ## Run the test-suite inside Docker (source is mounted in, deps fetched at build)
 docker-test:
