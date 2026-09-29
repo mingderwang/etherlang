@@ -1342,21 +1342,24 @@ Recorded because the documentation claimed otherwise, and because each of these 
   - Run generalStateTests to verify state transitions
   - Fix any divergences found
 
-## Phase 6: JSON-RPC API Completion (7 tasks)
-- [ ] **Debug API** — `debug_traceTransaction`, `debug_traceBlockByNumber`, `debug_traceBlockByHash`, `debug_traceRawTransaction`
-  - **Not needed, and closing it with a reason rather than leaving it open.** geth-specific, not in EIP-1474, and no consensus layer calls it. The one argument for building it is developer speed: with 249 `state_mismatch` fixtures outstanding, a `structLog` tracer over a failing case would be genuinely useful. It is a tool, not a conformance item, and the corpus plus `eth_call` already give a sharper signal
-  - Trace mode: `callTrace`, `structLog`, `builtInTracer`
-  - Parity-style trace API compatibility
-- [ ] **Trace API** — `trace_replayTransaction`, `trace_replayBlock`, `trace_filter`, `trace_transaction`
-- [ ] **Miner API** — `miner_start`, `miner_stop`, `miner_setExtra`, `miner_setGasPrice`, `miner_setEtherbase`
-  - **Answering `ok` would be a claim this node cannot back.** `miner_setEtherbase` and `miner_setGasPrice` configure block *authoring*, and this node never authors a block; `eth_mining` and `eth_hashrate` already answer `false` and `0x0`, which is the truth. A `miner_setEtherbase` that returned `true` would be the same class of answer as the old catch-all: a success flag for something that did not happen. Left unimplemented, and it now **refuses** rather than forwarding
-- [ ] **Admin API** — `admin_nodeInfo`, `admin_peers`, `admin_datadir`, `admin_startRPC`, `admin_stopRPC`
-- [ ] **Personal API** — `personal_importRawKey`, `personal_listAccounts`, `personal_newAccount`, `personal_sign`, `personal_ecRecover`, `personal_sendTransaction`, `personal_unlockAccount`
-  - **This node has no keystore, no unlocked account and no signer**, and `eth_accounts` correctly answers `[]` for exactly that reason. Proxied, `personal_listAccounts` would report *another node's* accounts and `personal_importRawKey` / `personal_sign` would sign with *another node's* key — the most dangerous answer in this phase. Unimplemented is the correct state, and it now refuses rather than forwarding
+## Phase 6: JSON-RPC API Completion (3 tasks)
+- **Out of specification, and not tracked here.** EIP-1474 covers the `eth_*`, `net_*`,
+  `web3_*` and `rpc_*` namespaces. The `debug_*`, `trace_*`, `admin_*`, `personal_*` and
+  `miner_*` namespaces are geth- or OpenEthereum-specific, are in no EIP, and no
+  consensus layer calls them, so they are **not implemented and not tracked**. Removed from
+  this list rather than left open with a reason: a box that cannot be closed is not a task,
+  and the policy line is a better record than five of them. The count in this heading is
+  tasks, and the policy line is not one of them: the 7 was these five out-of-spec
+  namespaces plus the two that remained.
+  - The one substantive argument for `debug_traceTransaction` is developer speed, and it
+    was weighed: the corpus and `eth_call` give a sharper signal per unit of effort than a
+    `structLog` tracer, and `tools/eth_call_check.escript` and `tools/eth_bench.escript`
+    cover the same ground.
 - [x] **Eth API completeness** — `eth_*` methods answer in the specification's response shapes. Seven of the eight that a catch-all clause was proxying are now answered from this node's own state, and each says what it is derived from: `eth_accounts` (`[]` — this node owns no accounts, and proxied it returned the *upstream* node's), `eth_getTransactionByHash` and `eth_getTransactionByBlockHashAndIndex` (a stored transaction plus the three positional fields it does not carry), `eth_getBlockReceipts` (stored receipts, distinguishing an empty block from a block whose receipts were never stored — the specification's `4444`), `eth_feeHistory` (from stored headers, refusing rather than inventing a value where the specification is silent), `eth_maxPriorityFeePerGas` (the minimum tip over the transactions this node would include, using the same `tip/2` the block builder selects on), `eth_getProof` (local trie only) and `eth_estimateGas` (a binary search for the least gas that does not run out). 53 tests in `eth_rpc_extra_tests`. Still outstanding:
   - `eth_createAccessList` — **not implemented**, and the blocker is named: `eth_state` and `eth_evm` do not record which accounts or storage slots an execution touched, so the access list cannot be produced at all, and EIP-2930's gas formula cannot be applied to a list that does not exist. Recording them means instrumenting the hot path of the EVM
   - `eth_getTransactionByBlockNumberAndIndex` now shares the same projection and answers the positional fields; noted here because it was the one that was silently wrong for as long as it existed — it returned a stored transaction with no `blockHash`, consistently, because `eth_getBlockByNumber` with `fullTransactions = false` omits exactly those fields for the same reason. Two methods wrong *together* is why no fixture could tell
-  - the filter, signed and miner APIs below
+  - the `net_*`, `web3_*` and `rpc_*` namespaces named above; the out-of-spec ones are
+    not tracked and the policy line says so
   - `eth_getBlockByNumber`, `eth_getBlockByHash` (with/unlimited transactions)
   - `eth_getTransactionByHash`, `eth_getTransactionByBlockHashAndIndex`
   - `eth_getTransactionReceipt`, `eth_getTransactionCount`
