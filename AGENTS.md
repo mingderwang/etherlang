@@ -19,9 +19,20 @@ Lighthouse-compatible execution client with a working Engine API.
 
 It is **not** yet a production execution client. It does not author blocks, it
 has no consensus layer, and its per-fork gas schedule is not wired in. `README.md`
-§"Current Status" and `TASKS.md` are the authority on what is and is not done;
-`docs/YELLOW_PAPER.md` describes the system model, the trust assumptions, and
-the boundary between what the node does and what it is becoming.
+§"Current Status" and `TASKS.md` are the authority on what is and is not done.
+
+**There is no design document here, and that is deliberate.** A prose description
+of a system model is a second statement of the rules, and a second statement drifts:
+the one this repository carried said "724 eunit tests" when the suite was at 932 and
+"58 test modules" when there were 59, and it had to be hand-patched on every commit
+that changed a number -- which is a maintenance tax with no correctness benefit and a
+guaranteed staleness cost. It was removed.
+
+**The authority is the specification, and it is four documents:**
+`ethereum/EIPs` for the per-fork rules, `ethereum/execution-specs` (EELS) for the
+state transition those rules add up to, `ethereum/execution-apis` for the Engine
+and JSON-RPC surface, and the networking specs (discv4, devp2p/RLPx) for the wire.
+Derive a rule from one of those, quote the clause, and pin it with a test.
 
 ### Read these before claiming anything works
 
@@ -29,7 +40,10 @@ the boundary between what the node does and what it is becoming.
 |------|------------|
 | `README.md` | Feature status, honesty notes, config, layout. |
 | `TASKS.md` | The 86-task / 9-phase list. Every unchecked box is a real gap. |
-| `docs/YELLOW_PAPER.md` | The design document: system model, trust assumptions, and the boundary between what the node does and what it is becoming. §1.3 is the list of things it deliberately does *not* claim. |
+| `ethereum/EIPs` | **The authority for every rule in `src/`.** Derive from the EIP text, quote the clause in a comment, pin it with a test. |
+| `ethereum/execution-specs` (EELS) | The state transition, as an implementation. **A second reading of the same EIPs**, and it finds what the EIP text alone does not: EIP-7702's step-4 `accessed_addresses` is one line of its `validate_authorization` and no fixture in this repository exercises it. |
+| `ethereum/execution-apis` | The Engine API and JSON-RPC surface this node serves. |
+| `ethereum/consensus-specs`, the networking specs | devp2p/RLPx, discv4, the beacon-node boundary. |
 
 Documentation in this repo is deliberately adversarial: it names specific gaps
 rather than softening them. **Keep it that way.** A README that says "partial"
@@ -1079,7 +1093,7 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
   by slicing it out -- `old = s[s.index(A):s.index(B)]`, `s.replace(old, new)` -- the
   two markers were in the **wrong order** in that file, so the slice was empty,
   and `''` is what Python's `replace/2` inserts between every character when asked.
-  `docs/YELLOW_PAPER.md` went from **38 KB to 98.7 MB in one edit** and 657 lines to
+  A design document went from **38 KB to 98.7 MB in one edit** and 657 lines to
   1,551,752, committed, and the change reported itself as a success. Two things
   caught it and neither was the tool: `git push` warned that the file was 94 MB, and
   a line count is not a thing anyone checks.

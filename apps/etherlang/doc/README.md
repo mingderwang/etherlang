@@ -87,7 +87,7 @@ confounded by the classifier rather than by the thing being compared. They agree
 | `AGENTS.md` | How the node is built and the rules it has had to learn. §10 is the open/closed ledger, §10a the traps. |
 | `TASKS.md` | The queue, and the measurement behind every claim in it. |
 | `README.md` | Feature status, honesty notes, the compatibility table. |
-| `docs/YELLOW_PAPER.md` | The system model, the trust assumptions, what the node does *not* claim. |
+| the EIPs and `execution-specs` | **The authority for every rule in `src/`** — not a file in this repository, which is the point. |
 | `apps/etherlang/test/vectors/eest/PROVENANCE.md` | Where the conformance fixtures came from, and how to run the whole corpus. |
 
 ## The application overview page is empty, and that is also the tool
