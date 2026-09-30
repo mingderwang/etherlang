@@ -784,18 +784,37 @@ behavioural change per commit, and each step says what it now does.
    of the EIP is **not measurable by the corpus at all** and the tests are the only
    evidence for it. Both figures also confirm **zero regressions** across every
    warm-set, access-cost and `CALL` change the work touches.
-6d. **EIP-2930: warm the access-list _address_, not only its storage keys.**
-   `eth_evm:access_list_access/2` folds the list into `{warm_store, Addr, Slot}`
-   entries and **never adds the address to `accessed_addresses`**, so an
-   access-list address is charged its 2,400 of intrinsic gas and then re-charged
-   2,600 as a cold access on first use. **Measured, and found by a test written for
-   a different EIP**: the EIP-7702 warm-resolution test warmed its delegate through
-   an access list, and the "warm" arm came out **2,400 more** than the cold one —
-   the list's own price, warming nothing. `v1.46` fixed the storage-key half; this is
-   the same defect one level up. **It is the smallest open item and the only one with
-   a reproduction already written** — the fix is to add `{warm_account, Addr}` for
-   each entry, and the `?EXPECTED`-style worry is only that every existing
-   access-list fixture's gas may move, so measure the 22-file set before and after.
+6d. ~~**EIP-2930: warm the access-list _address_, not only its storage keys.**~~
+   **Done.** `eth_evm:access_list_access/2` seeded `{warm_store, Addr, Slot}` and
+   never `{warm_account, Addr}`, so a listed address was charged 2,400 intrinsic and
+   re-charged 2,600 as a cold access on first use. EIP-2930's specification-in-code
+   does both, and its motivation names the half that was missing -- "the SLOAD and
+   EXT\* opcodes would only cost 100 gas", and `EXT\*` is an *account* access.
+   The function's comment claimed the addresses were "already warm", on the reasoning
+   that the frame's own address is the transaction's recipient: not a justification,
+   since that says nothing about any *other* address. **Measured:** 22-file set
+   3,831/3,884 and the committed subset 226/266, both unchanged, which is the result
+   to want from a change to every access-list transaction's warm set.
+6f. **EIP-3529: the refund cap's base is the frame's gas, not the transaction's.**
+   Found by reading `execution-specs`' `fork.py`, not by a fixture:
+   `tx_gas_refund = min(tx.gas - tx_output.gas_left, refund_counter) // 5`, and
+   `tx.gas - gas_left` **includes the intrinsic**. This node caps inside the frame
+   against the frame's own consumption, so its cap is smaller by `intrinsic / 5` and
+   it **under-refunds** by up to that much whenever the cap binds. With a 21,000
+   intrinsic and 30,000 of frame gas the reference allows 10,200 and this node
+   allows 6,000. The *divisor* is right (1/5 London, 1/2 before); only the base is
+   wrong.
+   - **Why it is not already fixed by 6e:** 6e has to seed the frame's refund
+     counter so the cap applies to the combined total, and if the cap's **base** is
+     wrong then seeding the counter moves the refund into a cap that is itself
+     divergent. **6f first**, so 6e's result is correct rather than differently
+     wrong.
+   - **The corpus does not catch it.** Every refund fixture the committed subset
+     contains agrees with this node, so the cap is not reached in them -- which is
+     the honest reason this is a named gap rather than a count. A fixture that
+     refunds more than `frameGasUsed / 5` and less than `totalGasUsed / 5` would
+     separate the two, and there is not one committed.
+
 6e. **EIP-7702: the `PER_EMPTY_ACCOUNT_COST` refund, and it is 11 corpus entries.**
    The one part of EIP-7702 still absent. **The structural objection in `v1.62` is
    solvable and was wrong to leave standing**: the EIP adds the refund to the

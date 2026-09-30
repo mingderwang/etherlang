@@ -489,6 +489,112 @@ tx() ->
       <<"accessList">> => []}, ?SENDER_PRIV).
 
 %% ---------------------------------------------------------------------------
+%% EIP-7702 step 4: `accessed_addresses`
+%% ---------------------------------------------------------------------------
+
+%% Step 4: "Add `authority` to `accessed_addresses`, as defined in EIP-2929."
+%%
+%% The subtle half is *when*. The EIP puts it immediately after recovery and
+%% before the code and nonce checks, and the reference implementation follows that
+%% exactly -- so a tuple that is **refused** still leaves its authority warm for the
+%% rest of the transaction. Warming only the authorities whose tuples *applied*
+%% would be a tidier-looking rule that disagrees on precisely the tuples a user gets
+%% wrong, which is the only place a user notices.
+%%
+%% The observable is a price, not a value: the delegate's code reads the refused
+%% authority's **balance**, and warm is 100 where cold is 2,600. The balance itself
+%% is irrelevant to what the frame computes, which is what makes it a clean probe.
+%%
+%% Two transactions, differing in **one thing**: which address the refused tuple
+%% names. Both tuples are refused (both claim nonce 7; neither account is at 7), so
+%% both transactions leave the post-state identical and the *only* difference is
+%% whether the account the frame reads was warmed. 2,500 is that gap and nothing
+%% else produces it.
+a_refused_authorization_still_warms_its_authority_test() ->
+    with_ctx(fun() ->
+        Priv = eth_secp256k1:generate_key(),
+        Me = addr_of(Priv),
+        %% PUSH20 <Me> BALANCE POP STOP -- the delegate reads the authority.
+        Prog = <<16#73, Me/binary, 16#31, 16#50, 16#00>>,
+        ?assertEqual(24, byte_size(Prog)),
+        Base = delegated(put_code(eth_state:new(0, #{}), ?DELEGATE, Prog, 0)),
+        Warm = gas_of_auth(Base, refused_authorization(Me, Priv)),
+        %% **Signed by a different key**, and that is the whole content of the
+        %% control. The authority is the account that *signed*, not the tuple's
+        %% `address' field -- the field is the delegation **target**, and the two are
+        %% different addresses. The first version signed both tuples with `Priv', so
+        %% both recovered to `Me', both arms warmed it, and both came back at
+        %% **46,105** -- the warm figure, twice. So the control was not a control at
+        %% all: it varied the field that step 4 does not read.
+        %%
+        %% This is worth stating on its own, because it is a distinction a test can
+        %% lose silently: an implementation that warmed the tuple's `address' would
+        %% pass a test that signs with the same key and fail this one.
+        Other = eth_secp256k1:generate_key(),
+        Cold = gas_of_auth(Base, refused_authorization(?OTHER, Other)),
+        ?assertEqual({want, 2500, Warm, Cold},
+                     {want, element(1, Cold) - element(1, Warm), Warm, Cold})
+    end).
+
+%% **The control, and it is an absolute rather than a comparison.** A type-2
+%% transaction has no authorization list, so nothing is warmed and the frame's
+%% `BALANCE' is cold. The figure is pinned outright and decomposed:
+%%
+%%     21,000  intrinsic
+%%     +    3  PUSH20
+%%     + 2,600  BALANCE, cold
+%%     +    2  POP
+%%     = 23,605
+%%
+%% The first version compared this against a **type-4** arm and asserted a 2,500
+%% gap, which measured **-22,500**: the two transaction types differ by EIP-7702's
+%% 25,000 authorization price, so the comparison was mostly that. **A control that
+%% crosses a difference the subject does not have in common measures the
+%% difference.** The 2,500 comparison is the previous test's job and it is done
+%% there with two transactions of the *same* type.
+a_transaction_with_no_authorization_list_leaves_the_account_cold_test() ->
+    with_ctx(fun() ->
+        Priv = eth_secp256k1:generate_key(),
+        Me = addr_of(Priv),
+        Prog = <<16#73, Me/binary, 16#31, 16#50, 16#00>>,
+        Base = delegated(put_code(eth_state:new(0, #{}), ?DELEGATE, Prog, 0)),
+        {Block, _} = run({tx_to(?ACCOUNT, #{}), Base}),
+        [Receipt] = eth_block:receipts(Block),
+        ?assertEqual(1, maps:get(<<"status">>, Receipt)),
+        ?assertEqual({want, 21000 + 3 + 2600 + 2},
+                     {want, maps:get(<<"gasUsed">>, Receipt)})
+    end).
+
+%% A tuple that is **refused**: it names `Address' and claims nonce 7, and no
+%% account in these fixtures is at nonce 7. The signature is over *this* tuple's own
+%% preimage -- chain id, address, nonce 7 -- or recovery would name a different
+%% authority and the test would measure the wrong warm set.
+refused_authorization(Address, Priv) ->
+    Nonce = 7,
+    Digest = eth_keccak:hash(<<16#05, (eth_rlp:encode(
+                   [eth_fork_schedule:chain_id(), Address, Nonce]))/binary>>),
+    {R, S, V} = eth_secp256k1:sign(Digest, Priv),
+    #{<<"chainId">> => eth_hex:encode_int(eth_fork_schedule:chain_id()),
+      <<"address">> => eth_hex:encode_bytes(Address),
+      <<"nonce">> => eth_hex:encode_int(Nonce),
+      <<"yParity">> => eth_hex:encode_int(V),
+      <<"r">> => eth_hex:encode_int(R),
+      <<"s">> => eth_hex:encode_int(S)}.
+
+%% **The destination is `?ACCOUNT`, stated rather than inherited.** `set_code_tx/2`'s
+%% default `to' is `?OTHER', which is codeless, so the first version of this helper
+%% sent the transaction to an account with no code and the frame ran nothing: both
+%% arms came back at **exactly** 46,000, the intrinsic and nothing else, with
+%% `status = 1'. A gas figure that is exactly the intrinsic is a frame that did not
+%% run, and it read as a difference of zero rather than as a broken fixture.
+gas_of_auth(State, Auth) ->
+    To = #{<<"to">> => eth_hex:encode_bytes(?ACCOUNT)},
+    {Block, _} = run({sign(set_code_tx([Auth], To), ?SENDER_PRIV), State}),
+    [Receipt] = eth_block:receipts(Block),
+    {maps:get(<<"gasUsed">>, Receipt), maps:get(<<"status">>, Receipt),
+     eth_state:storage(State, ?ACCOUNT, 0)}.
+
+%% ---------------------------------------------------------------------------
 %% The resolution's own gas
 %% ---------------------------------------------------------------------------
 

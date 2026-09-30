@@ -734,7 +734,7 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     %% authorizations. So the delegations survive a revert without any special case
     %% here, and putting this call *inside* the frame's starting state instead would
     %% roll them back and diverge on exactly the transactions that fail.
-    StateAuth = process_authorizations(State0, Tx, fork(Block)),
+    {StateAuth, AuthAuthorities} = process_authorizations(State0, Tx, fork(Block)),
     %% The EVM runs with what the intrinsic cost left, never the full limit.
     EvmGas = max(0, GasLimitTx - Intrinsic),
     %% The EVM reads its message and environment through atom keys (s_msg/3,
@@ -791,6 +791,9 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
         %% transaction that touches the delegate twice, which is why it needs its own
         %% test rather than falling out of a gas total.
         delegate => TxDelegate,
+        %% EIP-7702 step 4's `accessed_addresses` additions, one per **recovered**
+        %% authority. Read by `eth_evm:initial_access/3' beside `delegate'.
+        auth_authorities => AuthAuthorities,
         %% EIP-2930's access list, in the frame, because the frame is where it has to
         %% act. `eth_tx:access_list_field/1' is the **same function `validate/2`
         %% priced**, so the list that is charged for and the list that is applied cannot
@@ -1034,54 +1037,141 @@ blob_base_fee(#block{excess_blob_gas = Excess}) ->
 %% touched -- and the arithmetic confirms it: those fixtures carry 10 authorizations
 %% and the expected post-state has 10 accounts holding
 %% `0xef0100000000000000000000000000000000000000NN`, one per tuple, in order.
+%% **Returns `{State, Authorities}`**, where `Authorities` is every authority that
+%% was **recovered**, whether or not its tuple went on to apply.
+%%
+%% That is EIP-7702 step 4 -- "Add `authority` to `accessed_addresses`, as defined in
+%% EIP-2929" -- and it is the step that makes the *refused* tuples observable. The
+%% reference implementation puts `message.accessed_addresses.add(authority)`
+%% immediately after recovery and **before** the code and nonce checks, so a tuple
+%% that names an authority which then fails step 5 or step 6 still leaves that
+%% account warm for the rest of the transaction: its `BALANCE` costs 100 rather than
+%% 2,600. Adding it only for tuples that apply would be a cheaper-looking rule that
+%% disagrees on exactly the tuples a user gets wrong.
+%%
+%% So the return value is two things rather than one, and the list is threaded
+%% through to the Msg as `auth_authorities' rather than being written into a warm set
+%% the EVM has not built yet -- `eth_evm:run/5' seeds that set from the Msg, and a
+%% set seeded anywhere else is a set nothing reads.
 process_authorizations(State, Tx, Fork) ->
     case eth_tx:tx_type(Tx) of
-        eip7702 -> apply_authorizations(State, eth_tx:authorization_list(Tx), Fork);
-        _ -> State
+        eip7702 ->
+            {S, A} = apply_authorizations(State, eth_tx:authorization_list(Tx), Fork),
+            {S, A};
+        _ ->
+            {State, []}
     end.
 
-apply_authorizations(State, [], _Fork) -> State;
+apply_authorizations(State, [], _Fork) -> {State, []};
 apply_authorizations(State, [Tuple | Rest], Fork) ->
-    case apply_authorization(State, Tuple, Fork) of
-        {ok, S1} -> apply_authorizations(S1, Rest, Fork);
-        skipped -> apply_authorizations(State, Rest, Fork)
-    end.
+    %% Three elements, not two: the status is discarded and the **state is carried
+    %% through either way**, because a skipped tuple leaves the state alone rather
+    %% than aborting the list. That is the EIP's "immediately stop processing the
+    %% tuple and continue to the next tuple", and it is why this is a match and not a
+    %% `case' -- a `case' would have two arms that both ignore the third element,
+    %% which is a way of writing the same rule twice.
+    {_Status, S1, Authority} = apply_authorization(State, Tuple, Fork),
+    {S2, Rest2} = apply_authorizations(S1, Rest, Fork),
+    {S2, warmed(Authority) ++ Rest2}.
 
-apply_authorization(State, Tuple, _Fork) ->
+%% One address, or none. `undefined' is what a tuple that failed *before* recovery
+%% carries, and it must not reach the warm map: `initial_access/3' filters the list
+%% to 20-byte binaries, so a stray atom would be dropped there -- but a list that
+%% mixes addresses and an atom is a list whose meaning depends on a reader three
+%% modules away knowing that. Better to be a list of addresses here.
+warmed(undefined) -> [];
+warmed(Addr) -> [Addr].
+
+%% `{ok, State, Authority}' when the tuple applied, `{skipped, State, Authority}'
+%% when it did not, and an `Authority' **whenever recovery succeeded** -- which is
+%% the whole of step 4, and the reason this function is not written as a `try'.
+%%
+%% **It used to be a `try`, and that was a real defect.** The EIP's rule is "if any
+%% step above fails, immediately stop processing the tuple and continue to the next
+%% tuple", which a `try`/`catch` around the seven steps expresses in one line -- and
+%% steps 5 and 6 were signalled by `true = (...)', so a *refused* tuple raised a
+%% `badmatch' and landed in the `catch'.
+%%
+%% **A `catch` clause cannot see the variables bound in the `try` body.** So
+%% `Authority' -- bound by step 3, and the answer step 4 needs -- was gone for
+%% exactly the tuples that were refused, and `apply_authorizations/3' received
+%% `undefined'. The visible effect was that only *applied* tuples warmed anything,
+%% which is the tidier-looking rule and the wrong one: it disagrees on precisely the
+%% tuples a user gets wrong. It was found by a test asserting the 2,500 gap on a
+%% `BALANCE' of a refused authority, and the two arms first came back **identical**
+%% at 48,605 -- the cold figure twice.
+%%
+%% So the steps are written out. Three predicates, then an action, and the authority
+%% is in scope throughout.
+apply_authorization(State, [ChainId, Address, Nonce | _Sig], _Fork) ->
+    %% The **whole** tuple goes to `authorization_authority/1', which re-reads `y_parity',
+    %% `r' and `s' from it: the signing preimage is over all three, so passing only the
+    %% first three would recover a different account. Passing three of six was the
+    %% first version of this line and it would have failed every tuple in the corpus
+    %% with a `function_clause' naming neither the tuple nor the field.
+    Tuple = [ChainId, Address, Nonce | _Sig],
     %% No step here is fork-gated, and that is not an oversight: a type-4
     %% transaction cannot be valid before Prague -- `eth_fork_schedule:
     %% tx_type_available/2' refuses the type at an earlier fork -- so this function
-    %% is unreachable for a pre-Prague block. `Fork' is therefore carried for a
-    %% future fork-gated step rather than omitted and re-added at every call site.
-    try
-        [ChainId, Address, Nonce, _YParity, _R, _S] = Tuple,
-        ChainIdId = eth_fork_schedule:chain_id(),
-        true = (ChainId =:= 0 orelse ChainId =:= ChainIdId),
-        true = (Nonce < ((1 bsl 64) - 1)),
-        {ok, Authority} = eth_tx:authorization_authority(Tuple),
-        Code = eth_state:code(State, Authority),
-        %% Step 5: "Verify the code of `authority` is empty or already delegated."
-        %% An authority with *real* code is skipped, so a delegation can never
-        %% overwrite a contract. That is also why the node's EIP-3607 check and this
-        %% one agree: an account that is not an EOA and not delegated is not a
-        %% delegation target either.
-        true = (Code =:= <<>> orelse eth_tx:is_delegation_indicator(Code)),
-        true = (eth_state:nonce(State, Authority) =:= Nonce),
-        S1 = case Address of
-                 %% Step 6's exception: delegating to the zero address CLEARS the
-                 %% code, restoring the account to a plain EOA. Writing
-                 %% `0xef0100 || 0x00..00' instead would leave a delegation that
-                 %% points at nothing, which the EIP's rationale explicitly wants to
-                 %% be expressible.
-                 <<0:160>> -> eth_state:set_code(State, Authority, <<>>);
-                 _ -> eth_state:set_code(State, Authority,
-                                         eth_tx:delegation_indicator(Address))
-             end,
-        {ok, eth_state:set_nonce(S1, Authority, Nonce + 1)}
-    catch
-        %% Every step's failure, uniformly, because the EIP says they are uniform.
-        _:_ -> skipped
-    end.
+    %% is unreachable for a pre-Prague block. `Fork' is carried for a future
+    %% fork-gated step rather than omitted and re-added at every call site.
+    case before_recovery(ChainId, Nonce) of
+        false ->
+            {skipped, State, undefined};
+        true ->
+            case eth_tx:authorization_authority(Tuple) of
+                error ->
+                    {skipped, State, undefined};
+                {ok, Authority} ->
+                    %% **Step 4 has happened.** Everything from here on may refuse
+                    %% the tuple, and the authority is warm either way.
+                    case applicable(State, Authority, Nonce) of
+                        false ->
+                            {skipped, State, Authority};
+                        true ->
+                            {ok, set_delegation(State, Authority, Address, Nonce),
+                             Authority}
+                    end
+            end
+    end;
+apply_authorization(State, _Malformed, _Fork) ->
+    {skipped, State, undefined}.
+
+%% Steps 1 and 2, before an account is named. A failure here has no authority to
+%% warm, because nothing was recovered: the tuple named no account at all.
+%% **One expression, parenthesised.** Written as two lines with a comma between
+%% them and `andalso' starting the second, the first line is a complete statement
+%% and `andalso' is a syntax error -- which the compiler reports as "`andalso'",
+%% with no hint that the comma was the problem and no note of the *first* line,
+%% which is where the reading error was. AGENTS.md §5 lists `band` binding tighter
+%% than `-'; this is the same class of mistake with a comma, and the symptom is the
+%% same: a message about the token you can see rather than the structure you cannot.
+before_recovery(ChainId, Nonce) ->
+    (ChainId =:= 0 orelse ChainId =:= eth_fork_schedule:chain_id())
+        andalso Nonce < ((1 bsl 64) - 1).
+
+%% Steps 5 and 6. `false' here refuses the tuple **and keeps the authority warm**.
+applicable(State, Authority, Nonce) ->
+    Code = eth_state:code(State, Authority),
+    %% Step 5: "Verify the code of `authority' is empty or already delegated." An
+    %% authority with *real* code is skipped, so a delegation can never overwrite a
+    %% contract -- and that is also why this agrees with the node's EIP-3607 check:
+    %% an account that is neither an EOA nor delegated is not a delegation target
+    %% either.
+    (Code =:= <<>> orelse eth_tx:is_delegation_indicator(Code))
+        andalso eth_state:nonce(State, Authority) =:= Nonce.
+
+%% Steps 6 and 7. Delegating to the zero address **clears** the code, restoring the
+%% account to a plain EOA; writing `0xef0100 || 0x00..00' instead would leave a
+%% delegation pointing at nothing, which the EIP's rationale explicitly wants to be
+%% expressible.
+set_delegation(State, Authority, Address, Nonce) ->
+    S1 = case Address of
+             <<0:160>> -> eth_state:set_code(State, Authority, <<>>);
+             _ -> eth_state:set_code(State, Authority,
+                                     eth_tx:delegation_indicator(Address))
+         end,
+    eth_state:set_nonce(S1, Authority, Nonce + 1).
 
 %% The blob fee is a straight debit with no arm on any path that could undo it.
 %% It is spelled as its own function rather than folded into `buy_gas/5' so that

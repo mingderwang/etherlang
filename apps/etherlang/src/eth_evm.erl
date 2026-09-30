@@ -92,6 +92,7 @@ initial_access(Msg, Env, Fork) ->
                      maps:get(address, Msg, <<0:160>>)]
                     ++ coinbase_at(Fork, maps:get(coinbase, Env, undefined))
                     ++ delegate_at(maps:get(delegate, Msg, undefined))
+                    ++ addresses_at(maps:get(auth_authorities, Msg, []))
                     ++ eth_fork_schedule:precompile_addresses(Fork),
             Warmed = lists:foldl(fun(Addr, Acc) -> Acc#{{warm_account, Addr} => true} end,
                                  #{}, Addrs),
@@ -189,6 +190,15 @@ coinbase_at(Fork, Addr) ->
 delegate_at(undefined) -> [];
 delegate_at(Addr) when is_binary(Addr) -> [Addr];
 delegate_at(_) -> [].
+
+%% EIP-7702 step 4's authorities. A **list, not a set** -- the warm set is a map
+%% keyed on the address, so a duplicate costs nothing and there is no reason to
+%% deduplicate, and a `sets` dependency for it would be a second representation of
+%% something the map already is. `undefined` entries are dropped by the map fold
+%% above, because a tuple that failed before recovery names no account: it did not
+%% recover one, so there is nothing to warm.
+addresses_at(L) when is_list(L) -> [A || A <- L, is_binary(A), byte_size(A) =:= 20];
+addresses_at(_) -> [].
 
 %% The fork this frame executes under, taken from the Env.
 %%

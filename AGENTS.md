@@ -79,8 +79,8 @@ depends on execution order, suspect the build before you suspect the code.
 
 ## 3. Architecture
 
-50 modules in `apps/etherlang/src` (14,113 lines of code), 59 test modules in
-`apps/etherlang/test` (13,101), and 926 eunit tests. **These counts drift and this
+50 modules in `apps/etherlang/src` (14,138 lines of code), 59 test modules in
+`apps/etherlang/test` (13,143), and 928 eunit tests. **These counts drift and this
 one had drifted** -- it said 47 and 44 for several commits after it stopped being
 true, which is the same defect as a stale conformance figure: a number in the
 architecture section that a reader will use as a measure of size and that no longer
@@ -489,6 +489,7 @@ is worse than none. It is now two tables.
 | A warm-set entry keyed on a value the frame cannot name | EIP-2929/3651 | `initial_access/3` warms `coinbase` from the **Env** with `maps:get/3`, so an Env that omits it warms nothing. `maps:get/2` would have warmed `undefined`. `v1.45`. |
 | EIP-7702's `PER_EMPTY_ACCOUNT_COST` **refund** | EIP-7702 | A type-4 transaction's authorizations are **applied** (`v1.62`) but not **refunded**: step 7 adds `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` = 12,500 to the global refund counter for each **non-empty** authority, so a delegation by an account that already exists under-refunds by 12,500 per tuple. **Not implemented deliberately, and the reason is structural:** the EIP says the *global refund counter*, and EIP-3529 caps the **combined** refund at `gasUsed / 5` -- but `eth_evm:run/5` applies that cap **inside** the frame and returns only the capped figure, so the transaction layer cannot cap a sum it cannot see. Charging it on top would over-refund by up to 12,500 per non-empty authority, which is a consensus divergence, and is why this is a named gap rather than a missing line. **And the corpus *does* exercise it, which this row asserted it did not.** `v1.62` said the corpus could not show this, on the evidence of one file: every authority in `prague/eip7623_increase_calldata_cost/test_transaction_validity_type_4.json` is absent from the pre-state, hence empty, hence no refund due. That was verified -- for that file -- and then written down as though it were a property of the corpus. It is not. In `prague/eip7702_set_code_tx/test_intrinsic_gas_cost.json` the authority is the fixture's own `signer`, and it **is** in the pre-state: 84 entries with 10-tuples and 0x1d2/0x1d4-named variants, and the expected sender balance is short by exactly 12,500 per non-empty authority. **All 11 remaining divergences in that directory are balance-only, with "one side produced a gas figure and the other did not"** -- the signature of a refund, not of a state transition. A measurement scoped to one file, stated without its scope, is the exact defect this file exists to prevent. |
 | An EIP-2930 access-list **address** is priced and never warmed | EIP-2930 / EIP-2929 | `eth_evm:access_list_access/2` folds the list into `{warm_store, Addr, Slot}` entries and **never adds the address to `accessed_addresses`**. EIP-2929's warm set has two kinds of entry and only the storage kind is seeded, so every access-list address is charged its 2,400 of intrinsic gas (EIP-2930's `2400 * access list address count`) and then re-charged 2,600 as a cold account access on first use. **Measured**, and found by a test written for a different EIP: the EIP-7702 warm-resolution test warmed its delegate through an access list, and the "warm" arm came out **2,400 more** than the cold one -- the list's own price, warming nothing. `v1.46` fixed the storage-key half and the tx field and left this; it is the same defect one level up, and the two are separable, so it is named here rather than folded into a delegation commit. |
+| The refund cap's **base** is the frame's gas, not the transaction's | EIP-3529 | `eth_evm:run/5` caps at `refund_cap(Fork, GasUsed)` where `GasUsed` is the **frame's** consumption; the reference implementation caps at the **transaction's** — `min(tx.gas - gas_left, refund) // 5`, where `tx.gas - gas_left` **includes the intrinsic**. So the node's cap is smaller by `intrinsic / 5` and it **over-refunds** nowhere and **under-refunds** by up to that much whenever the cap binds. **Found by reading `execution-specs`, not by a fixture**, and it is a long-standing divergence rather than a recent one: it applies to every `SSTORE` refund. With a 21,000 intrinsic and 30,000 of frame gas the reference allows 10,200 and this node allows 6,000. The corpus agrees with the node on every refund fixture it has, so the cap is not reached in them — which is the honest reason this is a named gap and not a count. Note that the EIP-3529 *divisor* is right (1/5 London, 1/2 before); only the base is in question. |
 | `eth_createAccessList` | — | The one genuinely absent JSON-RPC method. |
 | `eth_tx:intrinsic_gas/1` takes no fork | — | Falls back to the operator's `ETH_FORK` pin. Correct for pool admission, where no block exists; **wrong** for `eth_call`, `estimateGas` and block execution, which must use `intrinsic_gas/2`. Not a gap so much as a hazard: it is a one-argument function that answers correctly in the one place nobody calls it wrongly. |
 
@@ -498,6 +499,7 @@ is worse than none. It is now two tables.
 |------|-----------|----------------|
 | EIP-7702's authorization list was never applied | EIP-7702 | **Fixed (`v1.62`)**, +16 tests, 13 injections. A type-4 transaction was **priced** for its authorizations (25,000 each) and **validated** structurally (a non-empty list, a non-null destination) and then executed **as though it carried none**: no authority recovery, no `0xef0100` designator, no nonce bump anywhere in `src/`. `grep` for `0xef0100`, `0x05` and `designator` found nothing, which is what the open-items table had been saying. **The corpus found it as the largest shape in the `state_mismatch` cluster** -- and the shape is what named it: 1,005 nonce and 1,002 code divergences and **not one storage write**, on `prague/eip7623_increase_calldata_cost/test_transaction_validity_type_4.json`, whose 84 entries carry 10 authorization tuples apiece. A delegation is 23 bytes of code written and a nonce bumped and nothing else, and `v1.61`'s shape histogram is what made the number 10-for-10 rather than a guess. `eth_block:process_authorizations/3` now applies the EIP's seven steps per tuple, in order, skipping a tuple that fails any of them. **Measured:** `prague/eip7702_set_code_tx` 54 of 80 (67.5%) -> **69 of 80 (86.3%)**, `state_mismatch` 26 -> 11; the 22-file validity set 3,760 -> **3,831 of 3,884 (98.6%)**, `state_mismatch` 122 -> **51**; the committed subset 224 -> **226 of 266 (85.0%)**. Two EIP clauses were read rather than assumed, and **one of them is the opposite of what intuition says**: "if transaction execution results in failure ... the processed delegation indicators is *not rolled back*." That falls out of *where* the call sits -- after `begin_transaction/8`'s nonce increment and before the frame, so the frame's revert restores to a state that already carries the delegations. Putting it inside the frame's starting state rolls them back and diverges on exactly the failing transactions, and injection 8 is that mistake. The other is EIP-2's `s =< n/2`, which `eth_secp256k1:recover/4` did **not** enforce: it checks `s < n` and recovers happily, so a validator without the check accepts a malleated tuple. Two gaps remained open when this was written: the `PER_EMPTY_ACCOUNT_COST` refund, and EIP-3607's relaxation plus following a delegation. **The second closed in `v1.63`**; the first is still open, and `v1.63` also showed that the corpus *does* exercise it, which this entry had denied. |
 | EIP-7702 wrote the designator and nothing read it | EIP-7702 | **Fixed (`v1.63`)**, +19 tests, 11 injections, all shown to bite. `v1.62` applied the authorization list, so an account held `0xef0100 || address` -- and no code-executing operation loaded the code it named, so the delegation did not run, which is the entire feature. `eth_tx:resolve_delegation/3` now resolves **at most one hop**, and `eth_evm:do_call/4` calls it **once**, using the answer for both the price and the code so the hop that was billed and the hop that runs cannot be two separate readings. Three of the EIP's rules here are counter-intuitive and all three are pinned: **one hop, then stop** (a chain resolves to a designator *executed as bytes*, and `0xef` is not an instruction, so the frame halts -- a recursive resolver is the wrong implementation *and* the one that looks right, because it terminates on no input); **a delegation to a precompile is empty code**, so `0x01` does not run `ecrecover`; and **the account keeps its own identity**, the delegate's code in the account's storage, balance and `ADDRESS`. EIP-3607 is relaxed to "no code **except** a delegation indicator", and `CODESIZE`/`CODECOPY` are left alone while `EXTCODESIZE` still reports the indicator's 23 bytes. The resolution carries EIP-2929's **extra** account access, 2,600 cold / 100 warm, in `eth_fork_schedule:delegation_resolution_cost/2` -- and that function exists because `2600` was written out in `access_prices/1` four times already and a fifth copy would have been a sixth home. **Measured: the corpus does not move.** `prague/eip7702_set_code_tx` 69 of 80 and the committed subset 226 of 266, both unchanged, and **that is the finding rather than a disappointment**: no committed fixture has a delegated destination or a delegated `CALL`, so this half of the EIP is not measurable by the corpus at all and the tests are the only evidence for it. Both figures also confirm **zero regressions** across every warm-set, access-cost and CALL change the work touches. |
+| EIP-7702 step 4: a refused authorization warmed nothing | EIP-7702 | **Fixed (`v1.64`)**, +2 tests, 3 injections. `v1.62`'s `apply_authorization/3` validated the EIP's seven steps inside a `try`, and steps 5 and 6 were signalled by `true = (...)`, so a **refused** tuple raised a `badmatch` and landed in the `catch` — and **a `catch` clause cannot see the variables bound in the `try` body**. So `Authority`, which step 3 had just bound, was gone for exactly the tuples that were refused, and step 4's `accessed_addresses.add(authority)` applied only to tuples that *applied*. The steps are now three predicates and an action, with the authority in scope throughout. The EIP puts step 4 **immediately after recovery and before the code and nonce checks**, and so does this: a tuple naming an authority whose nonce does not match is skipped and still leaves that account warm, so its `BALANCE` in the same transaction costs 100 rather than 2,600. Warming only the authorities that succeeded is the tidier-looking rule and it disagrees on precisely the tuples a user gets wrong. **Found by reading `execution-specs`' `validate_authorization`, which is one line long and is the step this node had been reading past for two commits.** Corpus unchanged at 3,831 of 3,884 and 226 of 266 — no committed fixture has a type-4 transaction whose frame reads one of its own authorities, so this is the third EIP-7702 change the corpus cannot see. |
 | EIP-196: an invalid point answered `unsupported` | EIP-196 | **Fixed (`v1.44`).** Note what the corpus could not tell us: the tally did **not** move, because the committed fixtures only ever call ECADD with *empty* input (valid -- the point at infinity) or with gas they cannot afford (so the precompile never runs). Nothing in the corpus exercises an invalid ECADD. The severity was not in a gas figure at all: `unsupported` is a halt, and `eth_block:run_transaction/5` turns a halt into a **refusal to produce the block**, so a mainnet contract doing a real curve operation would have made this node reject its block. `ECADD`/`ECMUL` now answer `{failed, {ecadd, not_on_curve}}` and `{failed, {ecmul, not_on_curve}}`, with the two EIP invalidity conditions -- off the curve, and a coordinate at or above `p` -- told apart. |
 | EIP-150's stipend: one figure where the spec has two | EIP-150 | **Fixed (`v1.47`)**, +6 fixtures, zero regressions. `child_gas/4` returned `min(request + stipend, cap)` for both roles. The spec's `MessageCallGas` has two: `cost = gas + extra_gas` (**no stipend**) and `sub_call = gas + stipend`. So the clamp belongs on the **pre-stipend** figure, and the insufficient-balance refund returns `sub_call` -- a `CALL` that cannot cover its value hands the caller 2,300 gas it never paid for, and a frame can finish with more gas than it started with. The old form swallowed the stipend into the cap whenever the cap binds, which is every `GAS`-forwarding call. The child legitimately holding more than the parent has left is **specified**, not an overflow: the stipend is a gift. |
 | EIP-2930's access list: priced, never applied | EIP-2930 | **Fixed (`v1.46`)**, +8 fixtures, zero regressions. The list was charged for and ignored, so a declared access was paid for twice -- once in the intrinsic and again as a cold access on every use. `eth_block` now puts `eth_tx:access_list_field/1` on the Msg -- the *same function* `validate/2` priced, so the list that is charged for and the list that is applied cannot disagree -- and `initial_access/3` seeds the warm sets, converting each slot to the interpreter's **word**. |
@@ -1095,6 +1097,73 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
     shape here is §10a's own: *a section that prints nothing must say what it did
     not look at* -- and a file that grew a thousandfold and said so in the push
     warning is an instrument that worked.
+
+- **A `catch` clause cannot see the variables bound in the `try` body, and a
+  `try` used as "any step may fail" throws away everything the failed step had
+  already computed.** `apply_authorization/3` validated EIP-7702's seven steps inside
+  a `try`, which is the natural way to write "if any step above fails, immediately
+  stop processing the tuple" in one line. Steps 5 and 6 were signalled by
+  `true = (...)`, so a **refused** tuple raised a `badmatch` and went to the
+  `catch` -- and `Authority`, bound by step 3, was out of scope there. The visible
+  effect was that only *applied* tuples warmed their authority, which is the
+  tidier-looking rule and the wrong one: EIP-7702 step 4 comes **before** the code
+  and nonce checks, so a refused tuple still leaves its account warm.
+  - The general form: **`try` is a scope boundary, and using it to mean "any of these
+    may fail" discards the values the successful prefix produced.** The steps are
+    now three predicates and an action, with the authority in scope throughout, and
+    the code is *longer* and says more.
+  - The tell was a test whose two arms came back **identical** at 48,605 -- the cold
+    figure twice, where the warm figure was 46,105. Two arms that agree on a figure
+    they were built to differ on is either a rule that does nothing or a rule that
+    always fires; here it was a rule that fired only in the case the test was not
+    exercising.
+
+- **The authority is the account that *signed*; the tuple's `address` is the
+  delegation *target*.** They are different addresses, and a control that varies the
+  wrong one is not a control. The step-4 test's first control signed both tuples with
+  the same key, so both recovered to the same account, both arms warmed it, and both
+  came back at the **warm** figure -- 46,105 -- with the difference reading 0. An
+  implementation that warmed the tuple's `address` field instead of the signer would
+  have passed that test. The second control signs with a different key, and the
+  comment says why, because "the field step 4 does not read" is not a thing the
+  fixture can say about itself.
+
+- **`%%/*` opens a block comment, and the comment swallows the rest of the file.**
+  A line of `%%` documentation that happened to begin `%%/*` was parsed as the start
+  of a `/* ... */` comment, which ran on until a stray `*/` somewhere later in the
+  module. The compiler then reported **two unrelated functions as undefined** --
+  `buy_blob_gas/3` and `apply_authorization/3` -- naming neither the comment, nor
+  the line, nor the fact that the text they were in had been consumed. Erlang has
+  both comment forms and the `%%` one does **not** win. `AGENTS.md` §5 lists `band`
+  binding tighter than `-`; this is the same family, and the same lesson: the error
+  names the token you can see rather than the structure you cannot.
+
+- **Cross-implementation reading finds what fixtures cannot.** Every EIP-7702 defect
+  in the last two commits was found by the corpus, by an injection, or by me
+  reasoning -- and the one that survived all three was EIP-7702 **step 4**, one line
+  of `execution-specs`' `validate_authorization`, which no fixture in this repository
+  exercises and which two of my own tests had walked past. The corpus is a
+  *sampling* of the specification; another client's source is a *reading* of it, and
+  the two fail differently. A sampling tool cannot tell you about the part of the
+  corpus you do not have, and a third implementation is a second opinion about the
+  part you do.
+
+- **A control that crosses a difference the subject does not have in common measures
+  the difference.** The step-4 test's second control compared a **type-2**
+  transaction (no authorization list) against a **type-4** one, and asserted a
+  2,500 gap. It measured **-22,500**: the two types differ by EIP-7702's 25,000
+  authorization price, which is 90% of the answer. The control is now an *absolute*
+  figure with its decomposition written out -- 21,000 + 3 + 2,600 + 2 = 23,605 --
+  which pins "cold" without comparing across transaction types at all. The 2,500
+  comparison belongs to the first test, where both arms are type-4.
+
+- **A gas figure that is exactly the intrinsic is a frame that did not run.** The
+  step-4 helper inherited its `to` from a shared fixture builder, which defaults to a
+  codeless account, so both arms came back at **46,000** -- 21,000 plus the 25,000
+  authorization price, and *nothing else*, with `status = 1`. The frame executed no
+  code, and the difference read as a confident 0. The signature is the number: a
+  figure that lands exactly on a sum you can name from the transaction's own fields
+  is not a measurement of anything the frame did.
 
 ## 11. Known dead code
 
