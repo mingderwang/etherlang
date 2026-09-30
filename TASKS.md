@@ -320,16 +320,40 @@ corpus's own expected gas varies with a value the program ignores, the divergenc
 in the comparison rather than in the state transition. That is the reading the
 evidence supports and it is **not** established.
 
-**The measurement that would settle it, and it is small:** the node's *actual*
-`gasUsed` for these 424 entries, taken from the receipt rather than by inverting a
-balance. If it is constant across all 424 -- which it must be, since the execution is
-identical -- then the whole of the 20,197-to-139,693 range is the fixture side, and
-the node is right. `eest_state_tests` already carries `Detail`'s `gas` map with
-`spent_actual` and `spent_expected` separately; what is missing is a run that
-separates them and prints both for entries whose post-state carries **no**
-`gasUsed`. That is a change to the *reporter*, not to the node, and it is the reason
-this cluster has taken this long: **an instrument that can only recover one side of a
-comparison by arithmetic will keep reporting a disagreement it cannot attribute.**
+### The node's receipt agrees with the inversion, so this is a real node defect
+
+`gas_story/5` recovered the node's gas by **inverting its balance difference** --
+arithmetic on a derived quantity -- while the node's own receipt, the fourth argument
+it was already passed, said it outright. It now reads it: `receipt_gas_used` and
+`delta_receipt` are in the gas story beside the inferred pair, and the two are not two
+figures for one question. The receipt is what the node charged; the inversion is what
+its balance arithmetic implies, and where they disagree the node's accounting is
+inconsistent with itself.
+
+**They agree in 848 of 848 entries.** So the node's accounting is internally
+consistent, and the divergence on `stTimeConsuming` is **real and not an artifact of
+how the harness recovered the figure.** That control is what makes the rest of this
+entry credible, and it was missing for the whole of the cluster.
+
+**And the fourth hypothesis is dead too.** The expectation was that the node's gas
+would be constant across the 424 push-values, because the executed work is identical,
+and that the whole 20,197-to-139,693 range would therefore be the fixture side. It is
+not: **both** sides vary, each with 62 distinct values over the 424 entries, and they
+track each other. The node is consistently higher, and the delta repeats with period
+three -- 20,197 / 20,695 / 80,195, then 20,197 / 20,695 / 80,195 again -- which is
+three structural variants of the calldata per repeat, not a per-opcode rounding
+difference.
+
+So the state of this cluster is: **a reproducible over-charge in this node, on create
+transactions whose init code makes `CALL`/`DELEGATECALL`/`CALLCODE` into three small
+`SSTORE`-writing callees and one unconditional reverter.** Not localised to a rule
+yet, and the period-3 structure is the most specific thing about it.
+
+The per-entry structure is not yet understood, and the earlier claim that "the only
+per-entry variable is the first `PUSH`'s immediate" was too quick: the immediates are
+all 2 bytes wide, yet the programs are 185, 187, 189 and 191 bytes, so the bodies
+differ too. That is the next thing to read, and it is a disassembly rather than a
+measurement.
 
 
 

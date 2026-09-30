@@ -1454,11 +1454,37 @@ gas_story(Diffs, Entry, PreState, Receipt, Tx) ->
             Before = overlay(PreState, {balance, Sender}, 0),
             Expected = gas_of(Before, Want, Price, Value),
             Actual = gas_of(Before, Got, Price, Value),
+            %% **The node's own figure, from its receipt, beside the one this
+            %% function inferred.**
+            %%
+            %% `gas_of/4' recovers the node's gas by *inverting its balance
+            %% difference* -- arithmetic on a derived quantity -- when the receipt the
+            %% node just built is sitting in the fourth argument saying it outright.
+            %% It was not read, and for `stTimeConsuming' that cost the entire
+            %% cluster: every one of its 10,374 entries reports a delta recovered by
+            %% inverting a balance, and the inversion is the only reason the report
+            %% cannot say which side of the comparison the node is on.
+            %%
+            %% Both are kept, and **they are not two figures for one question**: the
+            %% receipt is what the node charged and the inversion is what the node's
+            %% balance arithmetic implies. Where they disagree the node's accounting
+            %% is inconsistent with itself, which is a finding in its own right and
+            %% invisible while only one of the two is printed.
+            ReceiptGas = receipt_gas_used(Receipt),
             #{price => Price, value => Value,
               spent_expected => Expected,
               spent_actual => Actual,
-              delta => gas_delta(Expected, Actual)}
+              receipt_gas_used => ReceiptGas,
+              delta => gas_delta(Expected, Actual),
+              delta_receipt => gas_delta(Expected, ReceiptGas)}
     end.
+
+%% The node's `gasUsed', as the same `{gas, N}'` shape the inversions produce so
+%% `gas_delta/2' works on all three. `no_receipt_gas' rather than `undefined' -- an
+%% atom names itself in the report, and `undefined' here would be ambiguous with a
+%% missing key.
+receipt_gas_used(#{<<"gasUsed">> := G}) when is_integer(G) -> {gas, G};
+receipt_gas_used(_) -> no_receipt_gas.
 
 %% How much more or less gas this node spent than the fixture expected, when
 %% both sides produced a figure. `no_comparable_gas' rather than a number when
