@@ -374,6 +374,41 @@ done is naming the term. The bands' separations are 50,713 and 110,713 -- and
 than one term, and separating them needs one call sequence's worth of hand-traced
 EIP-150/EIP-2929/EIP-2200 arithmetic.
 
+### The callee that must run out of gas, and the one arm that is left
+
+`0x2000...` is 166 bytes and disassembles to **33 `SSTORE`s, and every one of them is
+a first write to a *distinct* slot from `original = 0`.** For `original == 0` both
+EIP-2200 arms cost the same thing -- if `current == new` the no-op arm lands on
+`SSTORE_SET_GAS`, and if `current != new` the set arm does -- so all 33 cost 20,000
+and the callee needs **660,000**.
+
+**The fifth call forwards 600,000. 660,000 > 600,000, so that frame must halt
+out of gas.** That conclusion is arithmetic and does not depend on anything else here:
+the callee's requirement exceeds its allowance under any reading of EIP-2200 in which
+`original == 0` is not free. It is the single most specific fact this cluster has
+produced, because an exceptional halt has consequences the node either gets right or
+does not -- the whole forwarded allowance is consumed and **none of it comes back**,
+which is a much larger and much sharper term than any of the 20,000s.
+
+And the callee re-writes **slot 1 three times** -- `1`, then `0`, then `1` -- so it
+also exercises EIP-2200's **dirty arm**, the one that costs `SLOAD_GAS` rather than a
+set price. **The dirty arm's gap is 19,900** (20,000 against 100), against an
+observed floor delta of **20,197**.
+
+**The hand-trace does not reconcile, and a hand-trace that does not reconcile is
+worth nothing.** Summing the five calls' overheads -- EIP-2929's cold/warm (2,600 then
+100, since `0xb000` and `0x3000` are each visited twice) and EIP-150's 63/64 clamp --
+gives roughly 740,000 if the fifth call is charged its whole allowance and roughly
+237,000 if it is not, and **neither is the 422,396 the node's receipt reports**. So one
+of those two assumptions is wrong, and which one is not something to guess: it is
+either "the fifth call is charged its whole forwarded allowance" or "the fifth callee
+runs out of gas", and those two imply each other's negation.
+
+That is the measurement to take, and it is small: **the node's own gas figure for the
+fifth call alone**, which `receipt_gas_used` now makes obtainable per entry. A single
+`CALL 0x2000` with 600,000 forwarded, as its own transaction, answers it -- and if the
+node does not run it out of gas, that is a real defect with a name.
+
 The two candidates the shape points at, in the order they should be checked:
 
 - **`CALLCODE` and `DELEGATECALL` run the callee's code against a different storage
