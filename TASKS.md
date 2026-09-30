@@ -404,10 +404,55 @@ of those two assumptions is wrong, and which one is not something to guess: it i
 either "the fifth call is charged its whole forwarded allowance" or "the fifth callee
 runs out of gas", and those two imply each other's negation.
 
-That is the measurement to take, and it is small: **the node's own gas figure for the
-fifth call alone**, which `receipt_gas_used` now makes obtainable per entry. A single
-`CALL 0x2000` with 600,000 forwarded, as its own transaction, answers it -- and if the
-node does not run it out of gas, that is a real defect with a name.
+### Named: EIP-2200's no-op arm, on a slot whose original is zero
+
+The measurement was taken and it names the defect. A single `SSTORE` at Cancun, in a
+bare frame, with the pre-state seeded explicitly:
+
+| case | node | EIP-2200 | |
+|---|---|---|---|
+| fresh set: 0 -> 1, `original = 0` | **22,106** | 22,106 | correct |
+| **no-op: 0 -> 0, `original = 0`** | **2,206** | **22,106** | **19,900 short** |
+| dirty: 1 -> 0, `original = 1` | 4,005 | 5,006 | 1,001 short |
+
+EIP-2200's clause for the no-op arm is three nested conditions, and the last one is
+the one this node misses:
+
+    if current_value == new_value:
+        if original_value == current_value:
+            if original_value == 0:
+                cost = SSTORE_SET_GAS          # <-- 20,000
+            ...
+    cost = SLOAD_GAS + COLD_SLOAD_COST
+
+**A write of zero into a slot that was already zero, on an account whose original
+value there is zero, must cost 20,000.** The node charges `COLD_SLOAD_COST` -- 2,100 --
+and so **under-charges every zero-to-zero write by exactly 19,900.**
+
+That is the clause, the figure, and the fixture family: **`stSStoreTest` is
+`sstore_0to0` and its siblings**, the exhaustive `SSTORE` price tests, and
+`sstore_0to0` is the *simplest* of them. The band floor of 20,197 is 19,900 plus 297,
+and 19,900 is this defect -- the remainder belongs to whichever of the other arms the
+particular entry also touches.
+
+**The correction to the last revision of this file, and it is the important part:**
+it predicted the `0x2000` callee "must halt out of gas", on 660,000 required against
+600,000 forwarded. It does not. The node charged that whole 33-write callee
+**30,696** and the `CALL` returned **1**. The prediction was arithmetic and it was
+still wrong, because it assumed the no-op arm costs 20,000 when the node charges
+2,100 -- **so a frame the specification empties runs here instead of halting.** That
+is a real and serious consequence, and it is the opposite direction from the
+over-charge the residual shows: the corpus delta is positive because the *other* arms
+over-charge, and the no-op arm under-charges inside the same frame.
+
+So both directions are present in one function, `sstore_cost/4`, and neither was
+visible before because the corpus's own figures come from the same node's price table
+whenever the fixture's `post` carries no `gasUsed` -- which these do not.
+
+**Not done:** the `dirty` arm's 1,001. Which direction it should move depends on
+whether `originals` records the pre-transaction value before the first write, and
+that is a separate reading of `#ctx.originals` against EIP-2200's `original_value`.
+Named, not claimed.
 
 The two candidates the shape points at, in the order they should be checked:
 
