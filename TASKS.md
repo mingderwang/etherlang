@@ -268,14 +268,58 @@ single missing clause explains the suite. And the deltas do **not** scale with
 calldata length: d0 has 376 bytes and delta 20,197 while d100 has 372 and 80,193, so
 EIP-7623's `21000 + 10 * tokens` floor is not the axis.
 
-So: one plausible lead, five entries that contradict it, and no arithmetic yet.
-**Recorded as a measurement, not a diagnosis.** What would settle it: the fixture's
-*per-operation* expected `gasUsed` (these `post` sections carry none, which is why
-the harness can only invert a balance), or a single entry hand-traced -- the init
-code loops over storage slots issuing `SSTORE`s and `CALL`s, so the number of each
-per entry is the first thing to establish. Two values in a set that differ by 1 are
-adjacent integers whatever their magnitude suggests; values that differ by ~60,000
-are not adjacent and are not one term.
+### The leading hypothesis is dead: it is not an `SSTORE` pricing error
+
+`v1.68` recorded one plausible lead -- the smallest delta, 20,197, is
+`20,000 + 197`, one `SSTORE_SET_GAS` plus 197 -- and five entries contradicting it.
+Four more measurements kill the hypothesis outright rather than merely weakening it.
+
+**The callee code is byte-identical across entries, and every entry has exactly 42
+`SSTORE`s in it.** The fixtures are `sstore_combinations`, so the writes are in the
+*callees*, not in the transaction's init code: the init code disassembles to 45-46
+opcodes with **zero** `SSTORE`s and 2-3 `CALL`s, and the storage work sits in five
+pre-state contracts of which one is 166 bytes and holds 33 `SSTORE`s. So the write
+count per entry is a constant, and it is 42.
+
+**There is exactly one distinct pre-state across all 424 divergent entries in
+`sstore_combinations_initial00_2_Paris.json`** -- one hash, covering `d0` through
+`d334` -- so the storage's initial values, and therefore the *correct* EIP-2200 price
+for each write, are identical too.
+
+Same code, same write count, same starting storage, and **68 distinct deltas**. A
+per-write pricing error cannot produce that, because there is nothing per-write to
+vary. **The `SSTORE_SET_GAS` lead is eliminated.**
+
+**And it is not the calldata either.** Only five distinct `(length, zero bytes)`
+pairs exist across the entries, and **every one of those five groups carries several
+distinct deltas** -- `(185, 116)` alone carries 20,193 / 20,197 / 20,695 / 70,909 /
+70,913 / 71,411. So the delta is not a function of calldata length or zero-byte
+count either, which also rules out a plain mis-priced `G_txdata` or EIP-7623's
+`21000 + 10 * tokens` floor as the *whole* of it.
+
+**What is left is the init code's control flow.** The `post` sections of these
+fixtures carry no `gasUsed` (`['hash','logs','txbytes','indexes','state']`), so the
+harness recovers the expected figure by inverting the sender's balance, and the only
+thing left that varies between entries is the calldata *content* -- which determines
+how many times the init code's loop runs. So the divergence is **data-dependent
+execution inside a create transaction's init code**, and the node charges more than
+the fixture by an amount that scales with how much of that loop ran.
+
+The delta bands are consistent with that and with nothing simpler: narrow clusters of
+**+/-1 gas** within a band (20,193 / 20,194 / 20,195 / 20,197 / 20,198, and 70,973
+through 70,976), separated by large steps, with **8781 and 8783 recurring twice**
+between bands and **2419** and **501** recurring as well. None of 8781, 2419 or 501
+is an EIP-2200, EIP-2929 or EIP-3529 term.
+
+**Recorded as a measurement, not a diagnosis.** What would settle it: instrument one
+entry's gas per opcode and compare the total against a hand-traced EIP-2200 sum, or
+add a `gasUsed` to these fixtures so the expected figure stops being an inversion.
+The smallest delta (20,197, entry `d0`, 187 bytes, 2 `CALL`s) is the one to trace,
+and the recurring step sizes are where to look first -- a defect that produces 8781
+twice is not a per-opcode rounding difference.
+
+The pre-state, write-count and calldata measurements that follow were made to test
+the `SSTORE_SET_GAS` lead recorded above, and they eliminated it.
 
 ## The full-corpus figure, measured for the first time
 
