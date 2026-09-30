@@ -344,10 +344,48 @@ three -- 20,197 / 20,695 / 80,195, then 20,197 / 20,695 / 80,195 again -- which 
 three structural variants of the calldata per repeat, not a per-opcode rounding
 difference.
 
-So the state of this cluster is: **a reproducible over-charge in this node, on create
-transactions whose init code makes `CALL`/`DELEGATECALL`/`CALLCODE` into three small
-`SSTORE`-writing callees and one unconditional reverter.** Not localised to a rule
-yet, and the period-3 structure is the most specific thing about it.
+### Localised: the delta is a function of which opcode each call uses
+
+The per-entry structure is the call sequence, and nothing else. `sstore_combinations`
+generates one transaction per `(opcode, target)` assignment over five calls, and the
+five calls' opcodes are what varies: 424 push-values, **51 distinct call sequences**,
+and the delta falls into **seven bands** with clean edges.
+
+| band | shape |
+|---|---|
+| 10,974 - 11,478 | `STATICCALL` in position 2 |
+| 20,193 - 20,697 | `DELEGATECALL` in position 2 |
+| 70,909 - 70,910 | `CALLCODE` in position 2 |
+| 70,911 - 70,912 | `CALLCODE` in position 2, later positions vary |
+| 80,193 - 80,197 | a sub-case of the `DELEGATECALL` band |
+| 130,474 - 130,912 | `CALLCODE` and `DELEGATECALL` combinations |
+| 139,693 - 139,695 | `CALLCODE` combinations |
+| 190,409 - 190,411 | `STATICCALL` in both early positions |
+
+The floor is **20,193**, and one signature returns exactly `20,197` and nothing else:
+`CALL DELEGATECALL DELEGATECALL CALLCODE CALL`. **So the divergence is a per-call term
+that depends on the call opcode**, not a whole-transaction error -- which is the
+narrowing from "this transaction costs 20,197 to 190,411 too much" to "one of five
+calls is charged a figure that depends on which opcode it is".
+
+That is the work list for this cluster, and it is a small one. What is **not** yet
+done is naming the term. The bands' separations are 50,713 and 110,713 -- and
+50,713 is not a schedule constant, so it is a *sum* of terms over several calls rather
+than one term, and separating them needs one call sequence's worth of hand-traced
+EIP-150/EIP-2929/EIP-2200 arithmetic.
+
+The two candidates the shape points at, in the order they should be checked:
+
+- **`CALLCODE` and `DELEGATECALL` run the callee's code against a different storage
+  context** -- `CALLCODE` the caller's, `DELEGATECALL` the caller's. `eth_evm` added
+  `check_call_value/5`'s `callcode` clause in `v1.47` and `handle_child/9` treats the
+  two differently, so a per-opcode divergence in the *forwarded allowance* or in the
+  *returned* gas would show up exactly like this and would be invisible in every
+  fixture that only uses `CALL`.
+- **EIP-2929's warm/cold account access**, charged per call and therefore per opcode
+  sequence: `2,600` cold and `100` warm. The same address called twice is warm the
+  second time, and the five calls here repeat `0xb000` and `0x3000`, so the order of
+  the opcodes changes how many cold charges there are.
 
 The per-entry structure is not yet understood, and the earlier claim that "the only
 per-entry variable is the first `PUSH`'s immediate" was too quick: the immediates are
