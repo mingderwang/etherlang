@@ -31,13 +31,13 @@
 
 **229 of the 235 non-`static` files, 15,660 entries: 6,786 match — 43.3%.** This is the
 number the documentation had been carrying as "never measured", and it is **less than
-half** the 93.6% the committed 25-file subset reports. Both numbers are true and the gap
+half** the 94.0% the committed 25-file subset reports. Both numbers are true and the gap
 between them is the most useful thing in this section.
 
 **Why the subset flatters.** The committed subset was chosen by a rule -- *the smallest
 file in each suite* -- to keep it under 150 KB per fixture. The smallest file in a suite
 is the one with the fewest entries and the least state, so the subset is systematically
-the easiest material. 25 files, 266 entries, 93.6%. 229 files, 15,660 entries, 43.3%.
+the easiest material. 25 files, 266 entries, 94.0%. 229 files, 15,660 entries, 43.3%.
 **The subset measures that the fixes work; the corpus measures what is still broken.**
 
 Per fork, biggest first:
@@ -815,30 +815,30 @@ behavioural change per commit, and each step says what it now does.
    - **6e is now unblocked** and its result will be correct rather than differently
      wrong: seeding the frame's refund counter flows through the right cap.
 
-6e. **EIP-7702: the `PER_EMPTY_ACCOUNT_COST` refund, and it is 11 corpus entries.**
-   The one part of EIP-7702 still absent. **The structural objection in `v1.62` is
-   solvable and was wrong to leave standing**: the EIP adds the refund to the
-   *global* counter and EIP-3529 caps the **combined** refund, which the node
-   applies inside the frame — but `eth_evm:run/6` can be given the authorization
-   refund as an **initial refund counter**, so the frame's existing cap then applies
-   to the combined total and `run/5` is untouched. **All 11 remaining divergences in
-   `prague/eip7702_set_code_tx/test_intrinsic_gas_cost.json` are this**: balance-only,
-   with "one side produced a gas figure and the other did not", and the authority is
-   the fixture's own `signer`, which **is** in the pre-state.
-   - **And `v1.62` asserted the corpus could not show this.** It verified one file
-     — `prague/eip7623_increase_calldata_cost/test_transaction_validity_type_4.json`,
-     whose authorities are all absent from the pre-state — and wrote the conclusion
-     down as though it were a property of the corpus. A measurement scoped to one
-     sample, stated without its scope, is the defect this repository keeps paying for.
-6c. ~~**Reorder `eth_tx:validate/2` so the fee conditions come last.**~~  **Closed
-   as unsupported by evidence, in `v1.57`.** The premise was the note above: that
-   `fee_ceiling_ok/4` running before `check_blobs/2` and the intrinsic gas check
-   caused the twelve `fee_too_low` entries. It did not — the missing `eip7702` clause
-   did. With the clause added and the stated base fee supplied, **no corpus entry
-   changes its answer**, and the reference implementation's order (intrinsic gas
-   first, fee conditions late) is not something any fixture in this corpus
-   distinguishes. So the node's order differs from `execution-specs'` and nothing
-   observable depends on it.
+6e. ~~**EIP-7702: the `PER_EMPTY_ACCOUNT_COST` refund, and it is 11 corpus entries.**~~
+   **Done (`v1.66`).** `prague/eip7702_set_code_tx` is **80 of 80** and the 22-file
+   set went 3,831 -> 3,842 with `state_mismatch` 51 -> 40.
+   - The refund is `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` = 12,500, **per
+     non-empty authority**, and it is written as the EIP's **difference** rather than
+     a literal 12,500: the subtraction is the specification, because the rule *is*
+     that delegating yourself costs half what delegating a new account costs.
+     `PER_AUTH_BASE_COST` did not exist in the node before this.
+   - **Seeded into the frame's starting refund counter**, not applied after the
+     frame returns. The EIP says *global refund counter*; the frame's counter is the
+     only global counter there is; and seeding means the frame's own refunds stack on
+     top and the cap applies to the sum. `v1.65` made this correct — the cap is now
+     taken over the transaction's gas used.
+   - **`exists/2` is read before the nonce bump.** `set_delegation/4` increments the
+     nonce, so reading it afterwards makes every account non-empty and refunds every
+     delegation the EIP exempts. The injection that moves the read bites.
+   - **Two of five injections do not bite, and neither should be chased.** A bare
+     `12500` cannot be distinguished from the difference because they are the same
+     number today — that is a *maintenance* property, not a runtime one, and no test
+     settles it. Seeding a child frame with the refund too largely cancels against
+     the parent; the residual is the child's own cap, and pinning that needs a fixture
+     tuned to a fraction of the refund, which is asserting the tuning.
+   - Committed subset 249 -> 250: **one**, because the subset holds one such fixture
+     and the directory holds eleven.
 
    That is recorded rather than acted on, because the honest position is that the
    order is **unverified in both directions**: this node cannot show its order is
@@ -1474,7 +1474,7 @@ they are not forgotten rather than worked on prematurely.
   - Lighthouse requires both methods, so "Lighthouse-compatible" is not currently true of the engine surface
 - [ ] **`engine_notifyHeaders`** — absent (see the Beacon requests item under Phase 3). The clause does not appear in any per-fork file of the `execution-apis` repository (`paris`, `shanghai`, `cancun`, `prague`, `osaka`, `amsterdam`, `bogota`, `common`); only the V2 `getPayloadBodiesBy*` methods appear under those names. Its shape would have to be guessed, so it is left undone rather than invented
 - [x] **Block authoring** — `payloadAttributes` are read, `forkchoiceUpdated` returns a `payloadId`, and `getPayload` returns a real block. This item said "no `payloadAttributes` handling, so `forkchoiceUpdated` can never return a `payloadId` and the node cannot build a block for the CL", which was true when written and stopped being true when `eth_block_builder` was added to the supervisor's child list; the box outlived the sentence. The builder was rewritten rather than switched on, because the dead version assembled a block with its own header constants, three of which were wrong in ways already found and fixed in `eth_block`, and discarded every `payloadAttributes` field.
-  **The block it builds is still not the block the network would build.** Its state root does not match the network's, for the reasons in item 7 — the same gas-schedule divergences that hold the conformance tally at 249 of 266 rather than all of it. So the item is closed as *wiring* and the divergence is tracked where it can be seen, not here.
+  **The block it builds is still not the block the network would build.** Its state root does not match the network's, for the reasons in item 7 — the same gas-schedule divergences that hold the conformance tally at 250 of 266 rather than all of it. So the item is closed as *wiring* and the divergence is tracked where it can be seen, not here.
 
 ### What the engine could not do before this pass
 
@@ -1882,7 +1882,7 @@ Recorded because the documentation claimed otherwise, and because each of these 
 - [ ] **Performance benchmarks** — block processing speed, state access latency
 - [x] **Conformance tests** — `eest_state_tests.erl` runs the `execution-spec-tests`
   `state_tests` corpus. **Started, and the first measurement is about 2%**
-  (78 of 266 committed entries at the first measurement, 249 of 266 now; see "What
+  (78 of 266 committed entries at the first measurement, 250 of 266 now; see "What
   to do next" item 5 for the number, the real defects it found, and the two harness
   bugs that made the figure irreproducible until they were fixed). The
   Ethereum Foundation's own `ethereum/tests` block-level suites and EEST's

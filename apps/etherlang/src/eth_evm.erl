@@ -36,9 +36,22 @@
 %% free, which is the whole reason it is a context field: a parameter would have
 %% to be passed at the two internal `run_t' call sites and a third the day a fourth
 %% appears, and forgetting one would silently cap that frame on the wrong base.
--record(ctx, {state, env, msg, transient = #{}, originals = #{}, fork, intrinsic = 0}).
+%% `refund0` is EIP-7702's step-7 refund, **already earned before the frame
+%% starts**. It is seeded into the top-level frame's `#e.refund` rather than added
+%% afterwards, and that placement is the whole point: the EIP says "add ... to the
+%% *global refund counter*", and the frame's counter is the only global counter
+%% there is. Seeding it means the frame's own `SSTORE` refunds accumulate on top of
+%% it and EIP-3529's cap -- which `v1.65` took over the transaction's gas used --
+%% then applies to the **sum**, which is what the EIP means and what charging the
+%% refund on top of an already-capped one would not be.
+%%
+%% A child frame must **not** be seeded: the refund is global and the parent already
+%% holds it, so seeding a child would multiply it by the call depth. The seeding
+%% happens in `run/7`, which only the top-level frame reaches.
+-record(ctx, {state, env, msg, transient = #{}, originals = #{}, fork, intrinsic = 0,
+              refund0 = 0}).
 
--export([run/5, run/6,
+-export([run/5, run/6, run/7,
            initial_access/3, valid_jumpdests/1]).
 
 %% ---------------------------------------------------------------------------
@@ -71,10 +84,31 @@ run(Code, Msg, State, Env, Gas) when is_binary(Code) ->
         | {error, term(), map(), list()}.
 run(Code, Msg, State, Env, Gas, TxIntrinsicGas)
   when is_binary(Code), is_integer(TxIntrinsicGas), TxIntrinsicGas >= 0 ->
+    run(Code, Msg, State, Env, Gas, TxIntrinsicGas, 0).
+
+%% `InitialRefund` is gas **already earned** by the enclosing transaction before this
+%% frame begins -- today that is only EIP-7702's step-7 authorization refund, and it
+%% is zero for every other caller.
+%%
+%% It is the third arity in a short chain, and each link documents why its default
+%% is right rather than convenient: `run/5` has no enclosing transaction at all, so
+%% it has no intrinsic and no refund; `run/6` adds the intrinsic for a caller that
+%% has one; `run/7` adds a refund the transaction earned by *executing* something
+%% outside the frame. A chain of defaults is only safe while every one of them is
+%% the correct answer for the callers that reach it, which is why each is written
+%% down and why `eth_block:run_transaction/5' is the only place `run/7` is called.
+-spec run(binary(), map(), map(), map(), non_neg_integer(),
+          non_neg_integer(), non_neg_integer()) ->
+          {ok, binary(), non_neg_integer(), map(), list()}
+        | {revert, binary(), non_neg_integer(), map(), list()}
+        | {error, term(), map(), list()}.
+run(Code, Msg, State, Env, Gas, TxIntrinsicGas, InitialRefund)
+  when is_binary(Code), is_integer(TxIntrinsicGas), TxIntrinsicGas >= 0,
+       is_integer(InitialRefund), InitialRefund >= 0 ->
     Fork = fork_of(Env),
     {Res, _Transient, _Originals} =
         run_t(Code, Msg, State, Env, Gas, initial_access(Msg, Env, Fork), #{}, Fork,
-              TxIntrinsicGas),
+              TxIntrinsicGas, InitialRefund),
     Res.
 
 %% EIP-2929, "When a transaction execution begins", in the EIP's own words:
@@ -246,7 +280,8 @@ fork_of(Env) -> maps:get(fork, Env).
 %% transaction-global: a child frame inherits a copy of the parent map and,
 %% on success, its writes merge back (child wins); on revert/error the
 %% parent map is kept unchanged.
-run_t(Code, Msg, State, Env, Gas, Transient, Originals, Fork, TxIntrinsicGas)
+run_t(Code, Msg, State, Env, Gas, Transient, Originals, Fork, TxIntrinsicGas,
+      InitialRefund)
   when is_binary(Code) ->
     %% **`intrinsic` is a transaction-level fact, so it lives in the context** and is
     %% inherited by every child frame automatically. Threading it as a `run_t`
@@ -255,8 +290,10 @@ run_t(Code, Msg, State, Env, Gas, Transient, Originals, Fork, TxIntrinsicGas)
     %% appears. A `#ctx' field cannot be forgotten by a call site, because there is
     %% nothing to pass.
     Ctx = #ctx{state = State, env = Env, msg = Msg, transient = Transient,
-               originals = Originals, fork = Fork, intrinsic = TxIntrinsicGas},
-    E0 = #e{code = Code, gas = max(Gas, 0), dests = valid_jumpdests(Code)},
+               originals = Originals, fork = Fork, intrinsic = TxIntrinsicGas,
+               refund0 = InitialRefund},
+    E0 = #e{code = Code, gas = max(Gas, 0), dests = valid_jumpdests(Code),
+            refund = Ctx#ctx.refund0},
     try exec(E0, Ctx) of
         {E1, Ctx1} ->
             GasUsed = E0#e.gas - E1#e.gas,
@@ -1352,7 +1389,7 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx, ChildCode)
                             {Result, ChildT, ChildO} =
                                 run_t(ChildCode, ChildMsg, StateIn, Env, CallGas,
                                       Ctx#ctx.transient, Ctx#ctx.originals,
-                                      Ctx#ctx.fork, Ctx#ctx.intrinsic),
+                                      Ctx#ctx.fork, Ctx#ctx.intrinsic, 0),
                             handle_child(Result, E, Ctx, StateIn, RetOff, RetLen,
                                          ChildT, ChildO)
                     end
@@ -1586,7 +1623,7 @@ create_with_value(_Op, Init, Value, Sender, NewAddr, State1, E1, Ctx, ChildGas) 
                  gas_price => s_msg(gas_price, Ctx, 0),
                  static => false, depth => s_msg(depth, Ctx, 0) + 1},
     Result = run_t(Init, ChildMsg, State2, Env, ChildGas, Ctx#ctx.transient,
-                   Ctx#ctx.originals, Ctx#ctx.fork, Ctx#ctx.intrinsic),
+                   Ctx#ctx.originals, Ctx#ctx.fork, Ctx#ctx.intrinsic, 0),
     case Result of
         {{ok, Code, Left, St, Logs}, ChildT, ChildO} ->
             %% **The code-deposit cost was not charged here at all.** Not the 200 per

@@ -640,8 +640,8 @@ validation_ctx(Block, State, BaseFee, GasLimit, BlobGasUsed) ->
 %% An EVM crash is an exceptional halt, which consumes the whole gas limit and discards
 %% the frame. It is not the same as a revert, which is a deliberate failure the caller
 %% can observe in the return data, and must not be recorded as one.
-run_frame(Code, Msg, State, Env, EvmGas, TxIntrinsic) ->
-    try eth_evm:run(Code, Msg, State, Env, EvmGas, TxIntrinsic) of
+run_frame(Code, Msg, State, Env, EvmGas, TxIntrinsic, AuthRefund) ->
+    try eth_evm:run(Code, Msg, State, Env, EvmGas, TxIntrinsic, AuthRefund) of
         {ok, Out, GL, St, L} ->
             {ok, Out, GL, St, L};
         {revert, Out1, GL1, St1, L1} ->
@@ -734,7 +734,8 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     %% authorizations. So the delegations survive a revert without any special case
     %% here, and putting this call *inside* the frame's starting state instead would
     %% roll them back and diverge on exactly the transactions that fail.
-    {StateAuth, AuthAuthorities} = process_authorizations(State0, Tx, fork(Block)),
+    {StateAuth, AuthAuthorities, AuthRefund} =
+        process_authorizations(State0, Tx, fork(Block)),
     %% The EVM runs with what the intrinsic cost left, never the full limit.
     EvmGas = max(0, GasLimitTx - Intrinsic),
     %% The EVM reads its message and environment through atom keys (s_msg/3,
@@ -856,7 +857,14 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     %% not a fact about the block or the environment: it is a quantity this
     %% transaction has already been charged, and the only function that knows it is
     %% the one that charged it.
-    case run_frame(Code, Msg, StateAuth, Env, EvmGas, Intrinsic) of
+    %% **EIP-7702's step-7 refund goes in as the frame's *starting* refund**, not as
+    %% an adjustment afterwards. The EIP says "add ... to the **global refund
+    %% counter**", and this frame's counter is the only global counter there is: the
+    %% frame's own `SSTORE` refunds accumulate on top of it and EIP-3529's cap -- now
+    %% taken over the transaction's gas used -- applies to the **sum**. Charging it
+    %% after the frame returned would add to a figure the cap has already trimmed,
+    %% which is the mistake `v1.62` declined to make and `v1.65` made unnecessary.
+    case run_frame(Code, Msg, StateAuth, Env, EvmGas, Intrinsic, AuthRefund) of
         {error, {unpriced, What}} ->
             {error, {unpriced, What}};
         {Result, Output, GasLeft, StateRun, Logs} ->
@@ -1065,13 +1073,13 @@ blob_base_fee(#block{excess_blob_gas = Excess}) ->
 process_authorizations(State, Tx, Fork) ->
     case eth_tx:tx_type(Tx) of
         eip7702 ->
-            {S, A} = apply_authorizations(State, eth_tx:authorization_list(Tx), Fork),
-            {S, A};
+            {S, A, R} = apply_authorizations(State, eth_tx:authorization_list(Tx), Fork),
+            {S, A, R};
         _ ->
-            {State, []}
+            {State, [], 0}
     end.
 
-apply_authorizations(State, [], _Fork) -> {State, []};
+apply_authorizations(State, [], _Fork) -> {State, [], 0};
 apply_authorizations(State, [Tuple | Rest], Fork) ->
     %% Three elements, not two: the status is discarded and the **state is carried
     %% through either way**, because a skipped tuple leaves the state alone rather
@@ -1079,9 +1087,9 @@ apply_authorizations(State, [Tuple | Rest], Fork) ->
     %% tuple and continue to the next tuple", and it is why this is a match and not a
     %% `case' -- a `case' would have two arms that both ignore the third element,
     %% which is a way of writing the same rule twice.
-    {_Status, S1, Authority} = apply_authorization(State, Tuple, Fork),
-    {S2, Rest2} = apply_authorizations(S1, Rest, Fork),
-    {S2, warmed(Authority) ++ Rest2}.
+    {_Status, S1, Authority, Refund} = apply_authorization(State, Tuple, Fork),
+    {S2, Rest2, Rest3} = apply_authorizations(S1, Rest, Fork),
+    {S2, warmed(Authority) ++ Rest2, Refund + Rest3}.
 
 %% One address, or none. `undefined' is what a tuple that failed *before* recovery
 %% carries, and it must not reach the warm map: `initial_access/3' filters the list
@@ -1112,7 +1120,7 @@ warmed(Addr) -> [Addr].
 %%
 %% So the steps are written out. Three predicates, then an action, and the authority
 %% is in scope throughout.
-apply_authorization(State, [ChainId, Address, Nonce | _Sig], _Fork) ->
+apply_authorization(State, [ChainId, Address, Nonce | _Sig], Fork) ->
     %% The **whole** tuple goes to `authorization_authority/1', which re-reads `y_parity',
     %% `r' and `s' from it: the signing preimage is over all three, so passing only the
     %% first three would recover a different account. Passing three of six was the
@@ -1126,25 +1134,39 @@ apply_authorization(State, [ChainId, Address, Nonce | _Sig], _Fork) ->
     %% fork-gated step rather than omitted and re-added at every call site.
     case before_recovery(ChainId, Nonce) of
         false ->
-            {skipped, State, undefined};
+            {skipped, State, undefined, 0};
         true ->
             case eth_tx:authorization_authority(Tuple) of
                 error ->
-                    {skipped, State, undefined};
+                    {skipped, State, undefined, 0};
                 {ok, Authority} ->
                     %% **Step 4 has happened.** Everything from here on may refuse
                     %% the tuple, and the authority is warm either way.
                     case applicable(State, Authority, Nonce) of
                         false ->
-                            {skipped, State, Authority};
+                            {skipped, State, Authority, 0};
                         true ->
+                            %% **Step 7, and it is read BEFORE the code is written and
+                            %% the nonce bumped.** "Add `PER_EMPTY_ACCOUNT_COST -
+                            %% PER_AUTH_BASE_COST` gas to the global refund counter
+                            %% **if `authority` is not empty**" -- and `set_delegation/4`
+                            %% increments the nonce, which *makes* the account non-empty
+                            %% by definition. Reading it afterwards would refund every
+                            %% delegation by every account, including the ones the EIP
+                            %% specifically exempts, and the difference is the whole
+                            %% rule: delegating yourself costs half what delegating a
+                            %% fresh account does.
+                            Refund = case eth_state:exists(State, Authority) of
+                                         true -> eth_fork_schedule:set_code_refund(Fork);
+                                         false -> 0
+                                     end,
                             {ok, set_delegation(State, Authority, Address, Nonce),
-                             Authority}
+                             Authority, Refund}
                     end
             end
     end;
 apply_authorization(State, _Malformed, _Fork) ->
-    {skipped, State, undefined}.
+    {skipped, State, undefined, 0}.
 
 %% Steps 1 and 2, before an account is named. A failure here has no authority to
 %% warm, because nothing was recovered: the tuple named no account at all.

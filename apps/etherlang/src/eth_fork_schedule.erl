@@ -68,6 +68,7 @@
           tx_type_available/2,
           introduced_tx_type/1,
           set_code_auth_cost/1,
+          set_code_refund/1,
           all_but_one_64th/1,
           call_stipend/1,
           sload_gas/1,
@@ -91,10 +92,22 @@
 %% is not restated here because it is already charged by `eth_tx:intrinsic_gas/4'
 %% and restating a price in two places is how they drift.
 -define(TOTAL_COST_FLOOR_PER_TOKEN, 10).
-%% EIP-7702's PER_EMPTY_ACCOUNT_COST. Its PER_AUTH_BASE_COST is a processing cost
-%% metered during the state transition and is not implemented; see the note beside
-%% `set_code_auth_cost/1'.
+%% EIP-7702's two authorization costs, **both** of them, and the refund is their
+%% difference rather than a third literal.
+%%
+%% `PER_EMPTY_ACCOUNT_COST` (25,000) is what the *sender* pays per tuple, charged in
+%% the intrinsic by `eth_tx:set_code_gas/2' -- for every tuple, "regardless of
+%% validity or duplication", so nothing about a tuple's contents may appear in it.
+%%
+%% `PER_AUTH_BASE_COST` (12,500) is a *processing* cost metered during the state
+%% transition, and it is the figure EIP-7702 step 7 subtracts: a delegation by an
+%% account that **already exists** is refunded `PER_EMPTY_ACCOUNT_COST -
+%% PER_AUTH_BASE_COST`, so the net cost of delegating yourself is half what it is
+%% for an account that did not exist. The node did not have it until `v1.66`, and
+%% having written the refund as a difference is what keeps the two from drifting:
+%% a hand-typed 12,500 next to a 25,000 is two numbers that can disagree.
 -define(PER_EMPTY_ACCOUNT_COST, 25000).
+-define(PER_AUTH_BASE_COST, 12500).
 %% EIP-2565 sets GQUADDIVISOR to 3 and adds a 200 gas minimum; EIP-198 set it to 20
 %% and had no minimum. See `modexp_cost/1'.
 -define(MOD_EXP_GQUADDIVISOR_BERLIN, 3).
@@ -1973,6 +1986,26 @@ set_code_auth_cost(Fork) when is_atom(Fork) ->
         false -> 0
     end;
 set_code_auth_cost(_Fork) -> 0.
+
+%% EIP-7702 step 7: "Add `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` gas to the
+%% global refund counter if `authority` is not empty."
+%%
+%% **The difference, not the value.** The EIP states it as a subtraction of two named
+%% parameters and the subtraction is the specification -- an authorization by an
+%% account that already exists costs half of one by an account that did not, and
+%% that relationship is the thing a future revision would change. Writing `12500`
+%% here would keep the number and lose the rule.
+%%
+%% **Zero before Prague**, for the same reason `set_code_auth_cost/1` is: no
+%% type-4 transaction can be valid earlier, so the figure is unreachable there and
+%% zero is the honest answer rather than an invented one.
+-spec set_code_refund(atom()) -> non_neg_integer().
+set_code_refund(Fork) when is_atom(Fork) ->
+    case at_least(Fork, prague) of
+        true -> ?PER_EMPTY_ACCOUNT_COST - ?PER_AUTH_BASE_COST;
+        false -> 0
+    end;
+set_code_refund(_Fork) -> 0.
 
 -spec tx_type_available(atom(), atom()) -> boolean().
 tx_type_available(legacy, Fork) when is_atom(Fork) -> true;

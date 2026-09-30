@@ -220,8 +220,15 @@
 %% files with little refundable work, so the whole 3,831 of 3,884 is unchanged by
 %% this commit. Two corpora, two samples, and "the corpus does not see it" is a
 %% statement about a *named* corpus.
--define(EXPECTED, #{match => 249,
-                    state_mismatch => 14,
+%% 249 -> 250 and `state_mismatch' 14 -> 13, from EIP-7702 step 7's
+%% `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` refund (`v1.66`). **One entry here,
+%% but eleven in `prague/eip7702_set_code_tx`, which is now 80 of 80.** The committed
+%% subset holds a single type-4 fixture whose authority exists in the pre-state; the
+%% directory holds eleven. The single figure is not the size of the fix and the
+%% directory figure is not a conformance claim -- they are two samples, and saying
+%% "+1" without saying that would understate the change by a factor of eleven.
+-define(EXPECTED, #{match => 250,
+                    state_mismatch => 13,
                     unpriced => 0,
                     tx_decode_failed => 0,
                     tx_roundtrip_mismatch => 0,

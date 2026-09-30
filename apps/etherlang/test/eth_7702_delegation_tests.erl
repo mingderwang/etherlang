@@ -489,6 +489,145 @@ tx() ->
       <<"accessList">> => []}, ?SENDER_PRIV).
 
 %% ---------------------------------------------------------------------------
+%% EIP-7702 step 7: the refund
+%% ---------------------------------------------------------------------------
+
+%% "Add `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` gas to the global refund
+%% counter **if `authority` is not empty**."
+%%
+%% The refund goes in as the frame's **starting** refund rather than as an
+%% adjustment to the gas afterwards, so the frame's own refunds accumulate on top of
+%% it and EIP-3529's cap applies to the **sum**. The observable is the receipt's
+%% `gasUsed`, and the two arms differ by exactly 12,500.
+%%
+%% **The two arms differ only in whether the authority already existed.** A fresh
+%% key is absent from the pre-state, so `eth_state:exists/2' is false and no refund
+%% is due; the same key with one wei in it is non-empty and the refund applies. That
+%% is the whole of the EIP's condition, and it is the half that is easy to lose:
+%% reading `exists/2'` *after* `set_delegation/4'` would make every account
+%% non-empty, because that function increments the nonce, and would refund every
+%% delegation the EIP specifically exempts.
+a_delegation_by_an_existing_account_is_refunded_test() ->
+    with_ctx(fun() ->
+        Priv = eth_secp256k1:generate_key(),
+        Fresh = addr_of(Priv),
+        %% One wei, and nothing else. An account with a balance is non-empty; the
+        %% amount is irrelevant and 1 is chosen so the *cause* is unambiguous.
+        Auth = good_authorization(?DELEGATE, 0, Priv),
+        %% **The destination is delegated in both arms**, and `?DELEGATE` holds *no*
+        %% code, so the frame is empty and the transaction's gas used is the
+        %% intrinsic alone -- 46,000, which is what makes the cap `div 5` land on
+        %% 9,200. The first version of this test never called `delegated/1` at all,
+        %% so the frame was empty *by accident* and the second test's `burn_gas/0'
+        %% never ran: both arms came back at 46,000 and 36,800 and the two tests were
+        %% the same test. A shared helper that leaves out the one call the test is
+        %% about is worse than no helper.
+        Existing = delegated(fund(eth_state:new(0, #{}), Fresh, 1)),
+        Refunded = gas_of_auth(Existing, Auth),
+        NotRefunded = gas_of_auth(delegated(eth_state:new(0, #{})), Auth),
+        %% 9,200 = 46,000 div 5: the raw refund is 12,500 and the cap allows 9,200.
+        %% `element(1, ...)`: `gas_of_auth/2' answers `{gasUsed, status, slot0}' so
+        %% that a test which cares about more than the figure can see the rest. The
+        %% first version subtracted the tuples and the error was
+        %% `erlang:'-'/2 called as {46000,1,0} - {36800,1,0}` -- which does contain
+        %% both figures, in a message about arithmetic.
+        ?assertEqual({want, 46000 div 5, NotRefunded, Refunded},
+                     {want, element(1, NotRefunded) - element(1, Refunded),
+                      NotRefunded, Refunded})
+    end).
+
+%% **The same rule with the cap *out* of the way, which is the half that pins the
+%% 12,500.** The test above grants 9,200, not 12,500, and that is EIP-3529 doing its
+%% job: the transaction used 46,000, and `46,000 div 5` is 9,200. The two rules
+%% interact, and asserting 12,500 there would have been asserting that the cap does
+%% not exist.
+%%
+%% So this one gives the frame something to do that **costs gas and refunds none** --
+%% ten cold `SLOAD`s of distinct slots, about 21,050 of it. That lifts the
+%% transaction's gas used past 62,500, the cap past 12,500, and the whole refund is
+%% granted. The only difference from the test above is the delegate's code.
+a_delegation_by_an_existing_account_is_refunded_in_full_once_the_cap_allows_test() ->
+    with_ctx(fun() ->
+        Priv = eth_secp256k1:generate_key(),
+        Fresh = addr_of(Priv),
+        %% **One state, and the authority's balance is the only thing that varies.**
+        %% The second version built the two arms from different states -- one with
+        %% the burning code and one without -- so they differed in the frame's gas
+        %% *and* the refund, and the answer came out 30,250 instead of 12,500. That is
+        %% the third time in this file, and the shape is always the same: two arms
+        %% built from two literals rather than from one state plus one edit. The
+        %% control has to be the *same* fixture with a single field changed, or it is
+        %% a second experiment.
+        Base = delegated(put_code(eth_state:new(0, #{}), ?DELEGATE, burn_gas(), 0)),
+        Auth = good_authorization(?DELEGATE, 0, Priv),
+        Refunded = gas_of_auth(fund(Base, Fresh, 1), Auth),
+        NotRefunded = gas_of_auth(Base, Auth),
+        ?assertEqual({want, 12500, NotRefunded, Refunded},
+                     {want, element(1, NotRefunded) - element(1, Refunded),
+                      NotRefunded, Refunded})
+    end).
+
+%% `PUSH1 n SLOAD POP` for n = 0..9, then STOP. Ten **distinct cold** slots, so
+%% 2,100 each and no refund anywhere -- EIP-2200 refunds a *write*, and a read of a
+%% zero slot refunds nothing. Every literal is one byte wide.
+burn_gas() ->
+    iolist_to_binary([<<16#60, N, 16#54, 16#50>> || N <- lists:seq(0, 9)]
+                     ++ [<<16#00>>]).
+
+%% **The figure itself, as the EIP's difference and not a literal.** Written as
+%% `25000 - 12500` here as well would be a second place to get it wrong; the
+%% constant lives in `eth_fork_schedule:set_code_refund/1' and this test reads it.
+the_authorization_refund_is_the_difference_of_the_two_eip_parameters_test() ->
+    ?assertEqual(25000, eth_fork_schedule:set_code_auth_cost(prague)),
+    ?assertEqual(12500, eth_fork_schedule:set_code_refund(prague)),
+    %% **Zero before Prague**, and pre-7702 the *sender's* cost is zero too -- so a
+    %% refund larger than the price would be a bug waiting to happen if the
+    %% predecessor were ever non-zero.
+    ?assertEqual(0, eth_fork_schedule:set_code_refund(istanbul)),
+    ?assertEqual(0, eth_fork_schedule:set_code_auth_cost(istanbul)),
+    %% And the relationship the EIP is actually about: delegating an account that
+    %% already exists costs half of delegating one that does not.
+    ?assertEqual(eth_fork_schedule:set_code_auth_cost(prague) div 2,
+                 eth_fork_schedule:set_code_refund(prague)).
+
+%% **Two injections over this change do not bite, and neither should be chased.**
+%%
+%% **(a) The refund written as a bare `12500` instead of the EIP's difference.** The
+%% injection bites nothing because `25000 - 12500 = 12500` -- the two spellings are
+%% the same number today, so no test can tell them apart, and a test that cannot tell
+%% them apart should not be written to. The difference form is a **maintenance**
+%% property, not a runtime one: it is what makes a future revision of either
+%% parameter change this one figure with it. That is the whole argument for it and
+%% it is not an argument a test can settle.
+%%
+%% **(b) A child frame seeded with the refund as well.** The near-cancellation is
+%% arithmetic, not luck: a child that returns 12,500 to its parent hands back gas the
+%% parent then returns again, so the transaction's total moves very little. The one
+%% part that does not cancel is the *cap* -- the child is capped on its own small
+%% consumption, so it returns less than 12,500, and the parent keeps the rest. That
+%% residue is a real difference, but pinning it needs a fixture where the child's
+%% consumption is tuned to a specific fraction of the refund, and **a test whose
+%% fixture has to be tuned to a quarter of the target is a test asserting the tuning**.
+%% The code is right for a structural reason instead: the refund is global, the parent
+%% holds it, and `run_t/10` passes a literal `0` for the two child call sites so the
+%% decision is visible at the call site rather than implied by a field's value.
+%%
+%% Recorded rather than fixed, because "the injection does not bite" and "the
+%% behaviour is wrong" are different claims and only the first is measured here.
+
+%% A **valid** authorization tuple, as the map a decoded payload carries.
+good_authorization(Address, Nonce, Priv) ->
+    Digest = eth_keccak:hash(<<16#05, (eth_rlp:encode(
+                   [eth_fork_schedule:chain_id(), Address, Nonce]))/binary>>),
+    {R, S, V} = eth_secp256k1:sign(Digest, Priv),
+    #{<<"chainId">> => eth_hex:encode_int(eth_fork_schedule:chain_id()),
+      <<"address">> => eth_hex:encode_bytes(Address),
+      <<"nonce">> => eth_hex:encode_int(Nonce),
+      <<"yParity">> => eth_hex:encode_int(V),
+      <<"r">> => eth_hex:encode_int(R),
+      <<"s">> => eth_hex:encode_int(S)}.
+
+%% ---------------------------------------------------------------------------
 %% EIP-3529: the refund cap's base is the transaction's gas used
 %% ---------------------------------------------------------------------------
 
