@@ -715,8 +715,7 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     %% when the code ran perfectly. Without the nonce bump a second transaction
     %% from the same sender cannot validate, because the account nonce never
     %% moves; without the gas purchase the coinbase is never credited.
-    State0 = begin_transaction(State, Sender, Target, Value,
-                                GasLimitTx, IsCreate, EffectiveGasPrice,
+    State0 = begin_transaction(State, Sender, GasLimitTx, EffectiveGasPrice,
                                 blob_fee(Block, Tx)),
     %% EIP-7702: "The authorization list is processed before the execution portion
     %% of the transaction begins, but after the sender's nonce is incremented."
@@ -736,6 +735,64 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     %% roll them back and diverge on exactly the transactions that fail.
     {StateAuth, AuthAuthorities, AuthRefund} =
         process_authorizations(State0, Tx, fork(Block)),
+    %% **The endowment moves here, and this position is the whole design.**
+    %%
+    %% EELS does it in `process_message/1', which is *inside* the message and after
+    %% the snapshot:
+    %%
+    %%     snapshot = copy_tx_state(tx_state)
+    %%     if message.should_transfer_value and message.value != 0:
+    %%         move_ether(tx_state, message.caller, message.current_target,
+    %%                     message.value)
+    %%     ...
+    %%     if evm.error:
+    %%         restore_tx_state(tx_state, snapshot)
+    %%
+    %% and `process_transaction/2` orders the transaction's own effects as **nonce,
+    %% then authorizations, then the message** -- EIP-7702 says the authorization
+    %% list "is processed before the execution portion of the transaction begins, but
+    %% after the sender's nonce is incremented". So the three layers are:
+    %%
+    %%     State0     gas, blob fee, nonce        <- before the frame, always survives
+    %%     StateAuth  + EIP-7702 delegations      <- the snapshot: the restore point
+    %%     StateValue + the endowment             <- inside the frame, undone by a revert
+    %%
+    %% **The first version of this fix put the transfer inside `begin_transaction/8`,
+    %% where it was already correct for a *create* but could not be undone**, because
+    %% that lands in `State0` and the restore below goes to `StateAuth`. A create
+    %% whose init code reverted therefore kept its endowment -- and the test for it
+    %% failed, which is the only reason that is a recorded mistake rather than a
+    %% shipped one. A restore point is only a restore point if everything that should
+    %% be undone sits *after* it.
+    %%
+    %% `Target' is already the contract address on a create, so this one call covers
+    %% both transaction shapes.
+    %%
+    %% **And the guard is EELS's own, `Value =/= 0', applied here rather than left to
+    %% `transfer/4'** -- which is a correction of the obvious reading of the previous
+    %% paragraph, and an instructive one. `transfer/4` has a `{0, _} ->
+    %% drop_if_empty(S2, To)' arm that reaches the same EIP-161(c) outcome by a
+    %% different route, so repeating the guard looked redundant. It is not.
+    %%
+    %% `drop_if_empty/2` sets a **`destroyed` marker** on the account, and
+    %% `eth_state:code/2` honours that marker over any code written afterwards. So a
+    %% zero-value create ran `drop_if_empty` on the address the `CREATE` was about to
+    %% populate, marked it destroyed, and the deployed code was then read back as
+    %% `<<>>' -- `creation_deploys_at_the_derived_address_test' failed with
+    %% `committed_code = undefined', and 10,374 corpus entries would have gone from
+    %% "no code and a 1-wei endowment missing" to "no code".
+    %%
+    %% EELS does not have this shape at all: `process_message/1` guards the *whole*
+    %% `move_ether' call on `message.value != 0', so for a zero-value message it moves
+    %% nothing and marks nothing. **A check that fires early and wrongly does not add
+    %% noise, it deletes the information about everything behind it** -- here the
+    %% marker deleted the deployed code. Following the specification's guard verbatim
+    %% is not just simpler than reaching the same outcome another way; the other way
+    %% has a second effect this rule does not have.
+    StateValue = case Value of
+                     0 -> StateAuth;
+                     _ -> transfer(StateAuth, Sender, Target, Value)
+                 end,
     %% The EVM runs with what the intrinsic cost left, never the full limit.
     EvmGas = max(0, GasLimitTx - Intrinsic),
     %% The EVM reads its message and environment through atom keys (s_msg/3,
@@ -864,7 +921,7 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     %% taken over the transaction's gas used -- applies to the **sum**. Charging it
     %% after the frame returned would add to a figure the cap has already trimmed,
     %% which is the mistake `v1.62` declined to make and `v1.65` made unnecessary.
-    case run_frame(Code, Msg, StateAuth, Env, EvmGas, Intrinsic, AuthRefund) of
+    case run_frame(Code, Msg, StateValue, Env, EvmGas, Intrinsic, AuthRefund) of
         {error, {unpriced, What}} ->
             {error, {unpriced, What}};
         {Result, Output, GasLeft, StateRun, Logs} ->
@@ -894,7 +951,56 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
         %% 21,010. `gasUsed' is a receipt field, so the block would have carried a number
         %% the sender was not charged, and the base fee would have been burned on gas
         %% nobody paid for.
-        State1 = settle_gas(deploy(StateRun, Result, Output, Target, IsCreate),
+        %% **A frame that reverts or halts exceptionally leaves nothing behind.**
+        %%
+        %%     snapshot = copy_tx_state(tx_state)
+        %%     if message.should_transfer_value and message.value != 0:
+        %%         move_ether(tx_state, message.caller, message.current_target,
+        %%                     message.value)
+        %%     ...
+        %%     if evm.error:
+        %%         restore_tx_state(tx_state, snapshot)
+        %%
+        %% (`execution-specs', `process_message/1'.) The snapshot is taken **before**
+        %% the value move, and the `except Revert' arm sets `evm.error' as well, so a
+        %% revert undoes the frame's writes *and* the endowment together, leaving only
+        %% what `process_transaction/2' did before the message existed: the nonce
+        %% increment, the gas purchase and the blob burn.
+        %%
+        %% `run_t/10' takes no snapshot, and no arity of `eth_evm:run' does -- all
+        %% three share `run_t/10' -- so `run/7' returned the **evolved** state for a
+        %% revert and this function passed it straight into `deploy/5'. A probe
+        %% against `eth_evm' with a frame that SSTOREs and then reverts:
+        %%
+        %%     STOP     ok       slot0=1
+        %%     REVERT   revert   slot0=1        <-- the SSTORE survived
+        %%
+        %% **Nested messages were never affected**, and the reason generalises: EELS
+        %% rolls back by restoring a snapshot, and this module reaches the same result
+        %% by *discarding the child's returned state*. `handle_child/9' and
+        %% `create_with_value/9' both return their own pre-call `State1' on every
+        %% failure path, so the child's writes are thrown away without needing a
+        %% snapshot. Only the transaction's own frame had nobody discarding its
+        %% result, and restoring to `StateAuth' is that discard.
+        %%
+        %% **`StateAuth` is the correct restore point and needs no special case**,
+        %% because of what sits before it. The comment above `process_authorizations/3'
+        %% already argues this for EIP-7702: the delegations are applied to `State0'
+        %% and the frame starts from `StateAuth', so restoring to `StateAuth' keeps
+        %% them -- which is what EIP-7702 requires ("if transaction execution results
+        %% in failure ... the processed delegation indicators is *not rolled back*").
+        %% The nonce increment, the gas purchase and the blob burn are in `State0' and
+        %% survive for the same reason and with no clause of their own. One restore
+        %% point, and the three things that must outlive a revert all sit above it.
+        %%
+        %% This is the same rule as the endowment fix above, and the two are one
+        %% change: without this, crediting a create transaction's endowment would
+        %% credit one whose init code reverts.
+        StateFrame = case Result of
+                         ok -> StateRun;
+                         _ -> StateAuth
+                     end,
+        State1 = settle_gas(deploy(StateFrame, Result, Output, Target, IsCreate),
                             Block, Sender, GasLeft, GasCharged, EffectiveGasPrice,
                             base_fee_of(BaseFee), GasCharged - GasCharged0),
         Cumulative = Block#block.gas_used + GasCharged,
@@ -921,8 +1027,7 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
 %% price, so the difference is the miner/validator's tip plus the portion of the
 %% cap that was never needed. That is why an over-paying 1559 sender is not
 %% refunded the cap.
-begin_transaction(State, Sender, Target, Value, GasLimit, IsCreate,
-                  EffectivePrice, BlobFee) ->
+begin_transaction(State, Sender, GasLimit, EffectivePrice, BlobFee) ->
     S1 = buy_gas(State, Sender, GasLimit, EffectivePrice),
     %% EIP-4844: "The actual `blob_fee' as calculated via `calc_blob_fee' is
     %% deducted from the sender balance before transaction execution and burned,
@@ -931,10 +1036,53 @@ begin_transaction(State, Sender, Target, Value, GasLimit, IsCreate,
     %% success, not on a revert, not on an exceptional halt.
     S2 = buy_blob_gas(S1, Sender, BlobFee),
     S3 = eth_state:set_nonce(S2, Sender, eth_state:nonce(S2, Sender) + 1),
-    case IsCreate of
-        true -> S3;
-        false -> transfer(S3, Sender, Target, Value)
-    end.
+    %% **The endowment moves on a contract creation too, and it used not to.**
+    %%
+    %%     snapshot = copy_tx_state(tx_state)
+    %%     if message.should_transfer_value and message.value != 0:
+    %%         move_ether(tx_state, message.caller,
+    %%                     message.current_target, message.value)
+    %%     ...
+    %%     if evm.error:
+    %%         restore_tx_state(tx_state, snapshot)
+    %%
+    %% (`execution-specs', `process_message/1'.) EELS moves the value inside the
+    %% **message**, so it applies to the transaction's own frame exactly as it does
+    %% to a nested `CALL' -- and `process_create_message/1' is a caller of
+    %% `process_message/1' like any other. This function had a
+    %%
+    %%     case IsCreate of
+    %%         true  -> S3;                             %% no transfer at all
+    %%         false -> transfer(S3, Sender, Target, Value)
+    %%     end
+    %%
+    %% and on the `true' arm `Target' is **already the contract address** -- it is
+    %% assigned at the call site as `case IsCreate of true -> ContractAddress;
+    %% false -> To end' -- so the one thing missing was the transfer. A create
+    %% transaction's endowment was simply never moved: the sender was not debited
+    %% and the new contract was not credited.
+    %%
+    %% **No wei was created or destroyed.** `stTimeConsuming` in the `static/'
+    %% corpus is **10,374 entries, all diverging**, and every one of them is a
+    %% create transaction carrying `value: "0x01"`. The arithmetic closes on the
+    %% pre-state 1,000,000,000,000 at `gasPrice' 10:
+    %%
+    %%   fixture  sender ends 999,995,752,129   4,247,872 out = 424,787 x 10 + 1
+    %%   node     sender ends 999,995,550,160   4,449,840 out = 444,984 x 10 + 0
+    %%
+    %% so conservation held on both sides and the divergence is an absent transfer,
+    %% not a lost balance. (`444,984 - 424,787 = 20,197` gas is a **second**
+    %% defect in the same fixtures, five percent of the transaction and not
+    %% explained by anything here. Named in `TASKS.md'.)
+    %%
+    %% EELS's `message.value != 0' guard is **not** repeated at this call site
+    %% because `transfer/4' already has the equivalent as its `{0, _} ->
+    %% drop_if_empty(S2, To)' arm -- the same EIP-161(c) outcome, that an account
+    %% touched by a zero-value transfer does not become existent-but-empty. Two
+    %% implementations of one rule that do not disagree is the point; the guard is
+    %% not missing, it is one call deeper.
+    %%
+    S3.
 
 %% EIP-4844's `calc_blob_fee(header, tx)':
 %%

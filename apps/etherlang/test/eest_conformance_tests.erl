@@ -227,6 +227,15 @@
 %% directory holds eleven. The single figure is not the size of the fix and the
 %% directory figure is not a conformance claim -- they are two samples, and saying
 %% "+1" without saying that would understate the change by a factor of eleven.
+%% 254 -> 255 and `state_mismatch' 9 -> 8, from a contract-creation transaction's
+%% **endowment never moving**: `begin_transaction/8' transferred on its
+%% `IsCreate = false' arm and not at all on the `true' arm, where `Target' is already
+%% the contract address. 10,374 entries of `static/state_tests/stTimeConsuming` are
+%% create transactions carrying `value: "0x01"' and every one of them diverged. Landed
+%% with the rollback it belongs to -- EELS snapshots *before* the value move -- so the
+%% committed subset moves one and **the corpus moves none of them yet**: the residual
+%% is a separate SSTORE pricing defect worth 20,197 gas on the same fixtures, and
+%% saying "+10,374" here would be claiming a fix the tally cannot see.
 %% 250 -> 254 and `state_mismatch' 13 -> 9, from EIP-161 (a): the account a `CREATE'
 %% or `CREATE2' makes has nonce 1, not 0. The create-*transaction* path
 %% (`eth_block:deploy/5') has always set it, so the two ways of deploying a contract
@@ -237,8 +246,8 @@
 %% same file is the corpus's single largest `nonce` cluster: 84 nonce divergences
 %% with *no* code divergence, since a create that did not happen and a create that
 %% happened with the wrong nonce are the same diff shape.
--define(EXPECTED, #{match => 254,
-                    state_mismatch => 9,
+-define(EXPECTED, #{match => 255,
+                    state_mismatch => 8,
                     unpriced => 0,
                     tx_decode_failed => 0,
                     tx_roundtrip_mismatch => 0,

@@ -153,72 +153,57 @@ So the corpus's `spent_expected` of 424,787 is right, the node's actual spend is
    **444,984 - 424,787 = 20,197 gas.** That is the number to explain, it is 5% of the
    transaction, and nothing in the endowment story accounts for it.
 
-**The endowment itself.** `eth_block:begin_transaction/8` transfers on its
-`IsCreate = false` arm and does not transfer at all on the `true` arm — and `Target`
-is *already* the contract address on that arm, so the fix is one line. The authority
-is `execution-specs', `process_message/1`:
+**Both resolved in `v1.68`.** The endowment moves, and the frame's rollback that
+makes moving it safe arrived with it. The transfer is now applied *after* the
+authorizations and *before* the frame:
 
-    snapshot = copy_tx_state(tx_state)
-    if message.should_transfer_value and message.value != 0:
-        move_ether(tx_state, message.caller, message.current_target, message.value)
-    ...
-    if evm.error:
-        restore_tx_state(tx_state, snapshot)
+    State0     gas, blob fee, nonce        <- before the frame, always survives
+    StateAuth  + EIP-7702 delegations      <- the snapshot: the restore point
+    StateValue + the endowment             <- inside the frame, undone by a revert
 
-Two things follow, and the second is why this is not landed yet.
+which is EELS's `process_message/1` ordering (`copy_tx_state` first, `move_ether`
+inside, `restore_tx_state` on `evm.error`) and EIP-7702's ("the authorization list
+is processed before the execution portion of the transaction begins, but after the
+sender's nonce is incremented"). A revert now returns `StateAuth`.
 
-EELS's `value != 0` guard is **already implemented** here, in a different shape:
-`eth_block:transfer/4` has a `{0, _} -> drop_if_empty(S2, To)'` arm, which is the
-same EIP-161(c) outcome ("no account may change state from non-existent to
-existent-but-empty") reached by a different route. So the call site needs no guard
-of its own, and the two implementations do not disagree.
+**A restore point is only a restore point if everything that should be undone sits
+after it.** The first version of this fix left the transfer inside
+`begin_transaction/8`, where it was already correct for a create but *could not be
+undone* -- it lands in `State0`, above the restore. A create whose init code reverted
+therefore kept its endowment, and `a_reverted_create_transaction_does_not_keep_the_
+endowment_test` failed on it. That test is the reason the mistake is recorded rather
+than shipped.
 
-**And the one-line fix is not safe on its own**, which is the whole reason this is
-recorded rather than landed. See the next item.
+**And EELS's `value != 0` guard had to be applied at the call site, not left to
+`transfer/4`.** `transfer/4` reaches the same EIP-161(c) outcome by a different
+route -- `{0, _} -> drop_if_empty(S2, To)' -- and repeating the guard looked
+redundant. `drop_if_empty/2` sets a **`destroyed` marker**, and `eth_state:code/2`
+honours that marker over any code written afterwards. So a zero-value create marked
+the address the `CREATE` was about to populate as destroyed, and the deployed code
+read back as `<<>>`: `creation_deploys_at_the_derived_address_test` failed with
+`committed_code = undefined`. EELS never had that shape -- it guards the *whole*
+`move_ether` call, so a zero-value message moves nothing and marks nothing.
 
----
+That is §10a's "a check that fires early and wrongly does not merely add noise, it
+deletes the information about everything behind it", at its sharpest: the marker
+deleted the **deployed code**. Following the specification's guard verbatim is not
+just simpler than reaching the same outcome another way -- the other way has a
+second effect this rule does not have.
 
-## Open: a top-level frame's state changes survive its own revert and halt
++6 tests in `eth_endowment_tests`, all through `eth_block:run_transaction/5' (the
+production path -- rule 2 lives in `eth_block', so a unit test against `eth_evm'
+would have passed with the node still broken). 2 injections, and they separate:
 
-**Measured, and it is the reason the endowment fix is not landed.** Probe: a frame at
-`depth 0` running `PUSH1 1, PUSH1 0, SSTORE` and then either `STOP` or `PUSH1 0,
-PUSH1 0, REVERT`, with a starting state whose slot 0 is 0:
+| injection | result |
+|---|---|
+| transfer removed | all 6 fail |
+| rollback removed (`StateFrame = StateRun`) | **exactly** the 3 rollback tests fail, the 3 presence tests pass |
 
-    STOP     ok       slot0=1  caller_bal=0  other_bal=100
-    REVERT   revert   slot0=1  caller_bal=0  other_bal=100
+Committed subset **254 -> 255 of 266**, `state_mismatch` 9 -> 8.
 
-**The `REVERT` arm kept the `SSTORE`.** Per EELS it must not: `process_message/1`
-takes `snapshot = copy_tx_state(tx_state)` *before* the value move and calls
-`restore_tx_state(tx_state, snapshot)` on `evm.error`, and the `except Revert` arm
-sets `evm.error` — so a revert undoes the frame's writes and its value move alike,
-leaving only the nonce increment (which `process_transaction/2` applies *before*
-`process_message`) and the gas.
-
-**Why it is confined to the top level.** `run_t/10` has no snapshot at any point, so
-`run/5`, `run/6` and `run/7` all return `Ctx1#ctx.state` for a revert
-(`{revert, Out, FinalGas, Ctx1#ctx.state, ...}`). Nested messages are unaffected
-because `handle_child/9` and `create_with_value/9` both **discard** the child's
-returned state and keep their own pre-call `State1' — which is `restore_tx_state`
-arrived at structurally, the same way EIP-161's rollback was. Only the transaction's
-own frame has nobody discarding its result: `eth_block:run_transaction/5` passes
-`StateRun' straight into `deploy/5' and `settle_gas/9'.
-
-**This is the same rule as the endowment** — *the value move and the frame's writes
-are inside the message and roll back with it* — which is why the one-line endowment
-fix cannot be landed alone: it would credit a reverting create transaction with an
-endowment it must not keep, and it would do so in a function whose frame does not
-roll back. **Both are one change or the endowment is a partial change.**
-
-**What is not yet known, and is the measurement to take first:** the committed
-266-entry subset does **not** exercise this. Its 9 remaining `state_mismatch`s are
-EIP-4844's precompile-before-fork, EIP-6780's selfdestruct-with-revert, the EIP-170
-deposit cap, and a BLS precompile — none of which is a top-level revert with an
-observable write. So the probe above is the only direct evidence, and it is a probe
-against `eth_evm', not through `eth_block:run_transaction/5`. **Confirming it through
-the transaction path needs one signed create transaction whose init code writes a
-slot and reverts, run through `finalize/1'** — the corpus has no committed fixture
-that says this, which is the §5 "a test must never reach upstream" constraint
-meeting a corpus that does not happen to cover it.
+**The corpus does not move, and that is the finding rather than a disappointment.**
+`stTimeConsuming` is still **0 of 10,374**: the endowment fix removed one of two
+defects on those fixtures, and the second is below.
 
 ---
 
@@ -246,6 +231,51 @@ different defects are sharing one suite**, and the histogram is what says so.
 
 Not investigated. Named here so the next pass starts from the measurement rather than
 from the suite's name.
+
+### The same fixtures' residual, after the endowment fix
+
+`v1.68` removed the endowment from all 10,374 and the suite is **still 0 of 10,374**
+-- so these fixtures carried two defects, and fixing one revealed the other rather
+than resolving the cluster. That is worth stating plainly because "10,374 entries"
+sounds like a single cause and was not.
+
+The shape also changed in a way that matters: before the fix every entry reported
+`no_comparable_gas` / `no_gas_not_divisible`; after it, every entry has a comparable
+gas figure. **The endowment was what made the arithmetic impossible** -- the 1 wei
+left the sender's balance difference indivisible by the price of 10, so the harness
+could not invert it. One wei was suppressing the instrument over ten thousand
+entries, which is the §10a "a section that prints nothing must say what it did not
+look at" shape with the arithmetic rather than a filter doing the hiding.
+
+Six measured deltas, node minus fixture, from
+`sstore_combinations_initial00_2_Paris.json` at Cancun:
+
+| entry | calldata bytes | delta |
+|---|---|---|
+| d0 | 376 | **20,197** |
+| d100 | 372 | **80,193** |
+| d101 | 372 | **139,693** |
+| d102 | 372 | **80,195** |
+| d103 | 376 | **71,412** |
+| d104 | 376 | **130,912** |
+
+**What can be closed from this and what cannot.** The smallest, 20,197, is
+`20,000 + 197`: one `SSTORE_SET_GAS` plus 197, so a single over-charged write is
+*consistent* with this -- but "consistent with" is not "is", and 197 is not a term I
+can name. The other five are spread over three magnitudes and differ from each other
+by 59,996, 59,500, 8,665 and 59,500 -- **not** multiples of one per-write cost, so no
+single missing clause explains the suite. And the deltas do **not** scale with
+calldata length: d0 has 376 bytes and delta 20,197 while d100 has 372 and 80,193, so
+EIP-7623's `21000 + 10 * tokens` floor is not the axis.
+
+So: one plausible lead, five entries that contradict it, and no arithmetic yet.
+**Recorded as a measurement, not a diagnosis.** What would settle it: the fixture's
+*per-operation* expected `gasUsed` (these `post` sections carry none, which is why
+the harness can only invert a balance), or a single entry hand-traced -- the init
+code loops over storage slots issuing `SSTORE`s and `CALL`s, so the number of each
+per entry is the first thing to establish. Two values in a set that differ by 1 are
+adjacent integers whatever their magnitude suggests; values that differ by ~60,000
+are not adjacent and are not one term.
 
 ## The full-corpus figure, measured for the first time
 
