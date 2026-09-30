@@ -27,6 +27,54 @@
 > labels are counted, not asserted; re-derive them with
 > `grep -cE '^- \[[ x]\]' TASKS.md` before quoting them.
 
+## Phase C: re-measuring the full corpus (IN PROGRESS — do not quote a total)
+
+The per-fork table below is annotated stale, and the reason is two measured deltas
+against it. This section is the re-measurement, **sharded by fork** so each fork
+gets its own number and its own `DATA_DIR` (the §10a trap: two workers sharing one
+`DATA_DIR` die at boot with `needs_repair` and produce no output at all).
+
+Two findings already, both independent of any code change:
+
+- **The committed 6-file slice of `prague/eip7702_set_code_tx` is 80 of 80, and the
+  full directory is 548 entries at 64.2%.** The `/tmp/rej_set` working set is 22
+  files chosen for declaring `expectException`; the real directory has **73**. So
+  196 EIP-7702 divergences were never in the set this work has been measuring
+  against. "100% of the 7702 fixtures" was true of six files and false of seventy-
+  three, and the honest form of the claim was always the narrower one.
+- **`static/` runs.** 2,449 files that had never been executed by anything in this
+  repository; `eest_report` handles them unchanged (a static test has no post-state,
+  so it is ~16x faster: 38 entries/s against 2.3 for a state test). `berlin`'s
+  `static` set alone is 2,957 entries.
+
+Shards finished, and their numbers **replace** the corresponding rows of the stale
+per-fork table:
+
+| fork | matched | total | pct |
+|---|---|---|---|
+| berlin | 2,956 | 2,957 | 100.0% |
+| homestead | 82 | 82 | 100.0% |
+| london | 10 | 11 | 90.9% |
+| osaka | 765 | 911 | 84.0% |
+| frontier | 3,661 | 5,625 | 65.1% |
+| shanghai | 155 | 288 | 53.8% |
+| byzantium | 144 | 405 | 35.6% |
+| constantinople | 57 | 192 | 29.7% |
+
+**No total is given, and none should be computed from this table yet** — prague,
+cancun, istanbul and paris were still running, and the static set was at 2,300 of
+2,446 files. What can be said is that these eight forks alone already contain
+**7,830 matches**, against the **6,786** the stale full-corpus run reported for
+*every* fork. The stale figure predates the blob fee, the refund cap, the
+authorization refund and the delegation work, so the corpus-wide number is stale by
+a lot more than the two deltas recorded above it.
+
+Two forks with low percentages deserve their own attention, and neither is a gas
+question: **constantinople at 29.7%** is where EIP-1283's `SSTORE` is refused
+(item 6a), and **byzantium at 35.6%** is the fork whose `eip196_ec_add_mul` and
+`eip152_blake2` fixtures account for most of the committed subset's remaining
+divergence.
+
 ## The full-corpus figure, measured for the first time
 
 **229 of the 235 non-`static` files, 15,660 entries: 6,786 match — 43.3%.** This is the
