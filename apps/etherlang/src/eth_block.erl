@@ -640,8 +640,8 @@ validation_ctx(Block, State, BaseFee, GasLimit, BlobGasUsed) ->
 %% An EVM crash is an exceptional halt, which consumes the whole gas limit and discards
 %% the frame. It is not the same as a revert, which is a deliberate failure the caller
 %% can observe in the return data, and must not be recorded as one.
-run_frame(Code, Msg, State, Env, EvmGas) ->
-    try eth_evm:run(Code, Msg, State, Env, EvmGas) of
+run_frame(Code, Msg, State, Env, EvmGas, TxIntrinsic) ->
+    try eth_evm:run(Code, Msg, State, Env, EvmGas, TxIntrinsic) of
         {ok, Out, GL, St, L} ->
             {ok, Out, GL, St, L};
         {revert, Out1, GL1, St1, L1} ->
@@ -847,7 +847,16 @@ run_transaction(#block{} = Block, Tx, State, BaseFee, GL) ->
     %% produced. Pricing the pre-Berlin SSTORE is the real fix and is still open
     %% (TASKS.md) -- but until it is done, refusing is the honest answer and executing
     %% wrongly is not.
-    case run_frame(Code, Msg, StateAuth, Env, EvmGas) of
+    %% **The intrinsic goes in with the frame.** EIP-3529 caps the refund at a
+    %% fraction of the *transaction's* gas used, and `Intrinsic` is the part of it
+    %% the frame cannot see -- it starts at `gasLimit - Intrinsic` and the 21,000
+    %% belongs to the transaction. Without this the cap's base is the frame's own
+    %% consumption and the node under-refunds by `intrinsic / 5` whenever the cap
+    %% binds. It is passed as an argument rather than left in the Env because it is
+    %% not a fact about the block or the environment: it is a quantity this
+    %% transaction has already been charged, and the only function that knows it is
+    %% the one that charged it.
+    case run_frame(Code, Msg, StateAuth, Env, EvmGas, Intrinsic) of
         {error, {unpriced, What}} ->
             {error, {unpriced, What}};
         {Result, Output, GasLeft, StateRun, Logs} ->

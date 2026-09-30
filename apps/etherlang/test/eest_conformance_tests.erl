@@ -213,8 +213,15 @@
 %% delegation the node was pricing, validating and then not applying. Both moved
 %% the same two entries, so the pair is the boundary of the change and nothing
 %% else in the subset moved -- which is what makes the pin worth keeping.
--define(EXPECTED, #{match => 226,
-                    state_mismatch => 37,
+%% 226 -> 249, and `state_mismatch' 37 -> 14, from EIP-3529's refund cap being
+%% taken over the **transaction's** gas used rather than the frame's (`v1.65`).
+%% **+23 is the largest single-figure move since the access list, and it came from a
+%% rule no fixture in the 22-file set exercises** -- those are transaction-*validity*
+%% files with little refundable work, so the whole 3,831 of 3,884 is unchanged by
+%% this commit. Two corpora, two samples, and "the corpus does not see it" is a
+%% statement about a *named* corpus.
+-define(EXPECTED, #{match => 249,
+                    state_mismatch => 14,
                     unpriced => 0,
                     tx_decode_failed => 0,
                     tx_roundtrip_mismatch => 0,

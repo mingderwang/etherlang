@@ -31,13 +31,13 @@
 
 **229 of the 235 non-`static` files, 15,660 entries: 6,786 match — 43.3%.** This is the
 number the documentation had been carrying as "never measured", and it is **less than
-half** the 85.0% the committed 25-file subset reports. Both numbers are true and the gap
+half** the 93.6% the committed 25-file subset reports. Both numbers are true and the gap
 between them is the most useful thing in this section.
 
 **Why the subset flatters.** The committed subset was chosen by a rule -- *the smallest
 file in each suite* -- to keep it under 150 KB per fixture. The smallest file in a suite
 is the one with the fewest entries and the least state, so the subset is systematically
-the easiest material. 25 files, 266 entries, 85.0%. 229 files, 15,660 entries, 43.3%.
+the easiest material. 25 files, 266 entries, 93.6%. 229 files, 15,660 entries, 43.3%.
 **The subset measures that the fixes work; the corpus measures what is still broken.**
 
 Per fork, biggest first:
@@ -795,25 +795,25 @@ behavioural change per commit, and each step says what it now does.
    since that says nothing about any *other* address. **Measured:** 22-file set
    3,831/3,884 and the committed subset 226/266, both unchanged, which is the result
    to want from a change to every access-list transaction's warm set.
-6f. **EIP-3529: the refund cap's base is the frame's gas, not the transaction's.**
-   Found by reading `execution-specs`' `fork.py`, not by a fixture:
-   `tx_gas_refund = min(tx.gas - tx_output.gas_left, refund_counter) // 5`, and
-   `tx.gas - gas_left` **includes the intrinsic**. This node caps inside the frame
-   against the frame's own consumption, so its cap is smaller by `intrinsic / 5` and
-   it **under-refunds** by up to that much whenever the cap binds. With a 21,000
-   intrinsic and 30,000 of frame gas the reference allows 10,200 and this node
-   allows 6,000. The *divisor* is right (1/5 London, 1/2 before); only the base is
-   wrong.
-   - **Why it is not already fixed by 6e:** 6e has to seed the frame's refund
-     counter so the cap applies to the combined total, and if the cap's **base** is
-     wrong then seeding the counter moves the refund into a cap that is itself
-     divergent. **6f first**, so 6e's result is correct rather than differently
-     wrong.
-   - **The corpus does not catch it.** Every refund fixture the committed subset
-     contains agrees with this node, so the cap is not reached in them -- which is
-     the honest reason this is a named gap rather than a count. A fixture that
-     refunds more than `frameGasUsed / 5` and less than `totalGasUsed / 5` would
-     separate the two, and there is not one committed.
+6f. ~~**EIP-3529: the refund cap's base is the frame's gas, not the transaction's.**~~
+   **Done (`v1.65`).** EIP-3529's own words: "the max gas refunded **after a
+   transaction** to `gas_used // MAX_REFUND_QUOTIENT`", and EIP-7623 spells
+   `gas_used` out as `21000 + ... + execution_gas_used` -- so the 21,000 is inside
+   it. The node capped on the frame's own consumption, so its cap was smaller by
+   `intrinsic / 5` and it **under-refunded** by that much whenever the cap bound.
+   The *divisor* had always been right; only the base was wrong.
+   - **Measured: the committed subset 226 -> 249 of 266**, `state_mismatch` 37 -> 14.
+     The largest single move since the access list, **and the 22-file set is
+     completely unchanged at 3,831 of 3,884** -- those are transaction-*validity*
+     files with little refundable work, so the whole rule is invisible to them. Two
+     corpora, two samples; "the corpus does not exercise it" is a claim about a
+     *named* corpus and this commit is the proof of why.
+   - `eth_evm:run/6` takes the enclosing transaction's already-spent gas on
+     `#ctx.intrinsic`, so every child frame inherits it. `run/5` is a bare frame and
+     passes 0, which is **right**: an `eth_call` and a system call both charge no
+     intrinsic, so there the frame's gas *is* the transaction's gas used.
+   - **6e is now unblocked** and its result will be correct rather than differently
+     wrong: seeding the frame's refund counter flows through the right cap.
 
 6e. **EIP-7702: the `PER_EMPTY_ACCOUNT_COST` refund, and it is 11 corpus entries.**
    The one part of EIP-7702 still absent. **The structural objection in `v1.62` is
@@ -1474,7 +1474,7 @@ they are not forgotten rather than worked on prematurely.
   - Lighthouse requires both methods, so "Lighthouse-compatible" is not currently true of the engine surface
 - [ ] **`engine_notifyHeaders`** — absent (see the Beacon requests item under Phase 3). The clause does not appear in any per-fork file of the `execution-apis` repository (`paris`, `shanghai`, `cancun`, `prague`, `osaka`, `amsterdam`, `bogota`, `common`); only the V2 `getPayloadBodiesBy*` methods appear under those names. Its shape would have to be guessed, so it is left undone rather than invented
 - [x] **Block authoring** — `payloadAttributes` are read, `forkchoiceUpdated` returns a `payloadId`, and `getPayload` returns a real block. This item said "no `payloadAttributes` handling, so `forkchoiceUpdated` can never return a `payloadId` and the node cannot build a block for the CL", which was true when written and stopped being true when `eth_block_builder` was added to the supervisor's child list; the box outlived the sentence. The builder was rewritten rather than switched on, because the dead version assembled a block with its own header constants, three of which were wrong in ways already found and fixed in `eth_block`, and discarded every `payloadAttributes` field.
-  **The block it builds is still not the block the network would build.** Its state root does not match the network's, for the reasons in item 7 — the same gas-schedule divergences that hold the conformance tally at 226 of 266 rather than all of it. So the item is closed as *wiring* and the divergence is tracked where it can be seen, not here.
+  **The block it builds is still not the block the network would build.** Its state root does not match the network's, for the reasons in item 7 — the same gas-schedule divergences that hold the conformance tally at 249 of 266 rather than all of it. So the item is closed as *wiring* and the divergence is tracked where it can be seen, not here.
 
 ### What the engine could not do before this pass
 
@@ -1882,7 +1882,7 @@ Recorded because the documentation claimed otherwise, and because each of these 
 - [ ] **Performance benchmarks** — block processing speed, state access latency
 - [x] **Conformance tests** — `eest_state_tests.erl` runs the `execution-spec-tests`
   `state_tests` corpus. **Started, and the first measurement is about 2%**
-  (78 of 266 committed entries at the first measurement, 226 of 266 now; see "What
+  (78 of 266 committed entries at the first measurement, 249 of 266 now; see "What
   to do next" item 5 for the number, the real defects it found, and the two harness
   bugs that made the figure irreproducible until they were fixed). The
   Ethereum Foundation's own `ethereum/tests` block-level suites and EEST's

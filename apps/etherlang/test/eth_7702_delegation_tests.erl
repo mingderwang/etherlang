@@ -489,6 +489,112 @@ tx() ->
       <<"accessList">> => []}, ?SENDER_PRIV).
 
 %% ---------------------------------------------------------------------------
+%% EIP-3529: the refund cap's base is the transaction's gas used
+%% ---------------------------------------------------------------------------
+
+%% The contract writes 1 into five slots and then writes 0 into each of them again.
+%%
+%% **Two writes per slot, and the order matters.** The first version wrote 0 into
+%% slots that were already 0, and EIP-2200 gives **no refund** for that -- original 0,
+%% current 0, new 0 is the no-op arm -- so the raw refund was **0** and no cap could
+%% possibly show. The signature was a `gasUsed` difference of *exactly* `4 * K` at
+%% every `K` from 1 to 1,800: two arms whose refund is zero are identical whatever
+%% the cap says, and the test would have passed against a node that ignored refunds
+%% entirely.
+%%
+%% Writing 1 and then 0 is the minimum that refunds, and it takes the *dirty* arm --
+%% original 0, current 1, new 0 -- so the refund is `SSTORE_SET_GAS - SLOAD_GAS` per
+%% slot rather than the clean clear-refund. It is the same counter either way, which
+%% is all this test needs.
+refunding_code() ->
+    One = [<<16#60, 1, 16#60, N, 16#55>> || N <- [0, 1, 2, 3, 4]],
+    Zero = [<<16#60, 0, 16#60, N, 16#55>> || N <- [0, 1, 2, 3, 4]],
+    iolist_to_binary(One ++ Zero ++ [<<16#00>>]).
+
+%% **Three runs of one frame, differing only in the transaction's intrinsic gas.**
+%%
+%% `run/5' is a bare frame -- no enclosing transaction -- so its cap base is the
+%% frame's own consumption. `run/6' takes the transaction's already-spent gas, and
+%% 21,000 is what a real transaction has spent. The third run passes a figure large
+%% enough that the cap cannot bind at all, which makes it the **uncapped** answer and
+%% therefore a measurement of the raw refund rather than an assumption about it.
+%%
+%%     A = uncapped, B = bare frame, C = intrinsic 21,000
+%%
+%% and the claims are `A > C > B`: the frame refunds, the transaction's own gas
+%% enlarges the cap, and the bare frame's smaller cap gives less back. `C == A` is
+%% the stronger half -- 21,000 is *enough* to grant the whole refund here -- and it
+%% is the assertion that the frame-only base gets wrong.
+%% Gas left after one frame, for a given transaction intrinsic.
+%%
+%% A **named function rather than a `fun`** bound to a variable: written as a `fun`,
+%% the binding and the call were separated in the source and the compiler reported
+%% `function run_gas/1 undefined' -- naming neither the `fun' three lines above nor
+%% the fact that a name bound to a fun is a variable rather than a function, which is
+%% exactly the `f([A, B]) is f/1` trap in AGENTS.md §11 wearing a different hat.
+left_gas(Code, Msg, St, Env, Gas, Intrinsic) ->
+    case eth_evm:run(Code, Msg, St, Env, Gas, Intrinsic) of
+        {ok, _, Left, _, _} -> Left;
+        Other -> Other
+    end.
+
+the_refund_cap_is_the_transaction_gas_not_the_frame_gas_test() ->
+    %% **`with_ctx/1`, and the reason it is not optional here.** This test builds a
+    %% state by hand and calls `eth_evm:run/6' directly, so nothing in it sets
+    %% `base_source'. The first `SSTORE' read a slot nothing had declared, the read
+    %% fell through `base_source` to the **upstream RPC**, and the test sat in
+    %% `eth_rpc_client:do_call/4' until it timed out -- a unit test performing a
+    %% network fetch, which AGENTS.md §5 forbids outright. The trace named
+    %% `eth_rpc_client' four frames below the opcode under test, so the failing line
+    %% was the transaction, not the test.
+    with_ctx(fun() ->
+        Code = refunding_code(),
+        St = put_code(eth_state:new(0, #{}), ?ACCOUNT, Code, 0),
+        Msg = #{caller => ?OTHER, origin => ?OTHER, address => ?ACCOUNT,
+                value => 0, data => <<>>, gas_price => 0, static => false, depth => 0},
+        Env = #{fork => prague, number => 1, timestamp => 1, coinbase => ?OTHER,
+                gas_limit => 30000000, base_fee_per_gas => 0, prevrandao => <<0:256>>,
+                delegate => undefined, auth_authorities => []},
+        Gas = 30000000,
+        {A, B, C} = {left_gas(Code, Msg, St, Env, Gas, 100000000),
+                     left_gas(Code, Msg, St, Env, Gas, 0),
+                     left_gas(Code, Msg, St, Env, Gas, 21000)},
+        %% The frame refunds at all -- without this the other two claims are
+        %% vacuous, which is the mistake the first version of this fixture made.
+        ?assert(A > B),
+        ?assert(C > B),
+        %% **The claim, exactly.** `C - B` is the refund the transaction's own 21,000
+        %% of gas bought back, and the EIP says it must be worth `intrinsic / 5`:
+        %% 21,000 div 5 = **4,200**. A frame-only base cannot return 4,200 here,
+        %% because it does not know the 21,000 exists.
+        %%
+        %% The first version asserted `C =:= A` -- that 21,000 is enough to lift the
+        %% cap clear -- and it is **false**, measurably: `A` is 73,088 above `C`, so
+        %% unbinding needs about 386,000 of intrinsic. A real transaction does not
+        %% spend that, so the assertion was asking for a configuration that does not
+        %% occur, and it would have been satisfied only by a contract that refunds
+        %% less. `C - B = 4200` asks the question the fix actually answers, and it
+        %% holds for **every** refund that binds the cap, which is the whole range
+        %% where the rule matters.
+        ?assertEqual({want, 21000 div 5, B, C, A},
+                     {want, C - B, B, C, A}),
+        %% **And the bare-frame default is 0, not "the usual 21,000."** `run/5` is
+        %% what `eth_call' and the system-call path go through, and a bare frame has
+        %% no enclosing transaction, so it has no intrinsic to add. The injection that
+        %% gave `run/5` a hard-coded 21,000 changed nothing here, which is the same
+        %% "nothing to see" the refund-zero fixture produced: nothing in the suite
+        %% runs a *refunding* frame through `run/5`. One line, and the default is
+        %% pinned rather than documented.
+        ?assertEqual(B, left_gas_bare(Code, Msg, St, Env, Gas))
+    end).
+
+left_gas_bare(Code, Msg, St, Env, Gas) ->
+    case eth_evm:run(Code, Msg, St, Env, Gas) of
+        {ok, _, Left, _, _} -> Left;
+        Other -> Other
+    end.
+
+%% ---------------------------------------------------------------------------
 %% EIP-7702 step 4: `accessed_addresses`
 %% ---------------------------------------------------------------------------
 

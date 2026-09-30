@@ -29,9 +29,16 @@
 %% is a transaction-start value, so the child can never disagree with the parent
 %% about one. The child's map is therefore the correct one on *both* the success
 %% and the revert path, and no merge rule is needed.
--record(ctx, {state, env, msg, transient = #{}, originals = #{}, fork}).
+%% `intrinsic' is the gas the enclosing **transaction** spent before this frame
+%% began -- normally 21,000. It is here, and not in the Env and not as a `run_t'
+%% parameter, because EIP-3529's refund cap is stated over the transaction's gas
+%% used and the frame is not the transaction. Every child frame inherits it for
+%% free, which is the whole reason it is a context field: a parameter would have
+%% to be passed at the two internal `run_t' call sites and a third the day a fourth
+%% appears, and forgetting one would silently cap that frame on the wrong base.
+-record(ctx, {state, env, msg, transient = #{}, originals = #{}, fork, intrinsic = 0}).
 
--export([run/5,
+-export([run/5, run/6,
            initial_access/3, valid_jumpdests/1]).
 
 %% ---------------------------------------------------------------------------
@@ -41,10 +48,33 @@
 %%   {ok, Output, GasLeft, State, Logs}
 %% | {revert, Output, GasLeft, State, Logs}
 %% | {error, Reason, State, Logs}
+%%
+%% **A bare frame: no enclosing transaction.** The `0` is the *right* answer rather
+%% than a convenient default, and it is worth saying why, because a parameter whose
+%% default is wrong is the `eth_tx:intrinsic_gas/1' hazard and this is its mirror
+%% image. EIP-3529's cap base is the transaction's gas used; a bare frame has no
+%% transaction, and both of this module's other callers are cases where the frame's
+%% gas *is* the whole thing -- an `eth_call' charges no intrinsic gas to anyone, and
+%% neither does a system call. `eth_block:run_transaction/5' is the one caller whose
+%% transaction has already spent 21,000 before the frame starts, and it says so.
 run(Code, Msg, State, Env, Gas) when is_binary(Code) ->
+    run(Code, Msg, State, Env, Gas, 0).
+
+%% `TxIntrinsicGas' is the gas the **enclosing transaction** spent before this frame
+%% began. It exists for one reason: EIP-3529 caps the refund at a fraction of the
+%% transaction's gas used, and the transaction's 21,000 is a term the frame cannot
+%% see. See the cap site for the arithmetic and for what it was worth.
+-spec run(binary(), map(), map(), map(), non_neg_integer(),
+          non_neg_integer()) ->
+          {ok, binary(), non_neg_integer(), map(), list()}
+        | {revert, binary(), non_neg_integer(), map(), list()}
+        | {error, term(), map(), list()}.
+run(Code, Msg, State, Env, Gas, TxIntrinsicGas)
+  when is_binary(Code), is_integer(TxIntrinsicGas), TxIntrinsicGas >= 0 ->
     Fork = fork_of(Env),
     {Res, _Transient, _Originals} =
-        run_t(Code, Msg, State, Env, Gas, initial_access(Msg, Env, Fork), #{}, Fork),
+        run_t(Code, Msg, State, Env, Gas, initial_access(Msg, Env, Fork), #{}, Fork,
+              TxIntrinsicGas),
     Res.
 
 %% EIP-2929, "When a transaction execution begins", in the EIP's own words:
@@ -216,19 +246,46 @@ fork_of(Env) -> maps:get(fork, Env).
 %% transaction-global: a child frame inherits a copy of the parent map and,
 %% on success, its writes merge back (child wins); on revert/error the
 %% parent map is kept unchanged.
-run_t(Code, Msg, State, Env, Gas, Transient, Originals, Fork) when is_binary(Code) ->
+run_t(Code, Msg, State, Env, Gas, Transient, Originals, Fork, TxIntrinsicGas)
+  when is_binary(Code) ->
+    %% **`intrinsic` is a transaction-level fact, so it lives in the context** and is
+    %% inherited by every child frame automatically. Threading it as a `run_t`
+    %% parameter would have meant threading it through the two internal call sites --
+    %% the child frame and the create frame -- and a third one the day a fourth
+    %% appears. A `#ctx' field cannot be forgotten by a call site, because there is
+    %% nothing to pass.
     Ctx = #ctx{state = State, env = Env, msg = Msg, transient = Transient,
-               originals = Originals, fork = Fork},
+               originals = Originals, fork = Fork, intrinsic = TxIntrinsicGas},
     E0 = #e{code = Code, gas = max(Gas, 0), dests = valid_jumpdests(Code)},
     try exec(E0, Ctx) of
         {E1, Ctx1} ->
             GasUsed = E0#e.gas - E1#e.gas,
+            %% **EIP-3529 caps "the max gas refunded _after a transaction_"**, and
+            %% `gas_used` in that sentence is the *transaction's*: EIP-7623 spells the
+            %% same quantity out as `21000 + ... + execution_gas_used`, where the
+            %% 21,000 is inside it. So the cap's base is the transaction's whole gas
+            %% used, **not** the frame's slice of it.
+            %%
+            %% It was the frame's, and the difference is `intrinsic / 5` -- 4,200 gas
+            %% on a plain transfer. The node therefore **under-refunds** whenever the
+            %% cap binds: with 21,000 of intrinsic and 30,000 of frame gas the EIP
+            %% allows 10,200 and this allowed 6,000.
+            %%
+            %% `TxIntrinsicGas` is what the enclosing transaction already spent before
+            %% this frame, which the frame cannot know: it starts at
+            %% `gasLimit - intrinsic` and the transaction, not the frame, owns the
+            %% 21,000. `run/5` passes 0, which is **right for a bare frame** rather
+            %% than a convenient default -- an `eth_call' and a system call both
+            %% charge no intrinsic to anyone, so there the frame's gas *is* the
+            %% transaction's gas used. `eth_block:run_transaction/5' is the one
+            %% caller with a different answer, and it passes its own.
+            GasUsedTx = GasUsed + Ctx#ctx.intrinsic,
             %% EIP-2200 (Berlin) capped refunds at gasUsed/2; EIP-3529 (London)
             %% cut that to gasUsed/5. The cap was Berlin's divisor while the
             %% refund amounts it capped were London's, so a London frame could
             %% hand back up to half of what it spent when the rule allows a
             %% fifth. See eth_fork_schedule:refund_cap/2.
-            MaxRefund = eth_fork_schedule:refund_cap(Fork, GasUsed),
+            MaxRefund = eth_fork_schedule:refund_cap(Fork, GasUsedTx),
             Refund = min(E1#e.refund, MaxRefund),
             FinalGas = E1#e.gas + Refund,
             Res = case E1#e.halt of
@@ -1295,7 +1352,7 @@ run_call(Kind, To, ToW, Value, Args, CallGas, RetOff, RetLen, E, Ctx, ChildCode)
                             {Result, ChildT, ChildO} =
                                 run_t(ChildCode, ChildMsg, StateIn, Env, CallGas,
                                       Ctx#ctx.transient, Ctx#ctx.originals,
-                                      Ctx#ctx.fork),
+                                      Ctx#ctx.fork, Ctx#ctx.intrinsic),
                             handle_child(Result, E, Ctx, StateIn, RetOff, RetLen,
                                          ChildT, ChildO)
                     end
@@ -1529,7 +1586,7 @@ create_with_value(_Op, Init, Value, Sender, NewAddr, State1, E1, Ctx, ChildGas) 
                  gas_price => s_msg(gas_price, Ctx, 0),
                  static => false, depth => s_msg(depth, Ctx, 0) + 1},
     Result = run_t(Init, ChildMsg, State2, Env, ChildGas, Ctx#ctx.transient,
-                   Ctx#ctx.originals, Ctx#ctx.fork),
+                   Ctx#ctx.originals, Ctx#ctx.fork, Ctx#ctx.intrinsic),
     case Result of
         {{ok, Code, Left, St, Logs}, ChildT, ChildO} ->
             %% **The code-deposit cost was not charged here at all.** Not the 200 per
