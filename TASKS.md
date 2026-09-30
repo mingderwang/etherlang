@@ -268,7 +268,70 @@ single missing clause explains the suite. And the deltas do **not** scale with
 calldata length: d0 has 376 bytes and delta 20,197 while d100 has 372 and 80,193, so
 EIP-7623's `21000 + 10 * tokens` floor is not the axis.
 
-### The leading hypothesis is dead: it is not an `SSTORE` pricing error
+### The residual is a function of one number the program never reads
+
+Two further measurements, and this is the sharpest thing in the whole cluster.
+
+**The `sstore_combinations` init code has no loop.** Disassembled with `PUSH`
+immediates skipped, all 187 bytes are straight-line: `PUSH2 <v>, PUSH1 64, MSTORE`,
+then five external calls --
+
+| # | op | target | gas forwarded |
+|---|---|---|---|
+| 1 | `CALL` | `0xb000...` | 300,000 |
+| 2 | `DELEGATECALL` | `0x3000...` | 300,000 |
+| 3 | `DELEGATECALL` | `0xb000...` | 300,000 |
+| 4 | `CALLCODE` | `0x3000...` | 300,000 |
+| 5 | `CALL` | `0x2000...` | 600,000 |
+
+-- and no `JUMP` or `JUMPI` anywhere. So "data-dependent execution in a loop", which
+the previous revision of this file proposed, is wrong: **the executed work is
+identical in all 424 entries.** The callees are equally simple -- three of them are
+the same 16 bytes, `PUSH1 i, PUSH1 i, SSTORE` for i in 0..2 then `STOP`, and
+`0x3000...` is `PUSH1 0x20, PUSH1 0x00, REVERT`, so it reverts unconditionally and
+is called twice.
+
+**And yet the delta is a function of a number the program never uses.** The only
+per-entry variable is the immediate of the first `PUSH`, which the program stores to
+memory[0x64] and **never reads** -- the calls take their arguments from memory[0..32],
+which is zero for every entry. Those immediates run 426 to 849 over the 424 entries,
+and the delta is **deterministic in them: 424 distinct values, and not one of them has
+more than one delta.**
+
+```
+426 -> 20197    427 -> 20695    428 -> 80195    429 -> 20197
+430 -> 20695    431 -> 80195    432 -> 20197    433 -> 70910
+434 -> 130910   435 -> 71412    436 -> 70910    437 -> 130910
+```
+
+**The value repeats with period three** -- 426, 429 and 432 all give 20,197; 427 and
+430 both give 20,695; 428 and 431 both give 80,195 -- and the pattern restarts at 433
+with a different band. That is the strongest evidence in this cluster and it points
+somewhere very specific: **a quantity that changes gas has to be reachable from the
+calldata, and the only such quantity in EIP-1559 pricing is `G_txdata`'s split
+between zero and non-zero bytes** (16 and 4) -- yet every one of those immediates is
+non-zero, so the split is constant per width. The width is 2 bytes for all of them.
+
+So: not a per-write price (42 writes, one pre-state, 68 deltas), not the calldata
+length or zero count (5 groups, several deltas each), not a loop (there is none), and
+not the execution (it is identical). **What remains is the *expected* figure, not the
+node's** -- the harness recovers it by inverting the sender's balance, and if the
+corpus's own expected gas varies with a value the program ignores, the divergence is
+in the comparison rather than in the state transition. That is the reading the
+evidence supports and it is **not** established.
+
+**The measurement that would settle it, and it is small:** the node's *actual*
+`gasUsed` for these 424 entries, taken from the receipt rather than by inverting a
+balance. If it is constant across all 424 -- which it must be, since the execution is
+identical -- then the whole of the 20,197-to-139,693 range is the fixture side, and
+the node is right. `eest_state_tests` already carries `Detail`'s `gas` map with
+`spent_actual` and `spent_expected` separately; what is missing is a run that
+separates them and prints both for entries whose post-state carries **no**
+`gasUsed`. That is a change to the *reporter*, not to the node, and it is the reason
+this cluster has taken this long: **an instrument that can only recover one side of a
+comparison by arithmetic will keep reporting a disagreement it cannot attribute.**
+
+
 
 `v1.68` recorded one plausible lead -- the smallest delta, 20,197, is
 `20,000 + 197`, one `SSTORE_SET_GAS` plus 197 -- and five entries contradicting it.
