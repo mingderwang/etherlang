@@ -784,39 +784,52 @@ behavioural change per commit, and each step says what it now does.
    of the EIP is **not measurable by the corpus at all** and the tests are the only
    evidence for it. Both figures also confirm **zero regressions** across every
    warm-set, access-cost and `CALL` change the work touches.
-6g. **EIP-3860 create-gas accounting -- and it is now the *entire* remaining
-   divergence in the 22-file set.** Measured after `v1.66`: of the 40 remaining
-   `state_mismatch` entries on `/tmp/rej_set`, **all 40 are EIP-3860** -- 34 in
-   `shanghai/eip3860_initcode/test_gas_usage.json` and 4 in
-   `test_contract_creating_tx.json`, plus 2 `fork_unreachable` elsewhere. Every one
-   is a **balance** diff; there is no code, nonce or storage diff left in the set.
-   - **The delta is 199 or 200 gas, and the node spends 199-200 LESS than the
-     fixture.** 200 is the yellow paper's `G_codedeposit` per byte, and the
-     EIP-3860 cases are exactly the `*-exact_execution_gas` and
-     `*-too_little_execution_gas` creates.
-   - **One case closes the framing.** `fork_Cancun-initcode_33_bytes-exact_execution_gas`:
-     `gasLimit` `0x1248bc` = **1,198,268**, effective price 10 wei, priority 3. The
-     sender's expected balance drops by **11,982,680** = 1,198,268 x 10, i.e. the
-     fixture expects the create to consume its **whole** allowance, and the coinbase
-     is credited 3,594,804 = 1,198,268 x 3. The expected post-state deploys a
-     contract with **2 bytes** of code. The node returns 200 more gas than the
-     fixture, and a 2-byte deposit is **400**.
-   - **The hypothesis, not yet closed: the node charges `G_codedeposit` for one byte
-     fewer than it deploys.** That fits 200 exactly. It does **not** explain the 199
-     entries, and 199 = 200 - 1 is not a multiple of any deposit. Until the 199 case
-     is accounted for the hypothesis is a guess, and the general rule here is that a
-     mechanism is a finding only once closed by arithmetic -- so this is recorded
-     as a measurement with a suspect, not as a diagnosed defect.
-   - **What would close it:** print the node's `gasUsed`, the expected `gasUsed`, and
-     `byte_size` of the code the node actually deploys for one `*-exact_execution_gas`
-     and one `*-too_little_execution_gas` case. If the node's deployed code is 1 byte
-     where the fixture's is 2, the charge follows the deployed code and the bug is
-     in what `Code` holds at the deposit site; if both deploy 2 bytes, the charge
-     arithmetic itself is wrong and the 199 is a second, smaller defect.
-   - **Not started, deliberately.** A 200-gas fix on a hypothesis about a
-     consensus constant is exactly the failure mode this file exists to prevent.
+6g. **A create _transaction_ deploys code for free: `G_codedeposit` is charged for
+   a `CREATE` opcode and not for a create transaction.** **Diagnosed, not fixed.**
+   The whole of it is in `eth_block:deploy/5`:
 
-6d. ~~**EIP-2930: warm the access-list _address_, not only its storage keys.**~~
+   ```erlang
+   deploy(State, ok, Output, Address, true) when byte_size(Output) =< 24576 ->
+       S1 = eth_state:set_code(State, Address, Output),
+       S2 = eth_state:set_nonce(S1, Address, 1),
+   ```
+
+   No deposit, and **no "cannot pay the deposit" branch at all**. `eth_evm:do_create/5`
+   charges `code_deposit_cost(Fork) * byte_size(Code)` and fails the create when the
+   frame cannot cover it, so the two create paths disagree -- and the transaction
+   one is the one a user writes.
+   - **Two consequences, both consensus.** A transaction deploys up to 24,576 bytes
+     of code for **free**, 200 per byte; and a create that cannot afford its own
+     deposit still **succeeds** and hands its gas back. This is the same class as
+     the blob-fee defect `v1.55` fixed -- a price the node knows, computes a
+     constant for, and never charges on one of the two paths that can incur it.
+   - **The 200s are closed by arithmetic.** From the runner's own gas map:
+     `initcode_32_bytes-exact_execution_gas` is `spent_actual 1198062` against
+     `spent_expected 1198262`, and the **only** diffs are two balances -- the
+     deployed code is **identical**, so the code is not the variable. A one-byte
+     deposit is 200. The node returns exactly that much too much gas.
+   - **The 199s are NOT explained and are not claimed to be.**
+     `initcode_32_bytes-too_little_execution_gas` is `1198062` against `1198261` --
+     199. The fixture's two cases differ from each other by **1** gas of execution,
+     and the node's two are identical, so the node is missing 200 in one and 199 in
+     the other. A deposit is 200 x n, so 199 is not one. The
+     "cannot-pay-fails-the-create" branch is the obvious candidate and it may well
+     account for it, **but that is a hypothesis and the two paths have not been
+     separated by a measurement.**
+   - **Why nothing is committed.** A consensus price is not a thing to land on a
+     partial explanation, and the remaining budget would not have covered the suite
+     twice, the injections and the corpus. The fix is well defined -- `deploy/5`
+     needs the fork and the gas left, so it becomes `deploy/6` returning
+     `{State, GasLeft'}`, the deposit is subtracted, and `GasCharged0` is computed
+     from the adjusted `GasLeft` -- and it needs one more measurement to be
+     trustworthy.
+   - **The one measurement that closes it:** for one `*-too_little_execution_gas`
+     case, print whether the node's create **succeeded**, and what `byte_size` of
+     `Output` it was about to deploy. If it succeeded where the fixture failed, the
+     missing branch is the 199 and both are one defect; if it succeeded on both,
+     there is a second, smaller one.
+
+~~**EIP-2930: warm the access-list _address_, not only its storage keys.**~~
    **Done.** `eth_evm:access_list_access/2` seeded `{warm_store, Addr, Slot}` and
    never `{warm_account, Addr}`, so a listed address was charged 2,400 intrinsic and
    re-charged 2,600 as a cold access on first use. EIP-2930's specification-in-code
