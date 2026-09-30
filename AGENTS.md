@@ -1165,6 +1165,29 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
   figure that lands exactly on a sum you can name from the transaction's own fields
   is not a measurement of anything the frame did.
 
+- **A number rendered in a notation you have not read is a number you have not
+  measured.** The EIP-3860 divergences printed as `gas delta -10#200w`, and I read
+  that as **-1,048,576** -- a power of two, which looked like a real finding about
+  initcode sizing. `~+w` renders an integer in Erlang's `10#<digits>w` form, so it
+  is **-200**. One `erl -eval` printing `-199`, `-1048576` and `-524287` through the
+  same format would have said so immediately. The tell was available the whole time
+  and I used arithmetic on a string: the two sample deltas differed by exactly 1,
+  which is implausible for a 49,152-byte initcode and obvious for two adjacent
+  integers. **Two values in a set that differ by 1 are adjacent integers, whatever
+  their magnitude suggests** -- and the general form is §10a's "a value no
+  arithmetic can produce means the expression is not what you think it is", applied
+  to output rather than to source.
+
+- **A hypothesis that fits every number except one is not a diagnosis.** The best
+  current explanation of the EIP-3860 create-gas divergence is that the node charges
+  `G_codedeposit` for one byte fewer than it deploys: it fits the -200 entries
+  exactly, a 2-byte deployment costs 400, and the node returns 200 more gas than the
+  fixture does. It does not fit the -199 entries, and 199 is not a multiple of any
+  deposit. Recorded in `TASKS.md` item 6g **as a measurement with a suspect**, with
+  the one measurement that would close or kill it written down, and with no code
+  changed. A consensus constant is the last place in this repository where "it fits"
+  is allowed to stand in for "it is".
+
 - **A test whose fixture produces no refund cannot see a refund rule, and it fails
   by looking correct.** The EIP-3529 cap test swept the calldata length from 1 to
   1,800 bytes and got `gasUsed` differences of *exactly* `4 * K` at every point --

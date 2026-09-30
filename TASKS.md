@@ -784,6 +784,38 @@ behavioural change per commit, and each step says what it now does.
    of the EIP is **not measurable by the corpus at all** and the tests are the only
    evidence for it. Both figures also confirm **zero regressions** across every
    warm-set, access-cost and `CALL` change the work touches.
+6g. **EIP-3860 create-gas accounting -- and it is now the *entire* remaining
+   divergence in the 22-file set.** Measured after `v1.66`: of the 40 remaining
+   `state_mismatch` entries on `/tmp/rej_set`, **all 40 are EIP-3860** -- 34 in
+   `shanghai/eip3860_initcode/test_gas_usage.json` and 4 in
+   `test_contract_creating_tx.json`, plus 2 `fork_unreachable` elsewhere. Every one
+   is a **balance** diff; there is no code, nonce or storage diff left in the set.
+   - **The delta is 199 or 200 gas, and the node spends 199-200 LESS than the
+     fixture.** 200 is the yellow paper's `G_codedeposit` per byte, and the
+     EIP-3860 cases are exactly the `*-exact_execution_gas` and
+     `*-too_little_execution_gas` creates.
+   - **One case closes the framing.** `fork_Cancun-initcode_33_bytes-exact_execution_gas`:
+     `gasLimit` `0x1248bc` = **1,198,268**, effective price 10 wei, priority 3. The
+     sender's expected balance drops by **11,982,680** = 1,198,268 x 10, i.e. the
+     fixture expects the create to consume its **whole** allowance, and the coinbase
+     is credited 3,594,804 = 1,198,268 x 3. The expected post-state deploys a
+     contract with **2 bytes** of code. The node returns 200 more gas than the
+     fixture, and a 2-byte deposit is **400**.
+   - **The hypothesis, not yet closed: the node charges `G_codedeposit` for one byte
+     fewer than it deploys.** That fits 200 exactly. It does **not** explain the 199
+     entries, and 199 = 200 - 1 is not a multiple of any deposit. Until the 199 case
+     is accounted for the hypothesis is a guess, and the general rule here is that a
+     mechanism is a finding only once closed by arithmetic -- so this is recorded
+     as a measurement with a suspect, not as a diagnosed defect.
+   - **What would close it:** print the node's `gasUsed`, the expected `gasUsed`, and
+     `byte_size` of the code the node actually deploys for one `*-exact_execution_gas`
+     and one `*-too_little_execution_gas` case. If the node's deployed code is 1 byte
+     where the fixture's is 2, the charge follows the deployed code and the bug is
+     in what `Code` holds at the deposit site; if both deploy 2 bytes, the charge
+     arithmetic itself is wrong and the 199 is a second, smaller defect.
+   - **Not started, deliberately.** A 200-gas fix on a hypothesis about a
+     consensus constant is exactly the failure mode this file exists to prevent.
+
 6d. ~~**EIP-2930: warm the access-list _address_, not only its storage keys.**~~
    **Done.** `eth_evm:access_list_access/2` seeded `{warm_store, Addr, Slot}` and
    never `{warm_account, Addr}`, so a listed address was charged 2,400 intrinsic and
