@@ -51,6 +51,7 @@ print(Dir, S, Ms) ->
     io:format("matched: ~w of ~w (~.1f%)~n~n", [Matched, Total, pct(Matched, Total)]),
     print_tally(Tally),
     print_by_fork(maps:get(by_fork, S)),
+    print_by_suite(maps:get(by_suite, S, #{})),
     print_gas(maps:get(gas, S)),
     print_shapes(maps:get(shapes, S)),
     print_rejects(maps:get(rejects, S, #{})),
@@ -75,6 +76,41 @@ print_by_fork(Bf) ->
                     N - maps:get(match, T, 0)])
      end || {F, L} <- lists:sort(maps:to_list(Bf))].
 
+%% The per-suite breakdown: the axis the divergence actually lives on.
+%%
+%% Ordered by **diverging count**, not by suite name and not by total. A suite with
+%% 4,000 entries and 3 divergences is not a problem, and a table sorted by `n' would
+%% put it above a suite with 30 entries and 30 divergences, which is. Sorting by
+%% the thing being investigated is the whole point of having the table.
+%%
+%% `Limit' truncates, and the count of what it dropped is printed -- the gas
+%% histogram's `v1.59' rule, which is that a section that prints nothing must say
+%% what it did not look at. A capped list that reads as complete is the same defect
+%% at a different scale, and the omitted suites are the *small* ones, which is the
+%% direction a reader least expects: the omitted tail is by construction the part
+%% where every suite looked fine.
+print_by_suite(Bs) ->
+    io:format("~n--- by suite, worst first (suite = the fixture's directory) ---~n"),
+    Ranked = [{N - maps:get(match, T, 0), N, Name, T}
+              || {Name, L} <- maps:to_list(Bs),
+                 T <- [lists:foldl(fun({O, _}, M) ->
+                                           maps:update_with(O, fun(C) -> C + 1 end, 1, M)
+                                   end, #{}, L)],
+                 N <- [lists:sum([C || {_, C} <- L])]],
+    Sorted = lists:reverse(lists:sort(Ranked)),
+    Limit = 30,
+    {Top, Rest} = case length(Sorted) > Limit of
+                      true -> lists:split(Limit, Sorted);
+                      false -> {Sorted, []}
+                  end,
+    [io:format("  ~-44s n=~-6w match=~-6w diverge=~-6w~n",
+               [binary_to_list(Name), N, maps:get(match, T, 0), D])
+     || {D, N, Name, T} <- Top],
+    case Rest of
+        [] -> ok;
+        _ -> io:format("  ... and ~w further suites, all with fewer divergences "
+                       "than the ~w shown here~n", [length(Rest), length(Top)])
+    end.
 %% The rejection histogram, in full and unsampled.
 %%
 %% Every distinct `{corpus code, node code, node reason}' triple, with its count, ordered

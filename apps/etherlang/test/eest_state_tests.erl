@@ -149,16 +149,16 @@ report_progress(_Acc, _Every, _T0) ->
 initial_survey(N, Every) ->
     #{files => N, files_done => 0, every => Every, total => 0,
       tally => maps:from_list([{O, 0} || O <- outcomes()]),
-      by_fork => #{}, gas => empty_gas(), shapes => #{}, rejects => #{},
-      sample => [], sample_limit => 40}.
+      by_fork => #{}, by_suite => #{}, gas => empty_gas(), shapes => #{},
+      rejects => #{}, sample => [], sample_limit => 40}.
 
 %% Fold one file's results in. Reversed so the accumulated list stays cheap.
 file_survey(File, Acc) ->
     Acc1 = lists:foldl(fun(R, A) -> survey_one(R, A) end, Acc, file_entries(File)),
     maps:update_with(files_done, fun(N) -> N + 1 end, 1, Acc1).
 
-survey_one({Key, Outcome, Detail, _File} = R, Acc) ->
-    #{total := T, tally := Tl, by_fork := Bf, gas := G, shapes := Sh,
+survey_one({Key, Outcome, Detail, File} = R, Acc) ->
+    #{total := T, tally := Tl, by_fork := Bf, by_suite := Bs, gas := G, shapes := Sh,
       rejects := Rj, sample := S, sample_limit := Lim} = Acc,
     Fork = fork_of_key(Key),
     Acc1 = Acc#{total => T + 1,
@@ -190,6 +190,9 @@ survey_one({Key, Outcome, Detail, _File} = R, Acc) ->
                 by_fork => maps:update_with(Fork,
                                            fun(L) -> [{Outcome, 1} | L] end,
                                            [], Bf),
+                by_suite => maps:update_with(suite_of_file(File),
+                                             fun(L) -> [{Outcome, 1} | L] end,
+                                             [], Bs),
                 gas => add_gas_delta(G, Outcome, Detail),
                 shapes => add_divergence_shape(Sh, Outcome, Detail),
                 rejects => add_reject_reason(Rj, Outcome, Detail)},
@@ -405,6 +408,36 @@ fork_of_key(Key) ->
         {match, [Name]} -> Name;
         _ -> undefined
     end.
+
+%% The suite a fixture belongs to: the directory the file sits in, which in the
+%% upstream corpus is the test class (`stEIP5656_MCOPY`, `eip7702_set_code_tx`) and
+%% is therefore the unit a *specification* question is asked in -- one EIP, one
+%% rule, one number.
+%%
+%% This exists because the fork breakdown cannot answer "which rule". The static
+%% corpus is 27,538 entries across exactly two forks, and it came back 42.0% with
+%% 15,900 of them `state_mismatch`; a per-fork table renders that as "Cancun 42%,
+%% Prague 42%", which is two numbers restating one question. The 40-entry sample
+%% named EIP-1153, EIP-5656 and EIP-4844 in three consecutive blocks, so the
+%% divergence is *not* spread over the corpus -- it is a handful of suites -- and
+%% nothing in the tally said so. This is AGENTS.md's "a tally is not a work list"
+%% and "an instrument built around one quantity classifies only what that quantity
+%% can measure": `by_fork' measures the fork, and the fork is not the axis the
+%% answer lives on.
+%%
+%% **The unit is the directory, not the EIP number**, and it is worth saying why
+%% that is not the same thing. `stEIP5656_MCOPY` is an EIP; `stRandom` and
+%% `stExample` are not, and `eip7702_set_code_tx` is a filler-generated suite whose
+%% name happens to carry an EIP. Deriving the label from the name would have
+%% produced a tidy "by EIP" table with two of the largest rows blank.
+%%
+%% On a flat corpus -- the committed subset, where every file sits in one directory
+%% -- this answers with that one directory's name, which is the directory the
+%% operator named. It is a correct answer to the question asked, and it is not a
+%% breakdown; `print_by_suite/1' says so rather than printing one row and letting it
+%% read as a classification.
+suite_of_file(File) ->
+    list_to_binary(filename:basename(filename:dirname(File))).
 
 %% ---------------------------------------------------------------------------
 %% Outcomes
