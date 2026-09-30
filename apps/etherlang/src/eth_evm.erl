@@ -1615,7 +1615,67 @@ run_create1(Op, Init, Salt, Value, E, Ctx) ->
     end.
 
 create_with_value(_Op, Init, Value, Sender, NewAddr, State1, E1, Ctx, ChildGas) ->
-    State2 = transfer(State1, Sender, NewAddr, Value),
+    %% **EIP-161 (a): the account a CREATE/CREATE2 makes has nonce 1, never 0.**
+    %%
+    %%     Account creation transactions and the CREATE operation SHALL, prior to
+    %%     the execution of the initialisation code, increment the nonce over and
+    %%     above its normal starting value by one.   -- EIP-161, Spurious Dragon
+    %%
+    %% and the EIP's own Rationale says why the rule is one rather than zero:
+    %%
+    %%     CREATE avoids zero in the nonce to avoid any suggestion of the oddity of
+    %%     CREATEd accounts being reaped half-way through their creation.
+    %%
+    %% That last clause is the whole mechanism. EIP-161 defines an account empty
+    %% when it has "no code and zero nonce and zero balance", and requires (d) that
+    %% an account touched by the transaction which is now empty be *deleted* -- so a
+    %% created account sitting at nonce 0 with no code yet would be a deletion
+    %% candidate for the whole of its initialisation. The nonce is what makes the
+    %% account non-empty in the window where it has no code.
+    %%
+    %% **Spurious Dragon and later, and earlier forks keep the zero.** EIP-161's own
+    %% "Hard fork" section is the authority -- `FORK_BLKNUM: 2,675,000, CHAIN_ID: 1
+    %% (Mainnet)' -- and the reason is in the same Rationale: the reaping problem it
+    %% fixes did not exist before it, because rule (d) is what (c) and (d) introduce.
+    %% So this is gated on the fork rather than applied everywhere, and the
+    %% unconditional version is not a simplification: it is wrong for Frontier
+    %% through Petersburg, which is four of the thirteen forks in the corpus, and
+    %% `eth_evm' already has the fork in `#ctx' and gates `EIP-3860' and `EIP-2929'
+    %% the same way a few hundred lines away.
+    %%
+    %% `execution-specs' puts it in the same place. `process_create_message/1'
+    %% (cancun):
+    %%
+    %%     mark_account_created(tx_state, message.current_target)
+    %%     increment_nonce(tx_state, message.current_target)   % before the init code
+    %%     evm = process_message(message)
+    %%     ...
+    %%     except ExceptionalHalt as error: restore_tx_state(tx_state, snapshot)
+    %%     else: set_code(tx_state, message.current_target, contract_code)
+    %%
+    %% It goes where EELS puts it, which is before the init code, and **that position
+    %% is not observable in this node.** An injection that deleted the write here and
+    %% added it to the success arm beside `set_code/3' -- so a deployed contract still
+    %% ended with nonce 1 -- passed every test written for this rule, because all four
+    %% failure branches below return `State1', the state from *before* this line, and
+    %% so discard the child's returned state, which is where the success arm would
+    %% have written it. The two placements agree on every reachable state.
+    %%
+    %% So what EELS gets from `restore_tx_state/2' on an exceptional halt, this module
+    %% gets from its failure branches, and the branches were already right. The nonce
+    %% is written before the init code because that is the specification's order and
+    %% because writing it anywhere else would be a reason to think about it, not
+    %% because a test here can tell the difference. The comment used to claim the
+    %% ordering was load-bearing; an injection refuted that, and a comment asserting a
+    %% difference no test can see is the failure this repository's own rules are about.
+    %%
+    %% The absence assertions that do bite are on the *failed* creates, against a
+    %% control arm one byte different that does create an account.
+    StateT = transfer(State1, Sender, NewAddr, Value),
+    State2 = case eth_fork_schedule:at_least(Ctx#ctx.fork, spurious_dragon) of
+                 true -> eth_state:set_nonce(StateT, NewAddr, 1);
+                 false -> StateT
+             end,
     Env = Ctx#ctx.env,
     ChildMsg = #{address => NewAddr, caller => Sender,
                  origin => s_msg(origin, Ctx, <<0:160>>),

@@ -93,8 +93,8 @@ depends on execution order, suspect the build before you suspect the code.
 
 ## 3. Architecture
 
-50 modules in `apps/etherlang/src` (14,176 lines of code), 59 test modules in
-`apps/etherlang/test` (13,220), and 932 eunit tests. **These counts drift and this
+50 modules in `apps/etherlang/src` (14,180 lines of code), 59 test modules in
+`apps/etherlang/test` (13,330), and 937 eunit tests. **These counts drift and this
 one had drifted** -- it said 47 and 44 for several commits after it stopped being
 true, which is the same defect as a stale conformance figure: a number in the
 architecture section that a reader will use as a measure of size and that no longer
@@ -501,7 +501,6 @@ is worse than none. It is now two tables.
 | ~~`TERMINAL_BLOCK_HASH`~~ | EIP-3675 | **Closed by scope, on the EIP's own words.** It is chain-config data — §"Client software configuration" says these values "MUST be included into its binary distribution", so the EIP mandates that it be *configured*, and names no value for it (unlike `TERMINAL_TOTAL_DIFFICULTY`, which it pins to `58750000000000000000000` for mainnet). Its one normative use is a **fork-choice** rule: "Canonical blockchain **MUST** contain a block with the hash defined by `TERMINAL_BLOCK_HASH` parameter at the height defined by `TERMINAL_BLOCK_NUMBER` parameter." That is an assertion about a chain's *contents*, not a per-block validity rule, and this node's head comes from the beacon chain over the Engine API — so there is no point at which a block could be refused for it. Carried and echoed, never checked, and that is now the correct behaviour rather than a deferral. |
 | Pre-Berlin `SSTORE` **at Constantinople** | EIP-1283 | The only fork still refused. EIP-1283 replaced the rule and Petersburg reverted it, so a single figure would be right for two spans and wrong at the third -- and wrong *only* at Constantinople is never noticed. Unreachable by block number on mainnet. |
 | ~~A warm-set entry keyed on a value the frame cannot name~~ | EIP-2929/3651 | **Closed as unreachable on every path that exists.** EIP-3651 is one sentence — "At the start of transaction execution, `accessed_addresses` shall be initialized to also include the address returned by `COINBASE`" — and `eth_block:block_env/2` sets `coinbase => Miner` from the block record **unconditionally**, so the Env never omits it. The `maps:get/3` default and `coinbase_at/2`'s `[]` are correct *defensive* code: if the key were ever absent, warming nothing is right and warming the atom `undefined` would be a warm entry no 160-bit address can equal. This sat in the Open table across several passes because the defensive branch looked like a defect, and the fix (`v1.45`) was correct all along. A "what if the key is missing" branch is not a gap when nothing can make the key missing. |
-| An EIP-2930 access-list **address** is priced and never warmed | EIP-2930 / EIP-2929 | `eth_evm:access_list_access/2` folds the list into `{warm_store, Addr, Slot}` entries and **never adds the address to `accessed_addresses`**. EIP-2929's warm set has two kinds of entry and only the storage kind is seeded, so every access-list address is charged its 2,400 of intrinsic gas (EIP-2930's `2400 * access list address count`) and then re-charged 2,600 as a cold account access on first use. **Measured**, and found by a test written for a different EIP: the EIP-7702 warm-resolution test warmed its delegate through an access list, and the "warm" arm came out **2,400 more** than the cold one -- the list's own price, warming nothing. `v1.46` fixed the storage-key half and the tx field and left this; it is the same defect one level up, and the two are separable, so it is named here rather than folded into a delegation commit. |
 | `eth_createAccessList` | — | The one genuinely absent JSON-RPC method. |
 | `eth_tx:intrinsic_gas/1` takes no fork | — | Falls back to the operator's `ETH_FORK` pin. Correct for pool admission, where no block exists; **wrong** for `eth_call`, `estimateGas` and block execution, which must use `intrinsic_gas/2`. Not a gap so much as a hazard: it is a one-argument function that answers correctly in the one place nobody calls it wrongly. |
 
@@ -530,6 +529,8 @@ is worse than none. It is now two tables.
 | EIP-4844's blob *validity* rules: one fabricated, two absent | EIP-4844 | **Fixed (`v1.56`)**, +5 tests. Three rules in the same EIP, all wrong, none of them visible in the tally. **(i)** `valid_versioned_hashes/1` required the hash's 31-byte remainder to be non-zero. **EIP-4844 has no such rule** — its `validate_block` says only "there must be at least one blob" and "all versioned blob hashes must start with `VERSIONED_HASH_VERSION_KZG`" — and whether the remainder is zero is a question about a 48-byte commitment the transaction does not carry, so the execution layer cannot answer it. The clause refused **1,827** corpus branches. **(ii)** `check_state/7` computed `max_total_fee` as `gas * maxFeePerGas + value`, omitting the EIP's `+= get_total_blob_gas(tx) * tx.max_fee_per_blob_gas`, so a sender who could not pay for its blobs was admitted — the 288-entry `INSUFFICIENT_ACCOUNT_FUNDS` cluster. **(iii)** `check_blobs/2` implemented the `maxFeePerBlobGas >= blob_base_fee` floor correctly and **could not fire**: no caller passed `blob_base_fee`, so the `undefined` branch was taken on every call and the `ensure/2` was dead — EIP-3607's shape exactly. Removing (i) is what made (ii) and (iii) *observable*: the fabricated clause had been answering `bad_blob_hashes` for all three, and all 322 now refuse for the right rule. The headline does not move (see the vocabulary boundary), and 4 entries stopped refusing for the wrong reason and now do not refuse at all — the per-block blob gas limit and the check-ordering question, both recorded in `TASKS.md`. |
 | EIP-4844's per-block blob gas cap was missing | EIP-4844 | **Fixed (`v1.58`)**, +4 tests. EIP-4844's `validate_block` requires `blob_gas_used <= MAX_BLOB_GAS_PER_BLOCK` (786,432 = 6 blobs) accumulated over the *whole block*, and this node had no such check, so a block carrying 7 or 9 blobs was admitted. It is **cumulative**, so it cannot be a per-transaction condition — a 4-blob transaction followed by a 3-blob one is an invalid block whose transactions are each valid — and the total is threaded through `eth_block:execute_transactions/6` into the validation context. It is threaded as an **argument**, not through `Block#block.blob_gas_used`, because on an imported payload that field holds the block's **declared** header value: writing an executed total into it would put a recomputed number under a key named after a header field, which §4.1 exists to prevent. The cap and the `blobGasUsed` *commitment* are therefore two questions with two values, and only the first is now answered. The conformance runner hands `validation_ctx/2` a total of 0 — a state test has one transaction per block, so **it structurally cannot express the cumulative half** — which is why the accumulation is pinned by hand on the real `finalize/1` path. |
 | The rejection vocabulary: the runner asked the wrong question for 1,974 entries | measurement | **Fixed (`v1.60`).** `rejection_mismatch` on the 22-file `expectException` set went 1,974 → **0**, `match` 1,784 → 3,760. **No refusal changed.** The node now refuses for exactly the reasons it did; the runner was comparing against strings that were not the corpus's. Three defects: the `node_exception/2` table's names were wrong in **ten of eleven** clauses (including one for `insufficient_funds`, a reason `eth_tx:validate/2` never throws), `exception_code/1` string-compared the whole `"A\|B"` so 31 entries were unreachable **by construction**, and the node conflated two of EIP-4844's asserts into one reason. Classified before anything was changed: **behavioural gaps 0**, vocabulary 1,943, harness 31. The corpus has exactly 18 distinct `expectException` codes and they are now printed in the table's comment with their measured counts, because a table that asserts "every code here has been asked for" is a claim that has to be derived. **That a wrong clause cannot manufacture a match is measured**: mapping EIP-7623's floor to the wrong code *loses* 76 and invents none. The committed 266-entry subset is **unchanged at 224 of 266**, because it never had a `rejection_mismatch` — the most useful single fact about how the headline figure and the corpus figure relate. |
+| An EIP-2930 access-list **address** is priced and never warmed | EIP-2930 / EIP-2929 | **Fixed (`b79e584`), and found by a test written for a different EIP.** The EIP-7702 warm-resolution test warmed its delegate through an access list and the "warm" arm came out **2,400 more** than the cold one — which is the list's own price, warming nothing. `eth_evm:access_list_access/2` folded the list into `{warm_store, Addr, Slot}` entries and **never added the address to `accessed_addresses`**, so EIP-2929's warm set had only its storage kind seeded: every access-list address was charged its 2,400 of intrinsic gas (EIP-2930's `2400 * access list address count`) and then re-charged 2,600 as a cold account access on first use. `v1.46` fixed the storage-key half and the tx field; this is the same defect one level up. **This row sat in the **Open** table describing a defect that had been closed, and the Closed table never gained a row for it at all** — so the fix was in the code and in the log and in neither table, which is the same defect as a stale conformance figure: a table a reader uses as a work list, disagreeing with the tree. |
+| A contract made by `CREATE`/`CREATE2` has nonce 0 | EIP-161 (a) | **Fixed (`v1.67`)**, +5 tests, 3 injections of which 2 bite. "Account creation transactions and the CREATE operation SHALL, prior to the execution of the initialisation code, increment the nonce over and above its normal starting value by one" — and the EIP's own Rationale says why the rule is one rather than zero: *"CREATE avoids zero in the nonce to avoid any suggestion of the oddity of CREATEd accounts being reaped half-way through their creation."* `eth_block:deploy/5` (the create-*transaction* path) had always set it; `eth_evm:create_with_value/9` (the opcode path) never did, so **the two ways of deploying a contract in this node disagreed and the opcode way was wrong.** The corpus found it as **84 nonce divergences and not one code divergence** in `constantinople/eip1014_create2/test_create2_return_data.json`, and the shape is the evidence: "a create that did not happen" and "a create that happened with the wrong nonce" are the *same* diff, so the absence of a code diff is what says the deployment occurred and only the nonce was wrong. **Measured: that file 36 -> 72 of 168** (and its per-fork table is the clearest result in this work — Cancun, Shanghai and Prague go 0 of 23 to 23 of 23 while Berlin, Istanbul, London and Paris stay at 0 of 23, so the residual is a *separate* 1-to-2 gas defect at pre-Cancun forks), **constantinople 57 -> 93 of 192, byzantium 144 -> 195 of 405, the committed subset 250 -> 254 of 266.** Gated on Spurious Dragon per the EIP's own "Hard fork" section, and the gate is pinned by an injection that removes it: `homestead` 82 of 82 and `frontier` 3,661 -> 3,667, both pre-SD, both unmoved-or-better. **Nothing here is a gas figure** — the whole cost of the defect is a state root, which is why the pin moved on `state_mismatch` and not on a gas number. |
 | A transaction type that fell out of a `case` on the fee field | EIP-1559 / EIP-7702 | **Fixed (`v1.57`)**, +1 table-driven test over all five wire formats. `fee_ceiling_ok/4` chose the ceiling with `case tx_type(Tx) of eip1559 -> MaxFee; eip4844 -> MaxFee; _ -> GasPrice end`, and `eip7702` was absent — so a type-4 transaction, which has **no `gasPrice` field**, fell to the legacy branch and read `field/3`'s default of `0`, and against a correct base fee every type-4 transaction was refused as underpriced *by its own cap*. **72 corpus entries**: 47 `INTRINSIC_GAS_TOO_LOW`, 14 `INTRINSIC_GAS_BELOW_FLOOR_GAS_COST`, 8 `SENDER_NOT_EOA`, 3 type-4 well-formedness. `fee_fields_ok/4` had the identical clause and `v1.54` fixed it there without re-reading its neighbour. The `case` on an enum that selects a *value* is more dangerous than one that selects a *rule*: a missing rule raises, a missing value answers plausibly. |
 
 ### The originals, kept because the reasoning is the point
@@ -1247,6 +1248,104 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
   that tells them apart is one line, and without it the default was unpinned --
   the injection that gave `run/5` a hard-coded 21,000 changed nothing, because no
   fixture in the suite runs a *refunding* frame through the bare entry point.
+
+- **An injection can refute the *reason* a fix is written where it is, and the
+  comment usually keeps the refuted reason.** The EIP-161 nonce belongs where EELS puts
+  it — `process_create_message/1` calls `increment_nonce` *before* `process_message`,
+  and takes a `copy_tx_state` snapshot so an exceptional halt rolls it back. The fix
+  therefore wrote it on the state handed to the init code, and the comment said that
+  was **load-bearing**: all four failure branches of `create_with_value/9' return
+  `State1'` and so discard it. Then the injection moved the write to the obvious
+  tidier place — the success arm, beside `set_code/3'` — and **every test passed**.
+  Both placements agree on every reachable state, because the failure branches return
+  the state from *before* the write either way.
+  - The general form: **"this is where the specification puts it" and "this is where
+    you can tell the difference" are two different sentences**, and writing the second
+    when you have only established the first is the §4.3 failure in its quiet form. A
+    placement can be correct by fidelity to the spec and untestable here, and both
+    facts belong in the comment — the second especially, because the next person will
+    otherwise assume a test is holding it in place and move it.
+  - It was found only because the injection was aimed at the *reason* rather than at
+    the code. "Delete the line" tests presence; "delete it and put it somewhere else
+    that also satisfies every test" tests the claim.
+
+- **A program with no jump runs into whatever bytes follow it, and `RETURN` versus
+  `REVERT` in those bytes decides whether the *outer* frame succeeds.** Every fixture
+  for a `CREATE` here is a driver followed by the init code it `CODECOPY`s, and the
+  driver ends with `SSTORE` — so the outer frame carried straight on into the init
+  code. The deploying arm still reported success, because `RETURN` is a successful
+  halt and `run_t` answers `{ok, Out, ...}' for it; the reverting arm made the
+  **outer** frame revert. The test was asserting an absent account in a state whose
+  outer frame had never finished, and no branch under test was being taken.
+  - The tell was the revert **payload**: 32 zero bytes, for a `MSTORE` of 42 that had
+    just run. Memory the frame itself wrote cannot be zero.
+  - The fix is a `STOP` fence between driver and init code, and the driver lengths
+    (**18** bytes for `CREATE`, **20** for `CREATE2`) are *matched*, not assumed.
+
+- **A frame's memory is scratch, and its code is not in it.** `eth_evm` keeps the code
+  in `#e.code` and zero-extends `#e.mem` in `charge_mem/2`. `CREATE` reads its init
+  code with `read(E, Off, Len)`, which is `binary:part(E#e.mem, ...)` — so an init code
+  that is merely *present in the program text* reads back as zeros. That is correct
+  behaviour and not a node defect: a real contract puts init code in memory with
+  `CODECOPY` or `CALLDATACOPY`, which is what the corpus does.
+  - The failure is silent and looks like a working create. `CREATE` pushed a real
+    address, the account existed, the nonce was 1 — and the deployed code was `<<>>`.
+    **Every pre-existing create test in `eth_evm_tests` passes `Len = 0'**, so nothing
+    in the module had ever noticed.
+  - The general form: **an absent assertion is not a passing test.** "The create
+    worked" was inferred from a real address and a live account, and both were true of
+    a create that deployed nothing. Assert the code before the nonce, always — the
+    deployment is the thing the other assertions are about.
+
+- **A helper that reconstructs a value carries a precondition nobody checks.**
+  `would_create/1` rebuilds the create address as `keccak(rlp([sender, nonce]))` with
+  the nonce *before* the increment, so it is valid **only on a state whose sender nonce
+  has been rolled back**. An injection that made the deposit-failure branch keep the
+  child's state — no longer rolled back — left the helper naming a different address,
+  and the test asserting *no account exists there* passed, because it was checking an
+  account that had never existed.
+  - The general form: **an assertion of absence passes for the wrong reason whenever
+    the thing reconstructed could be wrong**, and a reconstructor is a second
+    implementation with an unwritten precondition. Two of these were written in this
+    session; one was deleted, and the survivor's precondition is now stated at the
+    definition rather than at the call.
+
+- **A fork *name* read as "old" is a rank asked for by a name.** The pre-Spurious-Dragon
+  arm of the EIP-161 fork test used `byzantium`, and failed correctly:
+  `fork_rank(spurious_dragon)` is **4** and `fork_rank(byzantium)` is **5**, so
+  Byzantium is two forks *after* the rule. The pre-SD forks are `frontier`,
+  `homestead`, `dao` and `tangerine_whistle` at ranks 0 to 3. This is §10a's
+  "a function that takes a name may be handed a label" again — and the schedule's own
+  comment records that it had the same bug once, when `byzantium` was rank 0 and
+  `at_least(frontier, byzantium)` was true.
+
+- **A per-fork table cannot tell "this fork's rule is refused" from "one suite in
+  this fork is broken", and a number attached to the first reading is a guess with a
+  decimal point.** This repository carried "**constantinople at 29.7%** is where
+  EIP-1283's `SSTORE` is refused" in `TASKS.md` for a commit. The per-suite
+  instrument says `eip1014_create2` is **131 of Constantinople's 135** divergences and
+  `eip145_bitwise_shift` is 3, and that the only two entries the directory runs at a
+  Constantinople fork are `ConstantinopleFix` — which is *Petersburg*, where the rule
+  is the reverted flat one, not EIP-1283's. **EIP-1283 is worth zero entries there.**
+  - The general form: **a rate is not a cause**, and the axis you happen to have is
+    usually the wrong one. Fork is the axis the corpus is *keyed* by, which is a
+    reason it is easy to measure and no reason it is where the answer lives. This is
+    `v1.61`'s "a tally is not a work list" reached from the other side: there the
+    instrument measured the wrong quantity, here it measured the right quantity on
+    the wrong axis.
+
+- **A message blaming one side of a comparison is a claim about the instrument, and
+  this one was wrong.** Every entry of `stTimeConsuming` reports `no_comparable_gas`
+  with the reason *"one side produced a gas figure and the other did not"*. The node's
+  receipt **does** carry a `gasUsed`. The harness reaches the node's figure by
+  *inverting the balance difference*, which is impossible when the difference is not
+  divisible by the price, so the correct reason is "the node's figure could not be
+  recovered", and the message as written says the *fixture* produced nothing — which
+  is true of these fixtures (their `post` keys are `['hash','logs','txbytes',
+  'indexes','state']`, with no `gasUsed`) and is **not** the reason for the failure.
+  - The general form: **an instrument that reports a cause should be able to name
+    which side it is talking about, and a message that always names the same side is
+    a message that has been read once and copied.**
 
 ## 11. Known dead code
 

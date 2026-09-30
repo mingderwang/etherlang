@@ -514,6 +514,272 @@ call_with_gas(ToByte, ArgLen, Gas) ->
 %% address it pushed.
 create_seq(Value) -> <<16#60, 0, 16#60, 0, (push_int(Value))/binary, 16#F0, 16#50>>.
 
+%% `CREATE'/`CREATE2' leave the created address on the stack; the programs here keep
+%% it and store it in slot 9 of the caller, so a test can ask about the account the
+%% frame made instead of recomputing `keccak(rlp([sender, nonce]))' -- a second
+%% implementation of the address rule, which is the way a fixture ends up disagreeing
+%% with the code for a reason that is not the one under test.
+%%
+%% `PUSH1 9' then `SSTORE': SSTORE pops key then value, and the value is the address
+%% `CREATE' just pushed, so the key goes on top of it.
+
+%% **The init code is `CODECOPY`'d into memory, because a frame's memory is scratch.**
+%% `eth_evm' keeps the code in `#e.code' and zero-extends `#e.mem' in `charge_mem/2';
+%% the code is never loaded into memory, so `CREATE' reading offset N gets zeros
+%% unless something wrote them there. In a real contract that something is `CODECOPY'
+%% or `CALLDATACOPY', and both are how the corpus does it.
+%%
+%% The first version of these tests put the init code in the *program text* at offset
+%% 10 and read it from offset 10, and deployed **zero bytes**. The create still looked
+%% like it worked: `CREATE' pushed a real address, the account existed, the nonce was
+%% 1 -- and the code was `<<>>'. So the failure mode was a create that succeeded and
+%% deployed nothing, which is a shape this module had no assertion for. Every
+%% pre-existing create test here passes `Len = 0', so nothing had ever noticed.
+%%
+%% **`STOP` fences the init code off from the driver, and without it the *outer* frame
+%% runs the init code.** There is no jump here: the interpreter starts at pc 0, runs
+%% the driver, and carries on into whatever bytes follow. So with the init code butted
+%% straight up against the driver, the outer frame executed it too -- and because the
+%% two arms' init codes differ only in `RETURN' versus `REVERT', the deploying arm
+%% still reported success (`RETURN' is a successful halt, and `run_t' answers `{ok,
+%% Out, ...}' for it) while the reverting arm made the *outer* frame revert. The test
+%% was then asserting an absent account in a state whose outer frame had never
+%% finished, and the branch under test was not the one being taken. The tell was that
+%% the reverting arm's revert payload was 32 zero bytes: memory the outer frame had
+%% just written 42 into cannot be zero.
+%%
+%% The `CREATE' driver is **18 bytes** including that `STOP', and the `CREATE2' driver
+%% **20** (one extra `PUSH1 0' for the salt). The init code starts immediately after,
+%% at that code offset. Both lengths are matched rather than assumed: a `PUSH1' that
+%% silently became a `PUSH2' would move the offset, and the program would then copy
+%% the wrong bytes -- the byte-width trap one level up, and it fails *silently*,
+%% because `CODECOPY' zero-pads rather than trapping.
+create_program(Init) ->
+    L = byte_size(Init),
+    Driver = <<(push_int(L))/binary, 16#60, 18, 16#60, 0, 16#39,
+                (push_int(L))/binary, 16#60, 0, 16#60, 0, 16#F0,
+                16#60, 9, 16#55, 16#00>>,
+    18 = byte_size(Driver),
+    <<Driver/binary, Init/binary>>.
+
+create2_program(Init) ->
+    L = byte_size(Init),
+    Driver = <<(push_int(L))/binary, 16#60, 20, 16#60, 0, 16#39,
+                16#60, 0,
+                (push_int(L))/binary, 16#60, 0, 16#60, 0, 16#F5,
+                16#60, 9, 16#55, 16#00>>,
+    20 = byte_size(Driver),
+    <<Driver/binary, Init/binary>>.
+
+%% A one-byte `STOP', and a `PUSH1 42, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN'
+%% that deploys 32 bytes.
+stop_init_code() -> <<16#00>>.
+word_init_code() -> <<16#60, 16#2a, 16#60, 0, 16#52, 16#60, 32, 16#60, 0, 16#F3>>.
+%% **`RETURN` becomes `REVERT` and nothing else does** -- one byte, same length, so
+%% `create_program/1' produces two outer programs that are byte-identical apart from
+%% the init code, and the two arms differ in exactly whether the create succeeded.
+%% The check that they differ in one byte is in the test rather than asserted here,
+%% because a control that has quietly drifted is the failure this module has already
+%% paid for twice.
+revert_init_code() -> <<16#60, 16#2a, 16#60, 0, 16#52, 16#60, 32, 16#60, 0, 16#FD>>.
+
+%% The address a run recorded, or `undefined' if the frame pushed nothing -- so a
+%% create that failed leaves `undefined' rather than slot 9's zero, which is a valid
+%% address (`0x0000...0000') and would read as "created the zero address".
+created_addr(St) ->
+    case eth_state:storage(St, ?CALLER, 9) of
+        0 -> undefined;
+        W -> eth_state:address(W)
+    end.
+
+%% The address a create *would* have used, for asserting that it does not exist.
+%% Only needed where the frame pushed 0, so slot 9 cannot say, and **only valid on a
+%% state whose caller nonce has been rolled back** -- it reconstructs
+%% `keccak(rlp([sender, nonce]))` with the nonce *before* the increment, so on a
+%% state that still carries the increment it names a different address and the
+%% assertion that follows is about an account nobody created.
+%%
+%% That is not hypothetical: a version of the EIP-2 item 3 test used this helper on
+%% the deposit-failure branch, and an injection that made that branch keep the
+%% child's state -- so no longer rolled back -- left the helper naming the wrong
+%% address. The test passed, because it was checking an account that had never
+%% existed. A helper that reconstructs a value is only as good as its precondition,
+%% and this one has two callers' worth of assumptions in it.
+would_create(St) ->
+    Nonce = eth_state:nonce(St, ?CALLER),
+    <<_:12/binary, Addr:20/binary>> =
+        eth_keccak:hash(eth_rlp:encode([?CALLER, Nonce])),
+    Addr.
+
+run_create_program(Code) ->
+    {ok, _, _, St, _} = eth_evm:run(Code, ?MSG0, call_state(0, <<16#00>>),
+                                    ?ENV, ?GAS),
+    St.
+
+%% ---------------------------------------------------------------------------
+%% EIP-161 (a): a contract made by CREATE or CREATE2 has nonce 1, never 0.
+%% ---------------------------------------------------------------------------
+%%
+%%     Account creation transactions and the CREATE operation SHALL, prior to the
+%%     execution of the initialisation code, increment the nonce over and above its
+%%     normal starting value by one.
+%%     -- EIP-161, Spurious Dragon
+%%
+%% and the EIP's Rationale gives the reason the rule is one rather than zero, which
+%% is what makes it a rule about the nonce rather than about a counter:
+%%
+%%     CREATE avoids zero in the nonce to avoid any suggestion of the oddity of
+%%     CREATEd accounts being reaped half-way through their creation.
+%%
+%% EIP-161 defines an account *empty* as "no code and zero nonce and zero balance",
+%% and (d) requires a touched account which is now empty to be deleted. A created
+%% account at nonce 0 with no code yet is therefore a deletion candidate for the whole
+%% of its initialisation; the nonce is what keeps it alive while it is bare.
+%%
+%% This was absent from `eth_evm:create_with_value/9' while `eth_block:deploy/5' -- the
+%% create-*transaction* path -- has always set it. So the two ways of deploying a
+%% contract in this node disagreed, and the opcode way was wrong. The corpus found it
+%% as **84 nonce divergences and not one code divergence** across
+%% `constantinople/eip1014_create2/test_create2_return_data.json` -- and the shape is
+%% the evidence: "a create that did not happen" and "a create that happened with the
+%% wrong nonce" are the same diff, so the *absence* of a code diff is what says the
+%% deployment occurred and only the nonce was wrong.
+
+a_created_contract_has_nonce_one_test() ->
+    eth_test_util:with_local_reads(fun() ->
+        St = run_create_program(create_program(stop_init_code())),
+        Addr = created_addr(St),
+        ?assertNotEqual(undefined, Addr),
+        ?assertEqual(1, eth_state:nonce(St, Addr))
+    end).
+
+%% **The rule is Spurious Dragon and later; earlier forks keep the zero.** EIP-161's
+%% own "Hard fork" section is the authority (`FORK_BLKNUM: 2,675,000'), and the reason
+%% is in its Rationale -- the reaping problem is created by the same EIP's rules (c)
+%% and (d), so there is nothing to avoid before it. An unconditional write is
+%% therefore not a simplification but a divergence on Frontier through Petersburg,
+%% which is four of the thirteen forks in the corpus.
+%%
+%% Both arms run the **same program** and differ only in the `fork' key of the
+%% environment, so nothing about the fixture differs except the thing under test. The
+%% pre-Spurious-Dragon arm has no control of its own, and does not need one: the
+%% Cancun arm above is the control, and it asserts the other value.
+%%
+%% **`homestead`, not `byzantium`.** The first version of this test used Byzantium for
+%% the "before" arm, and it failed -- correctly. `fork_rank/1' puts Spurious Dragon at
+%% 4 and Byzantium at **5**: Byzantium is two forks *after* it, so the arm was asking
+%% for a nonce of 0 at a fork that has had the rule for two forks. The pre-SD forks
+%% are `frontier', `homestead', `dao' and `tangerine_whistle', at ranks 0 to 3. The
+%% mistake is a fork *name* read as "old" rather than as a rank -- the same class of
+%% error as reading a fixture's fork name where this module wanted an atom.
+a_created_contract_keeps_nonce_zero_before_spurious_dragon_test() ->
+    eth_test_util:with_local_reads(fun() ->
+        Code = create_program(stop_init_code()),
+        {ok, _, _, St, _} = eth_evm:run(Code, ?MSG0, call_state(0, <<16#00>>),
+                                        #{fork => homestead}, ?GAS),
+        Addr = created_addr(St),
+        ?assertNotEqual(undefined, Addr),
+        ?assertEqual(0, eth_state:nonce(St, Addr)),
+        %% Same program, one fork later: the rule applies. Asserted here as well as in
+        %% its own test so this test cannot pass on a node that never writes the nonce.
+        {ok, _, _, St2, _} = eth_evm:run(Code, ?MSG0, call_state(0, <<16#00>>),
+                                         #{fork => spurious_dragon}, ?GAS),
+        ?assertEqual(1, eth_state:nonce(St2, created_addr(St2)))
+    end).
+
+a_contract_created_by_create2_has_nonce_one_test() ->
+    eth_test_util:with_local_reads(fun() ->
+        St = run_create_program(create2_program(stop_init_code())),
+        Addr = created_addr(St),
+        ?assertNotEqual(undefined, Addr),
+        ?assertEqual(1, eth_state:nonce(St, Addr))
+    end).
+
+%% A create whose init code returns a word: the deployed code is asserted **first**,
+%% because otherwise the nonce is being asked about a bare account, which is the
+%% window EIP-161's rationale is about and also a state a real create passes through
+%% on its way to having code. This is the assertion that catches "a create that
+%% succeeded and deployed nothing" -- which is what the first version of every program
+%% in this section actually did.
+a_created_contract_carries_the_code_it_returned_test() ->
+    eth_test_util:with_local_reads(fun() ->
+        St = run_create_program(create_program(word_init_code())),
+        Addr = created_addr(St),
+        ?assertNotEqual(undefined, Addr),
+        ?assertEqual(32, byte_size(eth_state:code(St, Addr))),
+        ?assertEqual(1, eth_state:nonce(St, Addr))
+    end).
+
+%% **The nonce is written before the init code runs, and the failure branches are what
+%% make that observable.** `execution-specs' `process_create_message/1' orders it:
+%%
+%%     mark_account_created(tx_state, message.current_target)
+%%     increment_nonce(tx_state, message.current_target)
+%%     evm = process_message(message)
+%%     ...
+%%     except ExceptionalHalt as error: restore_tx_state(tx_state, snapshot)
+%%     else: set_code(tx_state, message.current_target, contract_code)
+%%
+%% so a create that halts rolls the nonce back along with everything else, and one
+%% that succeeds keeps it. This node reaches the same result without a snapshot: the
+%% nonce goes on the state handed to the init code, and all four failure branches of
+%% `create_with_value/9' return `State1' -- the state from *before* that line -- so
+%% they discard it structurally rather than by hand.
+%%
+%% **This test does not pin the *placement* of the nonce, and an injection is why
+%% that sentence is here rather than a claim that it does.** The obvious alternative
+%% is to write the nonce in the success arm beside `set_code/3'. Moving it there --
+%% deleting it from here and adding it there, so the deployed contract still ends up
+%% with nonce 1 -- **passed every test written for this rule**, because all four
+%% failure branches of `create_with_value/9' return `State1'`, the state from *before*
+%% the transfer, and so discard the child's returned state entirely. The two
+%% placements agree on every reachable state, and an account with nonce 1 and no code
+%% is not reachable by writing the nonce in the wrong place.
+%%
+%% So what EELS gets from `restore_tx_state/2' on an exceptional halt, this module
+%% gets from its failure branches, and the branches were already right. The nonce
+%% goes where EELS puts it because that is the specification's order, not because a
+%% test here would notice the difference -- and a comment claiming otherwise would be
+%% the exact failure this repository's own rules are about.
+%%
+%% What this test *does* pin is real and does bite: a create that fails leaves no
+%% account behind, checked against a control arm that differs in one byte and does
+%% create one.
+a_reverted_create_leaves_no_account_behind_test() ->
+    eth_test_util:with_local_reads(fun() ->
+        %% **The revert is in the init code, not in the outer program.** The first
+        %% version appended a `REVERT' after the `SSTORE', and `REVERT' pops offset
+        %% and length -- off a stack `CREATE' and `SSTORE' have already emptied -- so
+        %% it underflowed instead of reverting, the outer frame reported success, and
+        %% slot 9 still held the address. The test then asserted an account was absent
+        %% from a state in which the *outer* frame had never reverted at all, which is
+        %% not the branch under test either way: what has to roll back is the create,
+        %% and only the init code can make a create revert.
+        Retrying = create_program(revert_init_code()),
+        Deploying = create_program(word_init_code()),
+        %% The control is checked before it is used, so a drifted pair fails here
+        %% rather than as an absence that both arms agree on.
+        ?assertEqual(1, count_differences(Deploying, Retrying)),
+        StD = run_create_program(Deploying),
+        StR = run_create_program(Retrying),
+        Deployed = created_addr(StD),
+        %% The control first: a test asserting an account's *absence* passes for the
+        %% wrong reason when the control also created nothing, which is the trap this
+        %% module has already paid for twice.
+        ?assertNotEqual(undefined, Deployed),
+        ?assertEqual(32, byte_size(eth_state:code(StD, Deployed))),
+        ?assertEqual(1, eth_state:nonce(StD, Deployed)),
+        ?assertEqual(undefined, created_addr(StR)),
+        ?assertNot(eth_state:exists(StR, would_create(StR)))
+    end).
+
+%% How many byte positions two equal-length binaries differ in. Length is asserted by
+%% the caller: `zip/2` truncates to the shorter, so a length difference would report a
+%% small number rather than fail.
+count_differences(A, B) when byte_size(A) =:= byte_size(B) ->
+    length([X || {X, Y} <- lists:zip(binary_to_list(A), binary_to_list(B)), X =/= Y]).
+
+
 %% **`16#61` is PUSH2, not `16#62`.** `16#62` is PUSH3, so a two-byte immediate written
 %% with it swallows the *next* opcode as its third byte -- which, in `create_seq/1', is
 %% the `CREATE` itself. The result is a program that never creates anything and reports

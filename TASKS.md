@@ -69,11 +69,83 @@ cancun, istanbul and paris were still running, and the static set was at 2,300 o
 authorization refund and the delegation work, so the corpus-wide number is stale by
 a lot more than the two deltas recorded above it.
 
-Two forks with low percentages deserve their own attention, and neither is a gas
-question: **constantinople at 29.7%** is where EIP-1283's `SSTORE` is refused
-(item 6a), and **byzantium at 35.6%** is the fork whose `eip196_ec_add_mul` and
-`eip152_blake2` fixtures account for most of the committed subset's remaining
-divergence.
+**The sentence this section used to carry about the two low forks was wrong, and the
+per-suite instrument is what refuted it.** It said "**constantinople at 29.7%** is
+where EIP-1283's `SSTORE` is refused (item 6a)". Constantinople is 29.7% because of
+`eip1014_create2`: **131 of its 135 divergences, against 3 from `eip145_bitwise_shift`**.
+EIP-1283 is worth **zero** entries there — the only two entries the directory runs at
+a Constantinople fork are `ConstantinopleFix`, which is *Petersburg*, where the rule
+is the reverted flat one, not EIP-1283's. Item 6a remains a real gap and remains
+unfinished; it is just not what this number was measuring. A number attached to a
+guess is still a number attached to a guess, and a per-fork table cannot tell the
+difference between "the fork's rule is refused" and "one suite in the fork is broken".
+
+The `eip1014_create2` half of it was **EIP-161 (a)** and is now fixed — see
+`AGENTS.md` §10's Closed table. Constantinople went **57 -> 93 of 192** and byzantium
+**144 -> 195 of 405**, and the per-fork breakdown of that one file is the clearest
+result in this work:
+
+| fork | before | after |
+|---|---|---|
+| Cancun | 0 of 23 | **23 of 23** |
+| Prague | 0 of 23 | **23 of 23** |
+| Shanghai | 0 of 23 | **23 of 23** |
+| Berlin | 0 of 23 | 0 of 23 |
+| Istanbul | 0 of 23 | 0 of 23 |
+| London | 0 of 23 | 0 of 23 |
+| Paris | 0 of 23 | 0 of 23 |
+
+The nonce is gone at every post-Spurious-Dragon fork, which is what fixed, and the
+residual is **a 1-to-2 gas figure at pre-Cancun forks and none at all from Cancun** —
+a second, separate defect in the same file, named in the Open table below.
+
+---
+
+## `stTimeConsuming`: 10,374 entries, none of them matching, and it is not a gas rule
+
+**38% of the entire `static/` corpus's divergence is one suite of twelve files.**
+`static/state_tests/stTimeConsuming` is 12 files of `sstore_combinations_*` — the
+exhaustive SSTORE gas combinations — and it is **0 of 10,374, every entry**, which is
+the shape of a harness problem rather than a rule problem: no EIP is wrong in 100% of
+a 10,000-entry suite.
+
+The measurements, and they are the whole of what is known:
+
+- **20,748 balance diffs — exactly two per entry**, and the other two shape families
+  (`nonce`, `code`, `storage`) are **zero**. So nothing is mis-executed and nothing is
+  mis-deployed; this is settlement.
+- Every entry reports `no_comparable_gas` with the reason *"one side produced a gas
+  figure and the other did not"*. **That message blames the wrong side, and fixing the
+  message is a job in its own right**: the node's receipt *does* carry a `gasUsed`, and
+  the harness reaches the node's figure by *inverting the balance difference* — which
+  is impossible here, so the reason should be `no_gas_from_divisible_balance` and not
+  "the other side". The post section of these fixtures has no `gasUsed` at all: its
+  keys are `['hash','logs','txbytes','indexes','state']`.
+- The sender's balance differs by **201,969 wei at a `gasPrice` of 10**, which is not
+  divisible by 10 — and **gas is always an integer, so a wei difference at a price of
+  10 must be**. 201,969 + 1 = 201,970 = **20,197 x 10**. The extra wei is the
+  transaction's `value`, which is `0x01`.
+- The created account `0x6295ee1b...`, which is **not in `pre`**, has
+  `{balance, 1, 0}`: the fixture says it holds 1 wei and the node says 0.
+
+So a **create transaction with a 1-wei endowment** is the thing all 10,374 entries
+share, and the node appears to debit the sender without crediting the new contract.
+`eth_block:begin_transaction/8` is where to look: it transfers the value on the
+`IsCreate = false` arm and does **not** transfer it on the `true` arm, and
+`eth_block:deploy/5` sets code, nonce and the EIP-6780 marker and **never a balance**.
+
+**This is recorded as a measurement with a suspect, and no code is changed on it.** The
+arithmetic does not close: if the fixture also debits the 1 wei from the sender, the
+difference should be a whole multiple of the price, and it is not, so *someone* is not
+debiting 1 wei that the other is. Two accounts' balances, the node's `gasUsed` from the
+receipt rather than by inversion, and the fixture's own arithmetic settle it, and that
+is the measurement to take first. One `would_create/1`-style reconstruction that
+cannot fail has already been written and deleted from this work; a second one on the
+balance side would be the same mistake.
+
+**What is not open to interpretation:** a value that leaves the sender and does not
+arrive is a consensus defect whatever the figure is, and it is the largest single
+cluster in the corpus by an order of magnitude.
 
 ## The full-corpus figure, measured for the first time
 
@@ -1567,7 +1639,7 @@ they are not forgotten rather than worked on prematurely.
   - Lighthouse requires both methods, so "Lighthouse-compatible" is not currently true of the engine surface
 - [ ] **`engine_notifyHeaders`** — absent (see the Beacon requests item under Phase 3). The clause does not appear in any per-fork file of the `execution-apis` repository (`paris`, `shanghai`, `cancun`, `prague`, `osaka`, `amsterdam`, `bogota`, `common`); only the V2 `getPayloadBodiesBy*` methods appear under those names. Its shape would have to be guessed, so it is left undone rather than invented
 - [x] **Block authoring** — `payloadAttributes` are read, `forkchoiceUpdated` returns a `payloadId`, and `getPayload` returns a real block. This item said "no `payloadAttributes` handling, so `forkchoiceUpdated` can never return a `payloadId` and the node cannot build a block for the CL", which was true when written and stopped being true when `eth_block_builder` was added to the supervisor's child list; the box outlived the sentence. The builder was rewritten rather than switched on, because the dead version assembled a block with its own header constants, three of which were wrong in ways already found and fixed in `eth_block`, and discarded every `payloadAttributes` field.
-  **The block it builds is still not the block the network would build.** Its state root does not match the network's, for the reasons in item 7 — the same gas-schedule divergences that hold the conformance tally at 250 of 266 rather than all of it. So the item is closed as *wiring* and the divergence is tracked where it can be seen, not here.
+  **The block it builds is still not the block the network would build.** Its state root does not match the network's, for the reasons in item 7 — the same gas-schedule divergences that hold the conformance tally at 254 of 266 rather than all of it. So the item is closed as *wiring* and the divergence is tracked where it can be seen, not here.
 
 ### What the engine could not do before this pass
 

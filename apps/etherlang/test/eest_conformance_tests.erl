@@ -227,8 +227,18 @@
 %% directory holds eleven. The single figure is not the size of the fix and the
 %% directory figure is not a conformance claim -- they are two samples, and saying
 %% "+1" without saying that would understate the change by a factor of eleven.
--define(EXPECTED, #{match => 250,
-                    state_mismatch => 13,
+%% 250 -> 254 and `state_mismatch' 13 -> 9, from EIP-161 (a): the account a `CREATE'
+%% or `CREATE2' makes has nonce 1, not 0. The create-*transaction* path
+%% (`eth_block:deploy/5') has always set it, so the two ways of deploying a contract
+%% in this node disagreed. Nothing here is a gas figure -- the whole cost of the
+%% defect is a state root, which is why the pin below is on `state_mismatch' and not
+%% on a number of gas units. **+4 here, and +36 of 168 on
+%% `constantinople/eip1014_create2/test_create2_return_data.json` alone**, where the
+%% same file is the corpus's single largest `nonce` cluster: 84 nonce divergences
+%% with *no* code divergence, since a create that did not happen and a create that
+%% happened with the wrong nonce are the same diff shape.
+-define(EXPECTED, #{match => 254,
+                    state_mismatch => 9,
                     unpriced => 0,
                     tx_decode_failed => 0,
                     tx_roundtrip_mismatch => 0,
