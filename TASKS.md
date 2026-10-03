@@ -13,13 +13,14 @@ with the file it sat above.
 > `execution-spec-tests` `state_tests` subset — 25 files, 266 entries — runs on every
 > `rebar3 eunit` and its outcome is asserted by `eest_conformance_tests`. The figure is
 > **255 of 266 (95.9%)**: `state_mismatch` 8, `fork_unreachable` 3, every other
-> outcome 0. It was 226 of 266 (85.0%) for several commits after that stopped being
+> outcome 0. It stood at 226 of 266 (85.0%) up to `v1.68`, 2026-09-30 -- for several
+> commits after the number itself had stopped being true --
 > true; the pin and this header now agree, and the changelog that got them there is in
 > the module comment of `eest_conformance_tests.erl`.
 >
 > **The subset is the smallest file in each suite, so it is the easiest ~2% of the
 > corpus** — see `PROVENANCE.md` for the selection rule and AGENTS.md §10a for the
-> measurement: 255 of 266 here against 6,786 of 15,660 on the 229 non-`static` files.
+> measurement: 255 of 266 here against 6,786 of 15,660 (43.3%), measured at `v1.49-full-corpus-measured`, 2026-09-29, and **not re-run since**, on the 229 non-`static` files.
 > Both are true and they are different measurements. **Quote the directory, never
 > "the corpus".** The full run is a developer step (`eest_report`).
 >
@@ -33,8 +34,8 @@ with the file it sat above.
 
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
-build. OTP 29.1. Current: **48 src modules / 14,110 code lines, 61 test modules /
-13,878 code lines, 966 eunit tests, all passing.**
+build. OTP 29.1. Current: **48 src modules / 14,110 code lines, 62 test modules /
+13,963 code lines, 969 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 49 done, 33 remaining.** Counted, not asserted; re-derive
 with `grep -cE '^- \[[ x]\]' TASKS.md` before quoting them. The previous header said
@@ -723,7 +724,7 @@ they are not forgotten rather than worked on prematurely.
   - Lighthouse requires both methods, so "Lighthouse-compatible" is not currently true of the engine surface
 - [ ] **`engine_notifyHeaders`** — absent (see the Beacon requests item under Phase 3). The clause does not appear in any per-fork file of the `execution-apis` repository (`paris`, `shanghai`, `cancun`, `prague`, `osaka`, `amsterdam`, `bogota`, `common`); only the V2 `getPayloadBodiesBy*` methods appear under those names. Its shape would have to be guessed, so it is left undone rather than invented
 - [x] **Block authoring** — `payloadAttributes` are read, `forkchoiceUpdated` returns a `payloadId`, and `getPayload` returns a real block. This item said "no `payloadAttributes` handling, so `forkchoiceUpdated` can never return a `payloadId` and the node cannot build a block for the CL", which was true when written and stopped being true when `eth_block_builder` was added to the supervisor's child list; the box outlived the sentence. The builder was rewritten rather than switched on, because the dead version assembled a block with its own header constants, three of which were wrong in ways already found and fixed in `eth_block`, and discarded every `payloadAttributes` field.
-  **The block it builds is still not the block the network would build.** Its state root does not match the network's, for the reasons in item 7 — the same gas-schedule divergences that hold the conformance tally at 254 of 266 rather than all of it. So the item is closed as *wiring* and the divergence is tracked where it can be seen, not here.
+  **The block it builds is still not the block the network would build.** Its state root does not match the network's, for the reasons in item 7 — the same gas-schedule divergences that hold the conformance tally at 255 of 266 (2026-10-04) rather than all of it. So the item is closed as *wiring* and the divergence is tracked where it can be seen, not here.
 
 ### What the engine could not do before this pass
 
@@ -1146,14 +1147,15 @@ Recorded because the documentation claimed otherwise, and because each of these 
   `bor`/`bxor`, which is the tautology the file's own header warns about and which the
   first version of it was.
   **Fuzzing, differential testing and geth vectors are still open**, and the corpus
-  (`execution-spec-tests`, 6,786 of 15,660) does more for EVM correctness than any of
+  (`execution-spec-tests`, 6,786 of 15,660 (43.3%), measured at `v1.49-full-corpus-measured`, 2026-09-29, and **not re-run since**) does more for EVM correctness than any of
   them; this covers the arithmetic the corpus reaches only indirectly.
 - [ ] **Fuzz testing** — fuzz the EVM interpreter for edge cases
 - [ ] **Differential testing** — run same block through etherlang and geth, compare outputs
 - [ ] **Performance benchmarks** — block processing speed, state access latency
 - [x] **Conformance tests** — `eest_state_tests.erl` runs the `execution-spec-tests`
   `state_tests` corpus. **Started, and the first measurement is about 2%**
-  (78 of 266 committed entries at the first measurement, 250 of 266 now; see "What
+  (78 of 266 committed entries at the first measurement, 2026-10-03, and
+  **255 of 266** as of 2026-10-04; see "What
   to do next" item 5 for the number, the real defects it found, and the two harness
   bugs that made the figure irreproducible until they were fixed). The
   Ethereum Foundation's own `ethereum/tests` block-level suites and EEST's

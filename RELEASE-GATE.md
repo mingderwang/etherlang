@@ -8,7 +8,7 @@ the checking. That is the failure this repository has already paid for in prose
 (AGENTS.md §10 — "a handle that cannot be trusted is worse than none"), and the reason
 the tri-state exists.
 
-**Current state: this node would not pass its own gate.** Tier 0.4 is red, Tier 1 is
+**Current state: this node would not pass its own gate.** Tier 1 is six of six `ABSENT`, Tier 2's full-corpus floor is unmeasured, and 8 deviations are open. The sections below record that rather than rounding it up.
 five of six `ABSENT`, and 8 deviations are open. The sections below record that
 rather than rounding it up.
 
@@ -52,18 +52,29 @@ The node must not be able to lie about itself. No release tag without all five.
 | # | Gate | Criterion | Command | Status |
 |---|---|---|---|---|
 | 0.1 | Builds warning-free | zero warnings; `warnings_as_errors` is set | `rebar3 compile` | **GREEN** |
-| 0.2 | Whole suite green | `Failed: 0` | `rebar3 eunit` | **GREEN** — 966 passed |
+| 0.2 | Whole suite green | `Failed: 0` | `rebar3 eunit` | **GREEN** — 969 passed |
 | 0.3 | No commitment returned as a bare value | every entry of a `Verification` map is `{verified,_} \| {unverified,_}`; no exception | review of `eth_block:finalize/1` | **GREEN** |
-| 0.4 | Every published figure has a corpus and a date | no number in README/TASKS/AGENTS without both | review | **RED** — see below |
+| 0.4 | Every published figure has a corpus and a date | no number in README/TASKS/AGENTS without both | `eth_published_figures_tests` | **GREEN** — enforced by a test, 2026-10-04 |
 | 0.5 | Known deviations exist, dated, each with a measurement | no entry without all four fields | review of §"Known deviations" | **GREEN** — 18 entries |
 
-**0.4 is red.** At the time this file was written the repository carried four mutually
-unequal conformance figures: `?EXPECTED`'s 255, TASKS.md's 226 in two places, and
-README's 250 and 224 further along. All are now 255. The gate stays because the
-condition, not the number, is what needs enforcing — and because the pin itself was
-deleted twice before the cause was found (AGENTS.md §5).
+**0.4 was red for as long as the cell existed, and turned green by being enforced rather
+than by being corrected.** The condition is now a test: `eth_published_figures_tests` reads the
+pin out of `eest_conformance_tests.erl`'s `?EXPECTED` -- so it tracks the pin rather than a copy
+of it -- and requires every markdown item that publishes a conformance figure to either
+publish the pin or name the pass it belongs to with a version tag. **A bare ISO date is not
+an attribution**: a date says when, a version tag says which measurement.
 
----
+**It was not a formality. It found three live figures disagreeing with the pin**, all in prose
+that reads as current: `250 of 266` in README's EVM-execution row, `254 of 266` in TASKS.md's
+block-authoring item, and `250 of 266 now` in TASKS.md's conformance item. Plus seven figures
+with a corpus and no date, and one sentence in README that a slice edit had left
+ungrammatical. This is the same failure the header of this file records having happened
+before -- *"four mutually unequal conformance figures"* -- and it had happened again.
+
+**Seven injections, all shown to bite**: the three stale figures put back, a historical
+figure stripped of its version tag, the pin moved under the documentation, the item splitter
+turned off, and `re:run/3' losing `global'. The first version of the test passed four of the
+seven, including all three stale figures, and that is recorded below rather than fixed quietly.
 
 ## Tier 1 — blocking
 
@@ -95,7 +106,7 @@ A release may raise a floor. Lowering one is a release-blocker in its own right.
 | 2.1 | committed-subset match rate | ≥ previous release | **255 of 266 (95.9%)** — `match` 255, `state_mismatch` 8, `fork_unreachable` 3, every other outcome 0 |
 | 2.2 | full-corpus state match rate | ≥ previous release | **not run since `v1.55`.** Last recorded: 6,786 of 15,660 on the 229 non-`static` files (43.3%), pre-dating the blob-fee, refund-cap, authorization-refund and delegation work. The 25-file subset and the full corpus disagree by ~52 points, so a release that quotes only the subset is quoting the easy 2% |
 | 2.3 | both figures recorded, with their directories | mandatory | **GREEN** — TASKS.md header and `apps/etherlang/doc/MEASUREMENTS.md` |
-| 2.4 | test count | ≥ previous release | **966** (`make counts`: 48 src modules / 14,110 lines, 61 test modules / 13,878 lines) |
+| 2.4 | test count | ≥ previous release | **969** (`make counts`: 48 src modules / 14,110 lines, 62 test modules / 13,963 lines) |
 | 2.5 | every consensus constant | derived-and-pinned, or documented-as-a-gap | review — **8 open, all in §"Known deviations"** |
 | 2.6 | every new test shown to bite | defect injected, test watched fail, restored, `touch` | review |
 

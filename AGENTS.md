@@ -112,8 +112,8 @@ depends on execution order, suspect the build before you suspect the code.
 
 ## 3. Architecture
 
-48 modules in `apps/etherlang/src` (14,110 lines of code), 61 test modules in
-`apps/etherlang/test` (13,878), and 966 eunit tests. **These counts drift and this
+48 modules in `apps/etherlang/src` (14,110 lines of code), 62 test modules in
+`apps/etherlang/test` (13,963), and 969 eunit tests. **These counts drift and this
 one had drifted** -- it said 47 and 44 for several commits after it stopped being
 true, which is the same defect as a stale conformance figure: a number in the
 architecture section that a reader will use as a measure of size and that no longer
@@ -598,7 +598,8 @@ below, which is the §3 defect in miniature: a number in a section a reader uses
 measure of scale, that no longer describes the tree. Every entry here was a real
 outage, so the list only grows.
 
-- **A key is written through one normaliser and read through another.** `eth_state:new/2`
+- **A key is written through one normaliser and read through another.**
+  (`v1.39-see-the-storage-writes`, 2026-09-28.) `eth_state:new/2`
   rewrites every `{store, A, S}` key of an overlay through `eth_state:slot_key/1`; a
   read path that does not go through the same normaliser sees nothing. It cost 21 of
   266 fixtures, and it presented as a *node* defect — `test_eip1559_tx_validity` was
@@ -1326,9 +1327,10 @@ outage, so the list only grows.
   between a unit test and a live fetch.
 
 - **"The corpus does not exercise it" is a claim about a *named* corpus, and this
-  commit is the proof.** EIP-3529's cap base moved the committed subset 226 -> 249
-  of 266 and moved the 22-file set **not at all** -- 3,831 of 3,884 before and
-  after. Both are true. The 22 files are transaction-*validity* fixtures with almost
+  commit is the proof.** EIP-3529's cap base (`v1.65-refund-cap-base`, 2026-09-30) moved
+  the committed subset 226 -> 249 of 266 and moved the 22-file set **not at all** --
+  3,831 of 3,884 before and after. Both are true. The 22 files are
+  transaction-*validity* fixtures with almost
   no refundable work; the committed subset is the smallest file per suite and is
   gas-execution heavy by accident. Three corpora are now in regular use here and
   they disagree, so a sentence about "the corpus" names nothing. Write the
@@ -1506,6 +1508,58 @@ outage, so the list only grows.
     a correct one** — `evm run <code>` prints the returned word and `evm t8n` prints a gas
     figure, so the cheap one covers the semantics and only the expensive one needs the
     signature to be right.
+
+- **A figure is laundered by the figure next to it, and this repository hit that three
+  times in one afternoon.** A test that checks "is this number attributable?" passed on all
+  three stale conformance figures until the *unit of attribution* was fixed. The failures were
+  not clever and each was a plain instance of the same shape:
+  - a **table row** is one block, so `v1.49-full-corpus-measured` — written to date the
+    full-corpus figure *in the same cell* — vouched for the committed-subset figure beside it.
+    Putting `250 of 266` where the pin belonged passed, because a version tag 40 characters
+    away said so.
+  - a **whole markdown section** is one block if it has no blank lines between its items.
+    TASKS.md's "Phase 8: Testing & Verification" is **68 lines and 8,505 characters** with no
+    blank line between list items, and carries a `v1.N` belonging to a different item.
+  - a **single date** in a block was accepted as attribution at all, and `2026-10-03`
+    belonging to one figure vouched for `250 of 266 now` beside it.
+  - **The general form: attribution is a property of a claim, and a claim is one item.**
+    So the block boundary is a markdown item — a table row, a list item, a heading, a
+    paragraph — not a paragraph and not a line. And **a date is not a measurement**: "when"
+    is not "which measurement", so only a version tag counts.
+  - **And a residual, stated rather than hidden:** the longest item in those three files is
+    **322 lines**, and a `v1.N` anywhere in 322 lines still vouches for a stale figure
+    anywhere else in them. Per-*sentence* attribution is not mechanical in markdown. What
+    bounds it is that the item splitter is asserted to split at all.
+
+- **A splitter that silently does not split still returns a plausible list, and a count is
+  the only thing that notices.** The block splitter existed in **two copies**, and the first
+  version of the fix put the *starter* line into the output list instead of into the new
+  accumulator — so nothing after it was ever accumulated. **README's 1,306 lines produced 5
+  blocks** that way, against 370 with the one-line correction, and the function returned a
+  list of lists at every step and crashed at none. The tell was not the failure; the tests
+  passed. The tell was `?assert(length(Blocks) >= N)`, which exists only because
+  `string:lexemes/2` had already made the same class of bug visible once. **A count is a
+  measurement of the thing that produces the list, not of the list.**
+
+- **An injection that breaks the build reads as "no effect", because it produces no output.**
+  Rewriting `starts_item(Line)' to `starts_item(_Line)' and leaving the body left `Line'
+  unbound; `warnings_as_errors` turned it into a compile failure; the harness grepped for
+  test names and printed **nothing at all**. Nothing is the same shape as "the injection did
+  not bite", and reading it that way would have retired a working injection. AGENTS.md
+  already says an injection that orphans a helper proves nothing about the test — this is
+  the harness half of that sentence: **a build failure must be reported as
+  `BUILD-BROKEN`, not as silence**, and the cheap check is the one this repository has
+  already been bitten by, *"read one line of the harness's own output against one known-good
+  run before believing the other six."*
+
+- **Seven injections, and the first version of the test passed four of them — including all
+  three stale figures it was written to catch.** `RELEASE-GATE.md`'s own header says what
+  happens next: *"a gate that reports `PASS` for something nobody runs is worse than no
+  gate: it stops the checking."* A gate that has never been made to fail is not a gate, it
+  is a comment with assertions in it. The three that passed were caught only by narrowing
+  the block unit, and each narrowing was a **real improvement to the documentation** rather
+  than a concession to the test: every conformance figure is now stated next to the
+  measurement it belongs to, which is what the gate asked for in the first place.
 
 - **A message blaming one side of a comparison is a claim about the instrument, and
   this one was wrong.** Every entry of `stTimeConsuming` reports `no_comparable_gas`
