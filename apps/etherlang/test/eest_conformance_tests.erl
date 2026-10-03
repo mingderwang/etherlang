@@ -1,11 +1,7 @@
 %% What this node's `execution-spec-tests' conformance level is, and what may be
 %% asserted about it.
 %%
-%% == Why there is no test asserting the tally
-%%
-%% The obvious test -- "assert that N of 266 fixtures match" -- was written, and it
-%% is wrong, and it is worth saying precisely why because the reason is the whole
-%% point of this module.
+%% == The tally is asserted, and the reason it is asserted changed
 %%
 %% `eth_state:storage/3' and `balance/2' answer from the transaction's overlay and
 %% then fall through to `base_source' for anything the overlay does not hold. A
@@ -15,30 +11,40 @@
 %% (`with_local_reads', which is what stops a unit test fetching over HTTP) -- and
 %% the local MPT is process-wide and shared with every other test in the run.
 %%
-%% So the tally depends on what else the suite did first. Measured, not
-%% hypothesised: the same corpus and the same code gave **6** matches in a fresh VM
-%% and **7** under eunit, the extra one being `frontier/touch/test_zero_gas_price_
-%% and_touching` -- EIP-161's rule that an account touched at zero gas price does
-%% not survive -- passing on an account another test had left in the store. Later
-%% runs of the suite produced 2. A *higher* match rate caused by unrelated data is
-%% worse than a flaky number, because it is a wrong answer that looks right.
+%% So the tally **was** a function of what else the suite did first, and it was
+%% measured rather than hypothesised: the same corpus and the same code gave **6**
+%% matches in a fresh VM and **7** under eunit, the extra one being
+%% `frontier/touch/test_zero_gas_price_and_touching' -- EIP-161's rule that an
+%% account touched at zero gas price does not survive -- passing on an account
+%% another test had left in the store. Later runs produced 2. A *higher* match rate
+%% caused by unrelated data is worse than a flaky number, because it is a wrong
+%% answer that looks right, and on that measurement `?EXPECTED' was removed and the
+%% figure became "reported, not asserted".
 %%
-%% Seeding everything the fixture mentions -- every address in `pre', in the post
+%% **That measurement no longer reproduces, and the pin is back.** `?EXPECTED' now
+%% holds, and it was checked three ways before it was restored: this module run
+%% alone, the full suite, and `eest_report' against the same directory. All three
+%% give **255 of 266, `state_mismatch' 8, `fork_unreachable' 3**.
+%%
+%% **Why it stopped drifting is not established**, and the most likely cause is the
+%% seeding of everything the fixture mentions -- every address in `pre', in the post
 %% state, as sender, as destination and as coinbase, and every slot the post state
-%% names -- removed most of it and is still done, because it is correct regardless.
-%% It did not remove all of it, because a slot the code reads and never writes is
-%% not knowable without executing the code.
+%% names. That was done for correctness regardless, and at the time it "removed most
+%% of it" without a figure saying how much, so the two measurements were never made
+%% against each other. The honest position is that the number is **observed stable
+%% rather than known stable**, and that an isolated state base for this runner -- the
+%% task named in TASKS.md -- is what would make it the second.
 %%
-%% So the tally is **reported, not asserted**. It is in README.md and TASKS.md with
-%% the date it was measured and the caveat attached, and it is reproducible only as
-%% "a number this node produced on a machine on a day", which is exactly what a
-%% conformance figure should not be treated as. The task that would fix this -- an
-%% isolated state base for the runner -- is in TASKS.md.
+%% That is a weaker guarantee than the old header claimed and a stronger one than
+%% "reported". It is stated here rather than in a commit message because the failure
+%% mode is specific: **a pin that has stopped meaning anything still passes.** So the
+%% pin is paired with `assert_not_mostly_matching/1' below, which fails if the runner
+%% ever stops comparing at all, and the two are read together -- `?EXPECTED' says the
+%% figure did not move, that function says the figure is still a figure.
 %%
-%% What *is* asserted here is everything that does not move: the shape of the
+%% What is also asserted, and does not depend on any of this: the shape of the
 %% corpus, the shape of the outcome vocabulary, and the fact that nothing in the
-%% corpus escapes classification. A tally that cannot be pinned is not a reason to
-%% assert nothing.
+%% corpus escapes classification.
 -module(eest_conformance_tests).
 
 -include_lib("eunit/include/eunit.hrl").
@@ -240,12 +246,30 @@
 %% or `CREATE2' makes has nonce 1, not 0. The create-*transaction* path
 %% (`eth_block:deploy/5') has always set it, so the two ways of deploying a contract
 %% in this node disagreed. Nothing here is a gas figure -- the whole cost of the
-%% defect is a state root, which is why the pin below is on `state_mismatch' and not
-%% on a number of gas units. **+4 here, and +36 of 168 on
+%% defect is a state root, which is why the movement is in `state_mismatch' and not
+%% in a number of gas units. **+4 here, and +36 of 168 on
 %% `constantinople/eip1014_create2/test_create2_return_data.json` alone**, where the
 %% same file is the corpus's single largest `nonce` cluster: 84 nonce divergences
 %% with *no* code divergence, since a create that did not happen and a create that
 %% happened with the wrong nonce are the same diff shape.
+%%
+%% **This pin was removed once and put back, and the reason it was removed is the
+%% reason it is worth writing down.** It read `match => 255, state_mismatch => 8',
+%% and a run measured **`match => 236, state_mismatch => 27'`** instead -- so the pin
+%% looked wrong, and it was deleted on the strength of that one figure.
+%%
+%% **The tree that produced 236 had a consensus gas defect in it.** An uncommitted
+%% change to `eth_fork_schedule:sstore_cost/4' was charging `SSTORE_SET_GAS' for a
+%% no-op write into a slot whose original value was zero, which EIP-2200 does not
+%% price that way, and it cost this tally 19 entries. Reverted, and 255 is what three
+%% independent paths produce.
+%%
+%% So the general form, and it is §10a's "establish the baseline before trusting the
+%% number" rather than a new trap: **a measurement taken against a tree that is
+%% already broken is not evidence about the pin, it is evidence about the defect, and
+%% the two are indistinguishable while the defect is present.** 236 was real, stable
+%% and reproducible, and it was wrong -- not about the tally, about the code. The
+%% three failing tests that came with it said so, and the pin did not.
 -define(EXPECTED, #{match => 255,
                     state_mismatch => 8,
                     unpriced => 0,
@@ -300,17 +324,6 @@ conformance_tally_is_reported() ->
     assert_the_block_resolves_to_the_fork_the_fixture_names(Results),
     assert_unreachable_are_reported(Results),
     ?assertEqual(?EXPECTED, eest_state_tests:tally(Results)).
-
-
-
-%% The headline claim, as a bound as well as a figure.
-%%
-%% `?EXPECTED' pins the number. This pins the *claim*, and it earns its place
-%% because it fails differently: the exact count is a fact about this corpus on this
-%% day, and a fixture moving from `state_mismatch' to `match' would change the count
-%% without changing the finding. This fails if the runner ever stops comparing at
-%% all -- the failure that would leave every other assertion here passing while the
-%% tally read as total conformance.
 
 %% The headline claim, as a bound rather than a figure.
 %%

@@ -39,7 +39,8 @@ Derive a rule from one of those, quote the clause, and pin it with a test.
 | File | What it is |
 |------|------------|
 | `README.md` | Feature status, honesty notes, config, layout. |
-| `TASKS.md` | The 86-task / 9-phase list. Every unchecked box is a real gap. |
+| `TASKS.md` | The 82-task / 9-phase list. Every unchecked box is a real gap. |
+| `RELEASE-GATE.md` | **What a release must show before it can be cut.** Three states per cell — `GREEN`, `RED`, `ABSENT` — and `ABSENT` is not `GREEN`. Holds the known-deviations list. Read it before claiming the node is in a releasable state; today it is not, and the file says so. |
 | `ethereum/EIPs` | **The authority for every rule in `src/`.** Derive from the EIP text, quote the clause in a comment, pin it with a test. |
 | `ethereum/execution-specs` (EELS) | The state transition, as an implementation. **A second reading of the same EIPs**, and it finds what the EIP text alone does not: EIP-7702's step-4 `accessed_addresses` is one line of its `validate_authorization` and no fixture in this repository exercises it. |
 | `ethereum/execution-apis` | The Engine API and JSON-RPC surface this node serves. |
@@ -94,7 +95,7 @@ depends on execution order, suspect the build before you suspect the code.
 ## 3. Architecture
 
 50 modules in `apps/etherlang/src` (14,183 lines of code), 60 test modules in
-`apps/etherlang/test` (13,463), and 943 eunit tests. **These counts drift and this
+`apps/etherlang/test` (13,468), and 943 eunit tests. **These counts drift and this
 one had drifted** -- it said 47 and 44 for several commits after it stopped being
 true, which is the same defect as a stale conformance figure: a number in the
 architecture section that a reader will use as a measure of size and that no longer
@@ -322,12 +323,32 @@ what it does now, and what the symptom was — concretely, with the values.
   `test/vectors/eest/` with a `PROVENANCE.md`; the full 503 MB run is a developer
   step (`eest_report`).
 
-  **The tally is not asserted and must not be.** It drifts between runs of the same
-  code, because a storage read a fixture's code performs but does not declare falls
-  through `base_source` to the local MPT, which is process-wide and shared with the
-  rest of the suite. Seeding everything the fixture mentions removes most of it; the
-  rest needs an isolated state base, and until that exists a pinned number is a test
-  that flips.
+  **The tally is asserted, and the reason it is asserted is weaker than the one that
+  removed it.** It used to drift between runs of the same code, because a storage read
+  a fixture's code performs but does not declare falls through `base_source` to the
+  local MPT, which is process-wide and shared with the rest of the suite. That was
+  measured, not hypothesised -- 6 matches in a fresh VM against 7 under eunit -- and
+  `?EXPECTED` was deleted on the strength of it.
+
+  **That drift no longer reproduces.** The pin is back and holds: 255 of 266,
+  `state_mismatch` 8, `fork_unreachable` 3, checked three ways (this module alone, the
+  full suite, and `eest_report` against the same directory). Seeding everything the
+  fixture mentions is the likely cause, but at the time it "removed most of it" with
+  no figure saying how much, so the two measurements were never made against each
+  other. The honest description is **observed stable, not known stable**, and an
+  isolated state base for this runner -- the task in `TASKS.md` -- is what would make
+  it the second. The pin is paired with `assert_not_mostly_matching/1`, which fails
+  if the runner ever stops comparing, because a pin that has quietly stopped meaning
+  anything still passes.
+
+  **A measurement taken against a tree that is already broken is not evidence about
+  the pin.** The pin was removed a second time, on a run that measured **236** against
+  its 255 -- reproducibly, in every context. The tree producing 236 had an
+  uncommitted `sstore_cost/4` change charging `SSTORE_SET_GAS` for a no-op write into
+  a slot whose original was zero, which EIP-2200 does not price that way. Reverted,
+  and 255 is what three paths produce. Three tests failed alongside the 236 and said
+  so; the pin did not. **Establish the baseline before you believe the number**, and
+  when a pin disagrees with a run, suspect the tree before suspecting the pin.
 
 - **No network.** Every test runs against `eth_mock_node` (in-process JSON-RPC)
   or a loopback devp2p stack on real sockets. **A unit test must never perform a
@@ -552,7 +573,12 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
 | A `CALL` the caller cannot afford | The spec's `call`: on `sender_balance < value` it pushes 0, **empties the return data**, and adds `sub_call` back. This module consumed the forwarded allowance instead, and `check_call_value/5` had no `callcode` clause at all, so `CALLCODE` moved no value and read no balance. `+45,247` on six corpus fixtures. The stipend's *field* — `cost` vs `sub_call` — is still open; see TASKS.md. |
 | Pre-Berlin SSTORE | **Priced, except at Constantinople.** The flat rule (the yellow paper's, which Petersburg restored) with EIP-2200's own inherited figures, and `SLOAD_GAS` fork-selected 50/200/800 by EIP-150 and EIP-1884. Constantinople is the *only* fork still refused, because EIP-1283 replaced the rule and Petersburg reverted it — and it is unreachable by block number on mainnet anyway, since it and Petersburg share block 7,280,000. `SLOAD` itself was also a flat 200 at every fork, right for one span of three. See §3 "Fork awareness" and TASKS.md. |
 
-## 10a. Three traps this repository has now paid for
+## 10a. The traps this repository has now paid for
+
+**No count, deliberately.** The heading said "Three traps" while sixty-one were listed
+below, which is the §3 defect in miniature: a number in a section a reader uses as a
+measure of scale, that no longer describes the tree. Every entry here was a real
+outage, so the list only grows.
 
 - **A key is written through one normaliser and read through another.** `eth_state:new/2`
   rewrites every `{store, A, S}` key of an overlay through `eth_state:slot_key/1`; a
@@ -991,6 +1017,43 @@ that stops the next person re-deriving them. Nothing here is a separate claim.
   row's precondition borrowed from a sibling row" with a sharper edge: there, a
   row failed for the wrong reason and said so; here, *both* rows did, and the
   injection is what noticed.
+
+- **A specification rewritten into a nesting is a specification you have not read, and
+  the rewrite is always in the direction that makes the rule look more complete.**
+  EIP-2200's `SSTORE` clause is a flat list of three bullets and the no-op arm is the
+  first of them, one condition wide:
+
+      If current value equals new value (this is a no-op), SLOAD_GAS is deducted.
+      If current value does not equal new value
+          If original value equals current value ...
+          If original value does not equal current value ...
+
+  A note in `TASKS.md` restated it as `if current_value == new_value:` wrapping
+  `if original_value == current_value:` wrapping `if original_value == 0:` --
+  **three conditions nested inside the no-op arm, ending in `SSTORE_SET_GAS`**. Every
+  one of those three clauses exists in EIP-2200, and none of them is under the no-op
+  arm; they are under "does not equal new value". The rewrite read as a *correction*
+  and was presented as a quotation, and EIP-2200 settles it against the rewrite three
+  times independently: the specification text is one condition; the Appendix proves
+  `original = 0` state A to state A costs `SLOAD_GAS` ("200 gas is deducted ...
+  200 * N == 200 * 1", because "no disk write is needed"); and the EIP's own test-case
+  table's `original = 0` row is the **cheapest** row in the table, which 20,000 could
+  not be.
+  - It cost **19,900 gas on every write of zero into a slot that was already zero**,
+    and it was a *consensus* defect, not a conformance figure. Three tests failed and
+    the committed subset went 255 -> 236, and the change was defended with a
+    measurement table whose EIP column was computed from the invented nesting -- so
+    the table agreed with the change and disagreed with the EIP, and the table is the
+    thing a reader trusts.
+  - The general form: **a rule whose rewritten form is *more elaborate* than the
+    original is the one to re-read, because elaboration is what a misreading looks
+    like.** This repository had already paid for the same shape twice -- a fork
+    *name* read as a rank, and `s <= n/2` explained by malleability when recovery maps
+    a signature to an *account*. In all three the wrong reading made the rule sound
+    optional or the defect sound worth fixing.
+  - And the cheap guard is the one §4.2 already asks for, applied to prose: **quote
+    the clause whole enough that its shape is visible.** A quotation that renders a
+    flat list as a tree has already changed something, and the change is the claim.
 
 - **"Malleable, therefore harmless" is a wrong reading of a signature rule.**
   EIP-2's `s =< n/2` is usually explained as malleability, and the natural gloss
