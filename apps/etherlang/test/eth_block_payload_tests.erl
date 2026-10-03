@@ -63,6 +63,51 @@ payload_withdrawals_root_matches_the_network_test() ->
               end
       end, eth_payload_fixture:all()).
 
+
+%% ---------------------------------------------------------------------------
+%% A payload may not carry more withdrawals than the bound
+%% ---------------------------------------------------------------------------
+%%
+%% `eth_fork_schedule:withdrawals_root/1' truncates at
+%% `?MAX_WITHDRAWALS_PER_PAYLOAD', and its own comment said the caller must reject
+%% the payload rather than accept the truncated commitment. **No caller did**, so a
+%% 17-withdrawal payload was given a root computed over 16 of its withdrawals --
+%% a root that is not the root of the payload's own list, so the header stopped
+%% committing to what the payload carried and nothing said so.
+%%
+%% Built from a **real** network payload rather than a hand-written one, so the
+%% other seventeen header fields are the ones the network actually published.
+%% `withdrawals` is the only thing changed, which is what makes the refusal
+%% attributable to the length and not to a malformed fixture.
+
+%% The committed Shanghai payload carries **exactly sixteen** withdrawals -- the cap
+%% itself. So the accepted arm needs no fixture change at all, and the refused arm
+%% is that payload plus one duplicated entry: the header's seventeen other fields
+%% are the ones the network published, so the refusal is attributable to the length
+%% and nothing else. A first version picked "a fixture with withdrawals" and matched
+%% two, because both Shanghai and Cancun carry sixteen; naming the fork is both
+%% simpler and deterministic.
+at_cap_withdrawals_are_accepted_test() ->
+    {shanghai, Fx} = pick_shanghai(),
+    Payload = maps:get(payload, Fx),
+    ?assertEqual(16, length(maps:get(<<"withdrawals">>, Payload))),
+    ?assertMatch({ok, _}, eth_block:from_payload(Payload)).
+
+over_cap_withdrawals_are_refused_test() ->
+    {Fork, Fx} = pick_shanghai(),
+    Payload0 = maps:get(payload, Fx),
+    Ws = maps:get(<<"withdrawals">>, Payload0),
+    Payload = Payload0#{<<"withdrawals">> => Ws ++ [lists:last(Ws)]},
+    ?assertEqual({Fork, {error, {too_many_withdrawals, 17, 16}}},
+                 {Fork, eth_block:from_payload(Payload)}).
+
+%% Shanghai, because that is the fork that introduced the field, and because the
+%% Committed fixture's payload is one that really carries withdrawals -- a Paris one
+%% has no such key and the check would be unreachable there.
+pick_shanghai() ->
+    [FX] = [FX || FX = {F, _} <- eth_payload_fixture:all(), F =:= shanghai],
+    FX.
+
 %% ===========================================================================
 %% Decoding the fields
 %% ===========================================================================

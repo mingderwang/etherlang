@@ -118,9 +118,18 @@ key_is_position_not_withdrawal_index_test() ->
     ?assertNotEqual(ByPosition,
                     eth_fork_schedule:withdrawals_root(Reversed)).
 
-%% EIP-4895 allows at most 16 withdrawals per payload. The root stays well
-%% defined past that by truncating, but a caller must reject the payload rather
-%% than accept the truncated commitment.
+%% **A property of the pure function, still true -- but the caller no longer relies
+%% on it.** `eth_block:withdrawals_within_bound/1' refuses a payload longer than the
+%% cap before this is reached, so the truncation is unreachable from the payload path
+%% and exists only to keep `withdrawals_root/1' total for a direct caller. That was
+%% not the case when this test was written: its comment said "a caller must reject
+%% the payload rather than accept the truncated commitment", **no caller did**, and a
+%% 17-withdrawal payload was given a root over 16 of its withdrawals -- a root that
+%% is not the root of the payload's own list.
+%%
+%% The bound itself is not EIP-4895's. The EIP says only that it is "enforced by the
+%% consensus layer", and `execution-apis` states no number either, so 16 is a recorded
+%% figure rather than a derived one (AGENTS.md §4.2).
 over_cap_list_is_truncated_test() ->
     A = <<16#01:160>>,
     Sixteen = [#{index => I, validatorIndex => I, address => A, amount => 1}

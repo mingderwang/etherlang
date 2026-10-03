@@ -1599,17 +1599,84 @@ payload_roots(Payload, Wire) ->
     case blob_quantities(Payload) of
         {error, Reason} ->
             {error, Reason};
-        {ok, BlobGasUsed, ExcessBlobGas} ->
-            {ok, #{transactions_root => tx_root_of_wire(Wire),
-                   withdrawals_root => withdrawals_root_of(Payload),
-                   blob_gas_used => BlobGasUsed,
-                   excess_blob_gas => ExcessBlobGas}}
+                   {ok, BlobGasUsed, ExcessBlobGas} ->
+              case withdrawals_root_of(Payload) of
+                  {error, Reason} ->
+                      {error, Reason};
+                  Wroot ->
+                      {ok, #{transactions_root => tx_root_of_wire(Wire),
+                             withdrawals_root => Wroot,
+                             blob_gas_used => BlobGasUsed,
+                             excess_blob_gas => ExcessBlobGas}}
+              end
     end.
 
+%% **The one place a payload's withdrawals are checked for anything.**
+%%
+%% Two things are decided here that previously were not decided at all.
+%%
+%% **(i) The length.** `eth_fork_schedule:withdrawals_root/1' truncates at
+%% `?MAX_WITHDRAWALS_PER_PAYLOAD', so a 17-withdrawal payload used to be given a
+%% root computed over 16 of them -- a root that is *not* the root of the payload's
+%% own list. That is wrong twice over: it silently discards data the caller
+%% supplied, and the resulting header no longer commits to the payload. EIP-4895
+%% does not state the bound ("enforced by the consensus layer"), so this refusal is
+%% the node declining a payload it cannot faithfully represent, not a rule quoted
+%% from the EIP -- and that is the honest description of it.
+%%
+%% **(ii) Nothing about the root, and that is a correction rather than an
+%% omission.** EIP-4895 has a section titled "Execution payload validity" whose
+%% entire content is
+%%
+%%     assert execution_payload_header.withdrawals_root ==
+%%         compute_trie_root_from_indexed_data(execution_payload.withdrawals)
+%%
+%% and this looks like where to put it -- until you notice that the Engine API
+%% payload **does not carry `withdrawalsRoot` at all**. `ExecutionPayloadV3` in
+%% `execution-apis` lists parentHash, feeRecipient, stateRoot, receiptsRoot,
+%% logsBloom, prevRandao, blockNumber, gasLimit, gasUsed, timestamp, extraData,
+%% baseFeePerGas, blockHash, transactions, withdrawals, blobGasUsed, excessBlobGas,
+%% and no `withdrawalsRoot` among them. **There is no declared value to compare
+%% against**, so the assertion EIP-4895 states is not expressible at this boundary.
+%%
+%% What the node does instead is structural, and it is not nothing: the computed
+%% root goes into the header, the header is hashed, and that hash is compared with
+%% the payload's own `blockHash` -- which the consensus layer derived from the
+%% network's real header, real `withdrawalsRoot` included. A payload whose
+%% withdrawals did not produce the network's root therefore fails on the block
+%% hash. The check is real; it is simply not a named verdict, and inventing one
+%% would be exactly the `{verified, _}` that AGENTS.md §4.1 exists to forbid.
 withdrawals_root_of(Payload) ->
     case pget(Payload, <<"withdrawals">>) of
-        undefined -> undefined;
-        {ok, Ws} -> eth_fork_schedule:withdrawals_root(withdrawals_from_json(Ws))
+        undefined ->
+            undefined;
+        {ok, _Ws} ->
+            case withdrawals_within_bound(Payload) of
+                {error, Reason} ->
+                    {error, Reason};
+                ok ->
+                    eth_fork_schedule:withdrawals_root(
+                      withdrawals_from_json(maps:get(<<"withdrawals">>, Payload)))
+            end
+    end.
+
+%% The bound, as a predicate both entry paths can ask. Kept in one place because
+%% `from_payload/1' and `payload_block_hash/1' are separate paths into this decoder
+%% and had already answered this question differently.
+withdrawals_within_bound(Payload) ->
+    case pget(Payload, <<"withdrawals">>) of
+        undefined ->
+            ok;
+        {ok, Ws} ->
+            %% `withdrawals_from_json/1' answers a plain list, not a tagged one, so
+            %% an earlier version of this matched `{ok, List}' against a bare list
+            %% and fell through every branch.
+            Limit = eth_fork_schedule:max_withdrawals_per_payload(),
+            case length(withdrawals_from_json(Ws)) > Limit of
+                true -> {error, {too_many_withdrawals,
+                                 length(withdrawals_from_json(Ws)), Limit}};
+                false -> ok
+            end
     end.
 
 %% These are quantities, and they have to be *decoded*.
@@ -1706,11 +1773,25 @@ decode_payload(Payload) when is_map(Payload) ->
                 {error, Reason} ->
                     {error, Reason};
                 {ok, Txs, Wire} ->
-                    Block0 = lists:foldl(fun({Field, Value}, Acc) ->
-                                                 put_field(Acc, Field, Value)
-                                         end, new(<<0:256>>, 0), Pairs),
-                    Block1 = put_optional_fields(Block0, Payload),
-                    {ok, Block1#block{transactions = Txs}, Wire}
+                    %% The withdrawals bound is checked **here** as well as in
+                    %% `payload_roots/2', because those are two separate paths into
+                    %% this decoder. The first version of this fix put the check in
+                    %% only one of them: `from_payload/1' still accepted a
+                    %% 17-withdrawal payload while `payload_block_hash/1' refused it,
+                    %% which is the worst shape for a validation rule -- two answers
+                    %% to one question. `put_optional_fields/2' is what fills the
+                    %% block's `withdrawals' and it runs next, so this is the last
+                    %% point at which the list can be refused.
+                    case withdrawals_within_bound(Payload) of
+                        {error, Reason2} ->
+                            {error, Reason2};
+                        ok ->
+                            Block0 = lists:foldl(fun({Field, Value}, Acc) ->
+                                                         put_field(Acc, Field, Value)
+                                                 end, new(<<0:256>>, 0), Pairs),
+                            Block1 = put_optional_fields(Block0, Payload),
+                            {ok, Block1#block{transactions = Txs}, Wire}
+                    end
             end
     end;
 decode_payload(_Payload) ->

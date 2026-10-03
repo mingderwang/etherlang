@@ -46,6 +46,24 @@ Derive a rule from one of those, quote the clause, and pin it with a test.
 | `ethereum/execution-apis` | The Engine API and JSON-RPC surface this node serves. |
 | `ethereum/consensus-specs`, the networking specs | devp2p/RLPx, discv4, the beacon-node boundary. |
 
+**None of those four directories is in this repository** (see `RELEASE-GATE.md`
+D-18), so the paths above do not resolve and must be fetched. The canonical
+locations, which are what every derivation here was checked against on
+2026-10-03:
+
+| What | Where |
+|------|-------|
+| EIPs | `https://eips.ethereum.org/EIPS/eip-<number>` -- the rendered text, one document per EIP |
+| execution-apis (Engine API) | `https://raw.githubusercontent.com/ethereum/execution-apis/main/src/engine/cancun.md` and the per-fork files beside it |
+| execution-specs (EELS) | `https://github.com/ethereum/execution-specs` |
+| networking specs | `https://github.com/ethereum/devp2p-specs`, `.../discv5` |
+
+The Engine API one is worth singling out: `src/engine/cancun.md` carries the
+complete `ExecutionPayloadV3` field list, and it settled a recorded finding
+(D-2) that had been wrong for the wrong reason -- see that entry. **A payload
+schema is a list you check, not a list you remember**, and this repository got one
+of its fields wrong by memory for long enough to record a deviation about it.
+
 Documentation in this repo is deliberately adversarial: it names specific gaps
 rather than softening them. **Keep it that way.** A README that says "partial"
 where the code says "broken" is a bug, not modesty.
@@ -94,8 +112,8 @@ depends on execution order, suspect the build before you suspect the code.
 
 ## 3. Architecture
 
-48 modules in `apps/etherlang/src` (14,075 lines of code), 61 test modules in
-`apps/etherlang/test` (13,806), and 959 eunit tests. **These counts drift and this
+48 modules in `apps/etherlang/src` (14,108 lines of code), 61 test modules in
+`apps/etherlang/test` (13,821), and 961 eunit tests. **These counts drift and this
 one had drifted** -- it said 47 and 44 for several commits after it stopped being
 true, which is the same defect as a stale conformance figure: a number in the
 architecture section that a reader will use as a measure of size and that no longer

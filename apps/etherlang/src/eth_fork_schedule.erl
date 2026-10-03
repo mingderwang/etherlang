@@ -33,6 +33,7 @@
           process_withdrawals/2,
           make_withdrawal/3,
           withdrawals_root/1,
+          max_withdrawals_per_payload/0,
           apply_withdrawals/1,
           add_beacon_root/2,
           get_beacon_root/1,
@@ -136,6 +137,15 @@
 -define(COLD_SLOAD_COST, 2100).
 -define(BASE_FEE_INITIAL, 1000000000).
 -define(MIN_BASE_FEE, 7).
+%% **Not EIP-4895's, and this constant's provenance is a gap.** EIP-4895 does not
+%% name a limit; it says the bound is "enforced by the consensus layer", and the
+%% `execution-apis` documents do not state one either. 16 is the figure the
+%% networks run, and the comment that used to sit here said "EIP-4895 allows at
+%% most 16 withdrawals per payload" -- an attribution no reachable document
+%% supports. It is kept because truncating on it is no longer reachable: every
+%% caller now refuses a longer list first (see `eth_block:withdrawals_root_of/1'),
+%% so this bounds only what a *pure* caller of `withdrawals_root/1' can be handed.
+%% Recorded rather than derived, per AGENTS.md §4.2.
 -define(MAX_WITHDRAWALS_PER_PAYLOAD, 16).
 -define(BEACON_ROOTS_ADDRESS,
         <<16#00, 16#0F, 16#3d, 16#f6, 16#D7, 16#32, 16#80, 16#7E,
@@ -908,6 +918,13 @@ withdrawals_root(Withdrawals) when is_list(Withdrawals) ->
     eth_trie:root(Pairs);
 withdrawals_root(_Withdrawals) ->
     withdrawals_root([]).
+
+%% The one place `?MAX_WITHDRAWALS_PER_PAYLOAD' is readable from outside. Exported as
+%% a function rather than duplicated as a macro in `eth_block', because a constant
+%% with two homes is the defect AGENTS.md §3 is about -- the same shape as the
+%% interpreter's deleted second copy of the gas table.
+-spec max_withdrawals_per_payload() -> pos_integer().
+max_withdrawals_per_payload() -> ?MAX_WITHDRAWALS_PER_PAYLOAD.
 
 %% RLP([index, validator_index, address, amount]) -- all four fields integers or
 %% a 20-byte string, in that order. eth_rlp encodes an integer 0 as the empty

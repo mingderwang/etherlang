@@ -66,8 +66,8 @@ beacon, validators, or block production).
 * **Ops** — Docker release image (non-root, volume-backed), compose stack with
   an EthStats dashboard (two host nodes reporting live), a dependency-free
   `eth_call` load benchmark, a live Sepolia smoke-test script, and an
-  in-process mock-upstream eunit suite (**959 tests, green**).
-* **Status** — v0.7.0; eunit green (959 tests) and verified live against Sepolia.
+  in-process mock-upstream eunit suite (**961 tests, green**).
+* **Status** — v0.7.0; eunit green (961 tests) and verified live against Sepolia.
 
 Built with `rebar3`, released via `relx` (cowboy + thoas + `inets/httpc`).
 
