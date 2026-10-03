@@ -487,17 +487,43 @@ a_zero_payload_id_is_not_answered_with_a_payload_test() ->
 %% burned, so this is the sum of *tips* over the gas the transactions actually used
 %% -- not the declared gas limits and not the full gas prices.
 
+%% **The shape of the argument is the defect, and it is pinned here rather than
+%% only implied.** `build/1' used to hand this function a `Verification' map, which
+%% has no `receipts' key, and the function answered 0 -- so `getPayload' reported
+%% `blockValue: 0` for every block this node built. Nothing caught it, because all
+%% eight of the other assertions on this function passed the map shape
+%% `#{receipts => [...]}`: the tip arithmetic was pinned correctly against a fixture
+%% **no production call could supply**. A test that pins the arithmetic and the call
+%% shape at once will happily pin a call shape that never happens.
+%%
+%% So this asserts the guard rather than a number. A `Verification` map is refused
+%% loudly instead of answering 0, which is the whole difference between the bug and
+%% the fix: the bug's failure mode was a **plausible number**, and this makes an
+%% incompatible argument an exception.
+%%
+%% **Not covered, and it should be:** no test exercises `getPayload` on a block that
+%% actually contains a transaction. That needs a funded state in the parent's trie,
+%% a signed transaction in a running pool, and the chain head carrying that state
+%% root -- and `store_head/0' builds a header with no state at all, so the fixture
+%% does not exist in this module. The end-to-end path is unverified here, and the
+%% `0x0` assertion in the wire test is *correct* for an empty block, which is why it
+%% never noticed.
+block_value_refuses_a_verification_map_rather_than_answering_zero_test() ->
+    ?assertError(function_clause,
+                 eth_block_builder:block_value(#{receipts => []})),
+    ?assertError(function_clause,
+                 eth_block_builder:block_value(#{})).
+
 block_value_of_a_block_with_no_transactions_is_zero_test() ->
-    ?assertEqual(0, eth_block_builder:block_value(#{})),
-    ?assertEqual(0, eth_block_builder:block_value(#{receipts => []})).
+    ?assertEqual(0, eth_block_builder:block_value([])).
 
 %% A receipt that did not execute carries no gas, so there is nothing to value. The
 %% answer is 0 rather than the product of a declared gas limit and a declared price,
 %% which would be a revenue the proposer does not receive.
 block_value_of_an_unexecuted_receipt_is_zero_test() ->
     ?assertEqual(0, eth_block_builder:block_value(
-                      #{receipts => [#{<<"gasPrice">> => <<"0x3b9aca00">>,
-                                       <<"gas">> => <<"0x5208">>}]})).
+                      [#{<<"gasPrice">> => <<"0x3b9aca00">>,
+                         <<"gas">> => <<"0x5208">>}])).
 
 block_value_sums_the_tip_over_the_gas_used_test() ->
     %% The tip is min(maxPriorityFeePerGas, maxFeePerGas - baseFee), and the
@@ -507,18 +533,18 @@ block_value_sums_the_tip_over_the_gas_used_test() ->
                 <<"baseFeePerGas">> => <<"0x3b9aca00">>,           %% 1 gwei
                 gas_used => 21000},
     ?assertEqual(21000 * 2000000000,
-                 eth_block_builder:block_value(#{receipts => [Receipt]})),
+                 eth_block_builder:block_value([Receipt])),
     %% Raise the base fee to meet the priority fee. The tip is unchanged at 2 gwei,
     %% because the *priority* term is still the binding one -- min(2 gwei, 8 gwei).
     Capped = Receipt#{<<"baseFeePerGas">> => <<"0x77359400">>},     %% 2 gwei
     ?assertEqual(21000 * 2000000000,
-                 eth_block_builder:block_value(#{receipts => [Capped]})),
+                 eth_block_builder:block_value([Capped])),
     %% A priority fee above the cap cannot be paid at all, so the tip is the cap
     %% minus the burn. Reading the priority fee alone here would report more
     %% revenue than the transaction can possibly pay.
     Over = Receipt#{<<"maxPriorityFeePerGas">> => <<"0x2540be400">>},
     ?assertEqual(21000 * (10000000000 - 1000000000),
-                 eth_block_builder:block_value(#{receipts => [Over]})).
+                 eth_block_builder:block_value([Over])).
 
 block_value_of_a_legacy_receipt_subtracts_the_burn_test() ->
     Receipt = #{<<"gasPrice">> => <<"0x3b9aca00">>,               %% 1 gwei
@@ -527,9 +553,9 @@ block_value_of_a_legacy_receipt_subtracts_the_burn_test() ->
     %% gasPrice equals the base fee, so the whole payment is burn and the tip is
     %% zero. This is the case that a builder multiplying gas by gasPrice would get
     %% wrong by 21000 gwei.
-    ?assertEqual(0, eth_block_builder:block_value(#{receipts => [Receipt]})),
+    ?assertEqual(0, eth_block_builder:block_value([Receipt])),
     Receipt2 = Receipt#{<<"baseFeePerGas">> => <<"0x2540be400">>},  %% 10 gwei
-    ?assertEqual(0, eth_block_builder:block_value(#{receipts => [Receipt2]})).
+    ?assertEqual(0, eth_block_builder:block_value([Receipt2])).
 
 %% ===========================================================================
 %% Fixtures

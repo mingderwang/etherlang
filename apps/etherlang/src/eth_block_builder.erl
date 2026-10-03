@@ -200,7 +200,7 @@ build(Attributes) when is_map(Attributes) ->
                     report_verdicts(Finalized#block.number, Verification),
                     case eth_block:to_payload(Finalized) of
                         {ok, Payload} ->
-                            {ok, Payload, block_value(Verification)};
+                            {ok, Payload, block_value(Finalized#block.receipts)};
                         {error, Reason} ->
                             {error, Reason}
                     end;
@@ -505,18 +505,27 @@ gas_of(Tx) ->
 %% not the sum of `gas' limits, and not the sum of full gas prices. A builder that
 %% reported the latter would state a revenue its proposer will not receive.
 %%
-%% It is computed from the receipts `finalize/1' produced, because those carry the
-%% gas each transaction really consumed. A block whose transactions were not
-%% executed has no receipts, and then the value is not knowable: this answers 0 and
-%% says why, rather than multiplying declared gas limits by declared prices.
--spec block_value(map()) -> non_neg_integer().
-block_value(Verification) ->
-    case maps:get(receipts, Verification, undefined) of
-        undefined ->
-            0;
-        Receipts when is_list(Receipts) ->
-            lists:sum([receipt_value(R) || R <- Receipts])
-    end.
+%% **This took a `Verification` map and read a `receipts` key that map does not
+%% have**, so `maps:get(receipts, Verification, undefined)` always answered
+%% `undefined`, the branch reserved for "not knowable" was taken every time, and
+%% `getPayload` reported `blockValue: 0` for every block this node built. The
+%% arithmetic below was correct throughout and never ran once on a real block.
+%%
+%% **Why it survived: the tests agreed with it.** `eth_block_builder_tests' has
+%% eight assertions on this function and every one of them passed the map shape
+%% `#{receipts => [...]}`, which is exactly the shape `finalize/1' never produces.
+%% So the tip arithmetic was pinned -- correctly -- against a fixture that no
+%% production call could have supplied. **A test that pins the arithmetic and the
+%% call shape at once will happily pin a call shape that never happens.** Those
+%% assertions now pass a receipt list.
+%%
+%% The map was not the wrong *shape* so much as the wrong *object*: `Verification`
+%% answers "what did you check" and correctly holds `state_root`,
+%% `transactions_root`, `receipts_root` and `gas_used`. The receipts are not a
+%% verdict, they are the block's own output, so they belong to `#block{}'.
+-spec block_value([map()]) -> non_neg_integer().
+block_value(Receipts) when is_list(Receipts) ->
+    lists:sum([receipt_value(R) || R <- Receipts]).
 
 receipt_value(Receipt) ->
     case {maps:get(gas_used, Receipt, undefined),
