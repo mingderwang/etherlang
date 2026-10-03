@@ -122,3 +122,73 @@ wait_bonded(N) ->
         true -> ok;
         false -> timer:sleep(100), wait_bonded(N - 1)
     end.
+
+%% ---------------------------------------------------------------------------
+%% D-14: a malformed packet costs the packet, not the process
+%% ---------------------------------------------------------------------------
+%%
+%% `handle_findnode/5' hands the decoded target to `table_closest/3', which
+%% measures every table entry against it with `distance/2' = `crypto:exor/2'.
+%% That needs two binaries of equal length, and **the target never has to be
+%% 64 bytes for the raise to happen**. Two distinct shapes, both measured:
+%%
+%%   * the target decodes to a **list**. `eth_discv4:to_bin/1' has clauses for a
+%%     binary and an integer and nothing else, so a list falls through to
+%%     `<<>>' -- and note that `eth_rlpx:to_bin/1' *does* have a `list_to_binary'
+%%     clause, so the two copies of this helper in the same tree disagree about
+%%     what a list is. That is the sixth hex-decoder copy in this repository.
+%%   * the target decodes to a **binary of the wrong length** -- two bytes is
+%%     enough, and it reaches `crypto:exor/2' unchanged.
+%%
+%% Either way it raised from `handle_info' with no `try' around the per-type
+%% handler. The child is `restart => permanent' and the supervisor is
+%% `intensity => 5, period => 10', so about six packets in ten seconds from any
+%% unauthenticated UDP sender ended the whole application.
+%%
+%% **The control is the point.** The 64-byte target must still be answered, or
+%% "nothing was raised" would be satisfied just as well by a handler that did
+%% nothing at all -- which is how an assertion like this passes for the wrong
+%% reason. So the working case runs first, on the same state, which also
+%% establishes the crash's only precondition: a non-empty table.
+malformed_findnode_target_is_dropped_and_the_process_survives_test() ->
+    {Sock, Priv, ID, Tab} = d14_fixture(),
+    S = d14_state(Sock, Priv, ID, Tab),
+
+    {noreply, S1} = d14_send(Sock, ID, Priv, S),
+    ?assertEqual(1, length(ets:tab2list(Tab))),
+
+    %% A list target: `to_bin/1' answers <<>>.
+    {noreply, S2} = d14_send(Sock, [<<16#01, 16#02>>, 16#03], Priv, S1),
+
+    %% A two-byte binary target: it reaches `crypto:exor/2' unchanged.
+    {noreply, _S3} = d14_send(Sock, <<16#01, 16#02>>, Priv, S2),
+
+    %% And the server is still functional, which is stronger than "still alive".
+    {noreply, _} = d14_send(Sock, ID, Priv, S2),
+    ok.
+
+%% The table must be non-empty, or the crash cannot happen and the malformed
+%% cases above would pass without exercising anything.
+d14_fixture() ->
+    {ok, Sock} = gen_udp:open(0, [binary, {active, false}, {reuseaddr, true}]),
+    Priv = eth_discv4:generate_key(),
+    ID = eth_discv4:node_id(Priv),
+    PeerID = eth_discv4:node_id(eth_discv4:generate_key()),
+    Tab = eth_discv4:table_new(),
+    true = eth_discv4:table_add(Tab, ID,
+                                #{id => PeerID, ip => {127, 0, 0, 1},
+                                  udp => 30303, tcp => 30303}),
+    {Sock, Priv, ID, Tab}.
+
+%% `#st{ sock, port, priv, id, tab, pending, bootnodes }' is private to
+%% eth_discv4, so the record is built by hand. If it gains a field this fails
+%% loudly with a badmatch rather than quietly testing something else.
+d14_state(Sock, Priv, ID, Tab) ->
+    {st, Sock, 30303, Priv, ID, Tab, #{}, []}.
+
+%% Delivered through the real dispatch point -- `handle_info/2' -- rather than by
+%% calling the handler, because the missing boundary was at this level and a test
+%% one level down would not see it.
+d14_send(Sock, Target, Priv, State) ->
+    Pkt = eth_discv4:encode_packet(?FINDNODE, [Target, 16#03], Priv),
+    eth_discv4:handle_info({udp, Sock, {127, 0, 0, 1}, 30304, Pkt}, State).

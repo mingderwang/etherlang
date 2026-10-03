@@ -252,7 +252,39 @@ code_change(_OldVsn, S, _Extra) -> {ok, S}.
 %% Packet handling
 %% ---------------------------------------------------------------------------
 
+%% **One boundary per remote packet, and it belongs around the handler rather
+%% than around the decoder.** The `{error, Reason}' clause below already handles
+%% "this packet did not decode", which is the failure everyone expects and the one
+%% that was already covered. It did not handle "this packet decoded and then the
+%% handler raised on it", and that is where a defect becomes an outage:
+%%
+%% `handle_findnode/5' passed the decoded target to `table_closest/3', which calls
+%% `distance/2' = `crypto:exor/2' on every table entry, and that needs two binaries
+%% of equal length. The target is attacker-chosen and is not necessarily 64 bytes,
+%% so it raised `badarg'. That reached `handle_info/2' uncaught, the process died,
+%% the child is `restart => permanent', and the supervisor is
+%% `intensity => 5, period => 10' -- so roughly six packets in ten seconds ended
+%% the whole application. One packet from one sender, with no relationship to the
+%% other peers or to the node's own state.
+%%
+%% The shape is the general one: **a defect reachable from the network must cost
+%% the connection, not the process.** A boundary that only covers parsing protects
+%% against malformed input and against nothing else, and the difference is
+%% invisible until one defect sits on the wrong side of it. `eth_peer_conn' has the
+%% mirror-image mistake -- seven `try`s, every one of them around an individual
+%% store or pool call, and none around the message dispatch.
 handle_packet(Packet, IP, InPort, S) ->
+    try
+        dispatch_packet(Packet, IP, InPort, S)
+    catch
+        Class:Reason:Stack ->
+            logger:notice("etherlang: discv4 packet handler raised (~p:~p), "
+                          "dropping the packet", [Class, Reason]),
+            logger:debug("etherlang: discv4 handler stacktrace ~p", [Stack]),
+            S
+    end.
+
+dispatch_packet(Packet, IP, InPort, S) ->
     case decode_packet(Packet) of
         {ok, #{type := ?PING, data := Data, id := ID, hash := Hash}} ->
             handle_ping(Data, ID, Hash, IP, InPort, S);

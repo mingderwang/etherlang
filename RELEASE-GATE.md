@@ -52,7 +52,7 @@ The node must not be able to lie about itself. No release tag without all five.
 | # | Gate | Criterion | Command | Status |
 |---|---|---|---|---|
 | 0.1 | Builds warning-free | zero warnings; `warnings_as_errors` is set | `rebar3 compile` | **GREEN** |
-| 0.2 | Whole suite green | `Failed: 0` | `rebar3 eunit` | **GREEN** — 943 passed |
+| 0.2 | Whole suite green | `Failed: 0` | `rebar3 eunit` | **GREEN** — 944 passed |
 | 0.3 | No commitment returned as a bare value | every entry of a `Verification` map is `{verified,_} \| {unverified,_}`; no exception | review of `eth_block:finalize/1` | **GREEN** |
 | 0.4 | Every published figure has a corpus and a date | no number in README/TASKS/AGENTS without both | review | **RED** — see below |
 | 0.5 | Known deviations exist, dated, each with a measurement | no entry without all four fields | review of §"Known deviations" | **GREEN** — 13 entries |
@@ -95,7 +95,7 @@ A release may raise a floor. Lowering one is a release-blocker in its own right.
 | 2.1 | committed-subset match rate | ≥ previous release | **255 of 266 (95.9%)** — `match` 255, `state_mismatch` 8, `fork_unreachable` 3, every other outcome 0 |
 | 2.2 | full-corpus state match rate | ≥ previous release | **not run since `v1.55`.** Last recorded: 6,786 of 15,660 on the 229 non-`static` files (43.3%), pre-dating the blob-fee, refund-cap, authorization-refund and delegation work. The 25-file subset and the full corpus disagree by ~52 points, so a release that quotes only the subset is quoting the easy 2% |
 | 2.3 | both figures recorded, with their directories | mandatory | **GREEN** — TASKS.md header and `apps/etherlang/doc/MEASUREMENTS.md` |
-| 2.4 | test count | ≥ previous release | **943** (`make counts`: 50 src modules / 14,183 lines, 60 test modules / 13,468 lines) |
+| 2.4 | test count | ≥ previous release | **944** (`make counts`: 50 src modules / 14,193 lines, 60 test modules / 13,492 lines) |
 | 2.5 | every consensus constant | derived-and-pinned, or documented-as-a-gap | review — **13 open, all in §"Known deviations"** |
 | 2.6 | every new test shown to bite | defect injected, test watched fail, restored, `touch` | review |
 
@@ -163,7 +163,7 @@ count is itself a gate**: two consecutive releases without reducing it blocks Ti
 | **D-11** | `SELFDESTRUCT` charges a flat 5,000: no cold-access term, no new-account term, no refund; and `SELFDESTRUCT(self)` leaves the balance intact | Cancun onward | `eth_evm.erl:819-840`. **`eip6780_selfdestruct` is 0 of 5 on the committed subset** — the corpus and the code agree |
 | **D-12** | `eth_state_management` and `eth_block_hash_oracle` are dead code, are listed in `registered`, and are not in AGENTS.md §11. Inside, three functions report work they did not perform | whole node | 0 starter call sites; `git grep` finds 0 mentions in either document |
 | **D-13** | No differential, Hive or fuzz harness exists | whole node | 0 configurations anywhere in the tree |
-| **D-14** | **A remote UDP sender can terminate the node.** `handle_findnode/5` → `table_closest(Tab, to_bin(Target), K)`, and `to_bin/1` answers `<<>>` for a two-element target, which `distance/2`'s `crypto:exor/2` cannot accept. | `eth_discv4.erl:300,190,401`. **Proven end to end:** a 64-byte target returns the table's node, `<<>>` raises `badarg`, and an empty table with the same bad target returns nothing. Reached from `handle_info` with no `try`; child is `permanent`; `intensity => 5, period => 10`. **≈6 packets in 10 s kills the application.** |
+| **D-14** | ~~**A remote UDP sender can terminate the node.**~~ **CLOSED 2026-10-03** — one boundary per remote packet; dropped and logged, node survives. Was: `handle_findnode/5` → `table_closest(Tab, to_bin(Target), K)`, and `to_bin/1` answers `<<>>` for a two-element target, which `distance/2`'s `crypto:exor/2` cannot accept. | `eth_discv4.erl:300,190,401`. **Proven end to end:** a 64-byte target returns the table's node, `<<>>` raises `badarg`, and an empty table with the same bad target returns nothing. Reached from `handle_info` with no `try`; child is `permanent`; `intensity => 5, period => 10`. **≈6 packets in 10 s kills the application.** |
 | **D-15** | **One inbound TCP connection stalls the peer manager for ten seconds.** `handle_info(accept, S)` calls `gen_server:start/3` inline and its `init/1` blocks in a 10-second handshake. | `eth_peer.erl:163`. No `dial_tick`, no `DOWN`, no `peer_up` for the duration, and `eth_peer:peers/0` — polled by `eth_sync` and `eth_statesync` — blocks behind it. |
 
 **Not deviations, recorded because they were suspected and are not.** `from_json/1`'s
