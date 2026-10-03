@@ -1020,31 +1020,47 @@ outage, so the list only grows.
 
 - **A specification rewritten into a nesting is a specification you have not read, and
   the rewrite is always in the direction that makes the rule look more complete.**
-  EIP-2200's `SSTORE` clause is a flat list of three bullets and the no-op arm is the
-  first of them, one condition wide:
+  EIP-2200 meters `SSTORE` over **three values** — the slot's *original* value (at the
+  start of the transaction), its *current* value, and the *new* value being written —
+  and its rule is a **flat partition into three cases**, asked in this order:
 
-      If current value equals new value (this is a no-op), SLOAD_GAS is deducted.
-      If current value does not equal new value
-          If original value equals current value ...
-          If original value does not equal current value ...
+      current == new ?                       -> no-op, SLOAD_GAS
+      current != new, original == current ?  -> clean write: SSTORE_SET_GAS when
+                                               original is 0, else SSTORE_RESET_GAS
+      current != new, original != current ?  -> dirty write: SLOAD_GAS plus refund
+                                               adjustments
 
-  A note in `TASKS.md` restated it as `if current_value == new_value:` wrapping
+  Only the **first** case is one condition wide, and the other two are unreachable
+  while it holds. `current == new` is a **no-op** — no write happens, so there is
+  nothing for `original` to qualify.
+
+  A note in `TASKS.md` restated this as `if current_value == new_value:` wrapping
   `if original_value == current_value:` wrapping `if original_value == 0:` --
-  **three conditions nested inside the no-op arm, ending in `SSTORE_SET_GAS`**. Every
-  one of those three clauses exists in EIP-2200, and none of them is under the no-op
-  arm; they are under "does not equal new value". The rewrite read as a *correction*
-  and was presented as a quotation, and EIP-2200 settles it against the rewrite three
-  times independently: the specification text is one condition; the Appendix proves
-  `original = 0` state A to state A costs `SLOAD_GAS` ("200 gas is deducted ...
-  200 * N == 200 * 1", because "no disk write is needed"); and the EIP's own test-case
-  table's `original = 0` row is the **cheapest** row in the table, which 20,000 could
-  not be.
-  - It cost **19,900 gas on every write of zero into a slot that was already zero**,
-    and it was a *consensus* defect, not a conformance figure. Three tests failed and
-    the committed subset went 255 -> 236, and the change was defended with a
-    measurement table whose EIP column was computed from the invented nesting -- so
-    the table agreed with the change and disagreed with the EIP, and the table is the
-    thing a reader trusts.
+  **the second and third tests pulled inside the first case**, ending in
+  `SSTORE_SET_GAS`. Every clause it names exists in EIP-2200, and not one of them
+  applies under the no-op. The rewrite read as a *correction* and was presented as a
+  quotation.
+
+  EIP-2200 settles it against the rewrite three times independently:
+  - **The specification text** is the flat partition above, quoted whole.
+  - **The Appendix's proof**, for this case -- `original = 0`, so state A: "We always
+    start at state A. The first SSTORE can: **Go to state A: 200 gas is deducted.**
+    We satisfy Case I because 200 * N == 200 * 1", where Case I is "If the final
+    value ends up still being 0, we want to charge 200 * N gases, **because no disk
+    write is needed**." A no-op write of zero needs no disk write, so it is metered
+    as one.
+  - **The EIP's own test-case table**: the `original = 0` row
+    (`0x60006000556000600055`, writing 0 into 0) is **the cheapest row in the table**
+    at 1,612 gas, against 5,812 for the same program with `original = 1`. 20,000
+    cannot appear in 1,612.
+
+  **What the rewrite cost:** 19,900 gas on every write of zero into a slot that was
+  already zero, and it was a *consensus* defect, not a conformance figure. Three tests
+  failed and the committed subset went 255 -> 236, and the change was defended with a
+  measurement table whose EIP column was computed from the invented nesting -- so
+  the table agreed with the change and disagreed with the EIP, and the table is the
+  thing a reader trusts.
+
   - The general form: **a rule whose rewritten form is *more elaborate* than the
     original is the one to re-read, because elaboration is what a misreading looks
     like.** This repository had already paid for the same shape twice -- a fork

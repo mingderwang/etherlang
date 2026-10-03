@@ -412,8 +412,18 @@ The measurement, at Cancun, in a bare frame, with the pre-state seeded explicitl
 | no-op: 0 -> 0, `original = 0` | **2,206** | **2,206** | **correct** — was recorded as "19,900 short" |
 | dirty: 1 -> 0, `original = 1` | 4,005 | 5,006 | 1,001 short — still open |
 
-EIP-2200's clause is a flat list, and the no-op arm is its first bullet, **one
-condition wide**:
+EIP-2200 meters `SSTORE` over **three values** — the slot's *original* value (at the
+start of the transaction), its *current* value, and the *new* value being written —
+and its rule is a **flat partition into three cases**, asked in this order:
+
+    current == new ?                       -> no-op, SLOAD_GAS
+    current != new, original == current ?  -> clean write: SSTORE_SET_GAS when
+                                             original is 0, else SSTORE_RESET_GAS
+    current != new, original != current ?  -> dirty write: SLOAD_GAS plus refund
+                                             adjustments
+
+The specification says it as a flat list, and the no-op arm is its first bullet, one
+condition wide:
 
     If current value equals new value (this is a no-op), SLOAD_GAS is deducted.
     If current value does not equal new value
@@ -422,7 +432,10 @@ condition wide**:
             Otherwise, SSTORE_RESET_GAS gas is deducted. ...
         If original value does not equal current value ...
 
-What this file used to say, and presented as a quotation, was:
+**Only the first case is one condition wide, and the other two are unreachable while
+it holds.** `current == new` is a no-op — no write happens, so there is nothing for
+`original` to qualify. What this file used to present as a quotation was the other two
+tests *pulled inside the first case*:
 
     if current_value == new_value:
         if original_value == current_value:
@@ -431,8 +444,8 @@ What this file used to say, and presented as a quotation, was:
             ...
     cost = SLOAD_GAS + COLD_SLOAD_COST
 
-**All three of those clauses exist in EIP-2200, and not one of them is under the
-no-op arm.** They are under "does not equal new value". The rewrite read as a
+**Every clause in that block exists in EIP-2200, and not one of them applies under the
+no-op.** They are the two cases reached when `current != new`. The rewrite read as a
 correction precisely because it was more elaborate than the original.
 
 EIP-2200 settles it three times independently:
