@@ -32,6 +32,7 @@
           fake_exponential/3,
           process_withdrawals/2,
           make_withdrawal/3,
+          exp_byte_cost/1,
           withdrawals_root/1,
           max_withdrawals_per_payload/0,
           apply_withdrawals/1,
@@ -1656,6 +1657,20 @@ call_cost(_Op, _Fork, _Args) ->
     0.
 
 account_creation_cost(_Fork) -> 32000.
+
+%% **EIP-160**, quoted: "increase the gas cost of EXP from 10 + 10 per byte in the
+%% exponent to 10 + 50 per byte in the exponent." Spurious Dragon, block 2675000.
+%%
+%% This is the whole EXP rule that is fork-dependent. The constant 10 that
+%% `base_gas_cost(16#0A, _, _) -> 10' already charges is right at every fork, so it
+%% is not repeated here and only the per-byte coefficient lives in this module --
+%% the same split `sload_gas/1' and the refund cap use.
+-spec exp_byte_cost(atom()) -> pos_integer().
+exp_byte_cost(Fork) when is_atom(Fork) ->
+    case at_least(Fork, spurious_dragon) of
+        true -> 50;
+        false -> 10
+    end.
 
 %% SELFDESTRUCT's base price, at every fork. EIP-2929's extra term lives in
 %% `selfdestruct_access_cost/2' below, because it is the one price that cannot be

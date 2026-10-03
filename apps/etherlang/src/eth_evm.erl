@@ -561,14 +561,65 @@ do_op(16#07, E, Ctx) -> bin_op(fun eth_word:smod/2, E, Ctx);
 do_op(16#08, E, Ctx) -> tri_op(fun eth_word:addmod/3, E, Ctx);
 do_op(16#09, E, Ctx) -> tri_op(fun eth_word:mulmod/3, E, Ctx);
 do_op(16#0A, E, Ctx) ->
-    %% EIP-2565: gas accounts for both modulus and exponent sizes,
-    %% not just the exponent (avoids undercharging for large moduli).
-    {Base, E1} = pop(E), {Exp, E2} = pop(E1),
-    Widest = max(byte_size(eth_word:to_bytes(Base)),
-                 byte_size(eth_word:to_bytes(Exp))),
-    Cost = 10 + 50 * Widest,
+    %% **EXP pops the base first, so the first pop below is `Base'.** `pop/1' takes
+    %% the stack top, and a `PUSH' conses, so the top is whichever operand was
+    %% pushed *last*. Measured against `evm run' from geth 1.17.7 -- the
+    %% implementation the chain actually runs -- on eight programs:
+    %%
+    %%     PUSH1 2,  PUSH1 3,  EXP  -> 9        3 ** 2
+    %%     PUSH1 3,  PUSH1 2,  EXP  -> 8        2 ** 3
+    %%     PUSH1 10, PUSH1 3,  EXP  -> 59049    3 ** 10
+    %%     PUSH1 3,  PUSH1 10, EXP  -> 1000     10 ** 3
+    %%     PUSH1 7,  PUSH1 4,  EXP  -> 16384    4 ** 7
+    %%     PUSH1 4,  PUSH1 7,  EXP  -> 2401     7 ** 4
+    %%     PUSH1 5,  PUSH1 0,  EXP  -> 0        0 ** 5
+    %%     PUSH1 0,  PUSH1 5,  EXP  -> 1        5 ** 0
+    %%
+    %% Every row is **the second push raised to the first**, so a program computing
+    %% `Base ** Exponent' pushes the exponent *first*. The last two rows are the
+    %% discriminating ones: 0 ** 5 = 0 and 5 ** 0 = 1, so a handler with the two the
+    %% other way round answers 1 where the chain answers 0, on a two-byte program.
+    %% Every non-zero row above is symmetric-looking, which is the hazard -- 2**3 and
+    %% 3**2 differ, but it takes reading the arithmetic to see which way round the
+    %% operands go, and that is the reasoning this comment replaces.
+    %%
+    %% The pop order here was renamed once, on the strength of a remembered reading
+    %% of the Yellow Paper that had the operands the other way round, and the "fix"
+    %% was then "confirmed" with a probe run against the already-edited tree -- so
+    %% the probe measured the edit rather than the interpreter. It was reverted the
+    %% moment the oracle was asked directly, which it could have been from the start
+    %% and in one command. A *measurement* taken against a tree you have just
+    %% changed is a measurement of your change.
+    {Base, E1} = pop(E),
+    {Exponent, E2} = pop(E1),
+    %% **EIP-160**, quoted whole: "increase the gas cost of EXP from 10 + 10 per
+    %% byte in the exponent to 10 + 50 per byte in the exponent." Spurious Dragon,
+    %% block 2,675,000. Two of the three things this charged wrongly are here:
+    %%
+    %%   * it measured `max(byte_size(base), byte_size(exponent))`, so a 32-byte
+    %%     base with an exponent of 1 was charged for 32 bytes of *nothing*. The
+    %%     EIP measures the exponent and says nothing at all about the base.
+    %%   * the coefficient was **50 at every fork**. Before Spurious Dragon the rule
+    %%     is 10 per byte, so every pre-SD block that ran EXP paid five times too
+    %%     much. `exp_byte_cost/1' in `eth_fork_schedule' is the one home for it.
+    %%
+    %% The flat 10 is not repeated here: `base_gas_cost(16#0A, _, _) -> 10' already
+    %% charges it and it is right at every fork.
+    %%
+    %% **The third wrong thing was the citation, and it is the reason the other two
+    %% survived:** the comment here attributed the rule to **EIP-2565**, which is
+    %% MODEXP's repricing -- a different instruction, opcode 0xf0, whose cost is a
+    %% product of three operand widths. Reading EIP-2565 makes `max(base, exponent)`
+    %% look deliberate, because EIP-2565 does consider both the base and the
+    %% exponent. It is a plausible shape borrowed from the wrong EIP.
+    %%
+    %% `eth_word:to_bytes/1' is the minimal big-endian encoding and maps 0 to `<<>>',
+    %% so an exponent of zero measures zero bytes -- which is what "per byte in the
+    %% exponent" has to mean for it.
+    PerByte = eth_fork_schedule:exp_byte_cost(Ctx#ctx.fork),
+    Cost = PerByte * byte_size(eth_word:to_bytes(Exponent)),
     case charge(E2, Cost) of
-        {ok, E3} -> next(push(E3, eth_word:exp(Base, Exp)), Ctx);
+        {ok, E3} -> next(push(E3, eth_word:exp(Base, Exponent)), Ctx);
         oog -> oog(E2, Ctx)
     end;
 do_op(16#0B, E, Ctx) ->

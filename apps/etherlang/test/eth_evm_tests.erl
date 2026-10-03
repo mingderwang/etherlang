@@ -3246,3 +3246,176 @@ emptying_the_stack_lets_it_be_refilled_to_the_limit_test() ->
 stack_overflow_is_a_halt_and_not_a_crash_test() ->
     ?assertMatch({error, stack_overflow, _, _}, stack_run(1025)),
     ?assertNotMatch({error, {evm_crash, _, _, _}, _, _}, stack_run(1025)).
+
+
+%% ---------------------------------------------------------------------------
+%% EXP: the operand order, and EIP-160's price
+%% ---------------------------------------------------------------------------
+%% Four defects, found together and fixed together, and the reason they were
+%% found together is the one worth recording.
+%%
+%% `evm t8n` was installed (geth 1.17.7, from the Homebrew `ethereum` bottle, which
+%% ships `evm` as well as `geth`) and used as an independent oracle. `evm run`
+%% answers four input pairs:
+%%
+%%     PUSH1 2,  PUSH1 3,  EXP  -> 9        3 ** 2
+%%     PUSH1 3,  PUSH1 2,  EXP  -> 8        2 ** 3
+%%     PUSH1 10, PUSH1 3,  EXP  -> 59049    3 ** 10
+%%     PUSH1 3,  PUSH1 10, EXP  -> 1000     10 ** 3
+%%     PUSH1 7,  PUSH1 4,  EXP  -> 16384    4 ** 7
+%%     PUSH1 4,  PUSH1 7,  EXP  -> 2401     7 ** 4
+%%
+%% **In every row the result is the second push raised to the first.** `push/1`
+%% conses, so the second push is what EXP pops, and EXP's first pop is the base --
+%% which means a program computing `Base ** Exponent' pushes the exponent *first*.
+%% That is the opposite of what the handler's own variable names invite a reader to
+%% assume, which is why the numbers are written out rather than described, and why
+%% the same table appears again next to the program builders below.
+%%
+%% The defects, in the order the fix takes them:
+%%
+%%   1. `max(byte_size(base), byte_size(exponent))` -- the base's width was priced.
+%%      EIP-160 measures the exponent and says nothing about the base.
+%%   2. the coefficient was 50 at every fork; before Spurious Dragon it is 10.
+%%   3. the handler's literal `10 +' double-charged the flat cost, which the
+%%      interpreter loop already takes from `constant_cost/2' ->
+%%      `base_gas_cost(16#0A, _, _) -> 10'. So every EXP cost 10 too much.
+%%   4. the comment attributed the rule to **EIP-2565**, which is MODEXP's
+%%      repricing -- a different opcode (0xf0) whose cost really does involve both
+%%      a base and an exponent. A plausible shape borrowed from the wrong EIP is
+%%      what let (1) read as deliberate.
+%%
+%% **The operand order was correct and it was broken here.** Recorded because it is
+%% the sharpest instance of a mistake this repository has made: the Yellow Paper was
+%% read from memory as `mu_s[0]` being the exponent, the two pops were swapped, and
+%% the swap was "confirmed" with a probe -- run against the tree just edited, so it
+%% measured the edit rather than the interpreter. The general form is one this file
+%% already states in a different place: **a measurement taken against a tree you
+%% have just changed is a measurement of your change**, and the oracle was available
+%% the whole time and answered in one command. What caught it was re-asking the
+%% oracle the question the oracle had been answering all along.
+
+exp_raises_the_base_to_the_exponent_test_() ->
+    {timeout, 30, fun exp_raises_the_base_to_the_exponent/0}.
+
+exp_raises_the_base_to_the_exponent() ->
+    %% {Base, Exponent, Base ** Exponent, Exponent ** Base}. The fourth column is
+    %% what the *reversed* operand order would answer, and it is written out rather
+    %% than recomputed: a pair where the two agree would pass under either order and
+    %% be a test that cannot see the rule, so the columns being different is the
+    %% property, and asserting `?assertNotEqual(Want, Swapped)` says so in the
+    %% failure message rather than leaving it as a fact about the fixture.
+    Cases = [{2, 3, 8, 9}, {3, 2, 9, 8}, {2, 10, 1024, 100},
+             {10, 3, 1000, 59049}, {7, 4, 2401, 16384}, {3, 10, 59049, 1000}],
+    [begin
+         ?assertNotEqual(Want, Swapped),
+         ?assertEqual(Want, exp_result(Base, Exponent, cancun)),
+         ?assertEqual(Swapped, exp_result(Exponent, Base, cancun))
+     end || {Base, Exponent, Want, Swapped} <- Cases],
+    ok.
+
+%% A base's width is not priced. The old rule measured `max(base, exponent)`, so
+%% these two programs differed by 1,550 gas and now cost exactly the same: 3 + 3
+%% (two PUSH1) + 10 (EXP's flat cost) + 50 * 1 (one byte of exponent).
+exp_prices_the_exponents_width_and_not_the_bases_test_() ->
+    {timeout, 30, fun exp_prices_the_exponents_width_and_not_the_bases/0}.
+
+exp_prices_the_exponents_width_and_not_the_bases() ->
+    Big = 16#7F00000000000000000000000000000000000000000000000000000000000000,
+    ?assertEqual(66, exp_gas(2, 1, cancun)),
+    ?assertEqual(66, exp_gas(Big, 1, cancun)),
+    %% And the exponent's width *is* priced: 50 more per byte, 31 more bytes.
+    ?assertEqual(66 + 50 * 31, exp_gas(2, Big, cancun)).
+
+%% EIP-160, quoted: "increase the gas cost of EXP from 10 + 10 per byte in the
+%% exponent to 10 + 50 per byte in the exponent." The boundary is Spurious Dragon.
+%%
+%% **The pair is Tangerine Whistle and Spurious Dragon, not Byzantium.** Spurious
+%% Dragon activated at block 2,675,000 and Byzantium at 4,370,000, so Byzantium is
+%% *after* it and already costs 50. Sampling "an old fork and a new fork" lands on a
+%% pair that straddles nothing: the first sample here was `byzantium' against
+%% `cancun', both post-SD, both 66, and the gate looked broken when it was working.
+%% A number that does not move across a boundary is measuring the wrong side of it.
+exp_costs_ten_per_byte_before_spurious_dragon_and_fifty_from_it_test_() ->
+    {timeout, 30, fun exp_costs_ten_per_byte_before_spurious_dragon_and_fifty_from_it/0}.
+
+exp_costs_ten_per_byte_before_spurious_dragon_and_fifty_from_it() ->
+    [?assertEqual(26, exp_gas(2, 3, F))
+     || F <- [frontier, homestead, tangerine]],
+    [?assertEqual(66, exp_gas(2, 3, F))
+     || F <- [spurious_dragon, byzantium, istanbul, cancun]],
+    %% 40 is the whole of EIP-160, and it is 40 rather than a ratio.
+    ?assertEqual(40, exp_gas(2, 3, cancun) - exp_gas(2, 3, homestead)).
+
+%% An exponent of zero measures zero bytes, because `eth_word:to_bytes/1' is the
+%% minimal big-endian encoding and maps 0 to `<<>>'. The old rule priced
+%% `max(base, exponent)', so a program whose base and exponent were both zero paid
+%% for nothing twice over -- and one whose base was 32 bytes and whose exponent was
+%% zero paid 1,550 for a single PUSH32.
+%% Same `{timeout, 30, fun .../0}' shape as the three above it, which is not
+%% decoration: written as a bare `_test_' with its assertions inline, this eunit
+%% rejects the generator with "result ... is not a test" and reports the atom `ok'
+%% it was handed. A generator that runs the interpreter wants a timeout like any
+%% other.
+an_exponent_of_zero_costs_only_the_flat_price_test_() ->
+    {timeout, 30, fun an_exponent_of_zero_costs_only_the_flat_price/0}.
+
+an_exponent_of_zero_costs_only_the_flat_price() ->
+    ?assertEqual(3 + 3 + 10, exp_gas(0, 0, cancun)),
+    ?assertEqual(3 + 3 + 10,
+                 exp_gas(16#7F00000000000000000000000000000000000000000000000000000000000000,
+                         0, cancun)).
+
+%% `<push base> <push exponent> EXP STOP', and nothing else. No state is touched,
+%% so nothing here can reach an upstream fetch -- `with_ctx/1' is not ceremony
+%% around this test but the only thing standing between a hand-built state and a
+%% live RPC call four frames below the opcode.
+exp_gas(Base, Exponent, Fork) ->
+    ?GAS - exp_gas_left(Base, Exponent, Fork).
+
+exp_gas_left(Base, Exponent, Fork) ->
+    Code = iolist_to_binary([exp_push(Exponent), exp_push(Base), <<16#0A, 16#00>>]),
+    {ok, _Out, GasLeft, _St2, []} =
+        eth_evm:run(Code, exp_msg(), eth_state:new(0, #{}), #{fork => Fork}, ?GAS),
+    GasLeft.
+
+%% The word EXP left on the stack, read back out through memory.
+exp_result(Base, Exponent, Fork) ->
+    Code = iolist_to_binary([exp_push(Exponent), exp_push(Base), <<16#0A>>,
+                             <<16#60, 0, 16#52, 16#60, 32, 16#60, 0, 16#F3>>]),
+    {ok, Out, _Gas, _St2, []} =
+        eth_evm:run(Code, exp_msg(), eth_state:new(0, #{}), #{fork => Fork}, ?GAS),
+    ?assertEqual(32, byte_size(Out)),
+    binary:decode_unsigned(Out).
+
+%% `?MSG0#{...}' is "expression updates a literal" and does not compile -- a macro
+%% is not a variable to update. Bind it first.
+exp_msg() ->
+    Base = ?MSG0,
+    Base#{address => <<0:160>>, caller => <<0:160>>, origin => <<0:160>>,
+          value => 0, static => false}.
+
+%% **Push order is the whole of EXP, and it is `exponent, base` -- the exponent
+%% FIRST.** `push/1' conses, so the *second* push is what EXP pops first, and EXP's
+%% first pop is the base. Measured on geth 1.17.7, all eight rows:
+%%
+%%     PUSH1 2,  PUSH1 3,  EXP  -> 9        3 ** 2
+%%     PUSH1 3,  PUSH1 2,  EXP  -> 8        2 ** 3
+%%     PUSH1 10, PUSH1 3,  EXP  -> 59049    3 ** 10
+%%     PUSH1 3,  PUSH1 10, EXP  -> 1000     10 ** 3
+%%     PUSH1 7,  PUSH1 4,  EXP  -> 16384    4 ** 7
+%%     PUSH1 4,  PUSH1 7,  EXP  -> 2401     7 ** 4
+%%     PUSH1 5,  PUSH1 0,  EXP  -> 0        0 ** 5
+%%     PUSH1 0,  PUSH1 5,  EXP  -> 1        5 ** 0
+%%
+%% Read the middle two columns as a pair and the rule is one sentence: **the result
+%% is the second push raised to the first.** The last two rows are in the table
+%% because they are the ones that separate "base" from "exponent" -- 0 ** 5 = 0 and
+%% 5 ** 0 = 1, so a node that had them the other way round would answer 1 where the
+%% chain answers 0, on a one-byte program.
+%%
+%% `PUSH1' for a small word, `PUSH32' for one that needs the full width. The width
+%% matters and is the point: a 32-byte base pushed with `PUSH1' would be a different
+%% program, and the whole claim is that the base's width never reaches the price.
+exp_push(W) when W < 256 -> <<16#60, W>>;
+exp_push(W) -> <<16#7F, W:256>>.

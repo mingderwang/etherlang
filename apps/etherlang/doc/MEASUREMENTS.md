@@ -1443,3 +1443,119 @@ behavioural change per commit, and each step says what it now does.
    consensus path to match a document rather than to match a result, which is the
    mirror image of the fabricated clause in item 6a. If it is ever changed it should
    be changed because a *fixture* demands it.
+---
+
+## 2026-10-04 — `evm run` as an oracle: EXP's operand order, and four defects
+
+**Scope.** One opcode. Measured against `evm run` from **geth 1.17.7**, installed from
+the Homebrew `ethereum` bottle — which ships **`evm` as well as `geth`**, so the oracle
+is a single `brew install`. Not a conformance figure and not comparable to any other
+number in this file; it is the measurement behind `RELEASE-GATE.md`'s D-8 and
+`TASKS.md`'s F8.
+
+### The measurement
+
+`evm run <code>` needs no signed transaction, no prestate and no fixture, which is why
+it worked on the first attempt where `evm t8n` did not work at all. Each row is a
+program, the two columns say what was pushed and in which order, and the last column
+names the arithmetic the result is:
+
+| program | first PUSH | second PUSH | result | equals |
+|---|---|---|---|---|
+| `PUSH1 2,  PUSH1 3,  EXP` | 2 | 3 | 9 | 3 ** 2 |
+| `PUSH1 3,  PUSH1 2,  EXP` | 3 | 2 | 8 | 2 ** 3 |
+| `PUSH1 10, PUSH1 3,  EXP` | 10 | 3 | 59049 | 3 ** 10 |
+| `PUSH1 3,  PUSH1 10, EXP` | 3 | 10 | 1000 | 10 ** 3 |
+| `PUSH1 7,  PUSH1 4,  EXP` | 7 | 4 | 16384 | 4 ** 7 |
+| `PUSH1 4,  PUSH1 7,  EXP` | 4 | 7 | 2401 | 7 ** 4 |
+| `PUSH1 5,  PUSH1 0,  EXP` | 5 | 0 | 0 | 0 ** 5 |
+| `PUSH1 0,  PUSH1 5,  EXP` | 0 | 5 | 1 | 5 ** 0 |
+
+**All eight rows: the result is the second push raised to the first.** `push/1` conses,
+so the operand pushed *last* is the one `EXP` pops first, and `EXP`'s first pop is the
+base. A program computing `Base ** Exponent` therefore pushes the exponent **first**.
+
+The last two rows are the ones that separate the two readings, and they separate them on
+a **two-byte program** with no gas figures and no large operands — `0 ** 5 = 0` and
+`5 ** 0 = 1`. Every non-zero row above is symmetric-looking, which is the hazard: `2 ** 3`
+and `3 ** 2` differ, but noticing *which way round* takes the arithmetic, and that is
+exactly the reasoning the measurement replaces.
+
+### What the node measured, per fork
+
+Program shape `<push base> <push exponent> EXP STOP`, no state touched, so nothing could
+reach an upstream fetch. `code` is the measured `gasUsed` minus the 21,000 intrinsic.
+
+| fork | base 1B, exp 1B | base 32B, exp 1B | base 1B, exp 32B | base 1B, exp 0 |
+|---|---|---|---|---|
+| frontier | 26 | — | — | — |
+| homestead | 26 | — | — | — |
+| tangerine | 26 | — | — | — |
+| spurious_dragon | 66 | — | — | — |
+| byzantium | 66 | — | — | — |
+| istanbul | 66 | — | — | — |
+| cancun | 66 | **66** | **1616** | **16** |
+
+Derived independently and agreeing in all five populated cells:
+`3 + 3 (two PUSH1) + 10 (EXP's flat cost) + per-byte * width(exponent)`, with
+`per-byte` = 10 before Spurious Dragon and 50 from it — EIP-160, *"increase the gas cost
+of EXP from 10 + 10 per byte in the exponent to 10 + 50 per byte in the exponent."*
+
+**The fork boundary is Tangerine Whistle / Spurious Dragon, not Byzantium / Cancun.**
+Spurious Dragon activated at block 2,675,000 and Byzantium at 4,370,000, so Byzantium is
+*after* it and already costs 50. The first sweep taken was `byzantium` against `cancun`:
+both arms 66, and a working gate read as broken. **A number that does not move across a
+boundary is measuring the wrong side of it.**
+
+The three cancun-only columns are the base-width control. `base 32B, exp 1B` costs exactly
+what `base 1B, exp 1B` costs, and `base 1B, exp 32B` costs 1,550 more. Under the old rule
+(`max(base, exponent)`) the first column would have been 1,616 and the second 66.
+
+### Four defects, and the recorded one was the smallest
+
+1. **the base's width was priced** — `max(byte_size(base), byte_size(exponent))`, where
+   EIP-160 measures the exponent and says nothing about the base;
+2. **the coefficient was 50 at every fork** — before Spurious Dragon it is 10;
+3. **the flat 10 was charged twice** — once by the interpreter loop, from
+   `constant_cost/2 -> base_gas_cost(16#0A, _, _) -> 10`, and once by the handler's own
+   literal;
+4. **the comment cited EIP-2565**, which is MODEXP's repricing — opcode `0xf0`, and its
+   cost genuinely *is* a product of a base's and an exponent's widths.
+
+(4) is why (1) read as deliberate rather than wrong. **A wrong citation is a defect that
+hides behind its own plausibility:** the EIP named a product of two widths, the code took
+a product of two widths, and nothing in the file invited the question.
+
+### A regression introduced and reverted, and the shape of it
+
+The operand order **was correct** and was broken here. The Yellow Paper was read from
+memory as `mu_s[0]` being the exponent; the two pops were swapped; and the swap was then
+"confirmed" with a probe **run against the tree just edited** — so the probe measured the
+edit rather than the interpreter. Reverted once the oracle was asked directly, which it
+could have been from the start and in one command.
+
+**A measurement taken against a tree you have just changed is a measurement of your
+change.** And the ordering that follows is the part worth keeping: **for anything a second
+implementation can answer, ask it before editing.**
+
+### The harness that did not work, and why that is recorded here
+
+`evm t8n` never ran. It requires a **signed** transaction, and four separate fixture
+defects each produced the same **empty output**:
+
+- the signature's preimage named a **different `to`** than the emitted transaction, so
+  geth recovered a *different sender* than the funded one;
+- `"v": "0x37"` written with `~p` (decimal 37) in a **hex** field, giving
+  `invalid chain id for signer: have 10 want 1`;
+- the **code was on the sender**, refused with `sender not an eoa`;
+- a **mixed-case** alloc key is a different account to the trie.
+
+**So the cross-fork gas figures above are pinned against EIP-160's text and by test, not
+against a second implementation.** The asymmetry is the trap: a working fixture that
+finds *nothing* is reported, and a broken fixture that finds *nothing* is silently
+believed. When an instrument returns empty on a rule you have just written, **the
+instrument is the suspect before the rule is** — and the way to tell them apart is to make
+it return non-empty on something known.
+
+D-13 (no differential, Hive or fuzz harness) is where this belongs, and this is a
+measured instance of it rather than a reason to close it.

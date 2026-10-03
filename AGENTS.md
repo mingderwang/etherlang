@@ -112,8 +112,8 @@ depends on execution order, suspect the build before you suspect the code.
 
 ## 3. Architecture
 
-48 modules in `apps/etherlang/src` (14,103 lines of code), 61 test modules in
-`apps/etherlang/test` (13,825), and 962 eunit tests. **These counts drift and this
+48 modules in `apps/etherlang/src` (14,110 lines of code), 61 test modules in
+`apps/etherlang/test` (13,878), and 966 eunit tests. **These counts drift and this
 one had drifted** -- it said 47 and 44 for several commits after it stopped being
 true, which is the same defect as a stale conformance figure: a number in the
 architecture section that a reader will use as a measure of size and that no longer
@@ -1430,6 +1430,82 @@ outage, so the list only grows.
     `v1.61`'s "a tally is not a work list" reached from the other side: there the
     instrument measured the wrong quantity, here it measured the right quantity on
     the wrong axis.
+
+- **An oracle answers the question you ask it, and the question is the easy part to get
+  wrong. Install one before you edit, not after.** `geth` 1.17.7 came from the Homebrew
+  `ethereum` bottle — which ships **`evm` as well as `geth`**, so `evm run` and `evm t8n`
+  are both there — and one invocation settled in a minute what four rounds of reading had
+  got backwards. `PUSH1 2, PUSH1 3, EXP` returns **9**, not 8: `push/1` conses, so the
+  operand pushed *last* is what `EXP` pops first, and that is the base. A program computing
+  `Base ** Exponent` therefore pushes the exponent **first**, which is the opposite of what
+  the handler's own variable names invite a reader to assume. Eight programs agree, and the
+  pair that actually separates the two readings is `PUSH1 5, PUSH1 0, EXP -> 0` against
+  `PUSH1 0, PUSH1 5, EXP -> 1` — a two-byte program, no gas figures, no large operands.
+  - **And the "confirmation" was circular.** The Yellow Paper was misremembered as
+    `mu_s[0]` being the exponent, the pops were swapped, and the swap was then verified by
+    a probe — **run against the tree I had just edited**, so it measured my own change.
+    The general form is already in this section as "a test that asserts a defect and argues
+    for it", and it has a sharper twin: **a measurement taken against a tree you have just
+    changed is a measurement of your change.** A probe is only evidence about the code that
+    was there before you touched it.
+  - **The rule that follows is about ordering, not about care:** for anything a second
+    implementation can answer, **ask it before editing**. The cost of asking is one command
+    and the cost of not asking here was a regression introduced into correct code, defended
+    by a measurement that agreed with it.
+
+- **A wrong EIP citation is a defect that hides behind its own plausibility, and it is the
+  cheapest defect in this repository to ship.** `EXP`'s gas comment cited **EIP-2565**, which
+  is MODEXP's repricing — opcode 0xf0, a different instruction whose cost genuinely *is* a
+  product of a base's and an exponent's widths. The code read `max(byte_size(base),
+  byte_size(exponent))`. EIP named a product of two widths, the code took a product of two
+  widths, and **nothing in the file invited the question.** The real rule is **EIP-160**,
+  which measures the exponent and says nothing about the base: *"increase the gas cost of
+  EXP from 10 + 10 per byte in the exponent to 10 + 50 per byte in the exponent."* A 32-byte
+  base with an exponent of 0 was being charged 1,550 gas for nothing.
+  - The general form: **a citation is an assertion about where a rule came from, and a
+    plausible-looking rule under a plausible-looking citation needs no further reading.**
+    Compare "a specification rewritten into a nesting", where the rewrite was *more
+    elaborate* than the original. Here the rewrite is not more elaborate — it is exactly as
+    elaborate as a real rule in a neighbouring opcode, which is why it survived review and
+    review again.
+  - **The cheap guard is to fetch the cited EIP, not the correct one.** Asking "is EIP-2565
+    really this?" is one web fetch and settles it. Asking "which EIP is this?" from memory
+    is what produced the defect in the first place.
+
+- **A fork boundary is not "an old fork and a new fork", and a sample that straddles
+  nothing looks exactly like a rule that does nothing.** Spurious Dragon is block 2,675,000
+  and Byzantium is 4,370,000, so **Byzantium is after it** and already costs EIP-160's
+  post-SD price. The first fork sweep was `byzantium` against `cancun`: both arms 66, and a
+  working gate looked broken. The pair that straddles the rule is **Tangerine Whistle and
+  Spurious Dragon** — 26 against 66, a difference of exactly 40, which is the whole of the
+  EIP. This is "a figure that does not move across a boundary is measuring the wrapper"
+  reached from the fixture side: **the sample has to be chosen from the rule's own
+  activation numbers, and `eth_fork_schedule' holds them, so the choice is derivable rather
+  than guessed.**
+
+- **Four different fixture defects, one symptom: empty output.** `evm t8n` never ran, and it
+  is worth listing because *every* failure printed the same thing.
+  - It requires a **signed** transaction — a bare `{from, to, gas, …}` is rejected with
+    `missing required field 'r'`.
+  - The signature's preimage named a **different `to`** than the emitted transaction, so
+    geth recovered a *different sender* than the one that had been funded.
+  - `"v": "0x37"` written with `~p` (decimal 37) in a **hex** field, so the chain id came out
+    as 10 and the message was `invalid chain id for signer: have 10 want 1`.
+  - The **code was on the sender**, which geth refuses with `sender not an eoa`.
+  - A **mixed-case** alloc key is a different account to the trie, so a funded address read
+    as unfunded.
+  - **The general form is §5's "a test must never perform a lazy upstream fetch" with the
+    sign flipped: a broken fixture and an absent measurement are the same output.** And the
+    asymmetry is the trap — *a working fixture that finds nothing* is reported, and *a
+    broken fixture that finds nothing* is silently believed. When an instrument returns
+    empty on a rule you have just written, **the instrument is the suspect before the rule
+    is**, and the way to tell them apart is to make it return non-empty on something known.
+    A harness that cannot produce a positive result cannot produce a negative one either.
+  - And `evm run` needs **no signature at all** and answered the operand-order question in
+    the first attempt. **Reach for the tool that needs no fixture before the one that needs
+    a correct one** — `evm run <code>` prints the returned word and `evm t8n` prints a gas
+    figure, so the cheap one covers the semantics and only the expensive one needs the
+    signature to be right.
 
 - **A message blaming one side of a comparison is a claim about the instrument, and
   this one was wrong.** Every entry of `stTimeConsuming` reports `no_comparable_gas`
