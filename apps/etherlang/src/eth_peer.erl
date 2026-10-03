@@ -17,6 +17,11 @@
 -define(FAILURE_TTL_MS, 3600000).
 -define(TRIM_SLACK, 5).
 
+%% How long the manager waits before re-probing its listen socket. `accept/2` with
+%% a zero timeout is what keeps `handle_info/2' from blocking the manager; this is
+%% only the idle re-poll. See the comment on `handle_info(accept, S)'.
+-define(ACCEPT_POLL_MS, 100).
+
 -record(st, {priv,
              node_id,
              client_id,
@@ -29,6 +34,7 @@
              interval = 10000,
              dialing = #{},
              failures = #{},
+             accepting = #{},
              pool}).
 
 start_link(Cfg) ->
@@ -157,32 +163,92 @@ handle_cast({broadcast, Hashes}, S) ->
     {noreply, S};
 handle_cast(_Msg, S) -> {noreply, S}.
 
+%% **The manager never blocks in `accept/2' or in a handshake.** Both used to.
+%%
+%% `gen_tcp:accept(S#st.lsock, 1000)' ran inside this callback, so with no
+%% connection anywhere the manager was unreachable for a one-second slice at a
+%% time, forever: measured over 20 idle calls, `status' took 798 ms to 1004 ms,
+%% median 1001 ms. `eth_sync:eth_ready_peers/1' (eth_sync.erl:454) and
+%% `eth_statesync:snap_peer/1' (eth_statesync.erl:109) both poll `eth_peer:peers/1',
+%% so that was not a theoretical stall.
+%%
+%% And `gen_server:start/3' does not return until `init/1' has acked, where
+%% `init/1' for an inbound connection is `eth_rlpx:recipient/3' with a ten-second
+%% timeout. So one TCP connection that had sent nothing at all took the manager
+%% down for ten seconds: no `dial_tick', no `DOWN' handling, no `peer_up'.
+%% Measured: unreachable at t=2.2, 4.4, 6.6 and 8.8 s, answering again only once
+%% the handshake logged its own failure.
+%%
+%% Two changes. `accept/2` is called with a **zero** timeout and the manager
+%% re-probes on a `?ACCEPT_POLL_MS' timer, so the callback returns in
+%% microseconds instead of holding the process. And the handshake is spawned the
+%% way `auto_dial/2' has always done it, which is why the conn pid comes back as a
+%% message rather than as a return value.
+%%
+%% **Why the socket stays owned by the manager.** The obvious alternative is a
+%% dedicated acceptor process, which is what `ranch' does and what removes the
+%% poll as well. It needs the acceptor to hand each socket to the conn, and
+%% `gen_tcp:controlling_process/2' may only be called by the current owner -- so
+%% the acceptor would have to spawn the conn, wait for a `gen_server:start/3' that
+%% cannot return until `init/1' has already run the handshake, and only then
+%% transfer. The bridge is possible and it is not free, and it would change who
+%% owns a peer socket. `gen_tcp:recv/3' and `send/2' do *not* require ownership
+%% (only setting `{active, ...}' does, and nothing in `eth_rlpx' sets it), so the
+%% handshake can run before the transfer below exactly as it always did. A
+%% 10-per-second poll on an idle listener is the cheap half of a fix whose
+%% expensive half is a socket-ownership change this module does not otherwise
+%% make.
+%%
+%% `{active, once}' on the listen socket is NOT the alternative, and it was tried:
+%% it makes no difference, because `{tcp_passive, _}' is the re-arm message for
+%% an *established* socket. Measured on OTP 29 -- `{active, once}', `{active, 1}'
+%% and `{active, true}' on a `gen_tcp:listen/2' socket each delivered no message
+%% at all while a client connected and `accept/2' succeeded. Adopting it would have
+%% produced a node that never accepts an inbound connection and reports itself
+%% perfectly responsive.
 handle_info(accept, S) ->
-    case gen_tcp:accept(S#st.lsock, 1000) of
+    case gen_tcp:accept(S#st.lsock, 0) of
         {ok, Sock} ->
-            case eth_peer_conn:start_recipient_unlinked(self(), Sock, conn_args(S, undefined)) of
-                {ok, Pid} ->
-                    %% Hand the socket to the conn: the acceptor (us) must
-                    %% not own peer sockets, and a short-lived owner would
-                    %% take the socket down with it on exit.
-                    ok = gen_tcp:controlling_process(Sock, Pid),
-                    Ref = monitor(process, Pid),
-                    Peers = (S#st.peers)#{Pid => #{ref => Ref}},
-                    self() ! accept,
-                    {noreply, S#st{peers = Peers}};
-                {error, _} ->
-                    (try gen_tcp:close(Sock) catch _:_ -> ok end),
-                    self() ! accept,
-                    {noreply, S}
-            end;
-        {error, timeout} ->
+            Manager = self(),
+            Args = conn_args(S, undefined),
+            Ref = make_ref(),
+            {_, Mon} =
+                spawn_monitor(
+                  fun() ->
+                      Manager ! {accepted, Ref,
+                                 eth_peer_conn:start_recipient_unlinked(
+                                   Manager, Sock, Args)}
+                  end),
             self() ! accept,
+            {noreply, S#st{accepting = (S#st.accepting)#{Ref => {Mon, Sock}}}};
+        {error, timeout} ->
+            erlang:send_after(?ACCEPT_POLL_MS, self(), accept),
             {noreply, S};
         {error, closed} ->
             {stop, listener_closed, S};
         {error, Reason} ->
             logger:warning("etherlang: rlpx accept failed (~p)", [Reason]),
-            self() ! accept,
+            erlang:send_after(?ACCEPT_POLL_MS, self(), accept),
+            {noreply, S}
+    end;
+handle_info({accepted, Ref, Res}, S) ->
+    case maps:take(Ref, S#st.accepting) of
+        {{Mon, Sock}, Accepting} ->
+            _ = demonitor(Mon, [flush]),
+            case Res of
+                {ok, Pid} ->
+                    %% Hand the socket to the conn: the acceptor (us) must not
+                    %% own peer sockets, and a short-lived owner would take the
+                    %% socket down with it on exit.
+                    ok = gen_tcp:controlling_process(Sock, Pid),
+                    MRef = monitor(process, Pid),
+                    {noreply, S#st{accepting = Accepting,
+                                   peers = (S#st.peers)#{Pid => #{ref => MRef}}}};
+                {error, _} ->
+                    (try gen_tcp:close(Sock) catch _:_ -> ok end),
+                    {noreply, S#st{accepting = Accepting}}
+            end;
+        error ->
             {noreply, S}
     end;
 handle_info({peer_up, Pid, RemoteID, Hello}, S) ->

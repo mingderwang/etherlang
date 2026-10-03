@@ -91,3 +91,113 @@ pair(Blocks) ->
     [{eth_hex:decode(maps:get(<<"number">>, B)), B, true} || B <- Blocks].
 
 stop(Name) -> (try gen_server:stop(Name) catch _:_ -> ok end).
+
+%% ---------------------------------------------------------------------------
+%% D-15: an inbound connection that stalls in the handshake must not stall the
+%% peer manager
+%% ---------------------------------------------------------------------------
+%%
+%% `handle_info(accept, S)' called `eth_peer_conn:start_recipient_unlinked/3'
+%% inline, and `gen_server:start/3' does not return until `init/1' has acked --
+%% so the manager sat inside `eth_rlpx:recipient/3' for its full ten-second
+%% timeout. One TCP connection that sent nothing at all took the manager with it:
+%% no `dial_tick', no `DOWN' handling, no `peer_up', and `eth_peer:peers/0' --
+%% which `eth_sync:eth_ready_peers/1' and `eth_statesync:snap_peer/1' both poll --
+%% blocked behind it.
+%%
+%% **The tell is the number.** A blocking `gen_tcp:accept/2' answers within its own
+%% one-second timeout, so "the manager is slow" is not the claim. "The manager is
+%% unreachable for longer than any accept timeout it has" is, and 3 s sits
+%% comfortably outside one second and inside the handshake's ten.
+%%
+%% Measured on the unfixed tree: `timed_out' at t=2.2, 4.4, 6.6 and 8.8 s, with
+%% `rlpx inbound handshake failed (timeout)' logged at t≈11 s -- the manager
+%% answering again only once that landed.
+%%
+%% The teardown is a hard kill **because the failure mode is a process that cannot
+%% be stopped politely**. `gen_server:stop/1' goes through `sys:send_system_msg'
+%% with a five-second timeout, and against a manager that is by construction stuck
+%% in `init/1' it times out too -- so the first version of this test was *cancelled*
+%% in cleanup rather than failing on its assertion, which is a worse report of the
+%% same fact.
+inbound_handshake_does_not_block_the_peer_manager_test_() ->
+    {timeout, 60, fun inbound_handshake_does_not_block_the_peer_manager/0}.
+
+inbound_handshake_does_not_block_the_peer_manager() ->
+    Priv = eth_secp256k1:generate_key(),
+    Cfg = #{name => d15_peer, port => 0, privkey => Priv,
+            target => 0, interval => 60000},
+    {ok, Pid} = eth_peer:start_link(Cfg),
+    %% The link is not what this test is about, and keeping it would mean the hard
+    %% kill in the teardown takes the test process down with the manager -- which
+    %% reads as "unexpected termination" rather than as the assertion it is.
+    unlink(Pid),
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, d15_port(Pid),
+                                 [binary, {active, false}], 2000),
+    try
+        timer:sleep(500),
+        ?assertEqual(answered, d15_ask(Pid, status, 3000)),
+        %% And again, so one fast answer is not mistaken for a fix.
+        ?assertEqual(answered, d15_ask(Pid, status, 3000))
+    after
+        (try gen_tcp:close(Sock) catch _:_ -> ok end),
+        (try gen_server:stop(Pid, kill, 1000) catch _:_ -> ok end)
+    end.
+
+d15_port(Pid) -> maps:get(port, gen_server:call(Pid, status, 2000)).
+
+d15_ask(Pid, Req, Timeout) ->
+    try gen_server:call(Pid, Req, Timeout) of
+        _ -> answered
+    catch
+        exit:{timeout, _} -> timed_out
+    end.
+
+%% ---------------------------------------------------------------------------
+%% D-15 (second half): a peer manager with no connections at all answers at once
+%% ---------------------------------------------------------------------------
+%%
+%% The other half of the same defect, and the half that is *always* present. The
+%% fixed `handle_info(accept, S)' used to call `gen_tcp:accept(S#st.lsock, 1000)',
+%% so with nothing connecting the manager sat inside that call for a one-second
+%% slice at a time, forever, and every other message -- including a
+%% `gen_server:call' -- waited behind the current slice.
+%%
+%% Measured on the unfixed tree over 20 idle calls: **798 ms min, 1001 ms median,
+%% 1004 ms max**. After the fix: **1 us min, 2 us median, 67 us max**. The two
+%% ranges do not come close, which is what lets the threshold below be a
+%% separator rather than a tolerance -- and it is also why this is worth a test
+%% rather than a note: nothing about a node with no peers looks slow until you
+%% time a call on it.
+%%
+%% 300 ms sits below the unfixed *minimum* (798 ms) and far above the fixed
+%% maximum (67 us), so the assertion separates the two behaviours with room on
+%% both sides rather than racing a load spike. It is checked against **every**
+%% call, not the median, because the old behaviour was a slice boundary rather
+%% than a constant delay: a single lucky call is not evidence of a fix.
+%%
+%% This is the production path, not a mock: `eth_sync:eth_ready_peers/1'
+%% (eth_sync.erl:454) and `eth_statesync:snap_peer/1' (eth_statesync.erl:109) both
+%% poll `eth_peer:peers/1', which is one `gen_server:call' into this process.
+-define(IDLE_BUDGET_MS, 300).
+
+with_no_connections_the_peer_manager_answers_every_call_test_() ->
+    {timeout, 60, fun with_no_connections_the_peer_manager_answers_every_call/0}.
+
+with_no_connections_the_peer_manager_answers_every_call() ->
+    Priv = eth_secp256k1:generate_key(),
+    {ok, Pid} = eth_peer:start_link(#{name => d15_idle, port => 0, privkey => Priv,
+                                      target => 0, interval => 60000}),
+    unlink(Pid),
+    try
+        timer:sleep(200),
+        Times = [d15_time_a_call(Pid) || _ <- lists:seq(1, 20)],
+        ?assertEqual([], [T || T <- Times, T >= ?IDLE_BUDGET_MS])
+    after
+        (try gen_server:stop(Pid, kill, 1000) catch _:_ -> ok end)
+    end.
+
+d15_time_a_call(Pid) ->
+    T0 = erlang:monotonic_time(millisecond),
+    _ = gen_server:call(Pid, status, 5000),
+    erlang:monotonic_time(millisecond) - T0.

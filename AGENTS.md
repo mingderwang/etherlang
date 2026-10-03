@@ -94,8 +94,8 @@ depends on execution order, suspect the build before you suspect the code.
 
 ## 3. Architecture
 
-50 modules in `apps/etherlang/src` (14,193 lines of code), 60 test modules in
-`apps/etherlang/test` (13,492), and 944 eunit tests. **These counts drift and this
+50 modules in `apps/etherlang/src` (14,212 lines of code), 60 test modules in
+`apps/etherlang/test` (13,536), and 946 eunit tests. **These counts drift and this
 one had drifted** -- it said 47 and 44 for several commits after it stopped being
 true, which is the same defect as a stale conformance figure: a number in the
 architecture section that a reader will use as a measure of size and that no longer
