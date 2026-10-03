@@ -9,7 +9,7 @@ the checking. That is the failure this repository has already paid for in prose
 the tri-state exists.
 
 **Current state: this node would not pass its own gate.** Tier 0.4 is red, Tier 1 is
-five of six `ABSENT`, and fourteen deviations are open. The sections below record that
+five of six `ABSENT`, and thirteen deviations are open. The sections below record that
 rather than rounding it up.
 
 ---
@@ -96,7 +96,7 @@ A release may raise a floor. Lowering one is a release-blocker in its own right.
 | 2.2 | full-corpus state match rate | ≥ previous release | **not run since `v1.55`.** Last recorded: 6,786 of 15,660 on the 229 non-`static` files (43.3%), pre-dating the blob-fee, refund-cap, authorization-refund and delegation work. The 25-file subset and the full corpus disagree by ~52 points, so a release that quotes only the subset is quoting the easy 2% |
 | 2.3 | both figures recorded, with their directories | mandatory | **GREEN** — TASKS.md header and `apps/etherlang/doc/MEASUREMENTS.md` |
 | 2.4 | test count | ≥ previous release | **952** (`make counts`: 50 src modules / 14,235 lines, 61 test modules / 13,753 lines) |
-| 2.5 | every consensus constant | derived-and-pinned, or documented-as-a-gap | review — **14 open, all in §"Known deviations"** |
+| 2.5 | every consensus constant | derived-and-pinned, or documented-as-a-gap | review — **13 open, all in §"Known deviations"** |
 | 2.6 | every new test shown to bite | defect injected, test watched fail, restored, `touch` | review |
 
 ### What the 255 hides
