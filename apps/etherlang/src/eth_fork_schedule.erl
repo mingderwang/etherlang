@@ -59,6 +59,7 @@
           access_cost/3,
           call_cost/3,
           refund_cap/2,
+          selfdestruct_access_cost/2,
           selfdestruct_deletes/1,
           sstore_cost/4,
           sstore_sentry/1,
@@ -1638,7 +1639,46 @@ call_cost(_Op, _Fork, _Args) ->
     0.
 
 account_creation_cost(_Fork) -> 32000.
+
+%% SELFDESTRUCT's base price, at every fork. EIP-2929's extra term lives in
+%% `selfdestruct_access_cost/2' below, because it is the one price that cannot be
+%% decided without knowing whether the beneficiary is warm.
 selfdestruct_cost(_Fork) -> 5000.
+
+%% **EIP-2929's SELFDESTRUCT term, in the EIP's own words:**
+%%
+%%   "If the ETH recipient of a SELFDESTRUCT is not in accessed_addresses
+%%    (regardless of whether or not the amount sent is nonzero), charge an
+%%    additional COLD_ACCOUNT_ACCESS_COST on top of the existing gas costs, and
+%%    add the ETH recipient to the set."
+%%
+%%   "Note: SELFDESTRUCT does not charge a WARM_STORAGE_READ_COST in case the
+%%    recipient is already warm, which differs from how the other call-variants
+%%    work. The reasoning behind this is to keep the changes small, a
+%%    SELFDESTRUCT already costs 5K and is a no-op if invoked more than once."
+%%
+%% **The warm figure is therefore 0, not 100**, and that is the one place in this
+%% module whose answer is not `access_cost/3'. Copying `call_cost/3''s shape here
+%% would charge 100 to every warm SELFDESTRUCT; `access_prices/1` has no `16#FF'
+%% row to produce even a correct cold figure, so a copy would fail on a function
+%% clause rather than quietly. Hence a separate function rather than another row.
+%%
+%% "regardless of whether or not the amount sent is nonzero" is load-bearing too,
+%% and is why the caller passes nothing about the value: a SELFDESTRUCT that
+%% sends nothing to a cold address is still 2600, and gating this on the transfer
+%% would make a no-op selfdestruct cheap -- which is the cheapest possible
+%% griefing primitive if it were the rule.
+-spec selfdestruct_access_cost(atom(), map()) -> non_neg_integer().
+selfdestruct_access_cost(Fork, Args) when is_atom(Fork), is_map(Args) ->
+    case at_least(Fork, berlin) of
+        false ->
+            0;
+        true ->
+            case maps:get(warm, Args, false) of
+                true -> 0;
+                false -> cold_account_access_cost()
+            end
+    end.
 
 %% ---------------------------------------------------------------------------
 %% SSTORE net metering (EIP-2200)

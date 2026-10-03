@@ -823,7 +823,19 @@ do_op(16#FF, E, Ctx) ->
             {Ben, E1} = pop(E),
             Addr = s_msg(address, Ctx, <<0:160>>),
             Beneficiary = eth_state:address(eth_word:to_bytes(Ben, 20)),
-            State = Ctx#ctx.state,
+            %% EIP-2929 charges the *beneficiary's* account access, and it is the
+            %% only price here that depends on the warm set, so it cannot be in the
+            %% loop's constant charge. Peek-then-charge, like every other
+            %% access-sensitive opcode: marking the address warm before charging is
+            %% what makes a second SELFDESTRUCT to the same beneficiary free.
+            {WarmB, Ctx1} = warm_account(Ctx, Beneficiary),
+            Access = eth_fork_schedule:selfdestruct_access_cost(
+                       Ctx#ctx.fork, #{warm => WarmB}),
+            case charge(E1, Access) of
+                oog ->
+                    oog(E1, Ctx1);
+                {ok, E2} ->
+            State = Ctx1#ctx.state,
             State1 = transfer(State, Addr, Beneficiary, eth_state:balance(State, Addr)),
             %% The balance always moves. Whether code and storage are deleted
             %% depends on the fork: before Cancun they always were, and from
@@ -831,12 +843,13 @@ do_op(16#FF, E, Ctx) ->
             %% transaction. The cost is 5000 either way, so this is a question
             %% about what the instruction destroys and not a price -- see
             %% eth_fork_schedule:selfdestruct_deletes/1.
-            State2 = case eth_fork_schedule:selfdestruct_deletes(Ctx#ctx.fork)
+            State2 = case eth_fork_schedule:selfdestruct_deletes(Ctx1#ctx.fork)
                           orelse eth_state:is_created(State1, Addr) of
                          true -> eth_state:set_destroyed(State1, Addr);
                          false -> State1
                      end,
-            {E1#e{halt = stop}, Ctx#ctx{state = State2}}
+            {E2#e{halt = stop}, Ctx1#ctx{state = State2}}
+            end
     end;
 
 do_op(Op, E, Ctx) -> unsupported({opcode, Op}, E, Ctx).

@@ -3093,3 +3093,95 @@ the_stipend_goes_to_the_child_and_is_refunded_if_unused_test() ->
     {ok, _, L1, _, _} = eth_evm:run(Code, ?MSG0, call_state(1000000, <<16#00>>),
                                     #{fork => homestead}, ?GAS),
     ?assertEqual(NoValue() + 0, ?GAS - L1).
+
+%% ---------------------------------------------------------------------------
+%% EIP-2929's SELFDESTRUCT term
+%% ---------------------------------------------------------------------------
+%%
+%% Quoted from the EIP: "If the ETH recipient of a SELFDESTRUCT is not in
+%% accessed_addresses (regardless of whether or not the amount sent is nonzero),
+%% charge an additional COLD_ACCOUNT_ACCESS_COST on top of the existing gas
+%% costs, and add the ETH recipient to the set."
+%%
+%% **The two arms run the identical program.** A cold/warm pair that differs in
+%% its own bytecode cannot attribute the difference to the warm set: any extra
+%% opcode in the warm arm is another gas term, and the arithmetic then has to
+%% exclude it. Here the *only* difference is `Msg.address`, and EIP-2929 puts
+%% `tx.to` in the warm set at transaction start, so the beneficiary is warm in
+%% one arm and cold in the other with the code held fixed.
+%%
+%% The frame holds no balance, so the transfer moves zero -- which is the EIP's
+%% own parenthetical, and the case a fix keyed on `value > 0' would get free.
+
+%% **Not `<<1:160>>`, which was the first thing tried and is the bug this comment
+%% exists to prevent.** `<<1:160>>` *is* the precompile 0x01 address, and EIP-2929
+%% puts "the set of all precompiles" in `accessed_addresses` at transaction start
+%% -- so the beneficiary was warm in **both** arms, the difference came out 0, and
+%% the failure read as "the EIP-2929 term is not being charged". It was charged; it
+%% was charged correctly to an address the specification had already declared warm.
+%% A fixture that is accidentally already-warm does not report a wrong answer, it
+%% reports no answer, which is strictly worse: the assertion `{expected, 2600},
+%% {value, 0}' is indistinguishable from a missing implementation.
+selfdestruct_beneficiary() -> <<255:160>>.
+
+selfdestruct_program() ->
+    <<16#73, (selfdestruct_beneficiary())/binary, 16#FF>>.
+
+%% **Hermetic by construction, not by a global.** The handler reads
+%% `eth_state:balance(State, Addr)' for the transfer, and the frame here holds a
+%% balance so the transfer is real. If that balance is absent from the overlay the
+%% read consults `eth_state:base_source/0', which is process-wide and defaults to
+%% `upstream' -- and the trace then points four frames below the opcode, at
+%% `eth_rpc_client:do_call/4', on a live JSON-RPC call. AGENTS.md §5 forbids that
+%% and §10a records the shape. `eth_test_util:with_ctx/1' was tried first and
+%% raised `undef' here rather than answering, which is the same failure wearing a
+%% different hat.
+%%
+%% Seeding both possible frame addresses costs one line and removes the dependency
+%% entirely: with the balance in the overlay there is nothing left to fall through,
+%% so these tests are as order-independent as any other pure arithmetic assertion.
+%% The previous global was also a *shared* one, so a test that mutated it could
+%% redirect another module's reads for the rest of the run -- which is the same
+%% hazard `with_ctx/1' exists to contain, contained here by not needing it.
+selfdestruct_gas_with_address(Fork, FrameAddr) ->
+    Base = ?MSG0,
+    Msg = Base#{address => FrameAddr, caller => <<0:160>>, origin => <<0:160>>,
+               value => 0, static => false},
+    %% Fund both addresses the frame might run as, so the transfer has something
+    %% to move and no read escapes to a base source.
+    Funded = lists:foldl(fun(A, St) -> eth_state:set_balance(St, A, 10) end,
+                         eth_state:new(0, #{}),
+                         [<<0:160>>, selfdestruct_beneficiary()]),
+    {ok, _Out, GasLeft, _St, []} =
+        eth_evm:run(selfdestruct_program(), Msg, Funded, #{fork => Fork}, ?GAS),
+    ?GAS - GasLeft.
+
+a_cold_selfdestruct_beneficiary_costs_two_thousand_six_hundred_more_test_() ->
+    {timeout, 30, fun a_cold_selfdestruct_beneficiary_costs_two_thousand_six_hundred_more/0}.
+
+a_cold_selfdestruct_beneficiary_costs_two_thousand_six_hundred_more() ->
+    Cold = selfdestruct_gas_with_address(cancun, <<0:160>>),
+    Warm = selfdestruct_gas_with_address(cancun, selfdestruct_beneficiary()),
+    ?assertEqual(2600, Cold - Warm).
+
+%% Before Berlin there is no cold-account term at all, and this pins the gate: a
+%% fix that charged 2600 everywhere would be right on every fork this node has
+%% synchronised past and wrong on half the history.
+before_berlin_selfdestruct_ignores_whether_the_beneficiary_is_warm_test() ->
+    Cold = selfdestruct_gas_with_address(istanbul, <<0:160>>),
+    Warm = selfdestruct_gas_with_address(istanbul, selfdestruct_beneficiary()),
+    ?assertEqual(0, Cold - Warm).
+
+%% The EIP's own note: "SELFDESTRUCT does not charge a WARM_STORAGE_READ_COST in
+%% case the recipient is already warm, which differs from how the other
+%% call-variants work." So the warm arm is the bare 5000 and nothing else. A copy
+%% of `call_cost/3''s shape would make this 5100, and the difference is only
+%% visible against a frame that has already touched the beneficiary.
+a_warm_selfdestruct_beneficiary_costs_exactly_five_thousand_test_() ->
+    {timeout, 30, fun a_warm_selfdestruct_beneficiary_costs_exactly_five_thousand/0}.
+
+a_warm_selfdestruct_beneficiary_costs_exactly_five_thousand() ->
+    %% PUSH20 (3) + SELFDESTRUCT (5000), with the beneficiary already warm
+    %% because it is tx.to. Nothing else -- no WARM_STORAGE_READ_COST, and no
+    %% new-account term, because the frame sends zero.
+    ?assertEqual(5003, selfdestruct_gas_with_address(cancun, selfdestruct_beneficiary())).
