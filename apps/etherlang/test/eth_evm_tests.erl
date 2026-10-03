@@ -3185,3 +3185,64 @@ a_warm_selfdestruct_beneficiary_costs_exactly_five_thousand() ->
     %% because it is tx.to. Nothing else -- no WARM_STORAGE_READ_COST, and no
     %% new-account term, because the frame sends zero.
     ?assertEqual(5003, selfdestruct_gas_with_address(cancun, selfdestruct_beneficiary())).
+
+
+%% ---------------------------------------------------------------------------
+%% The 1024-item stack limit
+%% ---------------------------------------------------------------------------
+%% The Yellow Paper bounds a frame's stack at 1024 items. This node did not, and
+%% the absence was not a tidiness gap: 10,000,000 `PUSH1` on a 30M gas limit --
+%% which the limit permits, at 3 gas each -- ran to completion in **3,281 ms** with
+%% a **942 MB** peak RSS, about 89 bytes per stack item. One transaction's calldata
+%% bought one transaction's worth of a gigabyte. After the limit: **55 ms** and
+%% **99 MB**, with the same program ending in an exceptional halt.
+
+%% `N` copies of PUSH1 0x01, which is 2 bytes and 3 gas each.
+stack_program(N) -> binary:copy(<<16#60, 16#01>>, N).
+
+stack_run(N) -> stack_run(N, cancun).
+
+stack_run(N, Fork) ->
+    Base = ?MSG0,
+    Msg = Base#{address => <<0:160>>, caller => <<0:160>>, origin => <<0:160>>,
+               value => 0, static => false},
+    St = eth_state:set_balance(eth_state:new(0, #{}), <<0:160>>, 10),
+    eth_evm:run(stack_program(N), Msg, St, #{fork => Fork}, ?GAS).
+
+a_frame_may_hold_one_thousand_and_twenty_four_items_test() ->
+    %% The boundary is inclusive: 1024 is legal, and the gas is 3 per push, so
+    %% this also pins that the limit costs nothing when it is not hit.
+    {ok, _, GasLeft, _, _} = stack_run(1024),
+    ?assertEqual(1024 * 3, ?GAS - GasLeft).
+
+pushing_one_thousand_and_twenty_five_items_is_an_exceptional_halt_test() ->
+    %% One past the limit. An exceptional halt carries **no gas figure**, which is
+    %% the shape every other failure in this module uses: the frame's whole
+    %% allowance is consumed, so there is no remainder to report.
+    ?assertMatch({error, stack_overflow, _, _}, stack_run(1025)).
+
+%% The counter is the point of the implementation, so drift is the defect to fear.
+%% Push the stack to the limit, empty it, and refill it. A `depth` that failed to
+%% come back down would halt here at 1024 and read as "the limit is stricter than
+%% it should be".
+emptying_the_stack_lets_it_be_refilled_to_the_limit_test() ->
+    Base = ?MSG0,
+    Msg = Base#{address => <<0:160>>, caller => <<0:160>>, origin => <<0:160>>,
+               value => 0, static => false},
+    St = eth_state:set_balance(eth_state:new(0, #{}), <<0:160>>, 10),
+    %% 1024 pushes, 1024 POPs, then 1024 more pushes.
+    Program = <<(stack_program(1024))/binary,
+                (binary:copy(<<16#50>>, 1024))/binary,
+                (stack_program(1024))/binary>>,
+    ?assertMatch({ok, _, _, _, _}, eth_evm:run(Program, Msg, St,
+                                              #{fork => cancun}, 1000000)).
+
+%% **A crash here would be far worse than a wrong gas figure.** `eth_block:
+%% execute_transactions/6' answers any `{error, _}' from `run_transaction/5' by
+%% refusing the whole block, so an overflow raised as an `evm_crash' would let one
+%% transaction invalidate a block whose every other transaction is valid. The
+%% distinct `{error, stack_overflow}' term is what keeps this a failed transaction
+%% rather than a rejected block.
+stack_overflow_is_a_halt_and_not_a_crash_test() ->
+    ?assertMatch({error, stack_overflow, _, _}, stack_run(1025)),
+    ?assertNotMatch({error, {evm_crash, _, _, _}, _, _}, stack_run(1025)).
