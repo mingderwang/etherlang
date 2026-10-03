@@ -33,7 +33,7 @@ with the file it sat above.
 
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
-build. OTP 29.1. Current: **50 src modules / 14,255 code lines, 61 test modules /
+build. OTP 29.1. Current: **48 src modules / 14,069 code lines, 61 test modules /
 13,780 code lines, 955 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 49 done, 33 remaining.** Counted, not asserted; re-derive
@@ -65,7 +65,7 @@ Ordered by what unblocks the most, not by severity.
 | **F8** | **`EXP` is priced on `max(base, exponent)`.** The comment cites EIP-2565, which is about ModExp; EELS charges the exponent's width only. | `eth_evm.erl:532-538`, `Cost = 10 + 50 * Widest`. | Systematic overcharge up to 50 gas/byte — `PUSH32` base with a `PUSH1 2` exponent is 1,500 gas over. The 50-per-byte figure is also applied at every fork, where Spurious Dragon changed it from 10. |
 | **F9** | **WITHDRAWN — the snappy claim was wrong.** It said snappy was enabled while never advertised, so every frame after the Hello failed against a real peer. Three separate checks say otherwise, and the first was the claim itself: **the devp2p specification makes compression unconditional after Hello at protocol version 5** ("All messages following Hello are compressed using the Snappy algorithm", EIP-706), and `?P2P_VERSION` is 5, so `snappy = true` is *correct*. `snappy` is not a capability -- geth keys it off `snappyProtocolVersion = 5` and `"snappy"` appears **0 times** in its capability lists -- so not advertising it is also correct. And `frame-size` carries the compressed length (`eth_rlpx.erl:317`), as the spec requires. **"Interoperability is broken" was never established**; it was inferred from a misreading, and no client is installed here to test against. What survives is small and is not an interop defect: `eth_snappy:compress/1` is literal-only, so it **expands** every body — measured +2 bytes on a Ping, +9 on a 400-byte one, and round-trip is correct on all nine payloads probed. Compression is safe and useless. |
 | **F10** | ~~**The txpool has no replacement rule, so two transactions with the same `(sender, nonce)` both live in the pool.**~~ **CLOSED 2026-10-03** — `insert/3` holds at most one per `(sender, nonce)`, and a strictly higher price replaces it. | `eth_txpool.erl` keyed on the transaction **hash** alone, so two transactions differing only in `gasPrice` were both admitted and both lived in the pool. **Measured over 12 runs** with a 1 gwei and a 2 gwei transaction at the same `(sender, nonce)`: the 2 gwei one won 8, the 1 gwei one won 4, **and the 2 gwei one won in exactly the 8 runs where its own hash was the larger of the two — twelve of twelve.** The fee was therefore not a weak tiebreaker, it was never consulted. `sender_pending/2` sorted on `nonce` with a `=<` comparator, true both ways for equal nonces, so the order came from `by_sender/1`'s prepending accumulator over a flatmap visited in key order — and the key is the hash. `cap_sender/2` evicted the *highest* nonce and so never resolved the conflict, and the old eviction fixture gave every transaction a fresh key, so no test could see it. A user bumping the price on a stuck transaction had a coin flip on being ignored, and the loser still occupied a per-sender and a global slot. **No price-bump threshold, deliberately:** no EIP specifies one and nothing here derives it; geth's ~10% is a mempool policy, and importing a peer's policy as a rule is what §4.2 exists to prevent. The cost of omitting it is that anyone can churn a slot by bidding one wei more, bounded by `per_sender`/`max`, and this node authors no blocks so there is nothing to gain. Three tests, each shown to bite: no replacement at all fails the two replacement tests and leaves the different-nonces control green; any price replacing fails the same two; making the rule ignore `nonce` fails all three, which is what proves the control is not vacuous. |
-| **F11** | **`eth_state_management` and `eth_block_hash_oracle` are dead code and are not listed as such.** | `grep -rn 'eth_state_management:start_link\|eth_block_hash_oracle:start('` → **0 hits**; neither is a child in `etherlang_sup.erl`. Both are in `app.src`'s `registered` list. Zero mentions in `TASKS.md` and in `AGENTS.md` §11, which is titled "Known dead code". Inside, `prune_recent/1` computes `_KeepFrom` and returns `{ok, pruned}` without pruning; `expire_state/1` computes `_ExpireAt` and returns `{ok, {expired, _}}`. | Three functions report work they did not do, to an RPC caller. `registered` claims 16 processes; four of those names are false. |
+| **F11** | ~~**`eth_state_management` and `eth_block_hash_oracle` are dead code and are not listed as such.**~~ **CLOSED 2026-10-03** — deleted, de-registered, and **three Phase 4 checkboxes re-opened**, which was the larger half of this and not what the entry said. | `grep -rn 'eth_state_management:start_link\|eth_block_hash_oracle:start('` → **0 hits**; neither was a child in `etherlang_sup.erl`. **That grep was also wrong in a way that mattered:** `eth_block_hash_oracle` has five call sites, which reads as live, but every one is inside `eth_state_management`, so the two are a **dead cluster** and searching one qualified name would have called the other live. | **The three functions that reported work they did not do, and why the modules were deleted rather than documented:** `prune_recent/1` computed `_KeepFrom`, carried `%% Prune blocks older than KeepFrom`, returned `{ok, pruned}` and pruned nothing; `expire_state/1` computed `_ExpireAt`, carried `%% Expire state older than ExpireAt`, returned `{ok, {expired, _ExpireAt}}` and expired nothing. Three RPC callers would have been told the work was done. **And `TASKS.md` had marked state pruning, state expiration and the block hash oracle `[x]` ✅ on the strength of exactly these functions** — so the ledger, not the code, was the thing that had to change. This is §11's `eth_block_builder` / `eth_engine` shape in a third place. No test referenced either module, so nothing caught it. The other four Phase 4 items are honest and remain `[x]`. |
 
 | **F12** | **PARTIALLY CLOSED 2026-10-03 — one of three terms.** ~~**`SELFDESTRUCT` charges a flat 5,000** — no cold-access term, no new-account term, no refund.~~ EIP-2929's beneficiary access term is implemented and gated on Berlin; the other two are **named, not guessed**. | `eth_fork_schedule:selfdestruct_access_cost/2` is the new term; the base 5,000 is unchanged and still charged by the machine loop. The warm case is **0**, per the EIP's explicit "does not charge a `WARM_STORAGE_READ_COST` in case the recipient is already warm, which differs from how the other call-variants work". **Still absent:** the new-account term for an empty beneficiary, and EIP-3529's pre-London 24,000 refund. Neither is derivable from anything in this tree, and §4.2 forbids inventing one. | **The corpus corroborates nothing here, and the entry previously said it did.** It claimed `eip6780_selfdestruct` at 0 of 5 "independently confirms" the defect. The tally is pinned exactly and **did not move** with this fix. That suite's committed fixture is a revert-semantics test whose transaction is a `CALL` into a pre-existing contract, so its divergence is in EIP-6780's deletion rules or in storage clearing — **not** in the price. This is §10a's "a rejected experiment's diagnosis has to be re-tested when the code it blamed changes", reached from the other side: here the *number* was right and the *story attached to it* was not, and both were recorded with the same authority. |
 | **F13** | ~~**A remote UDP sender can terminate the node.**~~ **CLOSED 2026-10-03** — one boundary per remote packet in `eth_discv4:handle_packet/4`; the malformed case is dropped and logged, and the node survives. Was: `handle_findnode/5` calls `table_closest(Tab, to_bin(Target), K)`, and `to_bin/1` answers `<<>>` for anything that is not a binary or integer — which is what a **two-element** FindNode target decodes to. `table_closest/3:190` then calls `distance(Target, Id)` unguarded, and `distance/2` is `crypto:exor/2`, which requires equal sizes. | **Proven end to end**, not inferred: with one node in the table, `table_closest(Tab, <<0:512>>, 16)` returns that node and `table_closest(Tab, <<>>, 16)` raises `badarg`; the empty table with the same bad target returns `0 node(s)`, so the table being non-empty is the whole precondition. It reaches the raise from `handle_info` at `:262` with no `try`, the child is `restart => permanent`, and the supervisor is `one_for_one` with `intensity => 5, period => 10` — so **about six packets in ten seconds take the whole application down**. Packet signature is verified before this point, which is why it survived reading: `decode_packet/1` checks the keccak of the signature, and the attacker can satisfy that cheaply. |
@@ -791,18 +791,40 @@ Recorded because the documentation claimed otherwise, and because each of these 
 - [ ] **Proposer selection** — receive proposer duties from consensus client, produce blocks when selected
 
 ## Phase 4: State Management (8 tasks)
-- [x] **State pruning** — implement archive, recent, and pruning modes
+- [ ] **State pruning** — implement archive, recent, and pruning modes.
+  **Re-opened 2026-10-03.** This was marked done and the only implementation was
+  `eth_state_management:prune_recent/1`, which computed `_KeepFrom`, carried the
+  comment `%% Prune blocks older than KeepFrom`, and returned `{ok, pruned}`. It
+  pruned nothing, and the module was never a child of `etherlang_sup` and had no
+  caller in `src/`. The module has been deleted rather than left in place, because
+  a `{ok, pruned}` that pruned nothing is a trap: it reads as the finished article.
+    - Archive mode: keep all historical states — **nothing implements this**
+    - Pruned mode: keep only recent states, prune old ones — **nothing implements this**
+    - Full mode: keep all states, prune old state tries but keep history — `prune_full/1`
+      returned `{ok, {archive, Num}}`, which is at least honest about keeping everything
   - Archive mode: keep all historical states ✅
   - Pruned mode: keep only recent states, prune old ones ✅
   - Full mode: keep all states, prune old state tries but keep history ✅
-- [x] **State expiration** — expire state older than `STATE_HISTORY` blocks (EIP-4444 client-side enforcement) ✅
+- [ ] **State expiration** — expire state older than `STATE_HISTORY` blocks
+  (EIP-4444 client-side enforcement). **Re-opened 2026-10-03.** The only
+  implementation was `eth_state_management:expire_state/1`, which computed
+  `_ExpireAt`, carried the comment `%% Expire state older than ExpireAt`, and
+  returned `{ok, {expired, _ExpireAt}}`. It expired nothing. Deleted with the
+  module.
 - [x] **History indices** — maintain history index for block hashes and receipts ✅
 - [ ] **Full state sync** — download full state from peers using snap sync protocol
   - Snap code (EIP-1189) — download account/storage ranges
   - Boundary proof verification
   - Parallel range downloads
   - State trie reconstruction from snap data
-- [x] **Block hash oracle** — maintain block hash list for `eth_getBlockByHash` and consensus ✅
+- [ ] **Block hash oracle** — maintain block hash list for `eth_getBlockByHash`
+  and consensus. **Re-opened 2026-10-03.** `eth_block_hash_oracle` was a real
+  implementation and a dead one: it is called from five places, all of them
+  inside `eth_state_management`, which nothing calls. Deleted with the module.
+  Note that `eth_chain` keeps a genuine hash and transaction index
+  (`index_txs/4`, `unindex_txs/2`, and the hash table `eth_getBlockByHash`
+  reads), so the *lookup* works — what never existed is the oracle as a
+  separate list maintained alongside the chain.
 - [x] **State trie persistence** — persist MPT to disk (DETS or ETS + snapshot files) ✅
 - [x] **Snapshot creation** — create state snapshots for fast restart ✅
   - `eth_mpt:snapshot/0` serializes the account, storage and code tables plus the root, and startup restores from it

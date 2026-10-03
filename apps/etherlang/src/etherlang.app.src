@@ -1,7 +1,14 @@
 {application, etherlang, [
     {description, "Ethereum-compatible JSON-RPC node in Erlang: gap-sync + follow from an upstream node, local EVM for eth_call, experimental discv4 discovery."},
     {vsn, "0.1.0"},
-    {registered, [etherlang_sup, eth_chain, eth_sync, eth_rpc_server, eth_discv4, eth_peer, eth_txpool, eth_statestore, eth_statesync, eth_engine, eth_engine_handler, eth_block_builder, eth_mpt, eth_block_hash_oracle, eth_state_management, eth_fork_schedule]},
+    %% Every name here is a child of etherlang_sup or started under it, and this
+    %% list is the only place that says so. It carried `eth_block_hash_oracle'
+    %% and `eth_state_management' for a long time and neither was ever a child:
+    %% nothing started them, nothing called them, and two of their functions
+    %% returned success for work they did not do. A `registered' list that names
+    %% a process which does not run is worse than no list, because it is the one
+    %% place a reader would check.
+    {registered, [etherlang_sup, eth_chain, eth_sync, eth_rpc_server, eth_discv4, eth_peer, eth_txpool, eth_statestore, eth_statesync, eth_engine, eth_engine_handler, eth_block_builder, eth_mpt, eth_fork_schedule]},
     {mod, {etherlang_app, []}},
     {applications, [kernel, stdlib, crypto, inets, ssl, ranch, cowboy, thoas]},
     {env, []},

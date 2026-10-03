@@ -94,7 +94,7 @@ depends on execution order, suspect the build before you suspect the code.
 
 ## 3. Architecture
 
-50 modules in `apps/etherlang/src` (14,255 lines of code), 61 test modules in
+48 modules in `apps/etherlang/src` (14,069 lines of code), 61 test modules in
 `apps/etherlang/test` (13,780), and 955 eunit tests. **These counts drift and this
 one had drifted** -- it said 47 and 44 for several commits after it stopped being
 true, which is the same defect as a stale conformance figure: a number in the
@@ -1427,6 +1427,34 @@ outage, so the list only grows.
     a message that has been read once and copied.**
 
 ## 11. Known dead code
+
+- `eth_state_management` and `eth_block_hash_oracle` were **deleted** 2026-10-03, and
+  the two facts that made them a hazard rather than merely dead are worth keeping.
+  Neither was ever a child of `etherlang_sup`, and `eth_state_management` had **zero**
+  callers in `src/`. `eth_block_hash_oracle` looked less dead -- it has five call sites --
+  but every one of them is inside `eth_state_management`, so it was unreachable for the
+  same reason. **A dead cluster is not two dead modules**, and a grep for one qualified
+  name would have called the second one live.
+  - The part that made deleting them better than documenting them: three of their
+    functions **reported work they did not do**. `prune_recent/1` computed `_KeepFrom`,
+    carried the comment `%% Prune blocks older than KeepFrom`, and returned
+    `{ok, pruned}`. `expire_state/1` computed `_ExpireAt`, carried `%% Expire state
+    older than ExpireAt`, and returned `{ok, {expired, _ExpireAt}}`. Neither touched a
+    store. Documenting that would not have helped, because the next reader's problem is
+    not knowing the modules exist -- it is seeing `{ok, pruned}` and concluding state
+    pruning is implemented.
+  - **Three of seven Phase 4 checkboxes in `TASKS.md` were marked `[x]` on the strength
+    of these two modules**, and are now `[ ]` again: state pruning, state expiration and
+    the block hash oracle. That is the same defect §11 already records for
+    `eth_block_builder` and `eth_engine`, in a third place, and it is the reason the
+    ledger was the thing to fix rather than the code. The other four Phase 4 items are
+    honest -- `eth_chain` really keeps a hash and transaction index, `eth_mpt` really
+    persists to DETS, and `snapshot/0`'s own comment says plainly that it is a dump of
+    the in-memory maps and not a persistent trie.
+  - They were also listed in `etherlang.app.src`'s `registered`, which claimed 16
+    processes and named 14. **A `registered` list is a claim a reader will check**, and
+    it was the one place in the tree where the claim was wrong in the direction of
+    making the node look more complete than it is.
 
 - `eth_block_builder` **is now started** and issues `payloadId`s. It was rewritten
   rather than switched on: the dead version assembled a block as a map with its own
