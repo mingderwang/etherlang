@@ -9,7 +9,7 @@ the checking. That is the failure this repository has already paid for in prose
 the tri-state exists.
 
 **Current state: this node would not pass its own gate.** Tier 0.4 is red, Tier 1 is
-five of six `ABSENT`, and thirteen deviations are open. The sections below record that
+five of six `ABSENT`, and fifteen deviations are open. The sections below record that
 rather than rounding it up.
 
 ---
@@ -52,10 +52,10 @@ The node must not be able to lie about itself. No release tag without all five.
 | # | Gate | Criterion | Command | Status |
 |---|---|---|---|---|
 | 0.1 | Builds warning-free | zero warnings; `warnings_as_errors` is set | `rebar3 compile` | **GREEN** |
-| 0.2 | Whole suite green | `Failed: 0` | `rebar3 eunit` | **GREEN** — 946 passed |
+| 0.2 | Whole suite green | `Failed: 0` | `rebar3 eunit` | **GREEN** — 949 passed |
 | 0.3 | No commitment returned as a bare value | every entry of a `Verification` map is `{verified,_} \| {unverified,_}`; no exception | review of `eth_block:finalize/1` | **GREEN** |
 | 0.4 | Every published figure has a corpus and a date | no number in README/TASKS/AGENTS without both | review | **RED** — see below |
-| 0.5 | Known deviations exist, dated, each with a measurement | no entry without all four fields | review of §"Known deviations" | **GREEN** — 13 entries |
+| 0.5 | Known deviations exist, dated, each with a measurement | no entry without all four fields | review of §"Known deviations" | **GREEN** — 15 entries |
 
 **0.4 is red.** At the time this file was written the repository carried four mutually
 unequal conformance figures: `?EXPECTED`'s 255, TASKS.md's 226 in two places, and
@@ -95,8 +95,8 @@ A release may raise a floor. Lowering one is a release-blocker in its own right.
 | 2.1 | committed-subset match rate | ≥ previous release | **255 of 266 (95.9%)** — `match` 255, `state_mismatch` 8, `fork_unreachable` 3, every other outcome 0 |
 | 2.2 | full-corpus state match rate | ≥ previous release | **not run since `v1.55`.** Last recorded: 6,786 of 15,660 on the 229 non-`static` files (43.3%), pre-dating the blob-fee, refund-cap, authorization-refund and delegation work. The 25-file subset and the full corpus disagree by ~52 points, so a release that quotes only the subset is quoting the easy 2% |
 | 2.3 | both figures recorded, with their directories | mandatory | **GREEN** — TASKS.md header and `apps/etherlang/doc/MEASUREMENTS.md` |
-| 2.4 | test count | ≥ previous release | **946** (`make counts`: 50 src modules / 14,212 lines, 60 test modules / 13,536 lines) |
-| 2.5 | every consensus constant | derived-and-pinned, or documented-as-a-gap | review — **13 open, all in §"Known deviations"** |
+| 2.4 | test count | ≥ previous release | **949** (`make counts`: 50 src modules / 14,212 lines, 61 test modules / 13,694 lines) |
+| 2.5 | every consensus constant | derived-and-pinned, or documented-as-a-gap | review — **15 open, all in §"Known deviations"** |
 | 2.6 | every new test shown to bite | defect injected, test watched fail, restored, `touch` | review |
 
 ### What the 255 hides
@@ -165,6 +165,8 @@ count is itself a gate**: two consecutive releases without reducing it blocks Ti
 | **D-13** | No differential, Hive or fuzz harness exists | whole node | 0 configurations anywhere in the tree |
 | **D-14** | ~~**A remote UDP sender can terminate the node.**~~ **CLOSED 2026-10-03** — one boundary per remote packet; dropped and logged, node survives. Was: `handle_findnode/5` → `table_closest(Tab, to_bin(Target), K)`, and `to_bin/1` answers `<<>>` for a two-element target, which `distance/2`'s `crypto:exor/2` cannot accept. | `eth_discv4.erl:300,190,401`. **Proven end to end:** a 64-byte target returns the table's node, `<<>>` raises `badarg`, and an empty table with the same bad target returns nothing. Reached from `handle_info` with no `try`; child is `permanent`; `intensity => 5, period => 10`. **≈6 packets in 10 s kills the application.** |
 | **D-15** | ~~**The peer manager is unreachable, and one inbound TCP connection makes it unreachable for ten seconds.**~~ **CLOSED 2026-10-03** — `accept/2` with a zero timeout plus a re-poll timer, and the handshake spawned the way `auto_dial/2` always did it. **This was two defects, and the second was the worse one because it was always present.** (i) `handle_info(accept, S)` called `gen_server:start/3` inline and its `init/1` runs `eth_rlpx:recipient/3`, a blocking handshake with a 10 s timeout: measured unreachable at t=2.2, 4.4, 6.6 and 8.8 s, answering only once the handshake logged its own failure. (ii) `gen_tcp:accept(S#st.lsock, 1000)` ran inside the callback, so with **no connection anywhere** the manager sat in a one-second slice at a time, forever. | `eth_peer.erl:163`. (i) No `dial_tick`, no `DOWN`, no `peer_up` for the duration, and `eth_peer:peers/0` — polled by `eth_sync.erl:454` and `eth_statesync.erl:109` — blocks behind it. (ii) Same callers, and it needed no attacker: **20 idle `status` calls measured 798 ms min / 1001 ms median / 1004 ms max**, which is a one-second stall on every poll of a node with no peers at all. After the fix: **1 µs / 2 µs / 67 µs**. The two ranges do not overlap, which is what lets the tests use 300 ms and 3 s as separators rather than tolerances. Each test bites its own half and not the other's, verified by two single-change injections. **`{active, once}` on the listen socket is not the fix and was tried:** `{tcp_passive, _}` is the re-arm message for an *established* socket; on OTP 29 `{active, once}`, `{active, 1}` and `{active, true}` on a `gen_tcp:listen/2` socket each delivered no message at all while a client connected and `accept/2` succeeded. Adopting it would have produced a node that never accepts an inbound connection and reports itself perfectly responsive. The remaining cost is a 10-per-second poll on an idle listener, kept in preference to a dedicated acceptor process because `gen_tcp:controlling_process/2` may only be called by the current owner, so an acceptor cannot hand a socket to a `gen_server:start/3` that does not return until `init/1` has already run the handshake. |
+| **D-16** | **One `NewPooledTransactionHashes` announcement stalls its own connection for ten seconds.** Carried as **F15**. `handle_msg/3`'s `Base + 8` arm requests the transactions and then blocks in `await_pooled/2` on a `eth_rlpx:recv/3` with a 10 s timeout, on the connection's own process, inside the poll handler. | **Measured**: peer answered code 25 (`GetPooledTransactions`, so the path ran); `status` timed out at 1500 ms; a second call was answered **8497 ms** later. **Severity is deliberately lower than D-15, and that difference is the finding:** D-15 blocked `eth_peer` — one process shared by every peer — so one connection took `eth_peer:peers/0` down for everybody. Here the blocked process is per-connection, so a peer can stall only its own and the manager stays answerable throughout. Pinned by `a_pooled_hash_announcement_stalls_only_its_own_connection_test`, which asserts both the blast radius and the recovery. **Open, and left so on purpose:** not fetching on an announcement drops an inbound path by which a peer chooses what enters the pool, and a shorter deadline is an invented constant. Deferred behind the fork-model decision. |
+| **D-17** | **Every inbound p2p handshake performs a live upstream JSON-RPC fetch, and waits for it.** Carried as **F17**. `maybe_eth/3` → `eth_eth:status_data/1` → `total_difficulty/0` is an uncached `eth_getBlockByNumber`. | **Measured 6059 ms and 6004 ms** on two consecutive eunit runs of a loopback peer. The same code *outside* eunit returns instantly, because the client is uninitialised and the call exits `noproc` — so **most of this suite cannot see this cost at all.** One unavailable upstream delays every inbound handshake by the full timeout, uncached. Correctness is unaffected (`?FALLBACK_TD` covers it), so this is availability, not consensus. Open, behind the same fork-model decision: whether this node computes total difficulty itself decides whether the fetch belongs here at all. |
 
 **Not deviations, recorded because they were suspected and are not.** `from_json/1`'s
 24-byte nonce is real but has no caller in `src/`. `CALLCODE` does not transfer value —
