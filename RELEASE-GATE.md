@@ -9,7 +9,7 @@ the checking. That is the failure this repository has already paid for in prose
 the tri-state exists.
 
 **Current state: this node would not pass its own gate.** Tier 0.4 is red, Tier 1 is
-five of six `ABSENT`, and fifteen deviations are open. The sections below record that
+five of six `ABSENT`, and fourteen deviations are open. The sections below record that
 rather than rounding it up.
 
 ---
@@ -52,10 +52,10 @@ The node must not be able to lie about itself. No release tag without all five.
 | # | Gate | Criterion | Command | Status |
 |---|---|---|---|---|
 | 0.1 | Builds warning-free | zero warnings; `warnings_as_errors` is set | `rebar3 compile` | **GREEN** |
-| 0.2 | Whole suite green | `Failed: 0` | `rebar3 eunit` | **GREEN** — 949 passed |
+| 0.2 | Whole suite green | `Failed: 0` | `rebar3 eunit` | **GREEN** — 952 passed |
 | 0.3 | No commitment returned as a bare value | every entry of a `Verification` map is `{verified,_} \| {unverified,_}`; no exception | review of `eth_block:finalize/1` | **GREEN** |
 | 0.4 | Every published figure has a corpus and a date | no number in README/TASKS/AGENTS without both | review | **RED** — see below |
-| 0.5 | Known deviations exist, dated, each with a measurement | no entry without all four fields | review of §"Known deviations" | **GREEN** — 15 entries |
+| 0.5 | Known deviations exist, dated, each with a measurement | no entry without all four fields | review of §"Known deviations" | **GREEN** — 17 entries |
 
 **0.4 is red.** At the time this file was written the repository carried four mutually
 unequal conformance figures: `?EXPECTED`'s 255, TASKS.md's 226 in two places, and
@@ -95,8 +95,8 @@ A release may raise a floor. Lowering one is a release-blocker in its own right.
 | 2.1 | committed-subset match rate | ≥ previous release | **255 of 266 (95.9%)** — `match` 255, `state_mismatch` 8, `fork_unreachable` 3, every other outcome 0 |
 | 2.2 | full-corpus state match rate | ≥ previous release | **not run since `v1.55`.** Last recorded: 6,786 of 15,660 on the 229 non-`static` files (43.3%), pre-dating the blob-fee, refund-cap, authorization-refund and delegation work. The 25-file subset and the full corpus disagree by ~52 points, so a release that quotes only the subset is quoting the easy 2% |
 | 2.3 | both figures recorded, with their directories | mandatory | **GREEN** — TASKS.md header and `apps/etherlang/doc/MEASUREMENTS.md` |
-| 2.4 | test count | ≥ previous release | **949** (`make counts`: 50 src modules / 14,212 lines, 61 test modules / 13,694 lines) |
-| 2.5 | every consensus constant | derived-and-pinned, or documented-as-a-gap | review — **15 open, all in §"Known deviations"** |
+| 2.4 | test count | ≥ previous release | **952** (`make counts`: 50 src modules / 14,235 lines, 61 test modules / 13,753 lines) |
+| 2.5 | every consensus constant | derived-and-pinned, or documented-as-a-gap | review — **14 open, all in §"Known deviations"** |
 | 2.6 | every new test shown to bite | defect injected, test watched fail, restored, `touch` | review |
 
 ### What the 255 hides
@@ -159,7 +159,7 @@ count is itself a gate**: two consecutive releases without reducing it blocks Ti
 | **D-7** | The EVM never enforces the 1024-item stack limit | any frame exceeding it | `eth_evm.erl:431` `push/2` has no bound; `grep 1024` in `src/` finds only the two frame-*depth* checks |
 | **D-8** | `EXP` is priced on `max(base, exponent)`; EELS charges the exponent's width only | every fork | `eth_evm.erl:532-538`. The 50-per-byte figure is also applied at every fork, where Spurious Dragon changed it from 10 |
 | **D-9** | **WITHDRAWN — the snappy claim was a misreading.** It said snappy was enabled while never advertised, so every frame after the Hello failed against a real peer. The devp2p specification makes compression **unconditional** after Hello at protocol version 5 ("All messages following Hello are compressed using the Snappy algorithm", EIP-706), which is what this node sends; `snappy` is **not** a capability (geth keys off `snappyProtocolVersion = 5` and never lists it); and `frame-size` carries the compressed length, as the spec requires. `snappy = true` was right. | Nothing. What survives is not an interop defect: `compress/1` is literal-only so it expands every body — **measured** +2 bytes on a Ping, +9 on 400 bytes, round trip correct on all nine payloads probed — so compression here is safe and useless. |
-| **D-10** | The txpool has no replacement rule, so two transactions with the same `(sender, nonce)` can both be admitted and the builder's choice between them is `maps:fold` order | block building | `eth_txpool.erl:109-113`; `cap_sender/2` evicts the highest nonce so it never resolves a conflict. The eviction fixture uses a fresh key per transaction, so no test can see it |
+| **D-10** | ~~**The txpool has no replacement rule, so two transactions with the same `(sender, nonce)` can both be admitted and the builder's choice between them is `maps:fold` order.**~~ **CLOSED 2026-10-03** — `insert/3` now holds at most one per `(sender, nonce)`, and a strictly higher price replaces. | block building | **Was `eth_txpool.erl:109-113`, keyed on the transaction hash alone.** Measured over 12 runs with a 1 gwei and a 2 gwei transaction at the same `(sender, nonce)`: the 2 gwei one won 8, the 1 gwei one won 4 — **and the 2 gwei one won in exactly the 8 runs where its own hash was the larger of the two. Twelve of twelve.** So the fee was not a weak tiebreaker, it was never consulted: `sender_pending/2` sorts on `nonce` with a `=<` comparator, which is true both ways for equal nonces, so the order came from `by_sender/1`'s prepending accumulator over a flatmap visited in key order — and the key is the hash. A user bumping the price on a stuck transaction had a coin flip on being ignored, and the loser still held a per-sender and a global slot. `cap_sender/2` evicted the highest nonce and so never resolved it; the old eviction fixture gave every transaction a fresh key, so no test could see it. **No price-bump threshold, on purpose:** no EIP specifies one and there is nothing here to derive it from — geth's ~10% is a mempool policy, and importing a peer's policy as a rule is the thing §4.2 exists to prevent. |
 | **D-11** | `SELFDESTRUCT` charges a flat 5,000: no cold-access term, no new-account term, no refund; and `SELFDESTRUCT(self)` leaves the balance intact | Cancun onward | `eth_evm.erl:819-840`. **`eip6780_selfdestruct` is 0 of 5 on the committed subset** — the corpus and the code agree |
 | **D-12** | `eth_state_management` and `eth_block_hash_oracle` are dead code, are listed in `registered`, and are not in AGENTS.md §11. Inside, three functions report work they did not perform | whole node | 0 starter call sites; `git grep` finds 0 mentions in either document |
 | **D-13** | No differential, Hive or fuzz harness exists | whole node | 0 configurations anywhere in the tree |

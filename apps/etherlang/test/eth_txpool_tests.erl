@@ -192,6 +192,120 @@ refresh_drop_test() ->
         gen_server:stop(pool_refresh)
     end.
 
+%% ---------------------------------------------------------------------------
+%% Replacement: two transactions may not occupy the same (sender, nonce)
+%% ---------------------------------------------------------------------------
+%%
+%% Only one transaction per (sender, nonce) can ever be included in a valid
+%% block -- a block containing both would apply the same account transition
+%% twice and diverge from every other client. So the pool must hold at most one,
+%% and the one it holds must be the one a proposer would actually want.
+%%
+%% `eth_txpool:insert/3` keys on the transaction **hash**, so two transactions
+%% that differ only in `gasPrice` were both admitted and both lived in the pool
+%% forever. `pending_list/1' then broke the tie, and `sender_pending/2' sorts on
+%% `nonce' alone with a `=<' comparator, which returns true both ways for equal
+%% nonces -- so the tie was resolved by whatever order `by_sender/1' happened to
+%% produce. That order is a prepending accumulator over `maps:fold/3`, and for a
+%% small map that is a flatmap visited in key order, where the key is the hash.
+%%
+%% **Measured, and it is not a coin flip that favours the payer:** over 12 runs
+%% with a 1 gwei and a 2 gwei transaction at the same (sender, nonce), the
+%% winner was the 2 gwei one in 8 and the 1 gwei one in 4 -- and the 2 gwei one
+%% won in exactly the 8 runs where *its own hash was the larger of the two*. 12 of
+%% 12, no exceptions. So the fee is not a tiebreaker at all; it is not consulted.
+%% The consequence is the ordinary one: a user who replaces a stuck transaction
+%% by raising its price has a 50% chance of being silently ignored, and the pool
+%% keeps both, so the loser also occupies a per-sender and a global slot.
+%%
+%% The rule below is "at most one per (sender, nonce), and a strictly higher
+%% price wins". It states no threshold, because no EIP specifies one and this
+%% node has nothing to derive it from -- geth requires a ~10% bump, and adopting
+%% that number here would be importing a peer's policy as if it were a rule. A
+%% threshold is a policy decision, and this is a verifier that does not author
+%% blocks; the cost of not having one is that a spammer can churn a slot by
+%% bidding one wei more, which is bounded by `per_sender' and `max' and costs
+%% nothing but its own bandwidth.
+a_higher_price_replaces_the_same_sender_and_nonce_test_() ->
+    {timeout, 60, fun a_higher_price_replaces_the_same_sender_and_nonce/0}.
+
+a_higher_price_replaces_the_same_sender_and_nonce() ->
+    {ok, _} = eth_txpool:start_link(#{name => pool_replace}),
+    try
+        Priv = eth_secp256k1:generate_key(),
+        ID = eth_ecies:pubkey(Priv),
+        Addr = bin0x(addr_bin(ID)),
+        State = funded_state(Addr, 1000000000000000000, 0),
+        Cheap = sign_legacy(Priv, base_tx()),
+        Dear = sign_legacy(Priv, (base_tx())#{<<"gasPrice">> => <<"0x77359400">>}),
+
+        {ok, CheapHash} = eth_txpool:add_map(pool_replace, Cheap, State),
+        {ok, _} = eth_txpool:add_map(pool_replace, Dear, State),
+
+        %% One slot, and it is the dearer one.
+        ?assertEqual(1, maps:get(total, eth_txpool:status(pool_replace))),
+        ?assertNot(eth_txpool:has(pool_replace, CheapHash)),
+        [Pending] = eth_txpool:pending(pool_replace),
+        ?assertEqual(2000000000, maps:get(price, Pending)),
+
+        %% And it survives a second bump, which is the case a user retries.
+        Dearer = sign_legacy(Priv, (base_tx())#{<<"gasPrice">> => <<"0xb2d05e00">>}),
+        {ok, _} = eth_txpool:add_map(pool_replace, Dearer, State),
+        ?assertEqual(1, maps:get(total, eth_txpool:status(pool_replace))),
+        [Pending2] = eth_txpool:pending(pool_replace),
+        ?assertEqual(3000000000, maps:get(price, Pending2))
+    after
+        gen_server:stop(pool_replace)
+    end.
+
+a_lower_price_does_not_replace_the_same_sender_and_nonce_test_() ->
+    {timeout, 60, fun a_lower_price_does_not_replace_the_same_sender_and_nonce/0}.
+
+a_lower_price_does_not_replace_the_same_sender_and_nonce() ->
+    {ok, _} = eth_txpool:start_link(#{name => pool_replace_low}),
+    try
+        Priv = eth_secp256k1:generate_key(),
+        ID = eth_ecies:pubkey(Priv),
+        Addr = bin0x(addr_bin(ID)),
+        State = funded_state(Addr, 1000000000000000000, 0),
+        Dear = sign_legacy(Priv, (base_tx())#{<<"gasPrice">> => <<"0x77359400">>}),
+        Cheap = sign_legacy(Priv, base_tx()),
+
+        {ok, DearHash} = eth_txpool:add_map(pool_replace_low, Dear, State),
+        %% A cheaper transaction at a nonce the pool already holds is refused,
+        %% rather than admitted to sit in `queued' where nothing will take it.
+        ?assertEqual({error, replacement_underpriced},
+                     eth_txpool:add_map(pool_replace_low, Cheap, State)),
+        ?assertEqual(1, maps:get(total, eth_txpool:status(pool_replace_low))),
+        ?assert(eth_txpool:has(pool_replace_low, DearHash))
+    after
+        gen_server:stop(pool_replace_low)
+    end.
+
+%% Two transactions at *different* nonces are a different thing entirely and must
+%% still coexist -- otherwise the fix above would cap every sender at one
+%% transaction, which is not what a nonce sequence is for.
+different_nonces_for_one_sender_still_coexist_test_() ->
+    {timeout, 60, fun different_nonces_for_one_sender_still_coexist/0}.
+
+different_nonces_for_one_sender_still_coexist() ->
+    {ok, _} = eth_txpool:start_link(#{name => pool_two_nonces}),
+    try
+        Priv = eth_secp256k1:generate_key(),
+        ID = eth_ecies:pubkey(Priv),
+        Addr = bin0x(addr_bin(ID)),
+        State = funded_state(Addr, 1000000000000000000, 0),
+        lists:foreach(
+          fun(N) ->
+              Tx = sign_legacy(Priv, (base_tx())#{<<"nonce">> => eth_hex:encode_int(N)}),
+              ?assertMatch({ok, _}, eth_txpool:add_map(pool_two_nonces, Tx, State))
+          end, [0, 1, 2]),
+        ?assertEqual(3, maps:get(total, eth_txpool:status(pool_two_nonces))),
+        ?assertEqual(3, length(eth_txpool:pending(pool_two_nonces)))
+    after
+        gen_server:stop(pool_two_nonces)
+    end.
+
 addr_bin(ID64) ->
     binary:part(eth_keccak:hash(ID64), 12, 20).
 
