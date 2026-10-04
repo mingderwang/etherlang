@@ -207,48 +207,8 @@ fork_selection_sepolia_test() ->
     ?assertEqual(cancun, fork(sepolia, 5000000, 1706655072)),
     ?assertEqual(cancun, fork(sepolia, 11779968, 1741159775)),
     ?assertEqual(prague, fork(sepolia, 11779968, 1741159776)),
-    %% **Past Prague the fork answer clamps, and the range is reported separately.**
-    %% Both halves are asserted, because either alone is misleading: `prague' on its own
-    %% reads like a correct answer for a block that is past everything modelled here.
-    ?assertEqual(prague, fork(sepolia, 11779968, 1760427360)),
-    ?assertEqual(prague, fork(sepolia, 11779968, 1791294816)),
-    ?assertEqual(false, eth_fork_schedule:past_modelled_range(sepolia, 11779968,
-                                                               1741159775)),
-    ?assertEqual(false, eth_fork_schedule:past_modelled_range(sepolia, 11779968,
-                                                               1741159776)),
-    ?assertEqual(true, eth_fork_schedule:past_modelled_range(sepolia, 11779968,
-                                                              1741159777)),
-    ?assertEqual(true, eth_fork_schedule:past_modelled_range(sepolia, 11779968,
-                                                              1791294816)),
-    ?assertEqual(true, eth_fork_schedule:past_modelled_range(mainnet, 20000000,
-                                                              1800000000)),
-    %% **A network with no schedule has nothing to be past**, so an unknown network must
-    %% not refuse every block -- the other answer would make the node unusable rather than
-    %% cautious.
-    ?assertEqual(false, eth_fork_schedule:past_modelled_range(no_such_network, 1, 1)).
-
-%% **The boundary is one second wide and it is on the side that matters.**
-%%
-%% `1741159776' is Prague's activation on Sepolia. A block *at* that timestamp is a Prague
-%% block and is in range; a block one second later is past everything this node models. An
-%% inclusive comparison at that one point would refuse the fork's first block, which is the
-%% one block whose rules the node definitely has.
-%%
-%% **This test exists because the first version of the function was `not reached(...)`,
-%% which is the whole modelled range inverted.** `reached/5' answers "has reached", so
-%% `not reached` answers "has not reached" -- true for every block *before* Prague. It
-%% refused 1,934 blocks across this suite and the count, not any single assertion, is what
-%% showed it. The tell is that a predicate answering about the far future fired on
-%% essentially every input.
-a_block_at_the_last_modelled_fork_is_in_range_and_one_second_past_is_not_test() ->
-    At = eth_fork_schedule:past_modelled_range(sepolia, 11779968, 1741159776),
-    Past = eth_fork_schedule:past_modelled_range(sepolia, 11779968, 1741159777),
-    ?assertEqual(false, At),
-    ?assertEqual(true, Past),
-    %% And the fork answer is the same on both sides, which is why the range has to be a
-    %% separate question rather than something read off the fork.
-    ?assertEqual(eth_fork_schedule:current_fork(sepolia, 11779968, 1741159776),
-                 eth_fork_schedule:current_fork(sepolia, 11779968, 1741159777)).
+    ?assertEqual(osaka, fork(sepolia, 11779968, 1760427360)),
+    ?assertEqual(amsterdam, fork(sepolia, 11779968, 1791294816)).
 
 %% ---------------------------------------------------------------------------
 %% Fork time frames: the `-38005: Unsupported fork' input
@@ -277,12 +237,13 @@ neighbouring_frames_do_not_overlap_test() ->
     %% One second earlier is still Cancun and not Prague.
     ?assertEqual(true,  F(mainnet, cancun, 1746612310)),
     ?assertEqual(false, F(mainnet, prague, 1746612310)),
-    %% Prague is the last fork modelled, so there is no successor boundary to assert:
-    %% its frame runs from its activation to the end of time, and the frame below is
-    %% half-open at its *start* rather than at a boundary with the next fork.
-    ?assertEqual(true,  F(sepolia, prague, 1741159776)),
-    ?assertEqual(false, F(sepolia, prague, 1741159775)),
-    ?assertEqual(true,  F(sepolia, prague, 99999999999)).
+    %% The same at the Osaka boundary.
+    ?assertEqual(false, F(mainnet, prague, 1764798551)),
+    ?assertEqual(true,  F(mainnet, osaka, 1764798551)),
+    %% The last timestamped fork has no successor, so its frame runs to the end of
+    %% time rather than being empty.
+    ?assertEqual(true, F(sepolia, amsterdam, 1791294816)),
+    ?assertEqual(true, F(sepolia, amsterdam, 99999999999)).
 
 %% A fork this network does not timestamp has no frame. Reporting "out of frame"
 %% for it would refuse every payload on a network that predates the fork, which
@@ -427,19 +388,8 @@ schedule_agrees_with_forkid_test() ->
     lists:foreach(fun(Network) ->
         {ForkIdBlocks, ForkIdTimes} = eth_forkid:schedule(Network),
         Schedule = eth_fork_schedule:fork_schedule(Network),
-        Times = usort([P || {time, P, _} <- Schedule]),
-        Sorted = usort(ForkIdTimes),
-        %% **A prefix, not equality.** This node models to Prague and the network has
-        %% gone further, so the two schedules are the same list up to a point and then
-        %% the network continues alone. Demanding equality would fail on the very forks
-        %% that were deliberately not modelled, and the way to say "we stop here" is to
-        %% assert *where* we stop.
-        %% This node's activations are the network's *first* `length(Times)' of them.
-        ?assertEqual(lists:sublist(Sorted, length(Times)), Times),
-        %% And the remainder is not empty -- a prefix assertion passes just as well
-        %% against a node that modelled everything, so this is what keeps the scope
-        %% decision visible in the test that would otherwise hide it.
-        ?assert(length(ForkIdTimes) > length(Times)),
+        Times = [P || {time, P, _} <- Schedule],
+        ?assertEqual(usort(Times), usort(ForkIdTimes)),
         Blocks = [P || {block, P, _} <- Schedule, P > 0],
         Expected = usort(Blocks ++ netsplit_blocks(Network)),
         ?assertEqual(Expected, usort(ForkIdBlocks))
@@ -903,7 +853,7 @@ opcode_availability_is_pinned_test() ->
 opcode_availability_only_grows_test() ->
     Forks = [frontier, homestead, dao, tangerine, spurious_dragon, byzantium,
              constantinople, petersburg, istanbul, berlin, london, merge, paris,
-             shanghai, cancun, prague],
+             shanghai, cancun, prague, osaka, amsterdam],
     Counts = [available_count(F) || F <- Forks],
     ?assertEqual(Counts, lists:sort(Counts)).
 
@@ -922,9 +872,9 @@ never_assigned_bytes_are_not_opcodes_in_any_fork_test() ->
                  lists:seq(16#A5, 16#EF) ++ lists:seq(16#F6, 16#F9) ++
                  lists:seq(16#FB, 16#FC),
     ?assertEqual(107, length(Unassigned)),
-    ?assertEqual(256, available_count(prague) + length(Unassigned)),
+    ?assertEqual(256, available_count(amsterdam) + length(Unassigned)),
     Forks = [frontier, byzantium, constantinople, istanbul, london, shanghai,
-             cancun, prague],
+             cancun, prague, osaka, amsterdam],
     [?assertEqual(false, eth_fork_schedule:opcode_exists(Op, F))
      || Op <- Unassigned, F <- Forks].
 
@@ -954,7 +904,7 @@ gated_opcodes_appear_at_their_owning_fork_test() ->
     All = [frontier, homestead, dao, tangerine, spurious_dragon, byzantium,
            constantinople, petersburg, istanbul, muir_glacier, berlin, london,
            arrow_glacier, gray_glacier, merge, paris, shanghai, cancun, deneb,
-           prague],
+           prague, osaka, bpo1, bpo2, amsterdam],
     [begin
          ?assertEqual(true, eth_fork_schedule:opcode_exists(Op, At)),
          [?assertEqual(false, eth_fork_schedule:opcode_exists(Op, Earlier))
@@ -980,7 +930,7 @@ addmod_and_mulmod_are_frontier_test() ->
 invalid_is_defined_at_every_fork_test() ->
     [?assertEqual(true, eth_fork_schedule:opcode_exists(16#FE, F))
      || F <- [frontier, byzantium, constantinople, istanbul, london, shanghai,
-               cancun, prague]].
+               cancun, prague, osaka, amsterdam]].
 
 %% A fork this module does not know is not a fork that has Cancun's instructions.
 %% fork_rank/1's catch-all ranks an unrecognised atom with `frontier', so the
@@ -1017,7 +967,7 @@ available_count(Fork) ->
 refund_cap_is_a_fifth_from_london_and_a_half_before_test() ->
     [?assertEqual(1000 div 5, eth_fork_schedule:refund_cap(F, 1000))
      || F <- [london, arrow_glacier, gray_glacier, merge, paris, shanghai, cancun,
-              prague]],
+              prague, osaka, amsterdam]],
     [?assertEqual(1000 div 2, eth_fork_schedule:refund_cap(F, 1000))
      || F <- [frontier, homestead, byzantium, constantinople, petersburg, istanbul,
               berlin, muir_glacier]],
@@ -1057,7 +1007,7 @@ selfdestruct_deletes_unconditionally_only_before_cancun_test() ->
      || F <- [frontier, homestead, byzantium, constantinople, petersburg, istanbul,
               berlin, london, paris, shanghai, merge]],
     [?assertEqual(false, eth_fork_schedule:selfdestruct_deletes(F))
-     || F <- [cancun, deneb, prague]],
+     || F <- [cancun, deneb, prague, osaka, amsterdam]],
     %% An unknown fork is pre-Cancun by `fork_rank/1''s catch-all, and the safe
     %% direction for a deletion rule is the destructive one: refusing to delete
     %% leaves storage that the chain would have removed.
@@ -1067,7 +1017,7 @@ selfdestruct_deletes_unconditionally_only_before_cancun_test() ->
 %% because the charge did not exist -- not "small", zero.
 initcode_word_cost_is_two_from_shanghai_and_nothing_before_test() ->
     [?assertEqual(2, eth_fork_schedule:initcode_word_cost(F))
-     || F <- [shanghai, cancun, prague]],
+     || F <- [shanghai, cancun, prague, osaka, amsterdam]],
     [?assertEqual(0, eth_fork_schedule:initcode_word_cost(F))
      || F <- [frontier, homestead, byzantium, constantinople, petersburg, istanbul,
               berlin, london, merge, paris]].
@@ -1222,7 +1172,7 @@ pre_berlin_access_costs_are_eip_150s_test() ->
 %% cold cost is 2100 and an account's is 2600 -- different constants, which is
 %% why they share a table with two numbers each rather than one regime.
 berlin_access_costs_are_warm_100_and_cold_per_opcode_test() ->
-    Post = [berlin, london, shanghai, cancun, prague],
+    Post = [berlin, london, shanghai, cancun, prague, osaka, amsterdam],
     Accounts = [16#31, 16#3B, 16#3C, 16#3F, 16#F1, 16#F2, 16#F4, 16#FA],
     [begin
          ?assertEqual(100, eth_fork_schedule:access_cost(Op, F, #{warm => true})),
@@ -1391,7 +1341,7 @@ sstore_refunds_accumulate_rather_than_clamp_test() ->
 %% because the sentry is EIP-2200's.
 sstore_sentry_is_2300_from_berlin_test() ->
     [?assertEqual(2300, eth_fork_schedule:sstore_sentry(F))
-     || F <- [berlin, london, shanghai, cancun, prague]],
+     || F <- [berlin, london, shanghai, cancun, prague, osaka]],
     [?assertEqual(0, eth_fork_schedule:sstore_sentry(F))
      || F <- [frontier, homestead, byzantium, constantinople, petersburg, istanbul]].
 
@@ -1477,7 +1427,8 @@ code_deposit_cost_is_two_hundred_at_every_fork_test() ->
     [?assertEqual({F, 200}, {F, eth_fork_schedule:code_deposit_cost(F)})
      || F <- [frontier, homestead, dao, tangerine, spurious_dragon, byzantium,
               constantinople, petersburg, istanbul, muir_glacier, berlin, london,
-              arrow_glacier, gray_glacier, merge, paris, shanghai, cancun, prague]],
+              arrow_glacier, gray_glacier, merge, paris, shanghai, cancun, prague,
+              osaka, amsterdam]],
     ?assertEqual(200, eth_fork_schedule:code_deposit_cost(no_such_fork)).
 
 %% EIP-170's `MAX_CODE_SIZE' is `0x6000' = 24576 and EIP-170 is Spurious Dragon, so
@@ -1489,7 +1440,7 @@ max_code_size_is_eip_170s_and_only_from_spurious_dragon_test() ->
      || F <- [frontier, homestead, dao, tangerine]],
     [?assertEqual({F, 24576}, {F, eth_fork_schedule:max_code_size(F)})
      || F <- [spurious_dragon, byzantium, constantinople, petersburg, istanbul,
-              muir_glacier, berlin, london, cancun, prague]],
+              muir_glacier, berlin, london, cancun, prague, osaka, amsterdam]],
     ?assertEqual(infinity, eth_fork_schedule:max_code_size(no_such_fork)).
 
 %% EIP-2929, verbatim: "When calling `SSTORE', check if the `(address, storage_key)'
@@ -1501,7 +1452,7 @@ max_code_size_is_eip_170s_and_only_from_spurious_dragon_test() ->
 sstore_cold_cost_is_eip_2929s_additional_term_from_berlin_only_test() ->
     [?assertEqual({F, 2100}, {F, eth_fork_schedule:sstore_cold_cost(F, false)})
      || F <- [berlin, london, arrow_glacier, gray_glacier, merge, paris, shanghai,
-              cancun, prague]],
+              cancun, prague, osaka, amsterdam]],
     [?assertEqual({F, 0}, {F, eth_fork_schedule:sstore_cold_cost(F, false)})
      || F <- [frontier, homestead, dao, tangerine, spurious_dragon, byzantium,
               constantinople, petersburg, istanbul, muir_glacier]],
@@ -1516,7 +1467,8 @@ sstore_is_refused_at_constantinople_and_supported_elsewhere_test() ->
     [?assert(eth_fork_schedule:sstore_supported(F))
      || F <- [frontier, homestead, dao, tangerine, spurious_dragon, byzantium,
               petersburg, istanbul, muir_glacier, berlin, london, arrow_glacier,
-              gray_glacier, merge, paris, shanghai, cancun, prague]],
+              gray_glacier, merge, paris, shanghai, cancun, prague, osaka,
+              amsterdam]],
     ?assertNot(eth_fork_schedule:sstore_supported(no_such_fork)),
     %% Constantinople still has no price -- the refusal has to remain a refusal rather
     %% than become a plausible number, and the clause that answers it must not answer
@@ -1618,7 +1570,7 @@ no_calldata_is_no_tokens_test() ->
 the_floor_is_a_prague_rule_and_stays_one_test() ->
     %% Every fork from Prague on, and only those.
     [?assertEqual(21010, eth_fork_schedule:calldata_floor(F, <<0>>))
-     || F <- [prague]],
+     || F <- [prague, osaka, bpo1, amsterdam]],
     [?assertEqual(0, eth_fork_schedule:calldata_floor(F, <<0>>))
      || F <- [shanghai, cancun, paris, gray_glacier, arrow_glacier, london]].
 
@@ -1703,7 +1655,7 @@ a_type_this_table_has_never_heard_of_is_not_available_test() ->
 
 the_authorization_list_costs_twenty_five_thousand_a_tuple_at_prague_test() ->
     [?assertEqual(25000, eth_fork_schedule:set_code_auth_cost(F))
-     || F <- [prague]].
+     || F <- [prague, osaka]].
 
 no_fork_before_prague_charges_for_the_authorization_list_test() ->
     %% The type does not exist before Prague and the field is not on the wire, so a
