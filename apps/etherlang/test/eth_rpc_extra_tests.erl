@@ -213,9 +213,27 @@ the_reward_is_the_tip_of_the_transaction_at_that_gas_percentile_test() ->
                                                                 <<"0x1">>,
                                                                 [0, 50, 100]),
                        [Row] = maps:get(<<"reward">>, R),
-                       ?assertEqual([<<"0x3b9aca00">>,      %% 1 gwei
-                                     <<"0xb2d05e00">>,      %% 3 gwei
-                                     <<"0xee6b2800">>],     %% 4 gwei
+                       ?assertEqual(3, length(Row)),
+                       Burn = burn_of(Chain, 1),
+                       %% **The expected row is derived, and the burn is pinned below.**
+                       %%
+                       %% It used to be three transcribed hex constants, which said "1 gwei,
+                       %% 3 gwei, 4 gwei". **Two of the three are the tips the fixture
+                       %% quotes and do not depend on the burn at all** -- a 1559
+                       %% transaction's tip is `min(maxPriorityFeePerGas,
+                       %% maxFeePerGas - baseFeePerGas)', and `10 gwei - 0.875 gwei` is
+                       %% still above the 1 gwei and 3 gwei priorities. Only the **legacy**
+                       %% transaction moves with the burn, because it has no priority fee:
+                       %% its tip *is* `gasPrice - baseFeePerGas`, so 5 gwei less the burn.
+                       %%
+                       %% **A transcribed constant is a claim that the burn is 1 gwei**, and
+                       %% it was true only because `linked_blocks/0' overrode every block's
+                       %% own column with a derivation. A block at a 1 gwei base fee with
+                       %% `gasUsed = 0' is not a chain EIP-1559 admits, so the constant was
+                       %% pinning a number the fixture never held.
+                       ?assertEqual([eth_hex:encode_int(1 * ?ONE_GWEI),
+                                     eth_hex:encode_int(3 * ?ONE_GWEI),
+                                     eth_hex:encode_int(5 * ?ONE_GWEI - Burn)],
                                     Row)
                    end).
 
@@ -227,8 +245,39 @@ a_legacy_transactions_tip_excludes_the_burn_test() ->
                        {ok, R} = eth_rpc_projection:fee_history(Chain, 1,
                                                                 <<"0x1">>, [100]),
                        [Row] = maps:get(<<"reward">>, R),
-                       %% 5 gwei price less the 1 gwei burn.
-                       ?assertEqual([<<"0xee6b2800">>], Row)
+                       %% 5 gwei price less the burn. **Derived from the block's own base
+                       %% fee**, for the reason the test above states: "1 gwei burn" was a
+                       %% transcribed figure the chain did not have.
+                       ?assertEqual([eth_hex:encode_int(5 * ?ONE_GWEI - burn_of(Chain, 1))],
+                                    Row)
+                   end).
+
+%% The block's own base fee, which is what a legacy transaction's tip is measured
+%% against.
+burn_of(Chain, Num) ->
+    {_, Block, _} = eth_chain:get_by_number(Chain, Num),
+    eth_hex:decode(maps:get(<<"baseFeePerGas">>, Block)).
+
+%% **The burn this chain actually has, with EIP-1559's arithmetic written out.**
+%%
+%% `linked_blocks/0' asks for 1 gwei on every block and gives block 0 a `gasUsed' of 0.
+%% EIP-1559: `gas_target = gas_limit / ELASTICITY_MULTIPLIER = 30,000,000 / 2 =
+%% 15,000,000`. `gasUsed' is 0, which is below the target, so the fee must **decrease**:
+%%
+%%     gas_used_delta = parent_fee * (gas_target - gas_used) / gas_target / 8
+%%                    = 1,000,000,000 * (15,000,000 - 0) / 15,000,000 / 8
+%%                    = 125,000,000
+%%     block 1 base fee = 1,000,000,000 - 125,000,000 = 875,000,000
+%%
+%% **The figure is asked of `eth_fork_schedule:base_fee/3' and the arithmetic is written
+%% out beside it**, because a test that derives its expectation from the function under test
+%% proves only that the function agrees with itself -- which is AGENTS.md's property-test
+%% rule applied to a fixture. A number that cannot be derived on paper is a number nobody
+%% checked.
+the_burn_of_this_chain_is_derived_from_eip_1559_test() ->
+    with_tip_chain(fun(Chain) ->
+                       ?assertEqual(875000000, burn_of(Chain, 1)),
+                       ?assertEqual(1000000000, burn_of(Chain, 0))
                    end).
 
 %% "All zeroes are returned if the block is empty." A block with no transactions has
@@ -984,11 +1033,103 @@ linked_blocks() ->
 %% would carry one and the pre-1559 assertion would have nothing to read; a zero
 %% base fee on a post-1559 block is a real value this fixture does not use, so the
 %% two cases are not confused here.
+%% **The base fee of every block whose parent carries one is derived, not supplied** --
+%% and the two cases where it *is* supplied are `fee_for/4', which is the only place the
+%% rule is written.
+%%
+%% The tuple shape is `{Num, Txs, BaseFee, Used, Limit}' and every caller passed
+%% `1 * ?ONE_GWEI' for every block, which was accepted for as long as nothing checked it.
+%% EIP-1559 does not let a block choose its base fee: below the gas target it must
+%% **decrease**, so with a parent using 3,000 of 30,000,000 the correct child fee is
+%% about 875,025,000 wei and 1 gwei is not a value the specification admits. Adding
+%% `eth_block_validator' refused all 24 blocks seeded this way with
+%% `{base_fee_mismatch, 1000000000, 875025000}' -- the check working.
+%%
+%% The **first** block's fee is still the caller's, because genesis has no parent and
+%% there is nothing to derive it from. That asymmetry is the rule, not an
+%% inconsistency: one figure in the tuple a caller may set, and it must be the genesis
+%% one.
+%%
+%% **That asymmetry is now implemented rather than described.** `chain_blocks/2' builds
+%% genesis from the column and `fee_for/4' derives every later block whose parent carries
+%% a fee -- see the two functions for what happens when the parent does not.
+
+%% **General form:** a fixture's convenience argument is a claim about a value the
+%% specification derives, and it stays wrong until something checks it.
 chain_blocks([], _Prev) ->
     [];
+%% **The first entry is a block, not a seed.**
+%%
+%% This used to hand the first entry's `BaseFee'/`Used'/`Limit' back as the *parent's*
+%% figures and recurse on `Rest' -- so the list came back one block shorter than it went
+%% in, and the block that was missing was genesis. Nothing said so, because every caller
+%% appends the result and every caller only ever asked about the blocks that survived.
+%%
+%% `a_pre_eip_1559_block_reports_a_zero_base_fee_test' is what makes it visible. It
+%% asserts on `lists:nth(2, Blocks)', and its comment says "**Block 1** of the fixture has
+%% no baseFeePerGas" -- so it believes `Blocks' is `[0, 1, 2]'. It was `[1, 2]', `nth(2)'
+%% was block **2**, and the assertion was checking the wrong block and had been failing
+%% for as long as the base fee moved.
+%%
+%% Genesis also takes its fee from the column, because it has no parent to derive from.
+%% For `fee_linked_blocks/0' that is the same figure it always got (`gasUsed' is exactly
+%% half the limit, so EIP-1559 returns the parent's fee unchanged, and the column *was*
+%% the parent seed). For `linked_blocks/0' it is **not** -- genesis moves from 937,500,000
+%% to the 1 gwei the comment above has always claimed -- and that is the fix, not a
+%% regression: the comment and the code finally agree.
 chain_blocks([{Num, Txs, BaseFee, Used, Limit} | Rest], Prev) ->
     Block = with_hash(Num, Prev, Txs, Used, Limit, BaseFee),
-    [{Num, Block} | chain_blocks(Rest, maps:get(<<"hash">>, Block))].
+    [{Num, Block} |
+     chain_blocks(Rest, eras_base_fee(BaseFee), Used, Limit,
+                  maps:get(<<"hash">>, Block))].
+
+chain_blocks([], _PBaseFee, _PUsed, _PLimit, _Prev) ->
+    [];
+chain_blocks([{Num, Txs, BaseFee, Used, Limit} | Rest],
+             PBaseFee, PUsed, PLimit, Prev) ->
+    Fee = fee_for(PBaseFee, PUsed, PLimit, BaseFee),
+    Block = with_hash(Num, Prev, Txs, Used, Limit, Fee),
+    [{Num, Block} |
+     chain_blocks(Rest, eras_base_fee(Fee), Used, Limit,
+                  maps:get(<<"hash">>, Block))].
+
+%% **What a child derives from: the parent's own base fee, or `undefined' when the
+%% parent has none.**
+%%
+%% `undefined' rather than `0' because "a pre-EIP-1559 parent" and "a parent whose base
+%% fee is zero wei" are different facts, and the second is a real value this fixture does
+%% not use. Collapsing them is AGENTS.md's *a default of zero is not the same as an absent
+%% field* -- `base_fee/3' answers 0 for both, so a chain that threaded 0 would produce a
+%% block with no `baseFeePerGas' at all where the fixture said there should be one.
+eras_base_fee(0) -> undefined;
+eras_base_fee(Fee) -> Fee.
+
+%% **The fee this block carries, and the only place the two rules are written.**
+%%
+%%   * the block asked for no field (column `0') -> it gets no field;
+%%   * the parent has no fee, so there is nothing to derive from -> the column supplies it;
+%%   * otherwise EIP-1559 derives it and the column is not consulted.
+%%
+%% **It threads `Fee`, the integer it just computed, and never re-reads the block.**
+%% The first version read it back with
+%% `maps:get(<<"baseFeePerGas">>', Block, undefined)' -- and `with_hash/6' stores a
+%% **hex string** there (`eth_hex:encode_int/1'), so the derivation was fed `<<"0x918d4e">>'
+%% where a wei figure belonged. **A round trip through a field's stored representation is a
+%% second normaliser**, and this one changed the *type*; the block's own map is not a place
+%% to read an arithmetic operand from.
+%%
+%% The third clause is why this fixture cannot assert "the block chose its own fee": the
+%% derivation wins, silently. That was true before this change too, and it is what let a
+%% caller write a column that nothing read -- see the `0' case, which was **inert for
+%% every block after the first** until now.
+fee_for(undefined, _PUsed, _PLimit, 0) ->
+    0;
+fee_for(undefined, _PUsed, _PLimit, BaseFee) ->
+    BaseFee;
+fee_for(_PBaseFee, _PUsed, _PLimit, 0) ->
+    0;
+fee_for(PBaseFee, PUsed, PLimit, _BaseFee) ->
+    eth_fork_schedule:base_fee(PUsed, PLimit, PBaseFee).
 
 %% The hash is stored in its canonical 0x-hex form, not as the 32 raw bytes
 %% `eth_header:hash/1' returns, for two reasons that are the same reason.

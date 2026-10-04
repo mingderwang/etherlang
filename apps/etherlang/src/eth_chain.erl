@@ -226,7 +226,7 @@ handle_call({tx_block, TxHash}, _From, S) ->
     end;
 
 handle_call({append, Blocks}, _From, S) ->
-    case verify_blocks(Blocks, S#st.verify) of
+    case verify_blocks(Blocks, S#st.verify, S) of
         {ok, Blocks1} ->
             {Res, S1} = do_append(Blocks1, S),
             S2 = case Res of
@@ -338,21 +338,143 @@ do_append_cont([{Num, Block, Full} | Rest], #st{head = {HN, HS}} = S) ->
             end
     end.
 
-%% Recompute and verify each block's header hash before storing it. The
-%% normalised block carries the recomputed hash, so the hash index (and thus
-%% parent linkage) is grounded in verified content, not the upstream's claim.
-verify_blocks(Blocks, false) -> {ok, Blocks};
-verify_blocks([], _Verify) -> {ok, []};
-verify_blocks([{Num, Block, Full} | Rest], true) ->
+%% Verify each block before storing it, in two independent steps.
+%%
+%% 1. **Integrity** -- `eth_header:verify/1' recomputes `Keccak256(RLP(header))' and
+%%    compares it with the hash the block claims. This answers "were these bytes the
+%%    bytes that were signed".
+%% 2. **Validity** -- `eth_block_validator:validate/2' checks the header against the
+%%    rules in `execution-specs`' `validate_header/2` and `check_gas_limit/2`.
+%%    This answers "should this block exist at all".
+%%
+%% **The second step is not what `VERIFY_HEADERS=false' turns off.** That switch is
+%% named for hash recomputation, which is what it did and all it did until this pass,
+%% and turning it off now disables a *consensus* check along with a performance
+%% optimisation. It is left gating both because a header rule that an operator can
+%% switch off is not a rule, and **the operator-facing name now understates what it
+%% does** -- recorded in `TASKS.md` rather than silently reinterpreted, because
+%% renaming an environment variable is an interface change and this is not the pass
+%% for it.
+%%
+
+%% **One arity, not two.** `verify_blocks/2' existed to short-circuit on
+%% `S#st.verify' before this pass; with the parent threaded through there is a single
+%% three-argument form, and leaving a two-argument clause that nothing called would be a
+%% second entry point reading blocks with no parent to check them against.
+verify_blocks(Blocks, false, _S) -> {ok, Blocks};
+verify_blocks([], _Verify, _S) -> {ok, []};
+verify_blocks(Blocks, true, S) ->
+    verify_blocks(Blocks, true, S, undefined).
+verify_blocks([], _Verify, _S, _BatchParent) ->
+    {ok, []};
+verify_blocks([{Num, Block, Full} | Rest], true, S, BatchParent) ->
     case eth_header:verify(Block) of
         {ok, H} ->
-            case verify_blocks(Rest, true) of
-                {ok, RestV} -> {ok, [{Num, Block#{<<"hash">> => H}, Full} | RestV]};
-                {error, _} = E -> E
+            Normalised = Block#{<<"hash">> => H},
+            Parent = parent_for(Normalised, BatchParent, S),
+            case eth_block_validator:validate(Parent, Normalised) of
+                ok ->
+                    case verify_blocks(Rest, true, S, Normalised) of
+                        {ok, RestV} -> {ok, [{Num, Normalised, Full} | RestV]};
+                        {error, _} = E -> E
+                    end;
+                {error, Reason} ->
+                    {error, {invalid_header, Num, Reason}}
             end;
         {error, Reason} ->
             {error, {bad_block, Num, Reason}}
     end.
+
+%% **The parent is the block its `parentHash\' names. The head is not it.**
+%%
+%% This pass used to be seeded with `head_block(S)\' and then thread each block into the
+%% next. That is right for a contiguous append and **wrong for every other batch**: a reorg
+%% hands it a fork that starts below the head. `eth_chain_tests:reorg_test\' appends blocks
+%% 3..11 while the head is block 8, and block 3 was validated against block 8 --
+%% `{invalid_header, 3, {timestamp_not_after_parent, 1003, 1008}}\', block 3\'s own second
+%% against block 8\'s. **The fixture was right and the check was reading the wrong
+%% parent**: the fork links to block 2, whose timestamp is 1002. A contiguous batch never
+%% showed it, because there the head *is* the parent -- which is why it took a reorg test
+%% to find, and why passing on the happy path was never evidence about this line.
+%%
+%% Two candidates, and the block\'s own `parentHash\' decides between them: the previous
+%% block of *this batch*, which is not in the store yet (`do_append/2\' runs after this
+%% pass), or a block the store holds. A genesis block names no parent, so neither matches
+%% and it is checked against `undefined\' -- the one case where the parent-relative rules
+%% cannot run.
+%%
+%% **Both forms are the hex string this store uses.** `eth_header:verify/1\' answers the
+%% `0x...\' form and `hash_tab\' is keyed on it (`do_append/2\' compares a block\'s
+%% `parentHash\' against the head hash directly), so the comparison is against `verify/1\'
+%% and not `hash/1\', whose answer is 32 raw bytes and can never equal a `parentHash\'.
+%%
+%% **The comparison in the second clause is unreachable through `append/2', and it is
+%% kept anyway.** An injection that deletes it passes the whole suite -- there is no test
+%% for it, because the shape it guards cannot be built: a batch that starts below the head
+%% rewinds to the common ancestor and drops everything above it, so the second block of a
+%% batch can only ever link to the first. The first version of a test here asked for one
+%% and got `{missing_parent, _}', which is the store catching the gap **before** the
+%% validator is reached. **A gap is caught by `missing_parent', not by this check**, and
+%% that is worth stating rather than leaving a plausible-looking test to imply otherwise.
+%%
+%% So this is defensive, in the sense AGENTS.md means for `eth_evm:run/5'\'s refund cap: a
+%% default that is right for every caller that exists. It is kept because it is the rule,
+%% because deleting it would make the function depend on a reachability argument that lives
+%% in `do_append/2' rather than here, and because **an assertion that a branch is
+%% unreachable is itself an assertion someone can check** -- the injection above is how.
+%%
+%% **The general form is the one this repository keeps meeting: a value looked up once and
+%% carried, where the thing it stands for is named per item.**
+parent_for(Block, undefined, S) ->
+    stored_parent(Block, S);
+parent_for(Block, BatchParent, S) ->
+    case maps:get(<<"parentHash">>, Block, undefined) of
+        Claimed when is_binary(Claimed) ->
+            case eth_header:verify(BatchParent) of
+                {ok, ParentHash} ->
+                    case Claimed =:= ParentHash of
+                        true -> BatchParent;
+                        false -> stored_parent(Block, S)
+                    end;
+                {error, _} ->
+                    stored_parent(Block, S)
+            end;
+        _ ->
+            undefined
+    end.
+
+stored_parent(Block, S) ->
+    case maps:get(<<"parentHash">>, Block, undefined) of
+        Claimed when is_binary(Claimed) ->
+            case dets:lookup(S#st.hash_tab, {Claimed}) of
+                [{{Claimed}, N}] ->
+                    case dets:lookup(S#st.num_tab, {N}) of
+                        [{{N}, {_H, Parent, _Full}}] -> Parent;
+                        [] -> undefined
+                    end;
+                [] ->
+                    undefined
+            end;
+        _ ->
+            undefined
+    end.
+
+%% The current head's stored header, or `undefined' for an empty store.
+%%
+%% `hash_tab' maps a hash to a *number*, so the block itself comes from `num_tab' --
+%% which is the point: the parent handed to the validator is the one **this node
+%% stored**, not one an upstream supplied alongside the child.
+%%
+%% **A pure function of the state, not a `gen_server:call'.** The first version read
+%% the head with `gen_server:call(?MODULE, head_block)' from inside `handle_call', and
+%% the suite died with
+%%
+%%     {calling_self, {gen_server, call, [eth_chain, head_block]}}
+%%
+%% cancelled at the third test -- `gen:call' refuses a call from the server to itself,
+%% so the parent lookup could not be a round trip. The state is already in hand at the
+%% call site; going out to ask for it was the whole bug.
+
 
 below_finality(#st{finalized = undefined}, _N) -> false;
 below_finality(#st{finalized = F}, N) -> N < F.
