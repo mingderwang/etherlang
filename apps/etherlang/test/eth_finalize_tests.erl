@@ -392,10 +392,19 @@ store_parent(ParentRoot) ->
     eth_test_util:store_parent(ParentRoot).
 
 state_root_of(Block) ->
-    hex_to_bin(maps:get(<<"stateRoot">>, eth_block:to_json(Block))).
+    eth_hex:must_decode_bytes(maps:get(<<"stateRoot">>, eth_block:to_json(Block))).
 
 %% Lowercase, matching eth_header's canonical hash form: the chain store indexes
 %% by it, so an uppercase key would silently miss.
 hex(B) -> <<"0x", (string:lowercase(binary:encode_hex(B)))/binary>>.
 
-hex_to_bin(<<"0x", Rest/binary>>) -> binary:decode_hex(Rest).
+%% **Removed: a copy of the hex decoder, in the test tree.**
+%% `eth_hex_owners_tests` had been scanning `?SRC` alone, so seven test modules kept their
+%% own -- `eth_test_util` among them, which is the module every other fixture builds its
+%% blocks with. **A guard scoped to one directory is a guard with a hole in it**, and the
+%% hole was the half of the tree where a helper gets written because `src/` does not appear
+%% to export one.
+%%
+%% The behaviour is `eth_hex:must_decode_bytes/1` exactly: it strips `0x`, refuses an odd
+%% length, and raises on a character that is not a hex digit -- as `binary:decode_hex/1`
+%% did, for the inputs these fixtures actually pass.

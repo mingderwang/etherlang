@@ -400,7 +400,7 @@ gossip() ->
         STx = sign_legacy(SPriv, base_tx()),
         {ok, SBin} = eth_tx:to_rlp(STx),
         {ok, SHash} = eth_txpool:add_raw(pool_gos_a, SBin),
-        SHRaw = hex_to_bin(SHash),
+        SHRaw = eth_hex:must_decode_bytes(SHash),
         gen_server:cast(PidA, {broadcast_hashes, [SHRaw]}),
         ok = wait_pool(pool_gos_b, SHash, 100),
         gen_server:stop(PidA),
@@ -426,7 +426,16 @@ conn_args(Priv, ID, Pool) ->
 conn_args(Priv, ID, Pool, RemoteID) ->
     (conn_args(Priv, ID, Pool))#{remote_id => RemoteID}.
 
-hex_to_bin(<<"0x", R/binary>>) -> binary:decode_hex(R).
+%% **Removed: a copy of the hex decoder, in the test tree.**
+%% `eth_hex_owners_tests` had been scanning `?SRC` alone, so seven test modules kept their
+%% own -- `eth_test_util` among them, which is the module every other fixture builds its
+%% blocks with. **A guard scoped to one directory is a guard with a hole in it**, and the
+%% hole was the half of the tree where a helper gets written because `src/` does not appear
+%% to export one.
+%%
+%% The behaviour is `eth_hex:must_decode_bytes/1` exactly: it strips `0x`, refuses an odd
+%% length, and raises on a character that is not a hex digit -- as `binary:decode_hex/1`
+%% did, for the inputs these fixtures actually pass.
 
 pair(Blocks) ->
     [{eth_hex:decode(maps:get(<<"number">>, B)), B, true} || B <- Blocks].

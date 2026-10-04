@@ -36,6 +36,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(SRC, "apps/etherlang/src").
+-define(TEST_DIR, "apps/etherlang/test").
 
 %% The names a second copy would take. `pairs/1' and `hexval/1' are here because they are
 %% the *implementation* of the hand-rolled decoder: a module could stop naming itself
@@ -82,6 +83,11 @@ no_module_decodes_hex_by_hand_test() ->
 the_scan_reached_every_source_file_test() ->
     Files = source_files(),
     ?assert(length(Files) >= 48),
+    %% **The test directory is asserted separately, so extending the guard cannot be
+    %% silently reverted.** A single floor over the union would still pass with the test
+    %% half removed as long as enough files were deleted from `src/', and this file has
+    %% been the victim of a union-shaped assumption once already.
+    ?assert(length(test_files()) >= 64),
     [begin
          Scanned = scan(File),
          %% A module that defines none of the forbidden names still has to have been
@@ -91,8 +97,19 @@ the_scan_reached_every_source_file_test() ->
      end || File <- Files],
     ok.
 
-%% One expansion, used by both tests, so the two cannot disagree about what was read.
-source_files() -> filelib:wildcard(?SRC "/*.erl").
+%% **Both directories, and the test directory is the one that was missing.**
+%%
+%% The guard ran over `?SRC' alone, so seven test modules kept their own decoders:
+%% `eth_test_util.erl' among them, which is the module every other fixture builds its
+%% blocks with. **A guard scoped to the directory with the tidiest name is a guard with a
+%% hole in it**, and the hole was the half of the tree where a helper gets written because
+%% `src/` does not export one.
+%%
+%% Two expansions, both used by every test here, so no test can disagree with another about
+%% what was read.
+source_files() -> filelib:wildcard(?SRC "/*.erl") ++ filelib:wildcard(?TEST_DIR "/*.erl").
+
+test_files() -> filelib:wildcard(?TEST_DIR "/*.erl").
 
 scan(File) ->
     {ok, Bin} = file:read_file(File),

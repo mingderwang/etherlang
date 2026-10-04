@@ -340,7 +340,7 @@ store_parent(ParentRoot) ->
              },
     {ok, HashHex} = eth_header:verify(Block),
     ok = eth_chain:append([{0, Block#{<<"hash">> => HashHex}, true}]),
-    hex_to_bin(HashHex).
+    eth_hex:must_decode_bytes(HashHex).
 
 %% An inbound block, built the way a peer's arrives: from_json/1 over a JSON-RPC
 %% header map. Constructing one through the record instead would bypass exactly
@@ -357,4 +357,13 @@ inbound_block(ParentHash, Overrides) ->
 %% by it, so an uppercase key would silently miss.
 bin_to_hex0x(Bin) -> <<"0x", (string:lowercase(bin_to_hex(Bin)))/binary>>.
 
-hex_to_bin(<<"0x", Rest/binary>>) -> binary:decode_hex(Rest).
+%% **Removed: a copy of the hex decoder, in the test tree.**
+%% `eth_hex_owners_tests` had been scanning `?SRC` alone, so seven test modules kept their
+%% own -- `eth_test_util` among them, which is the module every other fixture builds its
+%% blocks with. **A guard scoped to one directory is a guard with a hole in it**, and the
+%% hole was the half of the tree where a helper gets written because `src/` does not appear
+%% to export one.
+%%
+%% The behaviour is `eth_hex:must_decode_bytes/1` exactly: it strips `0x`, refuses an odd
+%% length, and raises on a character that is not a hex digit -- as `binary:decode_hex/1`
+%% did, for the inputs these fixtures actually pass.

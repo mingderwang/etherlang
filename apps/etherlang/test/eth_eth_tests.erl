@@ -77,7 +77,7 @@ serve_test() ->
         %% Hash ref resolves.
         H3 = maps:get(<<"hash">>, lists:nth(4, Blocks)),
         {ok, ByHash} = eth_eth:serve_headers(chain_serve_a,
-                                             {hash, hex_to_bin(H3)}, 2, 0, false),
+                                             {hash, eth_hex:must_decode_bytes(H3)}, 2, 0, false),
         ?assertEqual([3, 4], [header_num(H) || H <- ByHash]),
         %% Beyond highest: empty (still valid).
         ?assertEqual({ok, []},
@@ -104,7 +104,7 @@ bodies_test() ->
     with_chain(chain_bodies_a, 6, fun(Blocks) ->
         H3 = maps:get(<<"hash">>, lists:nth(4, Blocks)),
         {ok, [Body]} = eth_eth:serve_bodies(chain_bodies_a,
-                                            [hex_to_bin(H3)]),
+                                            [eth_hex:must_decode_bytes(H3)]),
         [Txs, Uncles] = Body,
         %% Fixture blocks carry two legacy transactions, no uncles.
         ?assertEqual(2, length(Txs)),
@@ -175,8 +175,16 @@ set_header_root(Header, Root) ->
     {Pre, [_ | Post]} = lists:split(4, Header),
     Pre ++ [Root | Post].
 
-hex_to_bin(<<"0x", Rest/binary>>) -> binary:decode_hex(Rest);
-hex_to_bin(H) -> binary:decode_hex(H).
+%% **Removed: a copy of the hex decoder, in the test tree.**
+%% `eth_hex_owners_tests` had been scanning `?SRC` alone, so seven test modules kept their
+%% own -- `eth_test_util` among them, which is the module every other fixture builds its
+%% blocks with. **A guard scoped to one directory is a guard with a hole in it**, and the
+%% hole was the half of the tree where a helper gets written because `src/` does not appear
+%% to export one.
+%%
+%% The behaviour is `eth_hex:must_decode_bytes/1` exactly: it strips `0x`, refuses an odd
+%% length, and raises on a character that is not a hex digit -- as `binary:decode_hex/1`
+%% did, for the inputs these fixtures actually pass.
 
 %% Block hash of a decoded header RLP list.
 block_hash(Header) ->

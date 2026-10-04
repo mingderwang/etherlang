@@ -58,7 +58,16 @@ stop_chain() ->
     try gen_server:stop(eth_chain) catch _:_ -> ok end.
 
 hex(B) -> <<"0x", (string:lowercase(binary:encode_hex(B)))/binary>>.
-hex_to_bin(<<"0x", Rest/binary>>) -> binary:decode_hex(Rest).
+%% **Removed: a copy of the hex decoder, in the test tree.**
+%% `eth_hex_owners_tests` had been scanning `?SRC` alone, so seven test modules kept their
+%% own -- `eth_test_util` among them, which is the module every other fixture builds its
+%% blocks with. **A guard scoped to one directory is a guard with a hole in it**, and the
+%% hole was the half of the tree where a helper gets written because `src/` does not appear
+%% to export one.
+%%
+%% The behaviour is `eth_hex:must_decode_bytes/1` exactly: it strips `0x`, refuses an odd
+%% length, and raises on a character that is not a hex digit -- as `binary:decode_hex/1`
+%% did, for the inputs these fixtures actually pass.
 
 store_parent(ParentRoot) ->
     ensure_started(eth_chain, eth_test_util:tmp_dir()),
@@ -70,7 +79,7 @@ store_parent(ParentRoot) ->
              },
     {ok, HashHex} = eth_header:verify(Block),
     ok = eth_chain:append([{0, Block#{<<"hash">> => HashHex}, true}]),
-    hex_to_bin(HashHex).
+    eth_hex:must_decode_bytes(HashHex).
 
 new_key() ->
     Priv = eth_secp256k1:generate_key(),
@@ -138,7 +147,7 @@ chain(Finalized) ->
     Map = eth_block:to_json(Finalized),
     {ok, HashHex} = eth_header:verify(Map),
     ok = eth_chain:append([{Finalized#block.number, Map#{<<"hash">> => HashHex}, true}]),
-    hex_to_bin(HashHex).
+    eth_hex:must_decode_bytes(HashHex).
 
 %% Run one block of transactions and return the finalized block.
 finalize(Parent, Number, Txs) ->
@@ -620,9 +629,9 @@ sign_1559(Priv, Tx) ->
          eth_hex:decode(maps:get(<<"maxPriorityFeePerGas">>, Tx)),
          eth_hex:decode(maps:get(<<"maxFeePerGas">>, Tx)),
          eth_hex:decode(maps:get(<<"gas">>, Tx)),
-         hex_to_bin(maps:get(<<"to">>, Tx)),
+         eth_hex:must_decode_bytes(maps:get(<<"to">>, Tx)),
          eth_hex:decode(maps:get(<<"value">>, Tx)),
-         hex_to_bin(maps:get(<<"input">>, Tx)),
+         eth_hex:must_decode_bytes(maps:get(<<"input">>, Tx)),
          []],
     Digest = eth_keccak:hash(<<16#02, (eth_rlp:encode(F))/binary>>),
     eth_secp256k1:sign(Digest, Priv).
@@ -1481,13 +1490,13 @@ signed_7702(Priv, Fields) ->
          eth_hex:decode(maps:get(<<"maxPriorityFeePerGas">>, Tx)),
          eth_hex:decode(maps:get(<<"maxFeePerGas">>, Tx)),
          eth_hex:decode(maps:get(<<"gas">>, Tx)),
-         hex_to_bin(maps:get(<<"to">>, Tx)),
+         eth_hex:must_decode_bytes(maps:get(<<"to">>, Tx)),
          eth_hex:decode(maps:get(<<"value">>, Tx)),
-         hex_to_bin(maps:get(<<"input">>, Tx)),
+         eth_hex:must_decode_bytes(maps:get(<<"input">>, Tx)),
          [],
          [begin
               C = eth_hex:decode(maps:get(<<"chainId">>, A)),
-              Ad = hex_to_bin(maps:get(<<"address">>, A)),
+              Ad = eth_hex:must_decode_bytes(maps:get(<<"address">>, A)),
               N = eth_hex:decode(maps:get(<<"nonce">>, A)),
               Y = eth_hex:decode(maps:get(<<"yParity">>, A)),
               R = eth_hex:decode(maps:get(<<"r">>, A)),

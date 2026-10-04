@@ -112,8 +112,8 @@ depends on execution order, suspect the build before you suspect the code.
 
 ## 3. Architecture
 
-48 modules in `apps/etherlang/src` (14,110 lines of code), 62 test modules in
-`apps/etherlang/test` (13,963), and 969 eunit tests. **These counts drift and this
+49 modules in `apps/etherlang/src` (14,334 lines of code), 64 test modules in
+`apps/etherlang/test` (14,224), and 997 eunit tests. **These counts drift and this
 one had drifted** -- it said 47 and 44 for several commits after it stopped being
 true, which is the same defect as a stale conformance figure: a number in the
 architecture section that a reader will use as a measure of size and that no longer
@@ -1541,7 +1541,8 @@ outage, so the list only grows.
   `string:lexemes/2` had already made the same class of bug visible once. **A count is a
   measurement of the thing that produces the list, not of the list.**
 
-- **An injection that breaks the build reads as "no effect", because it produces no output.**
+- **An injection that breaks the build reads as "no effect", because it produces no output —
+  and the classifier that is supposed to prevent that reading was itself wrong three times.**
   Rewriting `starts_item(Line)' to `starts_item(_Line)' and leaving the body left `Line'
   unbound; `warnings_as_errors` turned it into a compile failure; the harness grepped for
   test names and printed **nothing at all**. Nothing is the same shape as "the injection did
@@ -1551,6 +1552,102 @@ outage, so the list only grows.
   `BUILD-BROKEN`, not as silence**, and the cheap check is the one this repository has
   already been bitten by, *"read one line of the harness's own output against one known-good
   run before believing the other six."*
+  - **Three later attempts at the classifier, and every one of them wrong in the direction
+    that hides evidence.** The second recognised a build failure by grepping for `error:`
+    — and eunit's own failure line is `**error:{assertEqual, ...}', so **every red test was
+    reported `BUILD-BROKEN`**, which is the verdict that proves nothing. **A pattern that
+    matches more than it means is a measurement of the pattern**, and this is the third time
+    in this file that sentence has applied (`re:run/3`'s first match, `pairs\(' inside
+    `parse_pairs(').
+  - The third was a `case $V in red) ... green)` over upper-case verdicts. `case` is
+    case-sensitive, so **all five injections reported `MISMATCH` — including the two that
+    were `RED` and the three that were `GREEN`.** A harness that reports disagreement for
+    the right reason on every row is worse than one that reports agreement, because it looks
+    like the harness is working.
+  - **The general form: a verdict classifier is part of the experiment, and it gets the same
+    scepticism as the code it interrogates.** All three were found the same way — by reading
+    one line of real output against the classifier — and none would have been found by
+    re-reading the classifier.
+
+- **`printf '%% the old ...'` writes one percent sign, because `printf` collapses `%%` into a
+  format escape -- and a single `%` is not a comment in Erlang.** An injection was meant to
+  add a *comment* mentioning `hex_to_bin(` and prove the guard ignores comments. It appended
+  `% the old hex_to_bin( and hexval( ...`, the guard went red, and for several minutes the
+  guard looked like it had a false positive. It had not: the injected line was not a comment,
+  it was **a syntax error that happened to be lexically legal**, and `strip_comment/2`
+  requires *two* percent signs precisely because one means nothing in Erlang.
+  - **The general form is the one above, one level down: the instrument was right and the
+    probe was malformed, and the way they are told apart is to read what the probe actually
+    wrote.** `tail -2` on the file answers it in one command, and it took three probe modules
+    and an `erl_crash.dump` to ask. The one thing that would have answered it immediately is
+    the one AGENTS.md already asks for after any probe: **check the shape of the thing you
+    just wrote against arithmetic you can do on paper** -- one line, `%%`, versus the one that
+    arrived.
+
+- **A restore path that is wrong makes every injection stack, and three agreeing verdicts
+  are not three results.** An injection harness stored its pristine copies as
+  `$DIR/eth_chain.erl.pristine` and restored from `$DIR/src/eth_chain.erl.pristine`. Every
+  `cp` failed, so injection 2 was applied on top of injection 1 and injection 3 on top of
+  that, and the run reported **three `BUILD-BROKEN` verdicts that were really one missing
+  file three times**. What caught it was `diff` against the pristine copy — which is
+  AGENTS.md's rule after a killed script — except that the script's own end-of-run
+  verification used **the same wrong path** and so could not have caught it either.
+  - **The general form is a filter is a measurement of the filter, applied to the harness's
+    own plumbing**: a verification step that shares its path expression with the step it
+    verifies checks nothing, and three identical answers are the signature of one fault
+    rather than of three findings.
+
+- **`$\|` is a perfectly legal Erlang character literal — it is the pipe — so a clause that
+  means `%` compiles, returns, and does nothing.** A comment-stripping helper for the hex
+  ownership guard was written
+  `strip_comment([$%, $\|Rest], N) -> ...`, and it truncated only where a `%` was
+  immediately followed by a literal `|`, which is not a comment. So it stripped **nothing**,
+  and the guard then reported the four comments written to record the deletion as four
+  offenders. `erlc` had no opinion, because `$\|` is a valid `char()`.
+  - **Three other versions of that one line were wrong too**, and all four compiled and
+    returned: `binary:part/3` on a *string*, a nested list handed to `re:run/3`, and a
+    dropped newline that let `;hex_to_bin(' form across a line boundary. **The count was the
+    only thing that showed any of them**, which is why the guard asserts the number of files
+    it scanned and asserts the offender count *before* the offender list — eunit truncates
+    the list, and a truncated list reads as a whole one.
+  - **The general form is `~/T(...)` and `band`-binds-tighter-than-`-`, one level down: the
+    error names the token you can see and never the structure you cannot.** Here nothing
+    named anything, which is why the guard was the only instrument that could.
+
+- **An unreachable defensive branch is proved by an injection, not by a plausible test.**
+  `eth_chain:verify_blocks/4` picks a block's parent from two candidates and lets the
+  block's own `parentHash' choose. Deleting that comparison **passes the whole suite**. The
+  first response was to write a test for it — a batch that skips a block the store already
+  holds — and it failed with `{missing_parent, _}`. That is the answer: a batch starting
+  below the head rewinds to the common ancestor and drops everything above it, so the second
+  block of a batch can only ever link to the first, and `do_append/2`'s `missing_parent`
+  catches a gap before the validator is reached. **The test was asserting a shape the store
+  cannot be given**, so it was deleted and the unreachability written at the check, naming
+  the injection as the evidence.
+  - This is AGENTS.md's EIP-161 nonce placement again: *correct by fidelity to the
+    specification and untestable here are two different sentences, and both belong in the
+    comment.* The specific trap here is that **a plausible test for an unreachable branch
+    will usually be written, will usually fail, and the failure will usually look like the
+    node being wrong** rather than the fixture being impossible.
+
+- **A fixture column that nothing reads, and a test that asserted on the wrong element
+  because of it.** `eth_rpc_extra_tests:chain_blocks/2` took the first entry of its list as
+  a *seed* and recursed on the rest, so it never built genesis: a three-entry fixture
+  returned two blocks. Every later block's base fee was then derived whatever the list said,
+  so the `0` that spells "this block has no `baseFeePerGas` field, it is pre-EIP-1559" was
+  discarded — the parameter was named `_BaseFee`. And `a_pre_eip_1559_block_reports_a_zero_
+  base_fee_test` asserts on `lists:nth(2, Blocks)` with a comment saying "**Block 1** of the
+  fixture", so it believed the list was `[0, 1, 2]`. It was `[1, 2]`, the assertion was
+  checking block 2, and **it had been failing for as long as the base fee moved** — which is
+  why it was filed as a base-fee bug and was not one.
+  - **The general form is AGENTS.md's "a key written through one normaliser and read through
+    another", where the normaliser is an argument.** Nothing reads an argument named
+    `_BaseFee`, so the compiler is silent and the fixture is quietly a different fixture
+    from the one its comment describes.
+  - **And the tell was a comment disagreeing with an index.** "Block 1" beside `nth(2)` is a
+    shape that can be checked by reading, and nobody read it because the test was failing for
+    a reason that had nothing to do with it. A comment that names an *element position* is a
+    claim about the data, not about the code, and it decays like any other published figure.
 
 - **Seven injections, and the first version of the test passed four of them — including all
   three stale figures it was written to catch.** `RELEASE-GATE.md`'s own header says what

@@ -48,13 +48,12 @@ sepolia_block() ->
       <<"hash">> =>
           <<"0xd79af795480c8bd40f009e5ff99a08675a5a44d3148f0a55070aaeb085f682e9">>}.
 
-unhex(<<"0x", Hex/binary>>) -> unhex(Hex);
-unhex(Hex) ->
-    <<<<(hexval(A) bsl 4 bor hexval(B))>> || <<A, B>> <= Hex>>.
-
-hexval(C) when C >= $0, C =< $9 -> C - $0;
-hexval(C) when C >= $a, C =< $f -> C - $a + 10;
-hexval(C) when C >= $A, C =< $F -> C - $A + 10.
+%% **This was a comprehension over a hand-written `hexval/1`** -- the fourth shape of hex
+%% decoder this repository has grown, and the only one that is a binary comprehension
+%% rather than a clause list, which is why a guard looking for `hex_to_bin(` missed it and
+%% why `eth_hex_owners_tests` lists `hexval(` as well. It is the same decoder: `<<A, B>> <=
+%% Hex` walks the string two characters at a time and `hexval/1` turns each into a nibble.
+unhex(Hex) -> eth_hex:must_decode_bytes(Hex).
 
 real_sepolia_header_test() ->
     B = sepolia_block(),
