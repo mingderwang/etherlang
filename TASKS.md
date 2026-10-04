@@ -34,8 +34,8 @@ with the file it sat above.
 
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
-build. OTP 29.1. Current: **49 src modules / 14,334 code lines, 64 test modules /
-14,224 code lines, 997 eunit tests, all passing.**
+build. OTP 29.1. Current: **49 src modules / 14,437 code lines, 65 test modules /
+14,328 code lines, 1020 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive
 them with the procedure below rather than editing this sentence.
@@ -692,11 +692,28 @@ that is a smaller piece of work than the guessing it replaces.
        and 2,952 is not a number this node's table contains, so the ModExp complexity
        formula was wrong somewhere rather than a constant being off by a little. The
        four fixes above moved them and the residue is elsewhere.
-     - **ECADD and ECMUL still conflate the two and are named open.** `bn128_add/2`
-       returns `unsupported` for an off-curve point where EIP-196 makes it a call
-       failure. I stopped there because the `byzantium/eip196_ec_add_mul` fixtures pass
-       with the present shape and a change there could move them in a direction I had
-       not measured. Named, not done.
+     - ~~**ECADD and ECMUL conflate a rejected input with an absent implementation.**~~
+       **CLOSED — the code was already fixed and this entry was not.** `bn128_add/2` and
+       `bn128_mul/2` answer **three** distinct things, measured against the precompiles
+       directly rather than read out of a comment:
+
+       | input | answer |
+       |---|---|
+       | `(0,0) + (0,0)`, `(1,2) + (0,0)` | `{ok, 64, 500}` |
+       | `(1,3) + (0,0)` — off the curve | `{failed, {ecadd, not_on_curve}}` |
+       | `(p,0) + (0,0)` — coordinate ≥ p | `{failed, {ecadd, {coordinate_not_in_field, p}}}` |
+
+       `unsupported` is reachable for `ecadd` only **below Byzantium**, where the precompile
+       does not exist yet, and for the precompiles this node genuinely does not implement.
+       EIP-196 lists the two invalidity conditions separately — "does not lie on the curve
+       **or** any of the field elements is equal or larger than the field modulus p" — so
+       they are told apart rather than both answered the same way.
+       **The stated reason for not doing it was that a change here "could move the
+       `byzantium/eip196_ec_add_mul` fixtures in a direction I had not measured". They did
+       not move: that fixture is one entry of the committed subset and the subset's tally is
+       asserted, so this is measured rather than assumed. **The entry was the thing that was
+       wrong** — a note reading "named, not done" outlived the change that did it, and I
+       repeated it in a status report before checking the code.
    - **`+56668` and `+56665`.** **Unresolved, and gone — verified on the full
      histogram at `v1.36`, and the verification matters more than the fact.** The entry
      spent several revisions insisting this fingerprint had to be "re-derived rather
@@ -1100,7 +1117,16 @@ Recorded because the documentation claimed otherwise, and because each of these 
     - **`ADDRESS` cost 3, not 2.** It had no clause in `base_cost/1` and fell to the `base_cost(_) -> 3` catch-all -- the same trap that had once mispriced three of the four `CALL` opcodes, which is what "a trap that has now fired twice" in Phase 5 refers to. One gas on every `ADDRESS` in every block, and `gasUsed` is a receipt field. The fork table has 2, so deleting the copy fixed it.
     - **EIP-161's two terms were gated on Berlin.** The 9000 for a value transfer and the 25000 for a new account are Spurious Dragon's, two forks earlier, so a Spurious-Dragon-through-Istanbul `CALL` carrying value paid neither while still being charged the access cost. The gate had never been exercised, because nothing called that function before this change.
   - **EIP-150's pre-Berlin figures existed only in the table and nowhere in execution.** A Frontier `BALANCE` cost 2600, because the interpreter had no path to the pre-Berlin price at all: 400 for `BALANCE` and `EXTCODEHASH`, 700 for `EXTCODESIZE`/`EXTCODECOPY`/the `CALL` family, 200 for `SLOAD`. They are applied now, from one table keyed by opcode rather than taking it as an argument -- the figures differ by opcode and an argument invites the caller to pass the wrong one for its own opcode. `SLOAD` had been a separate function differing in two numbers (200 and 2100 against 400/700 and 2600), which is a second place for the two to drift.
-  - What is still missing is the part a price table cannot express at all: **EIP-150's 63/64 gas-retention rule and the 2300 stipend** are applied at every fork. The EIP states the rule it introduced, not the one it replaced, and no client consulted still supports a pre-Whistle block — so the pre-EIP-150 behaviour would have to be invented, and it is not. (An earlier version of this row also claimed `eth_evm` had no EIP-150 pre-Berlin access costs at all. That was fixed in the pass that made the table the only owner of every price — a Frontier `BALANCE` is 400 and a Frontier `SLOAD` 200 — and the row was left behind.)
+  - ~~**What is still missing is the part a price table cannot express at all: EIP-150's
+      63/64 gas-retention rule and the 2300 stipend.**~~ **Both are implemented, and the
+      entry is the residue of the work that did them.** `eth_evm:child_gas/4` asks
+      `eth_fork_schedule:all_but_one_64th(Fork)`, and when it is true computes
+      `Call = min(GasReq, Avail - Avail div 64)` and hands the child `Call + Stipend`, with
+      `Stipend` from `eth_fork_schedule:call_stipend(Fork)` and zero when the value is zero.
+      The clamp is on the **pre-stipend** figure, which is the position EIP-150's own
+      `MessageCallGas` and `sub_call` give it -- `min(gas + extra_gas, gas + call_stipend)`
+      is a different function and is wrong whenever the cap binds. `eth_evm_tests` pins the
+      boundary and the saturation case separately.
   - The table is a per-fork schedule at every fork the node's chain has reached, SSTORE included. Before Berlin the `SSTORE` is *absent* rather than wrong, on purpose: see the pre-Berlin note above.
   - `fork_rank/1` used to collapse Frontier through Petersburg into a single rank 0.
     That was invisible while the only gates were Berlin, London, Shanghai and Cancun,
@@ -1122,7 +1148,15 @@ Recorded because the documentation claimed otherwise, and because each of these 
   - Done: blob transaction type (0x03), blob gas accounting and `blobGasPrice`, excess blob gas carried across blocks
   - Done: the point-evaluation precompile `0x0A` is wired into execution. `eth_kzg` implements it and is verified against mainnet exec-specs fixtures, but for a long time `is_precompile(10)` was `false`, so the module was reachable only from its own tests. It is now dispatched, and a real mainnet point evaluation is driven through the EVM by `eth_evm_tests` rather than only through the precompile boundary
   - A precompile that **ran and failed** now has a return of its own, `{error, Reason}`, distinct from `unsupported`. The distinction is load-bearing: `unsupported` means "this node cannot run this, ask someone else", and `eth_call` answers it with an upstream fallback. A point evaluation that fails is not that -- the input is invalid, the answer is a hard failure that consumes the frame's gas, and falling back would substitute another node's verdict for this one's. A failed `0x0A` now halts with `{error, {kzg, point_evaluation_failed}}` and refunds its caller nothing
-  - **Not** done: KZG *commitment* verification. `eth_kzg` has `g1_mul/2`, the pairing check and `versioned_hash/1`, but no `blob_to_kzg_commitment/1` -- the G1 MSM over 4096 field elements, the bit-reversal permutation, and the compressed 48-byte encoding. So a transaction's commitment is still accepted without being checked against its blob, and a block carrying an invalid commitment is not rejected. Blob data propagation is also absent
+  - ~~**Not done: KZG *commitment* verification.**~~ **Wrong when written, and closed by
+      measuring the module rather than the note.** `eth_kzg:verify/4` exists and is the
+      verification: it computes `PY = Cpt + [G]·(r − y)` and `XMZ = G2 + [G2]·(r − z)` and
+      answers `e(−G2, PY) · e(XMZ, Ppt) == 1` in Fq12, which is the KZG verification
+      equation. It is exported, it is built on `g1_mul/2`, `g2_mul/2`, `pairing/2` and
+      `fq12_eql/2`, and it answers `false` on an exception rather than raising. The entry
+      said the module "has `g1_mul/2`, the pairing check and `versioned_hash/1`, but no
+      commitment verification" -- the pairing check **is** half of that verification and the
+      note read the list of exports as the list of gaps.
   - **Not** done, and deliberately: `commit_to_blob/1` is *not* implemented, because it cannot be verified here. Its `g1_lin` derivation has to come from the specification, and the published test vector could not be fetched (no network access) and is not present in the repository. Shipping a KZG commitment function that no test can check would be a second table that passes its own tests while being wrong, which is the failure mode this project has already had to unpick twice. It needs the spec text and one authoritative vector before it can be written honestly
 - [x] **EIP-4788 (beacon roots)** — store beacon block roots in state ✅
   - Runs the deployed contract's code as `0xff..fe` on every post-Cancun block, rather than writing the two slots directly. The EIP permits the shortcut, but only where the code at the address is the code the EIP specifies; hardcoding the slots would silently commit to a state nobody else computed on a network that deployed something else.
@@ -1179,7 +1213,12 @@ Recorded because the documentation claimed otherwise, and because each of these 
 - [ ] **EVM opcode fidelity** — bit-exact EVM for all opcodes
   - The gas schedule is shared across all forks, so opcode costs are right for Cancun-era rules and wrong for every earlier fork. **Unverified** as the sole cause of root divergence: the per-fork exact schedule has not been ruled out as the only remaining difference, because that cannot be checked end-to-end without real prestate
   - Fixed within the Cancun-era schedule: `CALL`/`CALLCODE`/`STATICCALL` were each charged 3 gas over the EIP-2929 figure, because they were the only members of their family absent from `eth_evm:base_cost/1` and fell to the catch-all. `DELEGATECALL`, which was listed, was correct — so the family was internally inconsistent and the inconsistency cost 3 gas on every call in every block
-  - The catch-all `base_cost(_) -> 3` remains a fallback for any opcode with no assigned cost, and it is a trap that has now fired twice: it once mispriced the four halting opcodes `RETURN`/`REVERT`/`INVALID`/`SELFDESTRUCT` at 3 gas each, and once charged 3 gas on top of EIP-2929 for `CALL`, `CALLCODE` and `STATICCALL`, the only three opcodes the table never listed. An unassigned opcode is still a guess rather than an error, and nothing in the code distinguishes "deliberately free" from "nobody has costed this yet"
+  - ~~**The catch-all `base_cost(_) -> 3` remains a fallback.**~~ **Gone, and the entry is
+      the residue of the deletion.** `grep -rn 'base_cost' apps/etherlang/src` returns four
+      hits and **every one is a comment** -- two of them in `eth_block_validator` and one in
+      `eth_block` saying the function was deleted for being a second copy of the schedule.
+      There is no catch-all because there is no `eth_evm:base_cost/1`: `eth_fork_schedule`
+      is the only price table, and the interpreter asks it for the fork in hand.
   - Fixed: `BASEFEE`, `BLOBHASH` and `BLOBBASEFEE` cost 2, 3 and 2. They cost 20 each, and 2 is the price of the `ADDRESS` family that a range clause had swept them into. A contract reading the base fee in a loop was charged a tenth of the real price, so it ran about ten times deeper than intended and the block's `gasUsed` came out low by that factor
   - Checked and already correct, not guesses: `LOG0`–`LOG4` (a flat 375 base plus `375 * topics` plus `8 * len`, which is right), EIP-2929 warm/cold access (100 base plus 2500/2000 charged from the transient set), and exceptional-halt gas (a frame that throws reports no remainder, and `handle_child/7` adds nothing back, so a failed sub-call cannot refund gas it never spent)
   - Fixed: EIP-3860's 2-gas-per-word init-code cost is now charged inside `do_create/3`. `CREATE` pays 2 a word and `CREATE2` pays 8 — the 2 for the init code plus the 6 for hashing it. Before this, `do_create/3` billed `CREATE2` its hashing term and `CREATE` nothing at all, so deploying a large contract cost nothing for the code that was about to run, and `CREATE2` was short two thirds of what it owes. `gasUsed` is a receipt field, so this was a receipts-root difference on every create in a block
