@@ -5,55 +5,148 @@
 -define(GWEI, 1000000000).
 -define(MAINNET_GAS_LIMIT, 30000000).
 -define(CREATE_BASE, 32000).
--define(TARGET, 20000000).
+%% **Half the gas limit, not two thirds.** EIP-1559's abstract defines the target as
+%% "block gas limit divided by elasticity multiplier" and its reference implementation is
+%% `parent_gas_limit // ELASTICITY_MULTIPLIER` with `ELASTICITY_MULTIPLIER = 2`. With a
+%% 30M limit that is 15M. This was 20,000000 -- two thirds -- and the test that pinned it
+%% said so in prose and contradicted itself in the same sentence: *"The elasticity target
+%% is two-thirds of the gas limit, not one-third."* The answer is one-half.
+-define(TARGET, 15000000).
+
+%% Used only by `base_fee_between_half_and_two_thirds_of_the_limit_*', where the two
+%% candidate targets give **opposite directions**. See that test.
+-define(TWO_THIRDS_TARGET, 20000000).
 
 %% ---------------------------------------------------------------------------
 %% EIP-1559 base fee
 %% ---------------------------------------------------------------------------
 
-%% The elasticity target is two-thirds of the gas limit, not one-third. With a
-%% 30M limit the target is 20M, and a parent that used exactly the target must
-%% leave the base fee unchanged.
-base_fee_target_is_two_thirds_test() ->
-    ?assertEqual(20000000, ?MAINNET_GAS_LIMIT * 2 div 3),
+%% **The target is half the gas limit**, and a parent that used exactly the target must
+%% leave the base fee unchanged -- `parent_gas_used == parent_gas_target` answers
+%% `parent_base_fee` with no arithmetic at all.
+%%
+%% Every figure in this section is derived from EIP-1559's reference implementation and
+%% written out, so a reader can check the arithmetic without running it. The order of
+%% operations is the EIP's and is not interchangeable: the deviation is applied to the
+%% parent fee, divided by the target, then by eight.
+base_fee_target_is_half_the_gas_limit_test() ->
+    ?assertEqual(?TARGET, ?MAINNET_GAS_LIMIT div 2),
     ?assertEqual(?GWEI, eth_fork_schedule:base_fee(?TARGET, ?MAINNET_GAS_LIMIT, ?GWEI)),
-    %% At the target the signed deviation is exactly zero.
+    %% At the target the gas deviation is exactly zero.
     ?assertEqual(0, eth_fork_schedule:base_fee_delta(?TARGET, ?MAINNET_GAS_LIMIT)),
-    ?assertEqual(10000000, eth_fork_schedule:base_fee_delta(?MAINNET_GAS_LIMIT,
+    %% A full 30M parent is 15M over a 15M target.
+    ?assertEqual(?TARGET, eth_fork_schedule:base_fee_delta(?MAINNET_GAS_LIMIT,
                                                            ?MAINNET_GAS_LIMIT)).
 
-%% An empty parent block (0 gas used) drops the base fee by parent * 20M/20M/8
-%% = parent/8, so 1 gwei becomes 875,000,000.
+%% An empty parent block (0 gas used).
+%%
+%%   gas_used_delta = 15,000,000 - 0                    = 15,000,000
+%%   base_fee_delta = 1e9 * 15,000,000 // 15,000,000 // 8 = 125,000,000
+%%   base_fee      = 1,000,000,000 - 125,000,000         =   875,000,000
+%%
+%% **This figure is the same under the old two-thirds target, and that is why the wrong
+%% target survived.** With `gas_used = 0` the deviation *equals* the target, so
+%% `parent * delta / target / 8` collapses to `parent / 8` whichever target you use. The
+%% simplest case in the file agreed with the specification by accident.
 base_fee_empty_block_test() ->
     ?assertEqual(875000000,
                  eth_fork_schedule:base_fee(0, ?MAINNET_GAS_LIMIT, ?GWEI)),
-    ?assertEqual(20000000, eth_fork_schedule:base_fee_delta(0, ?MAINNET_GAS_LIMIT)).
+    ?assertEqual(?TARGET, eth_fork_schedule:base_fee_delta(0, ?MAINNET_GAS_LIMIT)).
 
-%% A full parent block (30M used) overshoots the target by 10M, which is half
-%% the target: parent * 10M/20M/8 = parent/16, so 1 gwei becomes
-%% 1,062,500,000.
+%% A full parent block (30M used, 15M over the target).
+%%
+%%   gas_used_delta = 30,000,000 - 15,000,000            = 15,000,000
+%%   base_fee_delta = 1e9 * 15,000,000 // 15,000,000 // 8 = 125,000,000
+%%   base_fee      = 1,000,000,000 + 125,000,000         = 1,125,000,000
+%%
+%% The old target gave 1,062,500,000 from a different delta (10M over 20M), so this test
+%% changed value and is one of the two that can tell the targets apart.
 base_fee_full_block_test() ->
-    ?assertEqual(1062500000,
+    ?assertEqual(1125000000,
                  eth_fork_schedule:base_fee(?MAINNET_GAS_LIMIT, ?MAINNET_GAS_LIMIT, ?GWEI)).
 
-%% A block one gas over target must still increase the fee, by at least one wei.
-%% 1e9 * 1 / 20e6 = 50, 50 / 8 = 6, so the next fee is 1,000,000,006.
+%% **The discriminating case: a parent between half and two thirds of its limit.**
 %%
-%% With a tiny parent fee the arithmetic truncates to zero, and the "at least
-%% one wei" rule is what keeps the base fee from getting stuck: 7 wei becomes 8.
+%% At 18,000,000 of 30,000,000 the two candidate targets do not disagree by a factor,
+%% they disagree about **which way the fee moves**:
+%%
+%%   half   (15M target): 18M > 15M, so it RISES.
+%%          gas_used_delta = 18,000,000 - 15,000,000            = 3,000,000
+%%          base_fee_delta = 1e9 * 3,000,000 // 15,000,000 // 8 = 25,000,000
+%%          base_fee      = 1,000,000,000 + 25,000,000         = 1,025,000,000
+%%
+%%   2/3   (20M target): 18M < 20M, so it FALLS.
+%%          gas_used_delta = 20,000,000 - 18,000,000            = 2,000,000
+%%          base_fee_delta = 1e9 * 2,000,000 // 20,000,000 // 8  = 12,500,000
+%%          base_fee      = 1,000,000,000 - 12,500,000         =   987,500,000
+%%
+%% **Every other case in this section agrees or differs by a rounding, and this one is
+%% where a sign error lives.** It is the test that bites.
+base_fee_between_half_and_two_thirds_of_the_limit_rises_test() ->
+    ?assertEqual(1025000000,
+                 eth_fork_schedule:base_fee(18000000, ?MAINNET_GAS_LIMIT, ?GWEI)),
+    %% The window is real: at two thirds the fee is still rising, at half it is still
+    %% falling, and everything between was decided by which target you picked.
+    ?assert(18000000 > ?TARGET),
+    ?assert(18000000 < ?TWO_THIRDS_TARGET).
+
+%% A block one gas over target must still increase the fee, by at least one wei.
+%%   base_fee_delta = max(1e9 * 1 // 15,000,000 // 8, 1) = max(66 // 8, 1) = 8
+%%
+%% **66, not 66/8-then-floor: the divisions are left to right and both are integer**, so
+%% `(1e9 // 15,000,000) // 8 = 66 // 8 = 8`. Dividing once and rounding would give a
+%% different constant, and the same expression under the old 20M target gives
+%% `(1e9 // 20,000,000) // 8 = 50 // 8 = 6` -- which is the 6 the previous version of this
+%% test asserted.
 base_fee_minimum_increase_test() ->
-    ?assertEqual(1000000006,
+    ?assertEqual(1000000008,
                  eth_fork_schedule:base_fee(?TARGET + 1, ?MAINNET_GAS_LIMIT, ?GWEI)),
+    %% With a tiny parent fee the arithmetic truncates to zero, and the "at least one wei"
+    %% rule is what keeps a rising base fee from getting stuck: 7 wei becomes 8.
     ?assertEqual(8, eth_fork_schedule:base_fee(?TARGET + 1, ?MAINNET_GAS_LIMIT, 7)).
 
-%% The floor is 7 wei, not 1 gwei. Repeatedly applying an empty parent decays
-%% geometrically by 7/8, so it takes roughly 140 steps to walk 1 gwei down to
-%% the floor; 400 steps is comfortably past that.
-base_fee_floor_is_seven_wei_test() ->
-    Fee = lists:foldl(
-        fun(_, F) -> eth_fork_schedule:base_fee(0, ?MAINNET_GAS_LIMIT, F) end,
-        ?GWEI, lists:seq(1, 400)),
-    ?assertEqual(7, Fee).
+%% **The base fee floor is 0, and no test can pin it.**
+%%
+%% The old constant was 7 wei and the old test argued for it: *"repeatedly applying an
+%% empty parent decays geometrically by 7/8, so it takes roughly 140 steps to walk 1 gwei
+%% down to the floor"*. The premise is wrong in a way that makes the argument worthless.
+%% `F -> F - F div 8` has a **fixed point at every F below 8** -- `7 div 8 = 0`, so
+%% `7 - 0 = 7` -- so the sequence converges to 7 and reaches **no floor at all**. Measured,
+%% all three of these answer 7 after 400 steps:
+%%
+%%   max(0, F - F div 8)     -> 7
+%%   F - F div 8              -> 7
+%%   max(7, F - F div 8)      -> 7
+%%
+%% **So the old test passed with the floor set to 0, set to 7, or removed entirely.** A
+%% constant that a test cannot distinguish from any other value is not pinned by it, and
+%% `eth_fork_schedule:base_fee/3' carried a fabricated consensus constant for exactly as
+%% long as a test argued for it. That is AGENTS.md's shape: *a test that asserts a defect
+%% and argues for it is worse than no test* -- and here the arguing is what made it look
+%% settled.
+%%
+%% The floor is also **unreachable** rather than merely unpinnable. `TargetDelta =
+%% |gas_used - target|` and `gas_used <= gas_limit`, so with `target = gas_limit // 2`
+%% the ratio `TargetDelta / target` is at most about 1 -- measured worst case 2, at a gas
+%% limit of 3 -- and `base_fee_delta = Fee * TargetDelta // target // 8` is then always
+%% below `Fee`. **The decreasing branch cannot produce a negative fee**, so `max(0, ...)` is
+%% defence in depth and not a rule.
+base_fee_floor_is_zero_and_no_test_can_pin_it_test() ->
+    Steps = lists:seq(1, 400),
+    Zero = lists:foldl(fun(_, F) -> max(0, F - F div 8) end, ?GWEI, Steps),
+    Seven = lists:foldl(fun(_, F) -> max(7, F - F div 8) end, ?GWEI, Steps),
+    Bare = lists:foldl(fun(_, F) -> F - F div 8 end, ?GWEI, Steps),
+    %% All three agree, which is the point: the sequence cannot distinguish them.
+    ?assertEqual(7, Zero),
+    ?assertEqual(Zero, Seven),
+    ?assertEqual(Zero, Bare),
+    %% And the branch cannot go negative, so nothing ever reaches the floor.
+    ?assert(lists:all(fun(L) ->
+                          Target = L div 2,
+                          Delta = max(0, L - Target),
+                          Ratio = case Target of 0 -> 0; _ -> Delta div Target end,
+                          Ratio =< 2
+                      end, lists:seq(1, 64))).
 
 %% A zero or negative gas limit is not meaningful input; the parent fee is
 %% returned unchanged rather than dividing by zero.
@@ -63,6 +156,8 @@ base_fee_zero_gas_limit_test() ->
 
 %% The two-argument form starts from the London initial base fee of 1 gwei.
 base_fee_default_initial_test() ->
+    %% The two-argument form starts from London's `INITIAL_BASE_FEE = 1000000000`, which
+    %% is EIP-1559's own constant rather than a choice this repository made.
     ?assertEqual(?GWEI, eth_fork_schedule:base_fee(?TARGET, ?MAINNET_GAS_LIMIT)),
     ?assertEqual(875000000, eth_fork_schedule:base_fee(0, ?MAINNET_GAS_LIMIT)).
 

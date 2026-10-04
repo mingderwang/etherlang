@@ -137,7 +137,30 @@
 %% cold *slot* is 2100, and they are different constants rather than different regimes.
 -define(COLD_SLOAD_COST, 2100).
 -define(BASE_FEE_INITIAL, 1000000000).
--define(MIN_BASE_FEE, 7).
+%% **EIP-1559 floors the decreasing branch at 0, not at 7 wei.**
+%%
+%% The reference implementation:
+%%
+%%     x := parent_base_fee - base_fee_delta
+%%     if x < 0 { x = 0 }
+%%
+%% There is no 7 anywhere in EIP-1559. The floor this module used was carried by
+%% `eth_fork_schedule_tests:base_fee_floor_is_seven_wei_test', which argued for it --
+%% *"repeatedly applying an empty parent decays geometrically by 7/8, so it takes roughly
+%% 140 steps to walk 1 gwei down to the floor"* -- an argument that is internally
+%% consistent and rests on a number nobody derived. **A test that asserts a defect and
+%% argues for it is worse than no test**, and six of them stood here.
+-define(MIN_BASE_FEE, 0).
+
+%% **EIP-1559, quoted:** `ELASTICITY_MULTIPLIER = 2`, and the abstract defines the
+%% target as *"block gas limit divided by elasticity multiplier"*. The reference
+%% implementation is `parent_gas_limit // ELASTICITY_MULTIPLIER`.
+%%
+%% **This module used `gas_limit * 2 div 3`**, which is the yellow paper's pre-EIP-1559
+%% heuristic rather than EIP-1559's rule. `eth_fork_schedule_tests:base_fee_target_is_two_thirds_test'
+%% stated it as the specification and contradicted itself in the same sentence --
+%% *"two-thirds of the gas limit, not one-third"*, when the answer is one-half.
+-define(ELASTICITY_MULTIPLIER, 2).
 %% **Not EIP-4895's, and this constant's provenance is a gap.** EIP-4895 does not
 %% name a limit; it says the bound is "enforced by the consensus layer", and the
 %% `execution-apis` documents do not state one either. 16 is the figure the
@@ -745,11 +768,23 @@ introduced_by(_) -> undefined.
 
 %% Compute the next block's base fee from its parent.
 %%
-%% The target is two-thirds of the parent gas limit.  The formula intentionally
-%% uses integer arithmetic in the same order as the consensus specification:
-%% the absolute gas deviation is applied to the parent fee, divided by the
-%% target, and then divided by eight.  A non-zero deviation always changes a
-%% rising base fee by at least one wei.
+%% **The target is HALF the parent gas limit**, `gas_limit // ELASTICITY_MULTIPLIER` with
+%% `ELASTICITY_MULTIPLIER = 2` -- EIP-1559, and the rule its abstract states in prose:
+%% the base fee is a function of the gas used in the parent and the *"gas target (block
+%% gas limit divided by elasticity multiplier)"*. This used two thirds.
+%%
+%% **And the two versions agree on an empty parent**, which is why this survived. With
+%% `gas_used = 0` the deviation equals the target exactly, so
+%% `parent * delta / target / 8` collapses to `parent / 8` *independently of the target*
+%% -- `base_fee(0, 30_000_000, 1 gwei)` is 875,000,000 either way. The two only part
+%% company when the parent used between **half** and **two thirds** of its limit, and in
+%% that window they do not merely disagree by a factor: one raises the fee where the
+%% other lowers it. `eth_fork_schedule_tests:base_fee_full_block_test' now pins both
+%% sides of that.
+%%
+%% The order of operations is EIP-1559's and is not interchangeable with any other:
+%% the deviation is applied to the parent fee, divided by the target, then by eight.
+%% A non-zero deviation always raises a rising base fee by at least one wei.
 base_fee(ParentGasUsed, ParentGasLimit) ->
     base_fee(ParentGasUsed, ParentGasLimit, ?BASE_FEE_INITIAL).
 
@@ -758,7 +793,7 @@ base_fee(_ParentGasUsed, 0, ParentBaseFee) when is_integer(ParentBaseFee) ->
 base_fee(ParentGasUsed, ParentGasLimit, ParentBaseFee)
   when is_integer(ParentGasUsed), is_integer(ParentGasLimit),
        is_integer(ParentBaseFee), ParentGasLimit > 0 ->
-    Target = ParentGasLimit * 2 div 3,
+    Target = ParentGasLimit div ?ELASTICITY_MULTIPLIER,
     case Target of
         0 -> ParentBaseFee;
         _ when ParentGasUsed =:= Target -> ParentBaseFee;
@@ -770,11 +805,16 @@ base_fee(ParentGasUsed, ParentGasLimit, ParentBaseFee)
             max(?MIN_BASE_FEE, ParentBaseFee - Delta)
     end.
 
-%% Signed fee-independent target deviation.  This is useful for diagnostics
-%% and is also the quantity used by base_fee/3 after applying the parent fee.
+%% **Fee-independent gas deviation from the target -- a magnitude, not a signed
+%% quantity.** The name said "signed" and the code returned `abs': a parent above the
+%% target and one equally far below it answer the same number, which is what
+%% `base_fee/3` needs but not what "signed" describes. The comment is corrected rather
+%% than the code, because the magnitude is right and the word was wrong.
+%%
+%% This is also the quantity `base_fee/3' applies to the parent fee.
 base_fee_delta(ParentGasUsed, ParentGasLimit)
   when is_integer(ParentGasUsed), is_integer(ParentGasLimit), ParentGasLimit > 0 ->
-    Target = ParentGasLimit * 2 div 3,
+    Target = ParentGasLimit div ?ELASTICITY_MULTIPLIER,
     TargetDelta = case ParentGasUsed > Target of
         true -> ParentGasUsed - Target;
         false -> Target - ParentGasUsed
