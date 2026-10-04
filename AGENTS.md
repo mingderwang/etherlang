@@ -537,10 +537,14 @@ Do not add a default to `config/sys.config`; it is empty on purpose.
   because a reader who trusts it is worse off than one who sees none. The full inventory is
   in `TASKS.md` §"Three things settled" — 97 tags, 22 semantic and 72 slug-shaped and 3
   neither, and the semantic scheme stopped being used at `v0.7.4`.
-- **Tag the window.** 28 commits carry no tag at all (everything since `v1.68`,
-  2026-09-30), and they are the most recent ten completed passes, whose figures are quoted
-  in `README.md` and `TASKS.md`. Under any rule that requires a version, those figures point
-  at nothing.
+- **Tag the window.** 29 commits carried no tag (everything since `v1.68`, 2026-09-30) and
+  they were the most recent ten completed passes, whose figures are quoted in `README.md` and
+  `TASKS.md`. **Closed 2026-10-04** — tagged `v1.69` .. `v1.97`, one tag per commit, no pass
+  boundaries guessed, and each `v1.N` checked for uniqueness first because the historical
+  `v1.0` and `v1.5` collisions are what reusing a number looks like. **Note that the count
+  was 28 in the sentence that said 29 commits existed and was written before the last of
+  them landed: a published figure expiring on the commit that completes the work it
+  describes.**
 - Update the test count in `README.md` and `TASKS.md` with the same change that
   moves it, from `make counts`. And **a hand-written tally of finished work is a claim about
   the work**: `TASKS.md` said 49 done / 33 remaining and the counts were 46 / 36, wrong by

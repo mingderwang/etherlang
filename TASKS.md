@@ -177,11 +177,21 @@ commits it means. Anywhere a figure is attributed to `v1.0` or `v1.5`, the attri
 ambiguous by construction, and **an ambiguous attribution is the same failure as a missing
 one** — a reader who trusts it is worse off than one who sees none.
 
-**And 28 commits carry no tag at all**, the window since `v1.68` on 2026-09-30. Ten of those
-are completed passes whose figures are recorded in this file and in `README.md`; under a rule
-that requires a version tag, **every one of those figures is unattributable**, and they are
-the most recent ones. Tag the window or record the commits; do not leave the figures
-pointing at nothing.
+**And 28 commits carried no tag at all** — the window since `v1.68` on 2026-09-30. Ten of
+those are completed passes whose figures are recorded in this file and in `README.md`; under
+a rule that requires a version tag, **every one of those figures was unattributable**, and
+they were the most recent ones.
+
+**Closed 2026-10-04: the window is tagged, `v1.69` .. `v1.97`, one tag per commit.** No pass
+boundaries were guessed — this repository's convention is one behavioural change per commit
+and the message states what the node now does, so every commit in the window is a completed
+change. Numbering continues upward, and the script asserts that each `v1.N` is unused before
+creating it, because **the historical `v1.0` and `v1.5` collisions are exactly what
+reusing a number looks like.**
+
+**The count in that paragraph was 28 when written and the tree then made it 29**, by one
+commit — this file's own claim expiring the moment the work it describes landed. It is the
+defect this section is about, and it happened inside the section.
 
 **The rule that survives all of this:** a `git rev-parse --short HEAD` hash, which is unique
 by construction, over any `v1.N`. A tag is a name a human chose and can be reused, renamed
@@ -200,6 +210,55 @@ by three in the flattering direction until it was counted per phase.
 counts of work:** a hand-written tally of what is finished is a claim about the work, it
 decays silently, and nothing in the build notices. The three defences that have actually
 caught something here are all mechanical — `make counts`, an eunit assertion, and `grep -c`.
+
+## The one decision that is actually open, and what has already been settled about it
+
+**Settled by measurement, so it is not part of the decision: `bpo3`, `bpo4` and `bpo5` can
+never be the current fork.** No activation table in `eth_fork_schedule` mentions them —
+mainnet's ends at `bpo2` and Sepolia's at `amsterdam` — and `current_fork/4` swept over every
+timestamp either schedule contains, and a long way past them, answers `bpo2` and then
+`amsterdam`. They are **names with no schedule**.
+
+**And that is worse than dead, because the module contradicts itself about them.**
+`bpo3`, `bpo4` and `bpo5` appear in exactly two places in `src/` — two `lists:member/2` gates
+that mean "at Cancun and later" and "at Prague and later" — and neither has a `fork_rank/1`
+clause. So a name the module *lists as post-Cancun* ranks **0**, which is Frontier, and
+`at_least(bpo3, cancun)` answers **false** while `at_least(bpo1, cancun)` answers **true**.
+The `fork_rank(_) -> 0` fallback is documented as "the safe direction, since a rule wrong
+inactive is a rule the node declines to apply", and for an atom nobody has heard of that is
+right. For these three it is not: they are not unknown, they are *known and unreachable*.
+
+### The decision: what is the fork after Prague on mainnet, and is it in this node at all
+
+**`fusaka` appears zero times in `src/`.** Not in the rank table, not in either activation
+schedule, not in `eth_config`'s name list. And `amsterdam` — which *is* present, at rank 21,
+with a Sepolia timestamp of 1,791,294,816 — is a **later** mainnet fork than the one that
+follows Prague.
+
+So the tree currently says the post-Prague mainnet fork is called `amsterdam`, and the
+network's name for the fork that follows Prague is not in the tree at all. **Which of these
+is intended cannot be derived from anything in this repository**, and the two possibilities
+have opposite consequences:
+
+- **If `amsterdam` is right**, then `bpo3`–`bpo5` are speculative and should be deleted from
+  the two gates, and the open work is D-4: EIP-7691's blob schedule, where the parameters
+  Osaka raises and each BPO revision changes again.
+- **If the fork is `fusaka`**, then naming it `amsterdam` is a **consensus defect with a
+  reachable symptom**: every mainnet block at or after that timestamp is priced, gated and
+  hashed under another fork's rules, and the naming error is invisible because nothing in
+  the tree holds both names to compare.
+
+**What is not part of the question.** Whether the node refuses an unpriceable block — it
+does, and that check is why a mis-named fork is a wrong answer rather than a crash. Whether
+the conformance corpus would catch it — it would not, since a fixture's fork comes from its
+own directory name and the corpus has no post-Prague suite. And whether `fork_rank/1`'s
+fallback is safe — for genuinely unknown atoms it is, and that part of its comment is right.
+
+**What would settle it, and it is not more reading here.** The activation timestamps and the
+parameter changes for the fork after Prague are in `ethereum/execution-specs` and in the
+client release notes, neither of which is in this repository (see §1 of `AGENTS.md`). One
+fetch of either settles the name, the block or timestamp, and the parameter deltas — and
+that is a smaller piece of work than the guessing it replaces.
 
 ## What to do next, in order
 
