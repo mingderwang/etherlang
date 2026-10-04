@@ -555,9 +555,15 @@ lower_hex(Bin) -> string:lowercase(binary:encode_hex(Bin)).
 %% reachable, and `hv/1` -- which had no clause for a non-hex character, so a raw
 %% `0x`-string died in it four frames from its caller -- is gone with it.
 %%
-%% **`hex_to_bin/1` is still exported**, because `eth_call` and `eth_pairing_bn128` call
-%% it qualified. The guard in `eth_hex_owners_tests' covers the *definition*, so those two
-%% are counted as depending on this one rather than as owning a second.
+%% **`data_bytes/1` is exported, and `eth_call` calls it qualified.** This comment said
+%% "`hex_to_bin/1' is still exported" for several commits after the function was renamed --
+%% the second stale claim in this repository found in one pass, and the same shape as the
+%% four in `TASKS.md`: a note that outlived the change it described. `grep -rn hex_to_bin
+%% apps/etherlang/src` now returns only the comments that record the rename, which is what
+%% it should return.
+%%
+%% The guard in `eth_hex_owners_tests' covers the *definition*, so a qualified caller is
+%% counted as depending on this one rather than as owning a second.
 data_bytes(V) when is_integer(V) -> binary:encode_unsigned(V);
 data_bytes(V) -> eth_hex:must_decode_bytes(V).
 

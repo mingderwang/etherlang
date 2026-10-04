@@ -35,7 +35,7 @@ with the file it sat above.
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
 build. OTP 29.1. Current: **49 src modules / 14,437 code lines, 65 test modules /
-14,328 code lines, 1020 eunit tests, all passing.**
+14,347 code lines, 1021 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive
 them with the procedure below rather than editing this sentence.
@@ -114,6 +114,49 @@ live. `CALLCODE` does not transfer value: `eth_evm.erl:1370` sets
 has no `send_timeout` while the outbound connect does, so the exposure is inbound-only.
 
 
+
+## Standing rule: a change to the node opens the ledger in the same commit
+
+**A commit that touches `apps/etherlang/src/` must also touch `TASKS.md`, `README.md` or
+`AGENTS.md`. Enforced by `make check-ledger`, not stated here and hoped for.**
+
+This exists because the rule was broken four times in one pass and nobody noticed. Checked
+against the source on 2026-10-05, **four entries in this file were false** -- each said
+something was missing that had since been implemented:
+
+| entry said | actually |
+|---|---|
+| "ECADD and ECMUL still conflate a rejected input with an absent implementation" | three distinct answers: `{ok, _, _}`, `{failed, {ecadd, not_on_curve}}`, `{failed, {ecadd, {coordinate_not_in_field, p}}}` |
+| "Not done: KZG commitment verification" | `eth_kzg:verify/4` is the verification and is exported |
+| "The catch-all `base_cost(_) -> 3` remains a fallback" | `eth_evm:base_cost/1` was deleted; the only four hits for the name are comments saying so |
+| "What is still missing is EIP-150's 63/64 rule and the 2300 stipend" | `eth_evm:child_gas/4` implements both, clamp on the pre-stipend figure |
+
+**A sentence cannot fail.** That is the whole reason a stale conformance figure survives, a
+stale architecture count survives, and a stale open-items list survives -- and the first two
+of those had already been given mechanical defences in this repository (`make counts`, and
+`eth_published_figures_tests`). The list had none.
+
+**Two halves, and the second is the one that keeps this file true.**
+
+`make check-ledger` is cheap and mechanical: `src/` changed without a ledger file is a
+failure. It does not check that this file is *right*, only that it was *opened*. Run against
+the real history it flags four of this pass's own commits -- `93513c2`, `f74787b`,
+`1342660` and `5de6e08`, the last being the blob-schedule work, whose absence from this
+ledger was a real omission and not a formality.
+
+`eth_open_claims_tests` is what makes the file *accurate*. Each genuinely-open item is paired
+with a check that must hold today, so **an item cannot be added without a passing check, and
+an item whose gap has been closed fails its own and has to come out.** That is a ratchet, not
+a list, and it is the only arrangement in which such a file stays true. Four items are in it:
+Constantinople's SSTORE refused while every other pre-Berlin fork is priced; `eth_kzg`'s two
+derivation functions absent while the verification is exported; `eth_evm:base_cost/1` gone;
+and the interpreter's EIP-3860 charge still a second, un-gated copy of the schedule's figure.
+
+**And the same decay was found inside `src/`, not only here.** `eth_state.erl` carried a
+comment saying "`hex_to_bin/1` is still exported" for several commits after the function was
+renamed, and `eth_evm:do_create/3` carried one blaming "this module has no fork" after
+`eth_evm:run/5` began requiring a `fork` key -- **a real gap described by a reason that is
+not**, which is why a reader who checks the reason leaves it alone.
 
 ## Three things settled, and how each was established
 

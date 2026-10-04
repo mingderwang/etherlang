@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 REBAR := $(shell command -v rebar3 2>/dev/null)
 
-.PHONY: all compile test eunit counts docs rationale edoc-preview clean docker-build docker-test docker-run compose-up compose-down compose-logs bench
+.PHONY: all compile test eunit counts check-ledger docs rationale edoc-preview clean docker-build docker-test docker-run compose-up compose-down compose-logs bench
 
 all: compile
 
@@ -22,6 +22,40 @@ eunit:
 ## in the script, where it can be read and re-run.
 counts:
 	@tools/counts.escript
+
+  ## **A commit that changes the node must change a ledger file in the same commit.**
+  ##
+  ## The open-items list is a claim about the code, and a hand-maintained claim decays
+  ## silently. Four entries in TASKS.md were checked against the source on 2026-10-05 and
+  ## **all four were false** -- each described work that had since been done, the oldest by
+  ## several commits. Nothing in the build noticed, because a sentence cannot fail.
+  ##
+  ## So the rule is enforced rather than stated: a commit that touches
+  ## `apps/etherlang/src/` must also touch TASKS.md, README.md or AGENTS.md. That is the
+  ## whole mechanism, and it is deliberately cheap -- it does not check that the ledger is
+  ## *right*, only that it was *opened*. Accuracy is `eth_open_claims_tests`, which pairs
+  ## each named-open item with a check that must hold today, so an item cannot be added
+  ## without a passing check, and an item whose gap has been closed fails its own.
+  ##
+  ## Run it before committing. Outside a git working tree it passes rather than failing,
+  ## because a source export has no history to check.
+  check-ledger:
+	@if ! git rev-parse --git-dir >/dev/null 2>&1; then \
+	    echo "not a git working tree -- nothing to check"; exit 0; fi; \
+	 H=`git rev-parse HEAD`; \
+	 if git diff-tree --no-commit-id --name-only -r $$H | grep -q '^apps/etherlang/src/'; then \
+	   if git diff-tree --no-commit-id --name-only -r $$H \
+	        | grep -qE '^(TASKS|README|AGENTS)[.]md$$'; then \
+	     echo "ledger: ok -- src/ and a ledger file changed together in $$H"; \
+	   else \
+	     echo "ledger: FAIL"; \
+	     echo "  $$H changes apps/etherlang/src/ and no ledger file."; \
+	     echo "  Update TASKS.md (the open-items list), README.md or AGENTS.md in this"; \
+	     echo "  commit, or say in the commit message why this change needs none."; \
+	   fi; \
+	 else \
+	   echo "ledger: ok -- $$H does not change apps/etherlang/src/"; \
+	 fi
 
 ## API reference (edoc) into doc/, which is gitignored -- it is a build artifact.
 ##

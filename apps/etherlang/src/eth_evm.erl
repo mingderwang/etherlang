@@ -1656,9 +1656,25 @@ do_create(Op, E, Ctx) ->
                     %% hashing the block has already paid for -- was free, and
                     %% CREATE2 was undercharged by two thirds.
                     %%
-                    %% Charged unconditionally, because this module has no fork and
-                    %% applies one schedule to every block; the Shanghai condition
-                    %% belongs with the per-fork branching that is still missing.
+                    %% **This is a named open item, and it is a second copy of a figure
+                    %% `eth_fork_schedule' already owns.** The schedule has
+                    %% `initcode_word_cost/1' and the two CREATE helpers built on it, both
+                    %% fork-gated, and `eth_tx:1109' asks the schedule for this very
+                    %% figure on the transaction path. **The three literals below are a
+                    %% fourth expression of the same rule**, they are not fork-gated, and
+                    %% `eth_fork_schedule_tests:initcode_word_cost_is_two_from_shanghai_
+                    %% and_nothing_before_test' pins the *schedule's* half, so a pre-Shanghai
+                    %% block is charged 2 and 8 here and 0 and 6 there.
+                    %%
+                    %% The comment used to say "this module has no fork", and that is no
+                    %% longer true either: `eth_evm:run/5' requires a `fork' key and
+                    %% `do_create/3' is reached with it. **So the stated reason is wrong as
+                    %% well as the gap**, which is the shape this repository keeps meeting --
+                    %% a gap that is real, described by a reason that is not, and therefore
+                    %% left alone by a reader who checked the reason.
+                    %%
+                    %% `eth_open_claims_tests' names it, so it cannot be forgotten by
+                    %% someone who reads the ledger's list of open items.
                     Words = (Len + 31) div 32,
                     Extra = case Op of
                                 create2 -> 8 * Words;

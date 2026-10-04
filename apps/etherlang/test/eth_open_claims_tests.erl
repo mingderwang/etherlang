@@ -72,6 +72,40 @@ open_kzg_derivation_functions_are_absent_test() ->
     %% pass by the module having been emptied.
     ?assert(lists:member({verify, 4}, Exports)).
 
+%% **The interpreter's EIP-3860 charge is a second copy of a figure the schedule owns, and
+%% it is not fork-gated.**
+%%
+%% `eth_fork_schedule:initcode_word_cost/1` is fork-gated -- two gas per word from Shanghai
+%% and nothing before it -- and `eth_tx:1109' asks the schedule for it on the transaction
+%% path. `eth_evm:do_create/3' writes the same rule out in three literals, unconditionally,
+%% so a pre-Shanghai block is charged 2 and 8 per word where the schedule says 0 and 6.
+%%
+%% **The check is that the literals are still there.** It reads as a strange assertion and
+%% it is deliberate: an item in this table must fail when it is fixed, so that the entry is
+%% removed rather than left behind describing a gap that has closed. The day
+%% `do_create/3` asks `eth_fork_schedule` for this figure, this assertion goes red and the
+%% comment above it goes with it.
+%%
+%% The comment there used to blame "this module has no fork", which stopped being true when
+%% `eth_evm:run/5' began requiring a `fork' key -- **a real gap described by a reason that
+%% is not**, which is the reason a reader who checks the reason leaves it alone.
+create_charge_is_still_a_second_copy_of_the_schedules_figure_test() ->
+    {ok, {_, [{abstract_code, {_, Forms}}]}} =
+        beam_lib:chunks(code:which(eth_evm), [abstract_code]),
+    Create = [Body || {function, _, do_create, 3, Body} <- Forms],
+    ?assertEqual(1, length(Create)),
+    %% **The check is that `do_create/3' does not ask the schedule.** Reading it as "the
+    %% literals are absent" would pass the moment the function was renamed, which is the
+    %% wrong reason to go green; what has to be true is that the second copy of the figure
+    %% is still a second copy.
+    ?assertNot(mentions(Create, initcode_word_cost)),
+    %% And the schedule's half is fork-gated, so the two are demonstrably different rules
+    %% rather than the same one written twice.
+    ?assertEqual(0, eth_fork_schedule:initcode_word_cost(frontier)),
+    ?assertEqual(0, eth_fork_schedule:initcode_word_cost(berlin)),
+    ?assertEqual(2, eth_fork_schedule:initcode_word_cost(shanghai)),
+    ?assertEqual(2, eth_fork_schedule:initcode_word_cost(cancun)).
+
 %% **`eth_evm:base_cost/1` does not exist.** `eth_fork_schedule` is the only price table,
 %% so the interpreter must ask it for the fork in hand. A second table is a second thing
 %% that can drift, and this repository has deleted one already.
@@ -166,3 +200,20 @@ ecadd(Padded) -> eth_evm_precompiles:precompile(16#06, Padded, byzantium).
 
 ecmul(Point, Scalar) ->
     eth_evm_precompiles:precompile(16#07, <<Point/binary, Scalar:256, 0:256>>, byzantium).
+
+%% Whether a term mentions an atom by name, anywhere inside it. The abstract code is a
+%% nested tuple, so this is a structural walk rather than a pattern, and it is used on a
+%% **function body** so that "this function does not call that" is decidable.
+%%
+%% **It looks for the atom alone, not for a remote call shape**, on purpose: a call written
+%% as `?INITCODE_WORD_COST(Fork)` through a macro would be the same second copy and a
+%% shape-specific pattern would not see it.
+mentions({atom, _, Name}, Name) -> true;
+mentions(Term, Name) when is_tuple(Term) ->
+    mentions(tuple_to_list(Term), Name);
+mentions([H | T], Name) ->
+    case mentions(H, Name) of
+        true -> true;
+        false -> mentions(T, Name)
+    end;
+mentions(_Other, _Name) -> false.
