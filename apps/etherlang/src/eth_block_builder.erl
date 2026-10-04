@@ -279,8 +279,15 @@ with_attributes(Block, Attributes) ->
         %% so a build on top of a parent whose blocks carried blobs would commit to
         %% an excess the network did not compute, and the block would be rejected
         %% by every validator. The update lives in eth_fork_schedule, which is also
-        %% where the Prague-era change to it is documented as not modelled.
+        %% where the per-fork blob schedule lives.
+        %%
+        %% **The fork is the block being built's own fork**, read from the attributes the
+        %% engine supplies, because the excess this block commits to is subtracted from a
+        %% target that is a fork parameter: three blobs at Cancun, six at Prague, fourteen
+        %% at BPO2. A builder that used Cancun's target on a Prague chain would commit to
+        %% an excess no validator computes, and every other node would reject the block.
         excess_blob_gas = eth_fork_schedule:excess_blob_gas(
+                            build_fork(Attributes),
                             maps:get(parent_excess_blob_gas, Attributes, 0),
                             maps:get(parent_blob_gas_used, Attributes, 0)),
         %% This node includes no blob transactions -- it has no transaction type-3
@@ -793,3 +800,12 @@ decode_nibbles(Hex) when byte_size(Hex) rem 2 =:= 0 ->
     catch _:_ -> error
     end;
 decode_nibbles(_Hex) -> error.
+
+%% The fork the block being built is under, from the attributes the engine hands over.
+%% An absent `fork' falls back to the operator's pin, which is the same answer
+%% `eth_fork_schedule:current_fork/4' gives when a network has no schedule.
+build_fork(Attributes) ->
+    case maps:get(fork, Attributes, undefined) of
+        undefined -> eth_fork_schedule:configured_fork();
+        Fork -> Fork
+    end.

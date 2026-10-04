@@ -324,7 +324,8 @@ excess_blob_gas_mismatch(_Parent, _Header, Fork) ->
                   num(Header, <<"blobGasUsed">>)} of
                 {PEG, HEG, PBGU} when is_integer(PEG), is_integer(HEG),
                                          is_integer(PBGU) ->
-                    case eth_fork_schedule:excess_blob_gas(PEG, PBGU) of
+                    case eth_fork_schedule:excess_blob_gas(
+                             Fork,PEG, PBGU) of
                         HEG -> ok;
                         Other -> {error, {invalid_header,
                                           {excess_blob_gas_mismatch, HEG, Other}}}

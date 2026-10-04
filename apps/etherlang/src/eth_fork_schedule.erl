@@ -7,7 +7,10 @@
 
 -module(eth_fork_schedule).
 
--export([ past_modelled_range/3,
+-export([ blob_gas_per_blob/0, blob_schedule/1, target_blob_gas_per_block/1,
+          max_blob_gas_per_block/1, excess_blob_gas/3, blob_base_fee/3,
+          blob_gas_price/2,
+          past_modelled_range/3,
           past_modelled_range/4,
           current_fork/3,
           current_fork/4,
@@ -27,10 +30,6 @@
           base_fee/3,
           base_fee_delta/2,
           burn_base_fee/2,
-          blob_gas_per_blob/0, max_blob_gas_per_block/0,
-          excess_blob_gas/2,
-          blob_base_fee/2,
-          blob_gas_price/1,
           fake_exponential/3,
           process_withdrawals/2,
           make_withdrawal/3,
@@ -921,17 +920,101 @@ burn_base_fee(BaseFee, GasUsed) when is_integer(BaseFee), is_integer(GasUsed) ->
 %% the excess-blob-gas calculation below is not the one that applies. This
 %% client does not model the later blob schedule, and saying so is preferable
 %% to silently charging the Cancun curve.
--define(BLOB_GASPRICE_UPDATE_FRACTION, 3338477).
 -define(MIN_BLOB_GASPRICE, 1).
--define(TARGET_BLOB_GAS_PER_BLOCK, 393216).
-%% EIP-4844's parameters table: `MAX_BLOB_GAS_PER_BLOCK | 786432'. The EIP's
-%% rationale says the same number as six blobs, and it is exactly
-%% `6 * blob_gas_per_blob/0' -- written as the product rather than transcribed,
-%% because a second literal for a figure that is another figure times six is a
-%% second thing that can drift.
--define(MAX_BLOB_GAS_PER_BLOCK, 6 * 131072).
 
 blob_gas_per_blob() -> 131072.
+
+%% **EIP-4844's per-blob gas never changes, so it is the one blob figure without a
+%% fork argument.** Every other figure in this section is a fork parameter, and having
+%% exactly one function here that cannot be asked for a fork is what keeps the others
+%% honest: a caller that has a fork in hand and calls this one is getting a constant,
+%% and a constant is the right answer for this one.
+
+%% **The blob schedule, per fork: `{TargetBlobs, MaxBlobs, UpdateFraction}'.**
+%%
+%% Source: the `BlobScheduleConfig' of go-ethereum's `params/config.go', fetched
+%% 2026-10-05. **Every one of these is a consensus constant read out of the chain
+%% configuration**, not derived here, and the table is the whole of it:
+%%
+%%     fork    target  max  update fraction
+%%     Cancun      3    6           3338477
+%%     Prague      6    9           5007716
+%%     BPO1       10   15           8346193
+%%     BPO2       14   21          11684671
+%%     BPO3       21   32          20609697
+%%     BPO4       14   21          13739630
+%%
+%% **BPO3 and BPO4 are in the table and not in any activation schedule this node knows.**
+%% No network has scheduled them, so they are unreachable, and they are here so that a
+%% future activation is a data change rather than a code change. **BPO5 has no entry in
+%% the source at all** -- the chain configuration defines `DefaultBPO5BlobConfig' in a
+%% different file and no network lists it -- so `bpo5' falls back to BPO4's, which is
+%% the wrong answer and is unreachable for the same reason.
+%%
+%% **Osaka and Amsterdam deliberately have no row.** The source says so: "Named forks such
+%% as Osaka or Amsterdam inherit the most recently configured BPO entry and must not
+%% declare their own BlobConfig." So `osaka' takes Prague's row on every network, because
+%% on all three BPO1 is scheduled *after* Osaka. That is a fact about the schedules and
+%% not a rule about names, and `blob_schedule/1` gets it by walking down the ranks
+%% rather than by naming forks -- see there.
+blob_schedule(Fork) ->
+    case blob_row(Fork) of
+        {ok, Row} -> Row;
+        none -> nearest_row(fork_rank(Fork))
+    end.
+
+%% **The rows, by name.** Only a fork the chain configuration gives a `BlobScheduleConfig'
+%% entry has one, and the two named forks that must *not* have one are absent on purpose.
+blob_row(cancun) -> {ok, {3, 6, 3338477}};
+blob_row(prague) -> {ok, {6, 9, 5007716}};
+blob_row(bpo1)   -> {ok, {10, 15, 8346193}};
+blob_row(bpo2)   -> {ok, {14, 21, 11684671}};
+blob_row(bpo3)   -> {ok, {21, 32, 20609697}};
+blob_row(bpo4)   -> {ok, {14, 21, 13739630}};
+blob_row(_Fork)  -> none.
+
+%% **The row a fork uses is the nearest row at or below it, not a row named after it.**
+%%
+%% Osaka and Amsterdam carry no row of their own and inherit one, so the lookup walks down
+%% from the fork's rank to the highest-ranked fork that *has* a row. Naming the forks
+%% instead would need a row per named fork, and the two lists would then be able to
+%% disagree -- which is the shape of the defect this table replaced: one Cancun figure
+%% serving every fork, in a comment that admitted it.
+%%
+%% The rows themselves are the four ranks at which the chain configuration declares a
+%% `BlobScheduleConfig' entry, which is `cancun, prague, bpo1 .. bpo4'.
+%% **The walk lists only the rows that have a rank**, and that is four of the six.
+%% `fork_rank/1' has no clause for `bpo3' or `bpo4' -- no network has scheduled them --
+%% so they rank 0 and the walk would step straight past them. `blob_schedule/1' still
+%% answers for them when a caller names one directly, so scheduling either is a data
+%% change and not a code change.
+%%
+%% **The list was wrong twice before this line was right.** It began with `cancun' and
+%% contained it twice, so `cancun' matched the first candidate for every fork and
+%% `blob_schedule(osaka)' answered Cancun's row. Every test in `eth_4844_tests' that
+%% asked what Prague changes failed at once, which is the only reason the list was read
+%% rather than assumed -- **a candidate list is a claim about order and has to be
+%% written in the order it is walked.**
+nearest_row(Rank) -> nearest_row(Rank, [bpo2, bpo1, prague, cancun]).
+
+%% Every fork below Cancun, and any fork whose rank is below Cancun's, uses Cancun's row:
+%% it is the only one that was in force before EIP-7691 and there is no earlier blob
+%% schedule to inherit from.
+nearest_row(_Rank, []) -> {3, 6, 3338477};
+nearest_row(Rank, [Candidate | Rest]) ->
+    case fork_rank(Candidate) =< Rank of
+        true ->
+            %% **The `{ok, _}' wrapper has to come off here.** `blob_row/1' returns it so
+            %% that "this fork has no row" is a value rather than a crash, and the two
+            %% callers want opposite things: `blob_schedule/1' unwraps, the walk below
+            %% hands the row straight out. Leaving the wrapper on leaked it to every
+            %% caller, and `blob_gas_price/2' destructures a three-tuple -- so the first
+            %% symptom was a `{ok, {6, 9, 5007716}}' where a row belonged.
+            {ok, Row} = blob_row(Candidate),
+            Row;
+        false ->
+            nearest_row(Rank, Rest)
+    end.
 
 %% EIP-4844: "ensure that the total blob gas spent is at most equal to the limit",
 %% over the whole block. **Not a per-transaction condition**, and that distinction is
@@ -939,26 +1022,47 @@ blob_gas_per_blob() -> 131072.
 %% whose transactions are each individually valid, so no per-transaction check can
 %% enforce it and a check written per transaction would be a different rule wearing
 %% the same name.
-max_blob_gas_per_block() -> ?MAX_BLOB_GAS_PER_BLOCK.
+%%
+%% **The max is a fork parameter and was not one.** At Cancun it is 786,432 -- six blobs,
+%% which is EIP-4844's own table entry and exactly `6 * blob_gas_per_blob/0', written as
+%% the product so a second literal for a figure that is another figure times six cannot
+%% drift. At Prague it is nine blobs, at BPO2 twenty-one.
+max_blob_gas_per_block(Fork) ->
+    {_Target, MaxBlobs, _Fraction} = blob_schedule(Fork),
+    MaxBlobs * blob_gas_per_blob().
+
+target_blob_gas_per_block(Fork) ->
+    {TargetBlobs, _Max, _Fraction} = blob_schedule(Fork),
+    TargetBlobs * blob_gas_per_blob().
 
 %% Excess blob gas carried into this block: the parent's excess plus the gas
 %% its blobs consumed, less the per-block target, floored at zero.
-excess_blob_gas(ParentExcessBlobGas, ParentBlobGasUsed)
+%%
+%% **The target is a fork parameter and was not one.** At Cancun it is 393,216 -- three
+%% blobs -- so a Prague block was having six blobs' worth of gas subtracted per block and
+%% a BPO2 block fourteen, which moves the excess counter by a third to five times the
+%% correct amount and therefore every blob base fee derived from it.
+excess_blob_gas(Fork, ParentExcessBlobGas, ParentBlobGasUsed)
   when is_integer(ParentExcessBlobGas), is_integer(ParentBlobGasUsed) ->
-    max(0, ParentExcessBlobGas + ParentBlobGasUsed - ?TARGET_BLOB_GAS_PER_BLOCK);
-excess_blob_gas(_ParentExcessBlobGas, _ParentBlobGasUsed) ->
+    max(0, ParentExcessBlobGas + ParentBlobGasUsed
+            - target_blob_gas_per_block(Fork));
+excess_blob_gas(_Fork, _ParentExcessBlobGas, _ParentBlobGasUsed) ->
     0.
 
-blob_base_fee(ParentExcessBlobGas, ParentBlobGasUsed) ->
-    blob_gas_price(excess_blob_gas(ParentExcessBlobGas, ParentBlobGasUsed)).
+blob_base_fee(Fork, ParentExcessBlobGas, ParentBlobGasUsed) ->
+    blob_gas_price(Fork, excess_blob_gas(Fork, ParentExcessBlobGas, ParentBlobGasUsed)).
 
 %% Blob gas price as a function of excess blob gas. This is the EIP-4844
 %% fake_exponential with the minimum price as its base, so a block whose
 %% predecessors used no more than the target charges 1 wei per blob gas.
-blob_gas_price(ExcessBlobGas) when is_integer(ExcessBlobGas) ->
-    fake_exponential(?MIN_BLOB_GASPRICE, max(0, ExcessBlobGas),
-                     ?BLOB_GASPRICE_UPDATE_FRACTION);
-blob_gas_price(_ExcessBlobGas) ->
+%%
+%% **The update fraction is a fork parameter and was not one.** Cancun divides by 3,338,477
+%% and Prague by 5,007,716, so the curve is materially flatter after Prague: at the same
+%% excess, a Prague block charges *less* per blob gas than a Cancun block would.
+blob_gas_price(Fork, ExcessBlobGas) when is_integer(ExcessBlobGas) ->
+    {_Target, _Max, Fraction} = blob_schedule(Fork),
+    fake_exponential(?MIN_BLOB_GASPRICE, max(0, ExcessBlobGas), Fraction);
+blob_gas_price(_Fork, _ExcessBlobGas) ->
     ?MIN_BLOB_GASPRICE.
 
 %% fake_exponential(Factor, Numerator, Denominator), as defined in EIP-4844.

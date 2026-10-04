@@ -278,11 +278,10 @@ a_built_block_carries_the_eip_4844_excess_blob_gas_test() ->
         %% The builder takes the parent's two EIP-4844 inputs as attributes --
         %% eth_engine is what reads them off the chain store, so a test that calls
         %% the builder directly has to supply what the engine would have supplied.
-        {ok, Payload, _Value} =
-            eth_block_builder:build(
-              (attributes(Head))#{parent_excess_blob_gas => 600000,
-                                   parent_blob_gas_used => 131072}),
-        Expected = eth_fork_schedule:excess_blob_gas(600000, 131072),
+        Attrs = (attributes(Head))#{parent_excess_blob_gas => 600000,
+                                     parent_blob_gas_used => 131072},
+        {ok, Payload, _Value} = eth_block_builder:build(Attrs),
+        Expected = eth_fork_schedule:excess_blob_gas(fork_of(Attrs), 600000, 131072),
         ?assertNotEqual(0, Expected),
         ?assertEqual(eth_hex:encode_int(Expected),
                      maps:get(<<"excessBlobGas">>, Payload))
@@ -771,3 +770,11 @@ call(Port, Method, Params) ->
     {ok, Decoded, Status}.
 
 hex(Bin) -> <<"0x", (string:lowercase(binary:encode_hex(Bin)))/binary>>.
+
+%% The fork the attributes name, for the same reason `eth_fork_schedule:excess_blob_gas/3'
+%% needs one: the per-block target is a fork parameter.
+fork_of(Attributes) ->
+    case maps:get(fork, Attributes, undefined) of
+        undefined -> eth_fork_schedule:configured_fork();
+        Fork -> Fork
+    end.

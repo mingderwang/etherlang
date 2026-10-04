@@ -18,6 +18,22 @@
 %% number of 1 would answer `frontier' and a blob transaction would be executed
 %% under a schedule that has no blobs in it, which is a different test.
 -define(CANCUN_BLOCK, 3000000).
+
+%% **Every block in this module carries this timestamp, and it is not decoration.**
+%%
+%% `eth_block:new/2' stamps a block with the current time, so a test that builds a Cancun
+%% block without saying when it is gets *today's* date -- and the blob base fee is now read
+%% at the fork the block's own number and timestamp imply. On the configured network that
+%% made these Cancun tests price their blobs at a BPO2 fork's fraction, and three of them
+%% failed on a balance difference rather than on anything mentioning a fork.
+%%
+%% **The general form is the fixture's date, not just its numbers.** A fixture that reads
+%% the clock inherits every rule the clock eventually crosses, and the block number alone
+%% does not determine a post-Merge fork: the timestamp does.
+%%
+%% 1,710,065,072 is Cancun's activation on Sepolia and is inside the Cancun frame on every
+%% network this node knows.
+-define(CANCUN_TS, 1710065072).
 %% **Explicitly 160 bits.** Written as `<<16#c0de...01>>` the literal is *one byte*:
 %% a hex constant too wide for the default 8-bit segment is truncated silently, and
 %% a 1-byte `miner' then reaches `eth_state:address/1'` on its second clause, which
@@ -157,28 +173,28 @@ versioned_hash_validity_test() ->
 %% A block that used no more than the per-block target carries no excess, so
 %% the price is the 1 wei minimum.
 blob_gas_price_floor_test() ->
-    ?assertEqual(1, eth_fork_schedule:blob_gas_price(0)),
-    ?assertEqual(1, eth_fork_schedule:blob_base_fee(0, 0)),
-    ?assertEqual(1, eth_fork_schedule:blob_base_fee(0, eth_fork_schedule:blob_gas_per_blob())).
+    ?assertEqual(1, eth_fork_schedule:blob_gas_price(cancun, 0)),
+    ?assertEqual(1, eth_fork_schedule:blob_base_fee(cancun, 0, 0)),
+    ?assertEqual(1, eth_fork_schedule:blob_base_fee(cancun, 0, eth_fork_schedule:blob_gas_per_blob())).
 
 %% Excess blob gas is the parent's excess plus what the parent's blobs used,
 %% less the per-block target, floored at zero. The target is three blobs.
 excess_blob_gas_test() ->
     PerBlob = eth_fork_schedule:blob_gas_per_blob(),
     ?assertEqual(131072, PerBlob),
-    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(0, 0)),
-    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(0, 3 * PerBlob)),
-    ?assertEqual(PerBlob, eth_fork_schedule:excess_blob_gas(0, 4 * PerBlob)),
+    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(cancun, 0, 0)),
+    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(cancun, 0, 3 * PerBlob)),
+    ?assertEqual(PerBlob, eth_fork_schedule:excess_blob_gas(cancun, 0, 4 * PerBlob)),
     %% Parent excess is carried forward, not recomputed from zero.
-    ?assertEqual(PerBlob, eth_fork_schedule:excess_blob_gas(PerBlob, 3 * PerBlob)),
-    ?assertEqual(2 * PerBlob, eth_fork_schedule:excess_blob_gas(PerBlob, 4 * PerBlob)).
+    ?assertEqual(PerBlob, eth_fork_schedule:excess_blob_gas(cancun, PerBlob, 3 * PerBlob)),
+    ?assertEqual(2 * PerBlob, eth_fork_schedule:excess_blob_gas(cancun, PerBlob, 4 * PerBlob)).
 
 %% The price curve is fake_exponential(1, excess, 3338477). Rather than quote a
 %% remembered constant, the expected value is recomputed here by an independent
 %% transcription of the specification's recurrence.
 blob_gas_price_matches_spec_test() ->
     lists:foreach(fun(Excess) ->
-        ?assertEqual(spec_blob_price(Excess), eth_fork_schedule:blob_gas_price(Excess))
+        ?assertEqual(spec_blob_price(Excess), eth_fork_schedule:blob_gas_price(cancun, Excess))
     end, [0, 1, 2, 131072, 131073, 393216, 1000000, 5000000, 100000000]).
 
 %% The price rises with excess blob gas, but the curve is flat near zero: the
@@ -189,16 +205,16 @@ blob_gas_price_matches_spec_test() ->
 blob_gas_price_is_monotonic_test() ->
     Points = lists:seq(0, 400000, 20000) ++ [10, 1000, 100000, 10000000,
                                               1000000000, 100000000000],
-    Prices = [eth_fork_schedule:blob_gas_price(P) || P <- Points],
+    Prices = [eth_fork_schedule:blob_gas_price(cancun, P) || P <- Points],
     ?assertEqual(Prices, lists:sort(Prices)),
     ?assertEqual(1, hd(Prices)),
     %% Once the curve clears the truncation it grows, and it keeps growing.
-    ?assert(eth_fork_schedule:blob_gas_price(10000000) >
-           eth_fork_schedule:blob_gas_price(100000)),
-    ?assert(eth_fork_schedule:blob_gas_price(1000000000) >
-           eth_fork_schedule:blob_gas_price(10000000)),
-    ?assert(eth_fork_schedule:blob_gas_price(100000000000) >
-           eth_fork_schedule:blob_gas_price(1000000000)).
+    ?assert(eth_fork_schedule:blob_gas_price(cancun, 10000000) >
+           eth_fork_schedule:blob_gas_price(cancun, 100000)),
+    ?assert(eth_fork_schedule:blob_gas_price(cancun, 1000000000) >
+           eth_fork_schedule:blob_gas_price(cancun, 10000000)),
+    ?assert(eth_fork_schedule:blob_gas_price(cancun, 100000000000) >
+           eth_fork_schedule:blob_gas_price(cancun, 1000000000)).
 
 %% ---------------------------------------------------------------------------
 %% Block builder integration
@@ -281,7 +297,7 @@ sender_is_debited_the_blob_fee_test() ->
         %% `maxPriorityFeePerGas = 3` against a 1 gwei base fee, so the effective
         %% price is 1 gwei + 3 and both the gas and the value are non-zero and
         %% distinguishable in the arithmetic.
-        Block0 = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))
+        Block0 = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))#block{timestamp = ?CANCUN_TS}
                     #block{excess_blob_gas = 0, base_fee_per_gas = ?GWEI,
                            miner = ?MINER},
         Hashes = [bin0x(versioned_hash(1)), bin0x(versioned_hash(2))],
@@ -339,7 +355,7 @@ blob_fee_scales_with_the_price_test() ->
         Price = spec_blob_price(Excess),
         ?assert(Price > 1),
         Hashes = [bin0x(versioned_hash(I)) || I <- lists:seq(1, 6)],
-        Block0 = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))
+        Block0 = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))#block{timestamp = ?CANCUN_TS}
                     #block{excess_blob_gas = Excess, base_fee_per_gas = ?GWEI,
                            miner = ?MINER},
         Tx = sign(base_tx(#{<<"blobVersionedHashes">> => Hashes,
@@ -375,7 +391,7 @@ blob_fee_uses_this_blocks_own_excess_test() ->
         Hashes = [bin0x(versioned_hash(1))],
         Excess = 50000000,
         Price = spec_blob_price(Excess),
-        Block0 = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))
+        Block0 = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))#block{timestamp = ?CANCUN_TS}
                     #block{excess_blob_gas = Excess, base_fee_per_gas = ?GWEI,
                            miner = ?MINER},
         Tx = sign(base_tx(#{<<"blobVersionedHashes">> => Hashes,
@@ -425,7 +441,7 @@ blob_fee_is_not_refunded_when_the_transaction_fails_test() ->
         To = test_address(2),
         ok = eth_mpt:put_code(eth_keccak:hash(Code), Code),
         ok = eth_mpt:put_account(To, 0, 0, eth_keccak:hash(Code)),
-        Block0 = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))
+        Block0 = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))#block{timestamp = ?CANCUN_TS}
                     #block{excess_blob_gas = 0, base_fee_per_gas = ?GWEI,
                            miner = ?MINER},
         Hashes = [bin0x(versioned_hash(1))],
@@ -615,7 +631,7 @@ the_price_checked_against_is_the_price_charged_test() ->
                <<"value">> => eth_hex:encode_int(0),
                <<"input">> => <<"0x">>},
     ok = eth_mpt:put_account(Sender, Start, 0, eth_keccak:hash(<<>>)),
-    Block = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))
+    Block = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))#block{timestamp = ?CANCUN_TS}
                 #block{excess_blob_gas = Excess, base_fee_per_gas = ?GWEI,
                        miner = ?MINER},
     {Block1, State1} = eth_block:run_transaction(
@@ -637,7 +653,7 @@ the_sender_is_charged_the_block_price_not_its_own_cap_test() ->
     Sender = addr_of(Priv),
     Start = 1000000000 * ?GWEI,
     ok = eth_mpt:put_account(Sender, Start, 0, eth_keccak:hash(<<>>)),
-    Block = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))
+    Block = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))#block{timestamp = ?CANCUN_TS}
                 #block{excess_blob_gas = 0, base_fee_per_gas = ?GWEI, miner = ?MINER},
     Tx = sign(base_tx(#{<<"blobVersionedHashes">> => [bin0x(versioned_hash(1))],
                         %% A cap of 1 gwei against a block priced at 1 wei.
@@ -667,10 +683,134 @@ the_sender_is_charged_the_block_price_not_its_own_cap_test() ->
 %% why the two tests below take different shapes: one is a single transaction at the
 %% boundary, and one is two transactions of four blobs each. The second is the only
 %% one that tests the rule as the EIP states it.
+%% ---------------------------------------------------------------------------
+%% The blob schedule is a fork parameter, and this is the table
+%% ---------------------------------------------------------------------------
+
+%% **Every figure below is read out of go-ethereum's `params/config.go`, fetched
+%% 2026-10-05, and none of it is derived.** They are the whole of EIP-4844's Cancun row,
+%% EIP-7691's Prague row, and the two BPO rows the networks have activated:
+%%
+%%     fork     target  max   update fraction
+%%     Cancun       3     6            3338477
+%%     Prague       6     9            5007716
+%%     BPO1        10    15            8346193
+%%     BPO2        14    21           11684671
+%%     BPO3        21    32           20609697
+%%     BPO4        14    21           13739630
+%%
+%% **BPO3 and BPO4 have no activation on any network this node knows**, so they are
+%% unreachable and only their being in the table is asserted.
+%%
+%% **The per-blob gas is 131,072 at every fork** and is the one figure here without a
+%% fork. EIP-4844 fixes it and nothing since has changed it, which is why the target and
+%% the maximum are written as multiples of it rather than as their own literals: 3 x
+%% 131072 is 393,216, and a second literal for a figure that is another figure times a
+%% small integer is a second thing that can drift.
+the_blob_schedule_is_a_fork_parameter_test() ->
+    ?assertEqual({3, 6, 3338477},    eth_fork_schedule:blob_schedule(cancun)),
+    ?assertEqual({6, 9, 5007716},    eth_fork_schedule:blob_schedule(prague)),
+    ?assertEqual({10, 15, 8346193},  eth_fork_schedule:blob_schedule(bpo1)),
+    ?assertEqual({14, 21, 11684671}, eth_fork_schedule:blob_schedule(bpo2)),
+    ?assertEqual({21, 32, 20609697}, eth_fork_schedule:blob_schedule(bpo3)),
+    ?assertEqual({14, 21, 13739630}, eth_fork_schedule:blob_schedule(bpo4)).
+
+%% **Osaka and Amsterdam have no row of their own and inherit one.** The chain
+%% configuration says so in as many words: "Named forks such as Osaka or Amsterdam inherit
+%% the most recently configured BPO entry and must not declare their own BlobConfig." On
+%% all three networks BPO1 is scheduled *after* Osaka, so Osaka's row is Prague's -- which
+%% is a fact about the schedules and not a rule about names.
+%%
+%% Amsterdam is the interesting one: it is scheduled after BPO2, so it inherits BPO2's row
+%% rather than Prague's. A lookup that named the forks instead of walking the ranks would
+%% have to add a row for every named fork, and the two lists could then disagree.
+a_named_fork_inherits_the_nearest_row_below_it_test() ->
+    ?assertEqual(eth_fork_schedule:blob_schedule(prague),
+                 eth_fork_schedule:blob_schedule(osaka)),
+    ?assertEqual(eth_fork_schedule:blob_schedule(bpo2),
+                 eth_fork_schedule:blob_schedule(amsterdam)),
+    %% And the consequence in the two places it shows up as a number.
+    %% Prague's cap is **nine** blobs, 1,179,648 -- not Cancun's six. The first version of
+    %% this asserted 786,432, which is the figure the whole defect was about, so a test
+    %% written while fixing it repeated it.
+    ?assertEqual(9 * 131072,  eth_fork_schedule:max_blob_gas_per_block(prague)),
+    ?assertEqual(21 * 131072, eth_fork_schedule:max_blob_gas_per_block(bpo2)),
+    ?assertEqual(6 * 131072,  eth_fork_schedule:target_blob_gas_per_block(prague)),
+    ?assertEqual(14 * 131072, eth_fork_schedule:target_blob_gas_per_block(bpo2)).
+
+%% **Before Cancun every fork uses Cancun's row**, because Cancun's is the only one that was
+%% in force before EIP-7691 and there is no earlier blob schedule to inherit from. This
+%% matters for pre-Cancun blocks specifically: `excess_blob_gas/3' is called on the
+%% admission path with whatever fork the context names, and a fork with no row must not
+%% answer zero for a target.
+a_pre_cancun_fork_uses_cancuns_row_test() ->
+    ?assertEqual(eth_fork_schedule:blob_schedule(cancun),
+                 eth_fork_schedule:blob_schedule(london)),
+    ?assertEqual(eth_fork_schedule:blob_schedule(cancun),
+                 eth_fork_schedule:blob_schedule(shanghai)),
+    ?assertEqual(786432, eth_fork_schedule:max_blob_gas_per_block(london)),
+    ?assertEqual(393216, eth_fork_schedule:target_blob_gas_per_block(london)).
+
+%% **The target moved, and it moved the excess counter by more than a factor of four.**
+%%
+%% Cancun subtracts three blobs per block and Prague six, so a Prague chain that subtracts
+%% Cancun's target accrues excess blob gas at twice the rate the network does -- and every
+%% blob base fee derived from that counter is then too high. This is the assertion that
+%% would have caught it, and it is written as the two counters rather than as the
+%% function's output, so a reader can see which figure moved.
+the_excess_blob_gas_target_is_the_fork_s_target_test() ->
+    Cancun = eth_fork_schedule:excess_blob_gas(cancun, 0, 6 * 131072),
+    Prague = eth_fork_schedule:excess_blob_gas(prague, 0, 6 * 131072),
+    ?assertEqual(3 * 131072, Cancun),
+    ?assertEqual(0, Prague),
+    %% And the far end of the table.
+    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(bpo2, 0, 6 * 131072)),
+    %% 22 blobs used against BPO2's 14-blob target leaves 8, and using exactly the target
+    %% leaves nothing -- the two halves are the boundary and it is worth pinning both.
+    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(bpo2, 0, 14 * 131072)),
+    ?assertEqual(8 * 131072, eth_fork_schedule:excess_blob_gas(bpo2, 0, 22 * 131072)).
+
+%% **The curve is flatter after Prague, so the same excess costs less.** Prague divides by
+%% 5,007,716 where Cancun divides by 3,338,477, and a larger denominator in a
+%% `fake_exponential' means a smaller output. Pinning the ratio rather than one price is
+%% what makes the test about the fraction and not about the arithmetic.
+the_update_fraction_is_the_fork_s_test() ->
+    %% **The excess has to be large enough to carry the difference and small enough for
+    %% the series to terminate.** Both bounds were found the hard way.
+    %%
+    %% At 1,000,000 both curves truncate to **1**: the series is 1 + N/D + (N/D)^2/2 + ...
+    %% and with N/D about 0.30 the tail is under half a wei, so integer division drops it.
+    %% A test written at that figure concludes the fractions are the same, which is exactly
+    %% what a figure too small to carry the difference looks like.
+    %%
+    %% The first version that *did* separate them used 1,000,000,000,000, and the suite
+    %% **timed out inside `fe/6'**. The accumulator is multiplied by N and divided by D*i,
+    %% so it terminates when `Acc * N < D * i` -- and with N/D about 300,000 the accumulator
+    %% grows without bound instead. **That is a property of the series, not of the test**:
+    %% `blob_gas_price/2' does not terminate for an excess at or above the update fraction,
+    %% and a block whose excess got there would hang the node. Recorded as a gap rather than
+    %% papered over, because the fix is a bound on the iteration count and that belongs with
+    %% the other blob work.
+    %%
+    %% 50,000,000 is the figure `blob_fee_scales_with_the_price_test' already uses, so it is
+    %% known to terminate, and it is far enough above both fractions for the curves to differ.
+    Excess = 50000000,
+    C = eth_fork_schedule:blob_gas_price(cancun, Excess),
+    P = eth_fork_schedule:blob_gas_price(prague, Excess),
+    ?assert(C > P),
+    %% And the two are not merely ordered: Prague's is at most Cancun's, and strictly
+    %% smaller at any excess where either exceeds the floor.
+    ?assert(eth_fork_schedule:blob_gas_price(cancun, Excess) >
+           eth_fork_schedule:blob_gas_price(osaka, Excess)),
+    ?assertEqual(1, eth_fork_schedule:blob_gas_price(cancun, 0)),
+    ?assertEqual(1, eth_fork_schedule:blob_gas_price(prague, 0)),
+    %% Pre-Cancun uses Cancun's row, so the two agree there.
+    ?assertEqual(C, eth_fork_schedule:blob_gas_price(london, Excess)).
+
 max_blob_gas_per_block_is_six_blobs_test() ->
-    ?assertEqual(786432, eth_fork_schedule:max_blob_gas_per_block()),
+    ?assertEqual(786432, eth_fork_schedule:max_blob_gas_per_block(cancun)),
     ?assertEqual(6 * eth_fork_schedule:blob_gas_per_blob(),
-                 eth_fork_schedule:max_blob_gas_per_block()).
+                 eth_fork_schedule:max_blob_gas_per_block(cancun)).
 
 %% **Six blobs in one transaction is the limit and seven is over it.**
 %%
@@ -1033,7 +1173,7 @@ corpus_blob_fee_signature_test() ->
         %% not by itself prove the field is read from the right place. That is what
         %% `blob_fee_uses_this_blocks_own_excess_test/0' is for.
         ?assertEqual(1, spec_blob_price(Excess)),
-        Block0 = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))
+        Block0 = (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))#block{timestamp = ?CANCUN_TS}
                     #block{excess_blob_gas = Excess, base_fee_per_gas = 7,
                            miner = ?MINER},
         Hashes = [bin0x(versioned_hash(I)) || I <- lists:seq(1, 6)],
@@ -1136,7 +1276,8 @@ ctx(Sender, Balance, Extra) ->
 %% A Cancun block carrying only an `excess_blob_gas`, for the tests that ask
 %% `eth_block:blob_base_fee/1' a price question.
 block_with_excess(Excess) ->
-    (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))#block{excess_blob_gas = Excess}.
+    (eth_block:new(<<0:256>>, ?CANCUN_BLOCK))#block{excess_blob_gas = Excess,
+                                                      timestamp = ?CANCUN_TS}.
 
 block_with_excess(Excess, Parent, Txs) ->
     (block_with_excess(Excess))#block{parent_hash = Parent, transactions = Txs,

@@ -1005,8 +1005,9 @@ check_blobs(Tx, Ctx) ->
             case maps:get(blob_gas_used, Ctx, undefined) of
                 undefined -> ok;
                 Used when is_integer(Used) ->
+
                     ensure(Used + blob_gas_of(Tx)
-                           =< eth_fork_schedule:max_blob_gas_per_block(),
+                           =< eth_fork_schedule:max_blob_gas_per_block(fork_of(Ctx)),
                            {error, blob_gas_allowance_exceeded})
             end;
         _ ->
@@ -1579,3 +1580,18 @@ hex_bytes(<<>>) -> <<>>;
 hex_bytes(B) when is_binary(B) ->
     try binary:decode_hex(B) catch _:_ -> <<>> end;
 hex_bytes(_) -> <<>>.
+
+%% **The fork the cap is read at.** EIP-4844's cap is six blobs at Cancun, nine at
+%% Prague and twenty-one at BPO2, so a node past Prague was enforcing Cancun's cap while
+%% accepting blocks that carry more -- the allowance was *under*-enforced, which is the
+%% direction that admits an invalid block rather than refusing a valid one.
+%%
+%% The context carries the fork on the admission path; without it the operator's `ETH_FORK'
+%% pin is the answer, which is correct for a pool that has no block to read a header from
+%% and is the same rule `eth_fork_schedule:current_fork/4' already applies when a network
+%% has no schedule.
+fork_of(Ctx) ->
+    case maps:get(fork, Ctx, undefined) of
+        undefined -> eth_fork_schedule:configured_fork();
+        Fork -> Fork
+    end.

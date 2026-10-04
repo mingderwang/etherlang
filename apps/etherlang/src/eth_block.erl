@@ -1182,8 +1182,20 @@ blob_fee(#block{} = Block, Tx) ->
 %% Exported because the conformance runner builds a block and must hand the
 %% validator the same figure, and re-deriving it in the test would be the
 %% second-copy mistake `eth_evm:base_cost/1' was deleted for.
-blob_base_fee(#block{excess_blob_gas = Excess}) ->
-    eth_fork_schedule:blob_gas_price(Excess).
+blob_base_fee(#block{excess_blob_gas = Excess, number = N, timestamp = Ts}) ->
+    eth_fork_schedule:blob_gas_price(fork_of_block(N, Ts), Excess).
+
+%% **The fork this block is under, from its own number and timestamp.** The blob price is
+%% a fork parameter, so the block cannot be priced without knowing which fork it belongs
+%% to, and the header already carries both figures. This is the same question
+%% `eth_block_validator' asks when it checks `excessBlobGas', so asking it here rather
+%% than taking a fork from the caller keeps the two from being able to disagree.
+fork_of_block(Number, Timestamp) ->
+    Network = eth_fork_schedule:configured_network(),
+    case eth_fork_schedule:current_fork(Network, Number, Timestamp) of
+        {ok, Fork} -> Fork;
+        _ -> eth_fork_schedule:configured_fork()
+    end.
 
 %% EIP-7702's authorization list, as a state transition.
 %%
