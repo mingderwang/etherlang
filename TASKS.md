@@ -37,11 +37,28 @@ edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fail
 build. OTP 29.1. Current: **49 src modules / 14,334 code lines, 64 test modules /
 14,224 code lines, 997 eunit tests, all passing.**
 
-**82 tasks across 9 phases — 49 done, 33 remaining.** Counted, not asserted; re-derive
-with `grep -cE '^- \[[ x]\]' TASKS.md` before quoting them. The previous header said
-86 / 41 / 45 and was wrong in all three. **The per-phase `(N tasks)` labels below are
-correct** and sum to 82 — the earlier claim that six of them were wrong had itself
-gone stale, which is the fate this section exists to prevent.
+**82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive
+them with the procedure below rather than editing this sentence.
+
+**This said 49 done and 33 remaining, and both were wrong by three.** The total, 82, was
+right: every phase heading's own count matches the number of checkboxes under it, 14 + 12 +
+7 + 8 + 13 + 3 + 7 + 8 + 10. The split was not, and the direction of the error is the
+interesting part — **three boxes had been re-opened and the sentence was never updated**,
+so the file claimed more finished work than it contained and correspondingly less
+remaining. §11 records the re-opening: `eth_state_management` and `eth_block_hash_oracle`
+were deleted and three Phase 4 checkboxes went from `[x]` back to `[ ]`.
+
+The derivation, which is the part worth keeping:
+
+    grep -cE '^[[:space:]]*[-*][[:space:]]+\[x\]' TASKS.md      # 46
+    grep -cE '^[[:space:]]*[-*][[:space:]]+\[ \]' TASKS.md      # 36
+
+and per phase, attributed to a heading rather than to the file as a whole, so a phase
+cannot be inflated by another's boxes. **The first version of this measurement reported
+`[ ]` = 0** — a Python `re.M` pattern with `\s*` under `^`, which is the AGENTS.md
+`string:lexemes/2` failure again: a count that is 0 because the pattern matched nothing is
+indistinguishable from a count that is 0 because there is nothing. `grep -c` is the
+authority here for the reason `make counts` is: it is a procedure, not a claim.
 
 
 ## Verified findings not yet in any task list
@@ -97,6 +114,92 @@ live. `CALLCODE` does not transfer value: `eth_evm.erl:1370` sets
 has no `send_timeout` while the outbound connect does, so the exposure is inbound-only.
 
 
+
+## Three things settled, and how each was established
+
+### p2p is on the critical path — settled by the operator, 2026-10-04
+
+**This is a decision, not a measurement**, and it is the answer to a question this file had
+carried unresolved across several passes: whether the peer transport is load-bearing for a
+release or whether this node is a verifier taking state from a provider. It is load-bearing.
+
+**What it changes, concretely.** Two carried findings stop being Tier 3 and become release
+blockers, because both are on the peer path and a release that cannot hold a connection
+cannot sync:
+
+| Finding | Where it lives | Why the decision makes it blocking |
+|---|---|---|
+| One `NewPooledTransactionHashes` announcement stalls **its own connection for ten seconds** | `eth_peer_conn:handle_msg/3` | the peer path is the critical path, so a ten-second stall on a gossip class is a liveness defect and not a throughput note |
+| **Every inbound p2p handshake performs a live upstream JSON-RPC fetch, and waits for it** | `eth_peer_conn:maybe_eth/3` → `eth_eth` | an inbound connection from an untrusted peer reaches an outbound dependency synchronously. This is F17, and it is the same shape as the one already closed for the peer manager (F14) |
+
+And it makes **Phase 7 the load-bearing phase: 0 of its 7 tasks are done.** Seven consensus
+clients, none integrated, plus the local docker-compose harness and mainnet readiness. With
+p2p critical, a node that has never spoken to a Lighthouse, Prysm, Nimbus, Teku or Lodestar
+has no evidence of the property the decision asserts.
+
+**What it does not change.** Nothing about the code. No line moves for this; what moves is
+which items gate a release, and a gate that has been reclassified is a gate whose cell has
+to be re-measured rather than re-labelled.
+
+**`RELEASE-GATE.md` is suspended and was not used to record any of this.** The operator's
+instruction is to leave it alone, so the decision is recorded here instead — which is the
+right home for it under AGENTS.md §12 anyway, since that names this section as the
+authoritative work list. Where this file and `RELEASE-GATE.md` disagree about the status of
+a finding, **this file is the one that was updated and the other is stale**, and that
+inversion is the reason to be careful reading either.
+
+### The version scheme, derived from the tags rather than believed
+
+All three schemes in the tree were checked against `git tag` and **all three are wrong**.
+The tag inventory is the evidence, and it is 97 tags:
+
+| Shape | Count | Range |
+|---|---|---|
+| `vX.Y.Z` semantic | **22** | `v0.1.0` .. `v0.7.4` |
+| `v1.N-<slug>` | **72** | `v1.0-block-production` .. `v1.66-7702-refund` |
+| neither | **3** | `v1.63.1-access-list-address`, `v1.67`, `v1.68` |
+
+So the semantic scheme in one file describes **only the v0 era**, which stopped being used
+at `v0.7.4` on 2026-09-25 — twenty tags and the entire pre-1.0 history. The `v1.N-<slug>`
+scheme in the other file describes the v1 era and holds for 72 of 75, with three exceptions
+that are individually enumerable:
+
+- **`v1.0` carries six tags** — `block-production`, `dev`, `engine-api`, `mpt`,
+  `state-management`, `tasks`. **`v1.5` carries two** — `gas-tables`, `merge-detection`.
+  So **`v1.N` does not identify a commit** for eight of the 72.
+- **`v1.53` does not exist.** The series runs `v1.52-word-properties` → `v1.54-admission-rules`.
+- **`v1.67` and `v1.68` have no slug**, and `v1.63.1-access-list-address` is a patch-level
+  tag sitting inside the `v1.N` series beside `v1.63-7702-follow-delegation`.
+
+**The consequence is the part that matters, and it is not cosmetic.** An attribution rule
+that accepts a bare `v1.N` as sufficient is satisfied by `v1.0` and cannot say which of six
+commits it means. Anywhere a figure is attributed to `v1.0` or `v1.5`, the attribution is
+ambiguous by construction, and **an ambiguous attribution is the same failure as a missing
+one** — a reader who trusts it is worse off than one who sees none.
+
+**And 28 commits carry no tag at all**, the window since `v1.68` on 2026-09-30. Ten of those
+are completed passes whose figures are recorded in this file and in `README.md`; under a rule
+that requires a version tag, **every one of those figures is unattributable**, and they are
+the most recent ones. Tag the window or record the commits; do not leave the figures
+pointing at nothing.
+
+**The rule that survives all of this:** a `git rev-parse --short HEAD` hash, which is unique
+by construction, over any `v1.N`. A tag is a name a human chose and can be reused, renamed
+or omitted, and this inventory is the proof of all three.
+
+### Nothing above was taken on trust
+
+Every number in this section was produced by a command in this repository, and two of the
+three measurements contradicted the file they were replacing. That is the second time in one
+session that a count written by this repository's own hand was wrong in a direction that
+made the tree look better than it is: `README.md` carried three stale conformance figures
+until a test was written to catch them (F-row Tier 0.4), and the task split above was wrong
+by three in the flattering direction until it was counted per phase.
+
+**The general form is the one AGENTS.md already has for published figures, extended to
+counts of work:** a hand-written tally of what is finished is a claim about the work, it
+decays silently, and nothing in the build notices. The three defences that have actually
+caught something here are all mechanical — `make counts`, an eunit assertion, and `grep -c`.
 
 ## What to do next, in order
 

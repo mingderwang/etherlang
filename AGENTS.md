@@ -46,6 +46,20 @@ Derive a rule from one of those, quote the clause, and pin it with a test.
 | `ethereum/execution-apis` | The Engine API and JSON-RPC surface this node serves. |
 | `ethereum/consensus-specs`, the networking specs | devp2p/RLPx, discv4, the beacon-node boundary. |
 
+**`RELEASE-GATE.md` is suspended, by the operator's instruction of 2026-10-04: do not use
+it.** Not as an authority, not as a source to quote, not as a file to edit. It is left in
+the tree unchanged and its cells are stale.
+
+**Where the decisions that would have gone there went instead.** `TASKS.md` §"Three things
+settled" — including the one that mattered, **p2p is on the critical path**, which makes the
+peer-path findings release blockers and makes Phase 7 (0 of 7 done) load-bearing. If you are
+looking for the release criteria and they are not in `RELEASE-GATE.md`, they are in
+`TASKS.md`'s "What to do next, in order", which §12 already names as authoritative.
+
+**Why it is worth saying where the inversion is.** The one place the two files disagree
+about a finding's status, `TASKS.md` is the one that was updated. So a reader who consults
+the suspended file for a current answer will get a stale one *and* have no way to tell.
+
 **None of those four directories is in this repository** (see `RELEASE-GATE.md`
 D-18), so the paths above do not resolve and must be fetched. The canonical
 locations, which are what every derivation here was checked against on
@@ -515,11 +529,23 @@ Do not add a default to `config/sys.config`; it is empty on purpose.
   the imperative, and what was wrong before if the commit fixes a defect.
   Recent examples: *"Make block finalization honest about the state root"*,
   *"Fix withdrawalsRoot: it is a trie root, not an SSZ hash"*.
-- Tag each completed pass: `v1.N-<short-slug>`. Existing:
-  `v1.9-engine-honesty`, `v1.8-admission-validation`, `v1.7-initcode-gas`,
-  `v1.6-point-evaluation`, `v1.5-gas-tables`.
+- **Attribute a figure to a commit, not to a version tag.** `git rev-parse --short HEAD`
+  is unique by construction. A `v1.N` is a name somebody chose and it does not identify a
+  commit: `v1.0` carries **six** tags and `v1.5` carries **two**, `v1.53` does not exist,
+  `v1.67` and `v1.68` carry no slug, and `v1.63.1-access-list-address` is a patch-level tag
+  inside the `v1.N` series. **An ambiguous attribution is the same failure as a missing one**,
+  because a reader who trusts it is worse off than one who sees none. The full inventory is
+  in `TASKS.md` §"Three things settled" — 97 tags, 22 semantic and 72 slug-shaped and 3
+  neither, and the semantic scheme stopped being used at `v0.7.4`.
+- **Tag the window.** 28 commits carry no tag at all (everything since `v1.68`,
+  2026-09-30), and they are the most recent ten completed passes, whose figures are quoted
+  in `README.md` and `TASKS.md`. Under any rule that requires a version, those figures point
+  at nothing.
 - Update the test count in `README.md` and `TASKS.md` with the same change that
-  moves it.
+  moves it, from `make counts`. And **a hand-written tally of finished work is a claim about
+  the work**: `TASKS.md` said 49 done / 33 remaining and the counts were 46 / 36, wrong by
+  three in the flattering direction, because three Phase 4 boxes were re-opened when the two
+  dead modules were deleted and the sentence was never updated. `grep -c` it.
 
 ---
 
