@@ -386,7 +386,7 @@ dispatch(<<"eth_sendRawTransaction">>, [RawHex], State) when is_binary(RawHex) -
         {ok, Bin} ->
             case (try eth_txpool:add_raw(Pool, Bin) catch _:_ -> {error, no_pool} end) of
                 {ok, Hash} ->
-                    eth_peer:broadcast([hex_to_bin(Hash)]),
+                    eth_peer:broadcast([eth_hex:must_decode_bytes(Hash)]),
                     {ok, Hash};
                 {error, _} = E ->
                     E
@@ -910,8 +910,6 @@ parse_raw_tx(Bin) when is_binary(Bin), byte_size(Bin) > 0 ->
 parse_raw_tx(_) ->
     {error, bad_tx_hex}.
 
-hex_to_bin(<<"0x", Rest/binary>>) -> binary:decode_hex(Rest);
-hex_to_bin(B) when is_binary(B) -> binary:decode_hex(B).
 
 %% Resolve a block-number reference ("latest"/"earliest"/"pending"/
 %% Resolving a tag to a height is eth_rpc_projection:resolve_block_number/2, for

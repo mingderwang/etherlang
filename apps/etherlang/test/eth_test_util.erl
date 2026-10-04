@@ -137,6 +137,23 @@ tx_hash(Num, Idx) ->
 
 %% Header-only map for block Num chained to Parent. `Salt' goes into extraData
 %% so that competing forks from the same parent hash differently.
+%% **`extraData' is DATA, and it used to be given a QUANTITY.**
+%%
+%% `eth_hex:encode_int(Salt)' answers `"0x0"' for a zero salt, and a QUANTITY is not a
+%% DATA value: DATA is an even-length hex string and `"0x0"' has one hex digit. The old
+%% `eth_header:hex_to_bin/1' accepted it -- `pairs([A]) -> [hexval(A)]' turns an odd
+%% number of hex characters into one byte each -- so the header was hashed over a
+%% `<<0>>' that no conformant payload could have produced, **and nothing said so**.
+%%
+%% **This was found by making the decoder strict, not by reading it.** `eth_hex' refuses
+%% an odd length, the duplication fix delegated to it, and 144 tests failed on a single
+%% value: every one of them this line. The same fixture writes `<<"logsBloom">> =>
+%% <<"0x">>' two lines above -- the correct encoding of an empty DATA value -- which is
+%% what makes the odd one beside it a defect rather than a style.
+%%
+%% `encode_bytes(binary:encode_unsigned(Salt))' is `"0x00"' for salt 0: still one byte,
+%% still `<<0>>', so **no hash in the suite changes** and the fixture becomes legal.
+%% Choosing `"0x"' would also be legal and would change every block this fixture builds.
 header(Num, Parent, Salt) ->
     #{<<"parentHash">> => Parent,
       <<"sha3Uncles">> => ?EMPTY_UNCLE_HASH,
@@ -150,7 +167,7 @@ header(Num, Parent, Salt) ->
       <<"gasLimit">> => eth_hex:encode_int(30000000),
       <<"gasUsed">> => eth_hex:encode_int(0),
       <<"timestamp">> => eth_hex:encode_int(1000 + Num),
-      <<"extraData">> => eth_hex:encode_int(Salt),
+      <<"extraData">> => eth_hex:encode_bytes(binary:encode_unsigned(Salt)),
       <<"mixHash">> => ?ZERO32,
       <<"nonce">> => <<"0x0000000000000000">>}.
 

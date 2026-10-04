@@ -99,7 +99,19 @@ head_root(Chain) ->
     try
         {N, _} = eth_chain:head(Chain),
         {ok, Block, _} = eth_chain:get_by_number(Chain, N),
-        {ok, hex_to_bin(maps:get(<<"stateRoot">>, Block))}
+        %% **Strict, and the shape is `{ok, Bytes}' because that is what the caller
+        %% destructures.** The deduplication pass replaced `hex_to_bin/1' here with
+        %% `eth_hex:decode_bytes/1', which answers `{ok, Bytes} | error' -- and this line
+        %% was *already* returning `{ok, ...}', so the result became `{ok, {ok, Bytes}}'.
+        %% Nothing said so at the definition: `heal_tick/1` does
+        %% `binary:part(StateRoot, 0, 4)' three frames later and raises `badarg' on a
+        %% tuple, which names neither this line nor the swap.
+        %%
+        %% **The general form is AGENTS.md's *a key written through one normaliser and read
+        %% through another*, with the arity of the function as the normaliser**: changing
+        %% `Bytes' to `{ok, Bytes}' is not a rename, it is a change of contract, and the
+        %% only evidence it is wrong is an exception raised where a value was expected.
+        {ok, eth_hex:must_decode_bytes(maps:get(<<"stateRoot">>, Block))}
     catch _:_ ->
         {error, no_head}
     end.
@@ -248,5 +260,3 @@ inc_hash(Bin) when byte_size(Bin) =:= 32 ->
     I = binary:decode_unsigned(Bin),
     <<((I + 1) band ((1 bsl 256) - 1)):256>>.
 
-hex_to_bin(<<"0x", R/binary>>) -> binary:decode_hex(R);
-hex_to_bin(B) when is_binary(B) -> binary:decode_hex(B).

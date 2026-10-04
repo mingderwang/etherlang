@@ -106,6 +106,19 @@
                             16#8a, 16#74, 16#13, 16#f0, 16#a1, 16#42, 16#fd,
                             16#40, 16#d4, 16#93, 16#47>>).
 
+%% The one home for this constant, exported because a second copy is the defect
+%% AGENTS.md §4.2 warns about by name. `eth_block_validator' needed it to check a
+%% header's `sha3Uncles', and wrote its own -- **one byte out**, at the same length and
+%% the same shape, which is why it is exported here rather than retyped: the copy read
+%% `...94874a7413...' where the derived value is `...948a7413f0...'.
+%%
+%% Derived, not remembered: `eth_keccak:hash(eth_rlp:encode([]))', which is
+%% `1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347'.
+-spec empty_uncle_hash() -> binary().
+-export([empty_uncle_hash/0]).
+empty_uncle_hash() -> ?EMPTY_UNCLE_HASH.
+
+
 %% ---------------------------------------------------------------------------
 %% Block construction
 %% ---------------------------------------------------------------------------
@@ -245,7 +258,7 @@ maybe_declare(Block, Hex, Field) when is_binary(Hex), byte_size(Hex) =:= 66 ->
         receipts_root -> Block#block{receipts_root = Root}
     end.
 
-to_bin(<<"0x", _/binary>> = H) -> hex_to_bin(H);
+to_bin(<<"0x", _/binary>> = H) -> eth_hex:must_decode_bytes(H);
 to_bin(B) when is_binary(B) -> B;
 to_bin(_) -> <<>>.
 
@@ -418,6 +431,12 @@ finalize_against(Block, ParentRoot, Txs, GasLimit, BaseFee) ->
 %% client's. Nothing caught it, because the tests for those calls invoke
 %% eth_fork_schedule directly with an explicit fork argument and so never go
 %% through this.
+%% **Exported**, and used by `eth_block_validator', which needs to answer the same
+%% question about a header that has not been turned into a `#block{}' yet. Two
+%% implementations of "which fork is this block under" is the `eth_evm:base_cost/1'
+%% mistake one level up, and the comment above records what the wrong answer costs:
+%% every block executed at the wrong fork, every computed state root wrong, and
+%% nothing caught it.
 fork_of(#block{number = Number, timestamp = Ts, total_difficulty = TD}) ->
     try eth_fork_schedule:current_fork(
           eth_fork_schedule:configured_network(), Number, Ts, TD) of
@@ -2163,16 +2182,14 @@ uint(_) ->
 opt_uint(undefined) -> undefined;
 opt_uint(V) -> uint(V).
 
-to_address(<<"0x", _/binary>> = H) -> hex_to_bin(H);
+to_address(<<"0x", _/binary>> = H) -> eth_hex:must_decode_bytes(H);
 to_address(A) when is_binary(A), byte_size(A) =:= 20 -> A;
 to_address(_) -> <<>>.
 
-to_bytes(<<"0x", _/binary>> = H) -> hex_to_bin(H);
+to_bytes(<<"0x", _/binary>> = H) -> eth_hex:must_decode_bytes(H);
 to_bytes(B) when is_binary(B) -> B;
 to_bytes(_) -> <<>>.
 
-hex_to_bin(<<"0x", Rest/binary>>) -> binary:decode_hex(Rest);
-hex_to_bin(B) when is_binary(B) -> B.
 
 %% EIP-1559 effective gas price paid by the sender:
 %%   min(maxFeePerGas, baseFeePerGas + maxPriorityFeePerGas)

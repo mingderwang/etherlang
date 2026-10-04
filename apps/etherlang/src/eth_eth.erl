@@ -37,7 +37,7 @@
 -define(FALLBACK_TD, 17000000000000000).
 
 network_id() -> ?NETWORK_ID.
-genesis_hash() -> hex_to_bin(?GENESIS_HEX).
+genesis_hash() -> data_bytes(?GENESIS_HEX).
 
 caps() -> [{"eth", ?ETH_VERSION}, {"snap", 1}].
 
@@ -136,7 +136,7 @@ head_info(Chain) ->
                 {ok, Block, _} ->
                     Time = (try eth_hex:decode(maps:get(<<"timestamp">>, Block))
                             catch _:_ -> 0 end),
-                    {ok, N, hex_to_bin(H), Time};
+                    {ok, N, data_bytes(H), Time};
                 _ ->
                     {error, no_local_head}
             end;
@@ -636,8 +636,13 @@ find_by_hash(_Chain, _H, N) when N < 0 -> {error, unknown_hash};
 find_by_hash(Chain, H, N) ->
     case (try eth_chain:canonical_hash(Chain, N) catch _:_ -> undefined end) of
         Hex when is_binary(Hex) ->
-            case hex_to_bin(Hex) of
-                H -> {ok, N};
+            %% **Lenient on purpose.** A stored hash this node cannot decode is "not the
+            %% block you asked for", and the answer is to keep walking -- which is what
+            %% the old `try ... catch _:_ -> <<>>' did, by accident rather than by
+            %% decision. `eth_hex:decode_bytes/1' says so explicitly, where a raising
+            %% decode would turn a lookup into a crash.
+            case eth_hex:decode_bytes(Hex) of
+                {ok, Bin} when Bin =:= H -> {ok, N};
                 _ -> find_by_hash(Chain, H, N - 1)
             end;
         _ ->
@@ -681,10 +686,35 @@ to_bin(I) when is_integer(I) -> binary:encode_unsigned(I);
 to_bin(L) when is_list(L) -> list_to_binary(L);
 to_bin(_) -> <<>>.
 
-hex_to_bin(Hex) when is_binary(Hex) ->
-    No0x = case Hex of
-               <<"0x", Rest/binary>> -> Rest;
-               <<"0X", Rest/binary>> -> Rest;
-               _ -> Hex
-           end,
-    try binary:decode_hex(No0x) catch _:_ -> <<>> end.
+%% **Removed. It returned `<<>>' for a value it could not read.**
+%%
+%% `try binary:decode_hex(No0x) catch _:_ -> <<>>' is a silent default, and a silent
+%% default on a *hash* is the worst place for one: a 32-byte field that fails to parse
+%% becomes the empty binary, which then compares unequal to every real hash rather than
+%% reporting that it could not be read. **A default is the failure mode this repository
+%% keeps paying for** -- `eth_hex:decode/1' answers 0 for a value it cannot read, and
+%% `eth_hex:decode_bytes/1' answers `{ok, Bytes} | error' precisely so that "absent" and
+%% "zero" stay different.
+%%
+%% The three call sites need **different strictness**, which is why this was never a
+%% one-line swap and why a single replacement would have been wrong:
+%%
+%%   * `genesis_hash/0' and the head lookup decode a value this node produced or was
+%%     handed whole, so a malformed one is a bug and should raise.
+%%   * `find_by_hash/2' compares a *stored* canonical hash against the caller's, and its
+%%     caller passes a chain number to walk. **There, a value that will not decode is
+%%     "not this block",** and the old `<<>>' produced exactly the right behaviour by
+%%     accident: no match, move to `N - 1`. Making it raise would turn "not found" into
+%%     a crash on any chain with one unreadable hash in it.
+%%
+%% So the lenient form is used there and the strict one everywhere else -- and the
+%% leniency is now a **stated decision at the call site** rather than a property of a
+%% decoder nobody was looking at.
+
+%% Strict: the value is one this node produced, so a malformed one is a bug.
+%%
+%% **Renamed from `hex_to_bin/1'`** because it does not convert hex -- `eth_hex'
+%% does -- and a delegating wrapper carrying the old name is indistinguishable from a
+%% copy to `eth_hex_owners_tests', which forbids the *definition*. A guard that cannot
+%% tell a wrapper from a copy has to be switched off, and then it catches nothing.
+data_bytes(Hex) -> eth_hex:must_decode_bytes(Hex).

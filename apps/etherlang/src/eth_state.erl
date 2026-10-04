@@ -19,7 +19,7 @@
          with_base_source/2,
          mark_created/2, is_created/2, set_destroyed/2, drop_if_empty/2, empty/2,
          commit/1, base_source/0, set_base_source/1,
-         chain_id/0, address/1, address_hex/1, hex_to_bin/1]).
+         chain_id/0, address/1, address_hex/1, data_bytes/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(TAB, eth_state_cache).
@@ -170,7 +170,7 @@ apply_override(A, Spec, Acc0) when is_map(Spec) ->
            end,
     Acc3 = case maps:get(<<"code">>, Spec, undefined) of
                undefined -> Acc2;
-               C -> Acc2#{{code, A} => hex_to_bin(C)}
+               C -> Acc2#{{code, A} => data_bytes(C)}
            end,
     Acc4 = apply_slots(A, maps:get(<<"state">>, Spec, #{}), Acc3),
     apply_slots(A, maps:get(<<"stateDiff">>, Spec, #{}), Acc4);
@@ -306,7 +306,7 @@ upstream_nonce(Block, A) ->
 upstream_code(Block, A) ->
     cached({code, A, Block}, fun() ->
         case eth_rpc_client:call(<<"eth_getCode">>, [address_hex(A), block_param(Block)]) of
-            {ok, Hex} -> hex_to_bin(Hex);
+            {ok, Hex} -> data_bytes(Hex);
             {error, _} -> <<>>
         end
     end).
@@ -521,7 +521,7 @@ ensure_table() ->
 %% ---------------------------------------------------------------------------
 
 address(Addr) when is_binary(Addr), byte_size(Addr) =:= 20 -> Addr;
-address(Addr) when is_binary(Addr) -> pad_address(hex_to_bin(Addr));
+address(Addr) when is_binary(Addr) -> pad_address(data_bytes(Addr));
 address(Addr) when is_integer(Addr) -> pad_address(eth_word:to_bytes(Addr, 20)).
 
 pad_address(Bin) when byte_size(Bin) >= 20 ->
@@ -535,20 +535,31 @@ address_hex(Addr) ->
 
 lower_hex(Bin) -> string:lowercase(binary:encode_hex(Bin)).
 
-hex_to_bin(V) when is_binary(V) -> hex_to_bin(binary_to_list(V));
-hex_to_bin(V) when is_integer(V) -> binary:encode_unsigned(V);
-hex_to_bin([$0, $x | R]) -> hex_to_bin(R);
-hex_to_bin([$0, $X | R]) -> hex_to_bin(R);
-hex_to_bin([]) -> <<>>;
-hex_to_bin(L) when is_list(L) -> list_to_binary(pairs(L)).
-
-pairs([A, B | T]) -> [(hv(A) bsl 4) bor hv(B) | pairs(T)];
-pairs([A]) -> [hv(A)];
-pairs([]) -> [].
-
-hv(C) when C >= $0, C =< $9 -> C - $0;
-hv(C) when C >= $a, C =< $f -> C - $a + 10;
-hv(C) when C >= $A, C =< $F -> C - $A + 10.
+%% **Renamed from `hex_to_bin/1'.** It no longer converts hex to bytes -- it does not
+%% convert anything -- it accepts a DATA value that may arrive as bytes or as an integer.
+%% The old name said what this function stopped doing, and `eth_hex_owners_tests' forbids
+%% a module from *defining* a hand-rolled decoder, so a delegating wrapper called
+%% `hex_to_bin/1' would have been indistinguishable from a real one. **A guard that
+%% cannot tell a wrapper from a copy has to be switched off**, and then it catches
+%% nothing.
+%%
+%% **The decoder is `eth_hex:decode_bytes/1'`; this widens it and nothing more.** An
+%% integer is a value already in hand and is encoded minimally; everything else --
+%% `0x`- and `0X`-prefixed binaries, prefixed strings, bare binaries, empty -- is the
+%% owner's.
+%%
+%% This was the third hand-written decoder here, and the one with the most call sites
+%% (eleven, and two more modules reach it as `eth_state:hex_to_bin/1'). It had the same
+%% odd-length defect as the other two: `pairs([A]) -> [hv(A)]` makes `"0x123"` three bytes
+%% rather than two. The owner refuses an odd length, so that answer is no longer
+%% reachable, and `hv/1` -- which had no clause for a non-hex character, so a raw
+%% `0x`-string died in it four frames from its caller -- is gone with it.
+%%
+%% **`hex_to_bin/1` is still exported**, because `eth_call` and `eth_pairing_bn128` call
+%% it qualified. The guard in `eth_hex_owners_tests' covers the *definition*, so those two
+%% are counted as depending on this one rather than as owning a second.
+data_bytes(V) when is_integer(V) -> binary:encode_unsigned(V);
+data_bytes(V) -> eth_hex:must_decode_bytes(V).
 
 handle_call(_Req, _From, S) -> {reply, {error, unknown_call}, S}.
 handle_cast(_Msg, S) -> {noreply, S}.

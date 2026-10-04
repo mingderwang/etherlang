@@ -154,19 +154,30 @@ required(Key, Block) ->
 qty_value(V) when is_integer(V) -> V;
 qty_value(V) -> eth_hex:decode(V).
 
-data_value(V) -> hex_to_bin(V).
+data_value(V) -> data_bytes(V).
 
 %% "0x"-prefixed hex (binary or list) -> raw bytes.
-hex_to_bin(V) when is_binary(V) -> hex_to_bin(binary_to_list(V));
-hex_to_bin(V) when is_integer(V) -> binary:encode_unsigned(V);
-hex_to_bin("0x" ++ R) -> hex_to_bin(R);
-hex_to_bin("0X" ++ R) -> hex_to_bin(R);
-hex_to_bin(L) when is_list(L) -> list_to_binary(pairs(L)).
-
-pairs([A, B | T]) -> [(hexval(A) bsl 4) bor hexval(B) | pairs(T)];
-pairs([A]) -> [hexval(A)];
-pairs([]) -> [].
-
-hexval(C) when C >= $0, C =< $9 -> C - $0;
-hexval(C) when C >= $a, C =< $f -> C - $a + 10;
-hexval(C) when C >= $A, C =< $F -> C - $A + 10.
+%%
+%% **Renamed from `hex_to_bin/1'.** It no longer converts hex to bytes -- it does not
+%% convert anything -- it accepts a DATA value that may arrive as bytes or as an integer.
+%% The old name said what this function stopped doing, and `eth_hex_owners_tests' forbids
+%% a module from *defining* a hand-rolled decoder, so a delegating wrapper called
+%% `hex_to_bin/1' would have been indistinguishable from a real one. **A guard that
+%% cannot tell a wrapper from a copy has to be switched off**, and then it catches
+%% nothing.
+%%
+%% **The decoder is `eth_hex:decode_bytes/1' and this function only widens it.** Two
+%% things are still needed here that it does not do: an **integer** is taken as a value
+%% already in hand and encoded minimally, and a **bare binary** -- a 32-byte hash rather
+%% than a `0x` string -- passes through. Everything else is delegated.
+%%
+%% The four lines this replaces were the second hand-written hex decoder in this
+%% repository, and they had a defect the owner does not: `pairs([A]) -> [hexval(A)]` turns
+%% an **odd** number of hex characters into one byte per character, so `"0x123"` decoded
+%% to <<0x12, 0x03>>. `eth_hex:from_hex/1` refuses an odd length outright, so that class
+%% of wrong answer cannot come out of it. The other half of the old shape is recorded in
+%% `eth_rpc_extra_tests`: `hexval/1` had no clause for a non-hex character, so a
+%% `0x`-prefixed string handed to it raw died in `hexval(21)` -- a `function_clause` four
+%% frames from the code that passed it.
+data_bytes(V) when is_integer(V) -> binary:encode_unsigned(V);
+data_bytes(V) -> eth_hex:must_decode_bytes(V).

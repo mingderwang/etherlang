@@ -443,8 +443,8 @@ param_hex(N) when is_integer(N) -> eth_hex:encode_int(N);
 param_hex(Tag) when is_binary(Tag) -> Tag.
 bin32(nil) -> <<0:256>>;
 bin32(Hex) when is_binary(Hex) ->
-    case byte_size(eth_state:hex_to_bin(Hex)) of
-        32 -> eth_state:hex_to_bin(Hex);
+    case byte_size(eth_state:data_bytes(Hex)) of
+        32 -> eth_state:data_bytes(Hex);
         _ -> <<0:256>>
     end.
 
@@ -489,7 +489,7 @@ block_hash_fetch(Key, N) ->
             {ok, Block} when is_map(Block) ->
                 case maps:get(<<"hash">>, Block, undefined) of
                     undefined -> error;
-                    H when is_binary(H) -> {ok, eth_state:hex_to_bin(H)};
+                    H when is_binary(H) -> {ok, eth_state:data_bytes(H)};
                     _ -> error
                 end;
             _ ->

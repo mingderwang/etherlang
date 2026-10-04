@@ -2,7 +2,7 @@
 
 %% Helpers for Ethereum-style 0x-prefixed hex encoding/decoding.
 
--export([decode/1, decode_bytes/1, encode/1, encode_int/1, encode_bytes/1, is_hex/1]).
+-export([decode/1, decode_bytes/1, must_decode_bytes/1, encode/1, encode_int/1, encode_bytes/1, is_hex/1]).
 
 %% decode/1 answers an *integer* -- it is a QUANTITY decoder, and a 32-byte hash
 %% can never come out of it. It is therefore not the function to reach for when
@@ -26,6 +26,26 @@ decode_bytes(Value) when is_binary(Value) ->
     end;
 decode_bytes(Value) when is_list(Value) -> decode_bytes(iolist_to_binary(Value));
 decode_bytes(_Value) -> error.
+
+%% **The raising variant, here and not at the call sites.**
+%%
+%% **Named `must_decode_bytes/1' and not `decode_bytes!/1'`** because `!' is not a legal
+%% character in an Erlang function name -- names are lowercase identifiers, so a `!' makes
+%% the parser read an unbound variable. Which is this repository's own recorded lesson
+%% about a function whose name is not a function, written in AGENTS.md as `~/T(...)'. Seven modules each carried a
+%% two-clause `hex_to_bin/1' because `decode_bytes/1' answers `{ok, Bytes} | error' and a
+%% caller that already knows the value is DATA has to unwrap. That is a good answer for a
+%% parser and a bad one for eight call sites that do not want it, so the unwrap lives
+%% here rather than eight times over.
+%%
+%% It raises rather than returning a default. **A default is the failure mode this
+%% repository keeps paying for**: `eth_hex:decode/1' is the quantity decoder, and a zero
+%% returned for a value it cannot read is indistinguishable from a zero it read.
+must_decode_bytes(Value) ->
+    case decode_bytes(Value) of
+        {ok, Bytes} -> Bytes;
+        error -> error({not_a_data_value, Value})
+    end.
 
 %% Lowercase, because that is what the rest of the codebase emits and what JSON
 %% peers compare hex as text against: bin0x/1 in eth_tx lowercases, and a payload
