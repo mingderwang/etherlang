@@ -289,8 +289,29 @@ base_fee_mismatch(_Parent, _Header, Fork) ->
 %% EIP-4844's update rule. **Asked of `eth_fork_schedule:excess_blob_gas/2'**, which
 %% already implements it for execution; this is the *validity* half, which nothing
 %% checked. The first version of this function computed the target itself and called a
-%% `target_blob_gas_per_block/0' that does not exist -- which is what a second
-%% implementation of a constant looks like when the real owner has a different name.
+%% `target_blob_gas_per_block/0' that does not exist.
+%%
+%% **The comment here used to finish "...which is what a second implementation of a
+%% constant looks like when the real owner has a different name", and that was wrong in
+%% three separate ways, which is worth recording because each looked right.**
+%%
+%%   * there is no `target_blob_gas_per_block' at any arity -- so nothing has "a different
+%%     name", because there is no function to be one;
+%%   * `blob_gas_per_blob' is **`/0`**, not `/1`;
+%%   * and the target is a **macro**, `?TARGET_BLOB_GAS_PER_BLOCK`, private to
+%%     `eth_fork_schedule`, reachable only through `excess_blob_gas/2`.
+%%
+%% All three were found by **calling the names I had written down**, which raised `undef`,
+%% and `undef` is a cheaper instrument than reading an export list. The first two attempts
+%% at this comment named functions with the *wrong arity* and were still wrong after I had
+%% "checked" that the schedule exposed them -- because what I checked was that the
+%% identifier appeared somewhere in the file, which is true of a name and of a call.
+%%
+%% **The general form is AGENTS.md's "a citation is a claim about where a rule came from",
+%% applied to a function name.** A plausible name in a comment *about a missing function*
+%% is indistinguishable, to a reader, from a real one, and it is the kind of error that
+%% reads as thorough rather than as wrong. The tell is the same as the wrong-EIP-citation
+%% case: nothing in the sentence invites the question.
 excess_blob_gas_mismatch(_Parent, _Header, Fork) ->
     case eth_fork_schedule:at_least(Fork, cancun) of
         false ->
