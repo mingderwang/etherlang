@@ -412,7 +412,12 @@ cases() ->
      {P, put(<<"difficulty">>, 1, C), non_zero_difficulty},
      {P, put(<<"nonce">>, <<1:64>>, C), non_zero_nonce},
      {P, put(<<"sha3Uncles">>, <<1:256>>, C), ommers_hash_not_empty},
-     {P, put(<<"extraData">>, <<0:264>>, C), extra_data_too_long}].
+     {P, put(<<"extraData">>, <<0:264>>, C), extra_data_too_long},
+     %% **Past the last fork this node models.** The default configured network in a test
+     %% run is Sepolia, whose modelled range ends at Amsterdam, 1,791,294,816 -- 2026-10-06.
+     %% One second later is outside it, and because this rule sits in the parentless group
+     %% it fires before `timestamp_not_after_parent' would.
+     {P, put(<<"timestamp">>, 1791294817, C), past_modelled_range}].
 
 
 %% **Any arity.** The reasons come in three shapes -- a bare atom

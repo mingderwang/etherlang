@@ -7,7 +7,9 @@
 
 -module(eth_fork_schedule).
 
--export([ current_fork/3,
+-export([ past_modelled_range/3,
+          past_modelled_range/4,
+          current_fork/3,
           current_fork/4,
           fork_schedule/1,
           fork_at/3,
@@ -265,12 +267,23 @@ configured_network() ->
 %% `{ok, Network}' or `error`. `error' means this node has no schedule for the name, which
 %% is not the same as "not a network": a private network is a legitimate reason to set
 %% ETH_FORK, and the answer for one of those is that this node cannot validate it.
+%% **Hoodi is here because it is the one public network that stays inside the modelled
+%% range.** Measured from go-ethereum's `params/config.go' (fetched 2026-10-04), all three
+%% public networks activated Prague in March 2025 and the fork after Prague in October or
+%% December 2025, so a node modelling to Prague follows none of them. Of the three, Hoodi is
+%% the one whose next fork after the modelled range is **unset**, which is what makes it
+%% durable rather than expiring -- Sepolia's next activation is 2026-10-06.
+%%
+%% Both the name and the chain id are accepted, because an operator who has a Hoodi chain id
+%% is as likely to paste `560048' as the word.
 network_of(Value) ->
     case string:lowercase(string:trim(Value)) of
         "sepolia" -> {ok, sepolia};
         "mainnet" -> {ok, mainnet};
+        "hoodi" -> {ok, hoodi};
         "1" -> {ok, mainnet};
         "11155111" -> {ok, sepolia};
+        "560048" -> {ok, hoodi};
         _ -> error
     end.
 
@@ -305,7 +318,8 @@ chain_id() ->
     chain_id(configured_network()).
 
 chain_id(mainnet) -> 1;
-chain_id(sepolia) -> 11155111.
+chain_id(sepolia) -> 11155111;
+chain_id(hoodi) -> 560048.
 
 %% An explicit rules pin, used for networks that have no schedule in this
 %% module. It is *not* consulted for a known network: silently overriding a
@@ -429,6 +443,35 @@ fork_schedule(sepolia) ->
      {time, 1761017184, bpo1},
      {time, 1761607008, bpo2},
      {time, 1791294816, amsterdam}];
+
+%% **Hoodi, from `params.HoodiChainConfig`.** Every pre-Merge fork is at block 0 and the
+%% terminal total difficulty is 0, so the chain is post-Merge from genesis -- which is why
+%% there is no `{ttd, ...}' entry with a non-zero figure and why Shanghai and Cancun are
+%% both at timestamp 0. `MergeNetsplitBlock` is 0 there too, so unlike Sepolia it
+%% contributes no block fork to a ForkID.
+%%
+%% `AmsterdamTime` is nil in the source, so the modelled range ends at BPO2. **That is the
+%% reason this network is here**: mainnet also leaves it unset, and Sepolia sets it for
+%% 2026-10-06.
+fork_schedule(hoodi) ->
+    [{ttd, 0, paris},
+     {block, 0, homestead},
+     {block, 0, tangerine},
+     {block, 0, spurious_dragon},
+     {block, 0, byzantium},
+     {block, 0, constantinople},
+     {block, 0, petersburg},
+     {block, 0, istanbul},
+     {block, 0, muir_glacier},
+     {block, 0, berlin},
+     {block, 0, london},
+     {time, 0, shanghai},
+     {time, 0, cancun},
+     {time, 1742999832, prague},
+     {time, 1761677592, osaka},
+     {time, 1762365720, bpo1},
+     {time, 1762955544, bpo2}];
+
 fork_schedule(_Other) ->
     [].
 
@@ -456,6 +499,39 @@ current_fork(Network, BlockNumber, BlockTimestamp, BlockTotalDifficulty)
                                reached(Kind, Point, BlockNumber, BlockTimestamp,
                                        BlockTotalDifficulty)],
             {ok, highest_ranked(Active)}
+    end.
+
+%% **Whether a block is past the last fork this node models.**
+%%
+%% Asked separately from `current_fork/4' because the two answers are different kinds of
+%% thing. `current_fork/4' answers a fork for every block and execution proceeds on it; this
+%% says whether that answer is a *certification*. A block past the range would be priced and
+%% executed under the last modelled fork's rules, which is a wrong figure rather than an
+%% absent rule, so a caller that has to certify -- `eth_block_validator' -- declines to.
+%%
+%% **This is the mechanism that would have caught the Prague decision.** Modelling to Prague
+%% makes every public network unusable -- all three activated Prague in March 2025 -- and
+%% nothing in the code said so until a test happened to build a block with the wall clock's
+%% timestamp. A range question answers it directly, per network, and it is the question to
+%% ask before adding a fork rather than after.
+%%
+%% **Strictly past.** A block at an activation is a block of the fork that activates there,
+%% so `Ts =:= Point` is in range. An inclusive comparison would refuse the one block whose
+%% rules the node definitely has.
+%%
+%% **And it expires, which is the point.** Sepolia's modelled range ends at Amsterdam,
+%% 2026-10-06. On that day this function starts answering `true' for its head, and that is
+%% the correct answer rather than a nuisance: it means the node is one fork behind and says
+%% so. Mainnet and Hoodi leave their next fork unset, so neither expires.
+past_modelled_range(Network, BlockNumber, BlockTimestamp) ->
+    past_modelled_range(Network, BlockNumber, BlockTimestamp, undefined).
+
+past_modelled_range(Network, BlockNumber, BlockTimestamp, BlockTotalDifficulty)
+  when is_integer(BlockNumber), is_integer(BlockTimestamp) ->
+    case last_activation(fork_schedule(Network)) of
+        none -> false;
+        {Kind, Point} -> beyond(Kind, Point, BlockNumber, BlockTimestamp,
+                                 BlockTotalDifficulty)
     end.
 
 reached(block, Point, BlockNumber, _BlockTimestamp, _BlockTotalDifficulty) ->
@@ -2551,3 +2627,19 @@ initcode_word_cost(_Fork) ->
 %% ---------------------------------------------------------------------------
 %% Internal helpers
 %% ---------------------------------------------------------------------------
+
+last_activation([]) -> none;
+last_activation([{Kind, Point, _Fork} | Rest]) ->
+    case last_activation(Rest) of
+        none -> {Kind, Point};
+        Other -> Other
+    end.
+
+beyond(time, Point, _BlockNumber, BlockTimestamp, _TotalDifficulty) ->
+    BlockTimestamp > Point;
+beyond(block, Point, BlockNumber, _BlockTimestamp, _TotalDifficulty) ->
+    BlockNumber > Point;
+beyond(ttd, _Point, _BlockNumber, _BlockTimestamp, _TotalDifficulty) ->
+    %% Total difficulty advances neither a height nor a timestamp, so a chain whose last
+    %% activation is the Merge transition has no "past the last fork" to detect.
+    false.

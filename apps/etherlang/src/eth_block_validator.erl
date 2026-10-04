@@ -132,7 +132,7 @@ rule_names() ->
      gas_used_above_gas_limit, gas_limit_above_bound, gas_limit_below_bound,
      gas_limit_below_minimum, base_fee_mismatch, excess_blob_gas_mismatch,
      non_zero_difficulty, non_zero_nonce, ommers_hash_not_empty,
-     extra_data_too_long].
+     extra_data_too_long, past_modelled_range].
 
 %% ===========================================================================
 %% Rules that need no parent
@@ -149,7 +149,8 @@ absolute(_Parent, Header, Fork) ->
          {fun() -> post_merge(fun() -> difficulty_non_zero(Header) end, Fork) end},
          {fun() -> post_merge(fun() -> nonce_non_zero(Header) end, Fork) end},
          {fun() -> post_merge(fun() -> ommers_not_empty(Header) end, Fork) end},
-         {fun() -> extra_data_too_long(Header) end}]).
+         {fun() -> extra_data_too_long(Header) end},
+         {fun() -> past_modelled_range(Header) end}]).
 
 %% ===========================================================================
 %% Rules that need a parent
@@ -528,4 +529,39 @@ first_error([{Check} | Rest]) ->
     case Check() of
         ok -> first_error(Rest);
         {error, _} = E -> E
+    end.
+
+%% **The one rule here that is not from `execution-specs'.** It asks a question about *this
+%% node*: is this block inside the range of forks the node models? The fork that follows
+%% the modelled range is one whose rules are not held here.
+%%
+%% **It is at the certification gate rather than inside `current_fork/4'` because the two
+%% answers differ in kind.** `current_fork/4' answers a fork for every block and execution
+%% proceeds on that answer; this rule says the answer is not a certification. A header
+%% checked against one fork's rules when it may be the next fork's has not been validated,
+%% it has been validated as far as this node can see -- so the block is refused here and
+%% `eth_block:finalize/1' reports its commitments as unverified.
+%%
+%% **The fork it would have been checked under is in the reason**, so a caller that logs it
+%% learns which schedule the node fell back to and not merely that something was refused.
+%%
+%% **It is in the parentless group so it fires before every relative rule.** A block past
+%% the range is refused for being past the range, not for whatever its timestamp happens to
+%% do against its parent -- and a test that provokes this rule needs the reason to be *this*
+%% one, which is why the fixture lives here.
+past_modelled_range(Header) ->
+    Network = eth_fork_schedule:configured_network(),
+    case {eth_hex:decode(maps:get(<<"number">>, Header, undefined)),
+          eth_hex:decode(maps:get(<<"timestamp">>, Header, undefined))} of
+        {Num, Ts} when is_integer(Num), is_integer(Ts) ->
+            case eth_fork_schedule:past_modelled_range(Network, Num, Ts) of
+                true ->
+                    {error, {invalid_header,
+                             {past_modelled_range, Network, Num, Ts,
+                              eth_fork_schedule:current_fork(Network, Num, Ts)}}};
+                false ->
+                    ok
+            end;
+        _ ->
+            ok
     end.

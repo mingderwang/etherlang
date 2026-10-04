@@ -395,6 +395,58 @@ schedule_agrees_with_forkid_test() ->
         ?assertEqual(Expected, usort(ForkIdBlocks))
     end, [mainnet, sepolia]).
 
+%% ---------------------------------------------------------------------------
+%% Hoodi, and the modelled range per network
+%% ---------------------------------------------------------------------------
+
+%% **Hoodi's activations, from `params.HoodiChainConfig'.** Every pre-Merge fork at block 0
+%% and a terminal total difficulty of 0, so it is post-Merge from genesis; Shanghai and
+%% Cancun are both at timestamp 0 and Prague arrives at 1,742,999,832 -- 2025-03-26.
+hoodi_selection_test() ->
+    %% **Cancun, not London.** Shanghai and Cancun are *both* at timestamp 0 on Hoodi, so
+    %% the highest-ranked activation at 0 wins and a block dated 0 is already Cancun. The
+    %% first version of this asserted London, from carrying Sepolia's shape over -- and
+    %% Sepolia's Cancun is at 1,706,655,072, not 0.
+    ?assertEqual(cancun, fork(hoodi, 1, 0)),
+    ?assertEqual(cancun, fork(hoodi, 1, 1742999831)),
+    ?assertEqual(prague, fork(hoodi, 1, 1742999832)),
+    ?assertEqual(osaka,  fork(hoodi, 1, 1761677592)),
+    ?assertEqual(bpo1,   fork(hoodi, 1, 1762365720)),
+    ?assertEqual(bpo2,   fork(hoodi, 1, 1762955544)),
+    ?assertEqual(560048, eth_fork_schedule:chain_id(hoodi)).
+
+%% **The name and the chain id are both accepted.** An operator holding a Hoodi chain id is
+%% as likely to paste `560048' as the word, and a name-only lookup would report an unknown
+%% network for a chain this node can follow.
+hoodi_is_selectable_by_name_and_by_chain_id_test() ->
+    ?assertEqual({ok, hoodi}, eth_fork_schedule:network_of("hoodi")),
+    ?assertEqual({ok, hoodi}, eth_fork_schedule:network_of("Hoodi")),
+    ?assertEqual({ok, hoodi}, eth_fork_schedule:network_of("560048")),
+    ?assertEqual({ok, mainnet}, eth_fork_schedule:network_of("1")),
+    ?assertEqual({ok, sepolia}, eth_fork_schedule:network_of("11155111")).
+
+%% **The range question, per network, and the answer is not the same for all three.**
+%%
+%% Each network's modelled range ends at its last scheduled activation: mainnet and Hoodi at
+%% BPO2, Sepolia at Amsterdam. **Sepolia's is 2026-10-06**, so this test is a clock: on that
+%% day the head it protects stops being certifiable, which is the mechanism working rather
+%% than the mechanism failing.
+%%
+%% The three rows are the reason the question is asked per network and not once globally. A
+%% single answer would have to be either "past" -- refusing three usable networks -- or "in
+%% range" -- accepting one that stopped being usable, and the first version of the Prague
+%% decision was exactly that second answer applied to all of them at once.
+the_modelled_range_ends_at_a_different_point_on_each_network_test() ->
+    ?assertEqual(false, eth_fork_schedule:past_modelled_range(mainnet, 20000000, 1767747671)),
+    ?assertEqual(true,  eth_fork_schedule:past_modelled_range(mainnet, 20000000, 1767747672)),
+    ?assertEqual(false, eth_fork_schedule:past_modelled_range(hoodi, 5000000, 1762955544)),
+    ?assertEqual(true,  eth_fork_schedule:past_modelled_range(hoodi, 5000000, 1762955545)),
+    ?assertEqual(false, eth_fork_schedule:past_modelled_range(sepolia, 11779968, 1791294816)),
+    ?assertEqual(true,  eth_fork_schedule:past_modelled_range(sepolia, 11779968, 1791294817)),
+    %% **An unknown network has nothing to be past**, so it must not refuse every block --
+    %% the other answer makes the node unusable rather than cautious.
+    ?assertEqual(false, eth_fork_schedule:past_modelled_range(no_such_network, 1, 9999999999)).
+
 netsplit_blocks(sepolia) -> [1735371];
 netsplit_blocks(mainnet) -> [].
 
