@@ -140,9 +140,27 @@ of those had already been given mechanical defences in this repository (`make co
 
 `make check-ledger` is cheap and mechanical: `src/` changed without a ledger file is a
 failure. It does not check that this file is *right*, only that it was *opened*. Run against
-the real history it flags four of this pass's own commits -- `93513c2`, `f74787b`,
-`1342660` and `5de6e08`, the last being the blob-schedule work, whose absence from this
-ledger was a real omission and not a formality.
+the real history -- `make check-ledger AUDIT=<sha>` -- it flags four of this pass's own
+commits: `93513c2`, `f74787b`, `1342660` and `5de6e08`, the last being the blob-schedule
+work, whose absence from this ledger was a real omission and not a formality.
+
+**Two modes, and the second exists because the first version was a gate that arrived one
+commit late.** It read `git diff-tree HEAD`, so run *before* committing -- which is when a
+gate is worth running -- it verified the **previous** commit and passed while the pending one
+violated the rule. An instrument pointed at the wrong object reports honestly about the wrong
+thing. It now judges `git diff --name-only HEAD`, staged and unstaged together, which is what
+the next commit will contain.
+
+**The version after that had a branch that could never be taken, and its comment described it
+as existing.** An automatic "the tree is clean, so audit HEAD" fallback looked obviously
+right. `.dockerignore` carries an uncommitted change that is not ours, so
+`git diff --name-only HEAD` is **never** empty and the fallback was dead -- and I had written
+a paragraph about it. The tell was printing which arm ran: it said "judging the pending
+change" on a tree I had just called clean. **A branch you have never seen taken is a claim,
+not a feature.** The fallback is gone and auditing a commit is explicit (`AUDIT=<sha>`),
+which is also the better design: it stops one command meaning two different things
+depending on untracked state, and a gate whose subject shifts under you is one you learn to
+skip.
 
 `eth_open_claims_tests` is what makes the file *accurate*. Each genuinely-open item is paired
 with a check that must hold today, so **an item cannot be added without a passing check, and

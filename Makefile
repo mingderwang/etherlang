@@ -37,25 +37,49 @@ counts:
   ## each named-open item with a check that must hold today, so an item cannot be added
   ## without a passing check, and an item whose gap has been closed fails its own.
   ##
-  ## Run it before committing. Outside a git working tree it passes rather than failing,
-  ## because a source export has no history to check.
+  ## **Two modes, and the second is explicit on purpose.**
+  ##
+  ## `make check-ledger' judges **what is about to be committed** -- `git diff --name-only
+  ## HEAD', staged and unstaged together. Run before committing, that is a gate. Run after,
+  ## it is a post-mortem.
+  ##
+  ## `make check-ledger AUDIT=<sha>' audits a commit already in the log, which is how you
+  ## check history rather than the next change.
+  ##
+  ## **There is deliberately no automatic "tree is clean, so audit HEAD" fallback, and the
+  ## first version had one and it was dead.** `.dockerignore' carries an uncommitted change
+  ## that is not ours, so `git diff --name-only HEAD' is never empty and the branch could
+  ## never be taken -- while its comment described it as existing. Two rules and the one
+  ## that bites: **a branch you have never seen taken is a claim, not a feature**, and the
+  ## cheapest test is to print which arm ran. It printed "judging the pending change" on a
+  ## tree I had just called clean.
+  ##
+  ## An automatic fallback would also have been the wrong design: it would make the same
+  ## command mean two different things depending on untracked state, and a gate whose
+  ## subject changes under you is one you learn not to read.
+  ##
+  ## Outside a git working tree it passes rather than failing, because a source export has
+  ## no history to check.
   check-ledger:
 	@if ! git rev-parse --git-dir >/dev/null 2>&1; then \
 	    echo "not a git working tree -- nothing to check"; exit 0; fi; \
-	 H=`git rev-parse HEAD`; \
-	 if git diff-tree --no-commit-id --name-only -r $$H | grep -q '^apps/etherlang/src/'; then \
-	   if git diff-tree --no-commit-id --name-only -r $$H \
-	        | grep -qE '^(TASKS|README|AGENTS)[.]md$$'; then \
-	     echo "ledger: ok -- src/ and a ledger file changed together in $$H"; \
-	   else \
-	     echo "ledger: FAIL"; \
-	     echo "  $$H changes apps/etherlang/src/ and no ledger file."; \
-	     echo "  Update TASKS.md (the open-items list), README.md or AGENTS.md in this"; \
-	     echo "  commit, or say in the commit message why this change needs none."; \
-	   fi; \
+	 if [ -n "$(AUDIT)" ]; then \
+	   LABEL="`git rev-parse --short $(AUDIT) 2>/dev/null || echo $(AUDIT)`"; \
+	   FILES="`git diff-tree --no-commit-id --name-only -r $(AUDIT)`"; \
 	 else \
-	   echo "ledger: ok -- $$H does not change apps/etherlang/src/"; \
-	 fi
+	   LABEL="the pending change"; FILES="`git diff --name-only HEAD`"; \
+	   echo "ledger: judging the pending change (staged and unstaged vs HEAD)"; \
+	 fi; \
+	 if [ -z "$$FILES" ]; then echo "ledger: nothing to judge in $$LABEL"; exit 0; fi; \
+	 echo "$$FILES" | grep -q '^apps/etherlang/src/' || { \
+	  echo "ledger: ok -- $$LABEL does not change apps/etherlang/src/"; exit 0; }; \
+	 echo "$$FILES" | grep -qE '^(TASKS|README|AGENTS)[.]md$$' && { \
+	  echo "ledger: ok -- src/ and a ledger file change together in $$LABEL"; exit 0; }; \
+	echo "ledger: FAIL"; \
+	echo "  $$LABEL changes apps/etherlang/src/ and no ledger file."; \
+	echo "  Update TASKS.md (the open-items list), README.md or AGENTS.md in this"; \
+	echo "  commit, or say in the commit message why this change needs none."; \
+	exit 1
 
 ## API reference (edoc) into doc/, which is gitignored -- it is a build artifact.
 ##
