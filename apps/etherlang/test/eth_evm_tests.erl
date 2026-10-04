@@ -1698,7 +1698,7 @@ push0_runs_from_shanghai_on_test() ->
     Code = <<16#5F, 16#60, 2, 16#60, 0, 16#F3>>,
     [?assertMatch({ok, <<0, 0>>, _, _, _},
                   eth_evm:run(Code, ?MSG0, ?STATE, #{fork => F}, ?GAS))
-     || F <- [shanghai, cancun, prague, osaka, amsterdam]].
+     || F <- [shanghai, cancun, prague]].
 
 %% The Cancun additions, each of which the interpreter used to run in every fork
 %% because every clause in do_op/3 is unconditional. TLOAD is the cheapest to see:
@@ -1963,7 +1963,7 @@ selfdestruct_destroys_only_from_cancun_test() ->
              ?assertEqual(<<16#00>>, eth_state:code(St, Victim)),
              ?assertEqual(7, eth_state:storage(St, Victim, 0)),
              ?assertEqual(true, eth_state:exists(St, Victim))
-         end || F <- [cancun, prague, osaka, amsterdam]]
+         end || F <- [cancun, prague]]
       end).
 
 run_gas(Code, State, Env, Gas) ->
@@ -2431,7 +2431,7 @@ balance_cost(Addr, Fork) -> balance_cost_in(Addr, ?MSG0, Fork).
 %% mentioned, so the whole difference is the warm/cold term.
 the_coinbase_is_warm_at_the_first_instruction_from_shanghai_test() ->
     [?assertEqual({F, 2500}, {F, coinbase_warmth(F)})
-     || F <- [shanghai, cancun, prague, osaka]],
+     || F <- [shanghai, cancun, prague]],
     %% **And not at Paris.** EIP-3651 is a Shanghai arrival and the warm set is
     %% EIP-2929's, so a Paris block charging the coinbase cold is not a gap in the
     %% rule -- it is the rule as it stood. Asserted because a fix that forgot the fork
@@ -2906,7 +2906,7 @@ a_failed_value_bearing_call_costs_the_stipend_less_test() ->
         [?assertEqual({F, Pushes + Price(F) - eth_fork_schedule:call_stipend(F)},
                       {F, value_call_cost(F, 200, 40000)})
          || F <- [tangerine, spurious_dragon, byzantium, istanbul, berlin, london,
-                  shanghai, cancun, prague, osaka]],
+                  shanghai, cancun, prague]],
         %% **Before Tangerine Whistle there is no stipend to hand back**, so the figure
         %% is the price and the pushes and nothing else. Without this the test would
         %% also pass against a `call_stipend/1' that ignored its fork.
@@ -3004,7 +3004,7 @@ child_gas_at_a_saturating_call_is_the_cap_plus_the_stipend_test() ->
         [?assertEqual({F, eth_fork_schedule:call_stipend(F)},
                       {F, child_gas(Big, 40, F) - child_gas(Big, 0, F)})
          || F <- [tangerine, spurious_dragon, byzantium, berlin, london, shanghai,
-                  cancun, prague, osaka]],
+                  cancun, prague]],
         %% **Before Tangerine Whistle there is no stipend**, so the two are identical.
         %% Without this the test would also pass against a `call_stipend/1' that ignored
         %% its fork, which is the other thing that could produce a 2,300.

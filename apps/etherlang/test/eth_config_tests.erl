@@ -131,7 +131,23 @@ accepted_values_are_not_problems_test_() ->
                          {"ETH_NETWORK", "sepolia"},
                          {"ETH_NETWORK", "11155111"},
                          {"ETH_FORK", "shanghai"},
-                         {"ETH_FORK", "Osaka"}]].
+                         {"ETH_FORK", "Prague"}]].
+
+%% **A fork this node does not model is refused, and that is the point.**
+%%
+%% `ETH_FORK=Osaka' used to be on the accepted list, so a node pinned to a fork past the
+%% modelled range was configured successfully and then answered every block under Prague's
+%% rules while reporting Osaka's name. **A pin the node cannot honour has to be refused at
+%% startup**, where the operator sees it, rather than accepted and silently wrong.
+%%
+%% The refusal is also the only place the scope decision is visible from the outside: the
+%% variable is named, the value is named, and `fork_of/1' has no clause for it.
+a_fork_past_the_modelled_range_is_refused_at_startup_test() ->
+    with_env([{"ETH_FORK", "Osaka"}],
+             fun() ->
+                 {error, Problems} = eth_config_settings:validate(),
+                 ?assertMatch([{"ETH_FORK", _, _} | _], problems_for("ETH_FORK", Problems))
+             end).
 
 an_unset_variable_is_the_default_and_not_a_problem_test() ->
     with_env([{"CHAIN_RETENTION", false}],

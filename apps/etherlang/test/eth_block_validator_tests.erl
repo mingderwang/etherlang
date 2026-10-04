@@ -408,11 +408,21 @@ cases() ->
      {P, put(<<"gasUsed">>, 0, put(<<"gasLimit">>, 100, C)), gas_limit_below_bound},
      {S, put(<<"gasLimit">>, 4999, child_of(S)), gas_limit_below_minimum},
      {P, put(<<"baseFeePerGas">>, 7, C), base_fee_mismatch},
+     %% **Past the last fork this node models.** Sepolia's Prague activation is
+     %% 1,741,159,776 and the configured network in a test run is Sepolia, so one second
+     %% later is outside the modelled range. The rule sits in the parentless group
+
      {P, put(<<"excessBlobGas">>, 999, C), excess_blob_gas_mismatch},
      {P, put(<<"difficulty">>, 1, C), non_zero_difficulty},
      {P, put(<<"nonce">>, <<1:64>>, C), non_zero_nonce},
      {P, put(<<"sha3Uncles">>, <<1:256>>, C), ommers_hash_not_empty},
-     {P, put(<<"extraData">>, <<0:264>>, C), extra_data_too_long}].
+     {P, put(<<"extraData">>, <<0:264>>, C), extra_data_too_long},
+     %% **Past the last fork this node models.** Sepolia's Prague activation is
+     %% 1,741,159,776 and the configured network in a test run is Sepolia, so one second
+     %% later is outside the modelled range. The rule sits in the parentless group
+     %% precisely so it fires before any relative rule, which is what makes this fixture
+     %% produce `past_modelled_range' and not `timestamp_not_after_parent'.
+     {P, put(<<"timestamp">>, 1741159777, C), past_modelled_range}].
 
 
 %% **Any arity.** The reasons come in three shapes -- a bare atom

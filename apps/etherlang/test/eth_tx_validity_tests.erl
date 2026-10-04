@@ -126,8 +126,22 @@ int_to_32(V) -> <<V:256/unsigned-big>>.
 
 %% A block ready to finalize: its parent's declared state root is the MPT's own
 %% root, which is the condition finalize/1 requires before it will execute.
+%% **The timestamp is pinned, and it was the wall clock until a test caught it.**
+%%
+%% `eth_block:new/2' stamps a block with the current time. That is right for building and
+%% wrong for a fixture: the modelled fork range ends at Prague, and Sepolia's Prague
+%% activation is 1,741,159,776 -- 2025-03-05 -- so a block built "now" is outside it and the
+%% validator refuses it with `past_modelled_range'. The first version of this fix was to
+%% raise the modelled range; the second was to date the fixture.
+%%
+%% **A fixture that reads the clock inherits every rule the clock eventually crosses.**
+%% The value below is inside the Cancun frame on Sepolia, so the transactions here are
+%% priced under the fork this file's other assertions assume.
+-define(CHILD_TIMESTAMP, 1706655072).
+
 child_block(Parent, Number, Txs) ->
     (eth_block:new(Parent, Number))#block{transactions = Txs,
+                                          timestamp = ?CHILD_TIMESTAMP,
                                           miner = ?COINBASE}.
 
 %% A child block whose fee collector is a known address, so the coinbase payment
@@ -979,7 +993,7 @@ initcode_gas_is_only_charged_from_shanghai_test() ->
     Base = eth_tx:intrinsic_gas(Create, london),
     Pre = [frontier, homestead, byzantium, constantinople, petersburg, istanbul,
            berlin, london, paris, merge],
-    Post = [shanghai, cancun, prague, osaka],
+    Post = [shanghai, cancun, prague],
     %% Before Shanghai the floor does not move with the fork.
     [?assertEqual(Base, eth_tx:intrinsic_gas(Create, F)) || F <- Pre],
     %% From Shanghai it carries two gas a word for the init code, and only that.

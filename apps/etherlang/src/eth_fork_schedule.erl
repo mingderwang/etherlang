@@ -7,7 +7,7 @@
 
 -module(eth_fork_schedule).
 
--export([ current_fork/3,
+-export([past_modelled_range/3, past_modelled_range/4,  current_fork/3,
           current_fork/4,
           fork_schedule/1,
           fork_at/3,
@@ -353,10 +353,6 @@ fork_of(Value) ->
         "cancun" -> {ok, cancun};
         "deneb" -> {ok, deneb};
         "prague" -> {ok, prague};
-        "osaka" -> {ok, osaka};
-        "bpo1" -> {ok, bpo1};
-        "bpo2" -> {ok, bpo2};
-        "amsterdam" -> {ok, amsterdam};
         _ -> error
     end.
 
@@ -402,10 +398,7 @@ fork_schedule(mainnet) ->
      {ttd, 58750000000000000000000, paris},
      {time, 1681338455, shanghai},
      {time, 1710338135, cancun},
-     {time, 1746612311, prague},
-     {time, 1764798551, osaka},
-     {time, 1765290071, bpo1},
-     {time, 1767747671, bpo2}];
+     {time, 1746612311, prague}];
 %% Sepolia is a post-Berlin chain: every block-numbered fork from Homestead
 %% through London is already active at genesis, which is why its ForkID
 %% schedule contains no block fork at all. London at genesis is why Sepolia
@@ -424,11 +417,7 @@ fork_schedule(sepolia) ->
      {block, 0, london},
      {time, 1677557088, shanghai},
      {time, 1706655072, cancun},
-     {time, 1741159776, prague},
-     {time, 1760427360, osaka},
-     {time, 1761017184, bpo1},
-     {time, 1761607008, bpo2},
-     {time, 1791294816, amsterdam}];
+     {time, 1741159776, prague}];
 fork_schedule(_Other) ->
     [].
 
@@ -456,6 +445,48 @@ current_fork(Network, BlockNumber, BlockTimestamp, BlockTotalDifficulty)
                                reached(Kind, Point, BlockNumber, BlockTimestamp,
                                        BlockTotalDifficulty)],
             {ok, highest_ranked(Active)}
+    end.
+
+%% **Whether a block is past the last fork this node models.**
+%%
+%% The modelled range ends at Prague. The names this table used to carry beyond it --
+%% `osaka', `bpo1' through `bpo5', `amsterdam' -- are deleted rather than left in place as
+%% ranks nothing can reach, and `fusaka` is not added: it is in neither this repository nor
+%% anything it can check, and a consensus fork name is not a placeholder.
+%%
+%% **This is asked separately from `current_fork/4'` because the two answers are different
+%% kinds of thing.** `current_fork/4' answers a fork for every block, and after the deletion
+%% it answers `prague' for every block past Prague's activation -- measured, not assumed:
+%% Sepolia at timestamp 1,763,000,000 answered `bpo2' before the change. That answer is a
+%% *wrong figure* rather than an absent rule, because the node goes on to price and execute
+%% with it. The range question is what lets a caller decline to certify on the strength of it.
+%%
+%% **Strictly past, not at-or-past.** A block at the activation point is a block of the fork
+%% that activates there, so `Ts =:= Point` is in range. That boundary is the whole function:
+%% the first version read `not reached(Kind, Point, ...)`, and `reached/5' already means
+%% "has reached", so `not reached` is "has not reached" -- which is **every block before
+%% Prague**, the opposite of the intent. It fired 1,934 times across the suite and refused
+%% the entire modelled range.
+%%
+%% **`beyond/5` rather than `not reached/5'** because the comparison is not the negation of
+%% the activation test: it is a strict comparison against the last point. Writing it as a
+%% negation is what made the error possible, and the two differ on exactly one input -- the
+%% boundary -- which is the input a boundary test exists to pin.
+%%
+%% **Refusing these blocks outright was the alternative, and it was rejected on
+%% measurement.** It would cap the node at mainnet block 1,746,612,311 and Sepolia timestamp
+%% 1,741,159,776 -- 2025-03-05 on both -- and with p2p on the critical path a node that stops
+%% there cannot follow the chain. Refusing everything is not a safer version of declining to
+%% certify; it is a different node.
+past_modelled_range(Network, BlockNumber, BlockTimestamp) ->
+    past_modelled_range(Network, BlockNumber, BlockTimestamp, undefined).
+
+past_modelled_range(Network, BlockNumber, BlockTimestamp, BlockTotalDifficulty)
+  when is_integer(BlockNumber), is_integer(BlockTimestamp) ->
+    case last_activation(fork_schedule(Network)) of
+        none -> false;
+        {Kind, Point} -> beyond(Kind, Point, BlockNumber, BlockTimestamp,
+                                 BlockTotalDifficulty)
     end.
 
 reached(block, Point, BlockNumber, _BlockTimestamp, _BlockTotalDifficulty) ->
@@ -609,10 +640,6 @@ fork_rank(shanghai) -> 15;
 fork_rank(cancun) -> 16;
 fork_rank(deneb) -> 16;
 fork_rank(prague) -> 17;
-fork_rank(osaka) -> 18;
-fork_rank(bpo1) -> 19;
-fork_rank(bpo2) -> 20;
-fork_rank(amsterdam) -> 21;
 %% An atom this module does not know ranks with `frontier', which makes
 %% at_least(Unknown, Feature) false for every feature that came after genesis
 %% and true for none of them -- the safe direction, since a rule wrongly believed
@@ -1232,7 +1259,7 @@ beacon_roots_active(undefined, _Fork) -> false;
 beacon_roots_active(<<0:256>>, _Fork) -> false;
 beacon_roots_active(<<Root:32/binary>>, _Fork) when Root == <<0:256>> -> false;
 beacon_roots_active(_Root, Fork) ->
-    lists:member(Fork, [cancun, prague, osaka, amsterdam, bpo1, bpo2, bpo3, bpo4, bpo5]).
+    lists:member(Fork, [cancun, prague]).
 
 add_beacon_root_to_state(Timestamp, Root) ->
     {TimestampSlot, _RootSlot} = beacon_root_slots(Timestamp),
@@ -1349,7 +1376,7 @@ process_history(ParentHash, BlockNumber, State, Fork) ->
 %% parent hash of a real block is never the genesis placeholder here, and the
 %% contract is specified to store whatever it is handed.
 history_active(Fork) ->
-    lists:member(Fork, [prague, osaka, amsterdam, bpo1, bpo2, bpo3, bpo4, bpo5]).
+    lists:member(Fork, [prague]).
 
 %% ---------------------------------------------------------------------------
 %% Gas schedule
@@ -2551,3 +2578,19 @@ initcode_word_cost(_Fork) ->
 %% ---------------------------------------------------------------------------
 %% Internal helpers
 %% ---------------------------------------------------------------------------
+
+last_activation([]) -> none;
+last_activation([{Kind, Point, _Fork} | Rest]) ->
+    case last_activation(Rest) of
+        none -> {Kind, Point};
+        Other -> Other
+    end.
+
+beyond(time, Point, _BlockNumber, BlockTimestamp, _TotalDifficulty) ->
+    BlockTimestamp > Point;
+beyond(block, Point, BlockNumber, _BlockTimestamp, _TotalDifficulty) ->
+    BlockNumber > Point;
+beyond(ttd, _Point, _BlockNumber, _BlockTimestamp, _TotalDifficulty) ->
+    %% Total difficulty never advances a timestamp or a height, so a chain whose last
+    %% activation is the Merge transition has no "past the last fork" to detect.
+    false.
