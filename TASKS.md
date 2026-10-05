@@ -388,12 +388,25 @@ as a header. `mac_header/2` fails, the connection answers `{error, bad_header_ma
 **no frame sent after one slow frame can ever be read again** -- because each attempt
 consumes another 32 bytes and misinterprets them.
 
-**This is a hypothesis with a mechanism, not a measurement.** What is measured is the symptom
-(20 s timeouts, no progress, both directions). What is *not* yet measured is that a partial
-read actually happens on these two nodes, and that the post-timeout reads fail with
-`bad_header_mac` rather than something else. **The measurement that would settle it** is to
-read `bad_header_mac` out of the two running logs; if it is absent, this hypothesis is wrong
-and the queue-latency reading (below) is the one to pursue.
+**This hypothesis was tested and it is WRONG.** The discriminator named below was run:
+`bad_header_mac`, `bad_frame_mac`, `short_header`, `frame_too_large` and `bad_rlp` were
+counted in both nodes' logs, and there are **zero of all five**. Every one of the 38 crash
+records is `exit:{timeout`.
+
+That refutes it on its own terms. A stream 32 bytes out of step cannot produce a *timeout* as
+its next symptom: the misread header fails `mac_header/2`, so the very next read answers
+`{error, bad_header_mac}` and `fetch_wait/5` returns that error rather than a deadline. Zero
+framing errors across ~40 minutes of two nodes hammering each other is not what a desynced
+stream looks like.
+
+**So the mechanism above is real code and a latent bug -- a partial read still discards 32
+bytes and the advanced MAC counter -- but it is not what is stopping these two nodes**, and
+recording it as the cause would have been the wrong claim to build the next change on. It
+stays here because the byte-level test for it is still missing and the defect is real; it is
+demoted from "the blocker" to "uncovered, not currently firing".
+
+What the timeout *is* is the reading below, and the arithmetic is why: the numbers line up
+with no free parameter.
 
 **There is no test for it, and that is the larger fact.** `eth_rlpx_tests` exercises the
 handshake, the Hello exchange, Ping/Pong and MAC tampering -- and **`recv_frame/3` is never
@@ -415,12 +428,20 @@ FIFO, so every message behind a poll waits up to a second. A stable backlog of ~
 would then put a `'$gen_call'` at the back of ~20 seconds of polls -- which is exactly the
 observed 20,000 ms budget, arrived at from the other direction.
 
-**Both readings predict the same number**, and the arithmetic is the tell: 20 messages x
-1,000 ms = the timeout, with no free parameter. The discriminator is cheap: the partial-read
-reading predicts `bad_header_mac` in the logs and predicts the *first* call to be slow and the
-rest fast, while the queue reading predicts every call to be slow by roughly the backlog.
-**Reading one line of log settles it**, which is the cheapest experiment available and has not
-been run yet.
+**Both readings predicted the same number**, and that is why the one-line experiment was worth
+naming in advance: 20 messages x 1,000 ms = the timeout, with nothing left to fit. The
+partial-read reading predicted `bad_header_mac` in the logs; the queue reading predicted none.
+**The logs have none, so the queue reading survives and the other is refuted.**
+
+**Still unmeasured, and it is the thing to measure next:** that the latency scales with the
+backlog. Nothing outside the process can observe it now -- `net_peerCount` answers from the
+manager and no longer calls the conn, which was the point of `cd511da`, so the one method
+that used to time a conn call is deliberately gone. The measurement has to be a test: put `N`
+messages in a live conn's mailbox and time a `handle_call` to it, with `N = 1, 3, 10`, and
+check the answer is about `N` seconds. If it is, the fix is to stop blocking for
+`?POLL_MS` inside `handle_info/2` -- and the reason `cd511da` is worth stating here is that
+it removed a symptom without touching this, so a green `net_peerCount` and a stuck `eth_sync`
+are not in conflict.
 
 ### Also found, also open
 
