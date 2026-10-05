@@ -225,8 +225,13 @@ interop() ->
                        Parent, {{127, 0, 0, 1}, Port},
                        args(PrivA, IDB, IDA, chain_eth_ab)),
         PidB = receive {recp, P} -> P after 8000 -> error(acceptor_timeout) end,
-        receive {peer_up, PidA, IDB, _} -> ok after 8000 -> error(a_no_peer_up) end,
-        receive {peer_up, PidB, IDA, _} -> ok after 8000 -> error(b_no_peer_up) end,
+        %% Five elements: the peer id, the remote id, the Hello, and the
+            %% negotiated `eth' value. `eth' was added to this message so the
+            %% manager never has to call into the conn to learn it -- a conn inside
+            %% `fetch_request/6' cannot answer for up to 15 s, and the manager used
+            %% to read that as the peer being dead.
+            receive {peer_up, PidA, IDB, _, _} -> ok after 8000 -> error(a_no_peer_up) end,
+        receive {peer_up, PidB, IDA, _, _} -> ok after 8000 -> error(b_no_peer_up) end,
         %% Both sides negotiated eth.
         #{eth := EthA} = gen_server:call(PidA, status),
         ?assertMatch(#{version := 68}, EthA),

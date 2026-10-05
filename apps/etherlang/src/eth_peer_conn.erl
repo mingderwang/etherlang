@@ -14,8 +14,8 @@
 -define(PING_MS, 15000).
 -define(POLL_MS, 1000).
 -define(IDLE_TIMEOUT_MS, 120000).
-%% Shorter than the 2000 ms `peer_status/1' timeout it has to be diagnosed against, so a
-%% window in which that call would time out is guaranteed to contain a report.
+%% Shorter than the 2000 ms timeout the peer manager used to give up at, so a window in
+%% which that call would have timed out is guaranteed to contain a report.
 -define(DIAG_MS, 1000).
 
 -record(st, {sock,
@@ -94,7 +94,38 @@ finish_init(Manager, Sock, Args, Sess) ->
                     erlang:send_after(?POLL_MS, self(), poll),
                     erlang:send_after(?PING_MS, self(), ping),
                     erlang:send_after(?DIAG_MS, self(), diag),
-                    Manager ! {peer_up, self(), eth_rlpx:remote_id(Sess1), Hello},
+                    %% **`eth' travels with `peer_up' now.** It used to be fetched later,
+                    %% by the manager calling into this process -- and this process spends
+                    %% up to 15 s inside `fetch_request/6' (`handle_call({get_headers,
+                    %% ...})' owns `recv' for that whole window, and a `gen_server' handles
+                    %% one message at a time), so the manager's 2 s `gen_server:call' timed
+                    %% out and the peer was reported **dead while it was working**. The
+                    %% value is fixed once the handshake is done and this message is sent
+                    %% after `maybe_eth' has already succeeded, so sending it costs
+                    %% nothing and removes the only reason the manager had to call in.
+                    %% **`eth_ready(S1)', not `S1#st.eth'.** The first version sent the raw
+                    %% negotiated value, which is `undefined' when no eth capability was
+                    %% shared -- and the consumers test `maps:get(eth, Info, false)
+                    %% =/= false', so `undefined' passes that test. **A peer with no eth
+                    %% capability would have counted as eth-ready**, which is the opposite
+                    %% of the filter's intent. `eth_ready/1' is the one definition of
+                    %% "eth-capable" and it answers `false' rather than `undefined', and it
+                    %% is the same value `handle_call(status, ...)' reports, so the manager
+                    %% and a direct query cannot disagree.
+                    %%
+                    %% **The two forms cannot differ on any path that exists today**, and
+                    %% that is worth saying rather than implying a test holds this: the
+                    %% `peer_up' send is inside `maybe_eth''s `{ok, S1}' branch, so by the
+                    %% time it happens `S1#st.eth' is already a map and `eth_ready/1'
+                    %% returns a map too. The reason to use `eth_ready/1' anyway is that the
+                    %% `undefined' form is what a future path would send -- a peer that
+                    %% completes RLPx without sharing `eth' -- and it **passes**
+                    %% `maps:get(eth, Info, false) =/= false`. So this is "correct by the
+                    %% specification and unobservable here", which are two different
+                    %% sentences, and both belong here: the next reader will otherwise
+                    %% assume something is holding `eth_ready/1' in place and may move it.
+                    Manager ! {peer_up, self(), eth_rlpx:remote_id(Sess1), Hello,
+                               eth_ready(S1)},
                     {ok, S1};
                 {error, Reason} ->
                     logger:notice("etherlang: rlpx eth handshake failed (~p)", [Reason]),

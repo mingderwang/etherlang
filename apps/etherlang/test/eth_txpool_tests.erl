@@ -393,8 +393,13 @@ gossip() ->
                        Parent, {{127, 0, 0, 1}, Port},
                        conn_args(PrivA, IDA, pool_gos_a, IDB)),
         PidB = receive {recp, P} -> P after 8000 -> error(acceptor_timeout) end,
-        receive {peer_up, PidA, IDB, _} -> ok after 8000 -> error(a_no_up) end,
-        receive {peer_up, PidB, IDA, _} -> ok after 8000 -> error(b_no_up) end,
+        %% Five elements: the peer id, the remote id, the Hello, and the
+            %% negotiated `eth' value. `eth' was added to this message so the
+            %% manager never has to call into the conn to learn it -- a conn inside
+            %% `fetch_request/6' cannot answer for up to 15 s, and the manager used
+            %% to read that as the peer being dead.
+            receive {peer_up, PidA, IDB, _, _} -> ok after 8000 -> error(a_no_up) end,
+        receive {peer_up, PidB, IDA, _, _} -> ok after 8000 -> error(b_no_up) end,
         %% A pools a signed tx, then announces it.
         SPriv = eth_secp256k1:generate_key(),
         STx = sign_legacy(SPriv, base_tx()),

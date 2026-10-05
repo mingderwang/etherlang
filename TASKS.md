@@ -228,18 +228,63 @@ Each was discarded against a control, which is the only reason any of them was c
 broken.** The two that worked were reading the abstract code and reading the log, and both
 were reached only after the failures.
 
-### The fix, and why the small one is the right one
+### Fixed: `peers/0` answers from the manager, and never calls the peer
 
-**`eth_peer:peers/0` must not call into a process that may be busy.** The manager already
-learns `remote` and `Hello` when `peer_up` arrives, and `eth_ready` is fixed once the
-handshake is done, so `peers/0` can answer from the manager's own state and never enter the
-conn. That is small, it is observable (`net_peerCount` becomes O(1) instead of 2.1-3.5 s),
-and an injection that puts the `gen_server:call` back makes it slow and `{error, down}`
-again during a fetch.
+`handle_call(peers, ...)` was `[{Pid, peer_status(Pid)}]` -- one
+`gen_server:call(Pid, status, 2000)` per peer. It is now a map lookup, and `peer_up` carries
+the negotiated `eth` value so the manager never has to ask.
 
-The structural alternative -- moving the fetch off the conn so it never owns `recv`, the way
-a real devp2p client tracks concurrent requests -- is correct and much larger, and it
-touches framing state.
+**Measured on the pair in `tools/two-node-p2p.sh`, 20 samples each, after the fix:**
+
+| | before | after |
+|---|---|---|
+| node B `net_peerCount` | `0x1` and `0x0` alternating | **`0x1` in 20 of 20** |
+| `net_peerCount` latency | **2091-3525 ms** median | **2.0 ms** median (min 0.9, max 9.1) |
+| node A `net_peerCount` | unreadable -- each sample timed out | **`0x0` in 20 of 20**, max 27 ms |
+
+The median latency figure is the one that decides it: **2.0 ms is inside the 2000 ms window
+the old call gave up in**, so even the old shape would now usually have returned. The fix is
+not that the deadline was tight. It is that a value the manager already holds was being
+re-read from a process that cannot answer while it is doing the work this node wants.
+
+**The test is the defect, stated as an assertion, and it does not depend on timing.**
+`sys:suspend/1` makes the peer provably unable to answer *any* message, and the answer must
+not change: `peers/0` still reports it eth-ready, `eth_peer_count/1` still says 1. Injecting
+the `gen_server:call` back turns it red with `{badmap,{error,down}}`.
+
+**Two things that were wrong inside the fix and were caught before it was committed**, both
+recorded because both would have shipped a peer-counting rule that is the opposite of the
+one intended:
+
+1. The first version put the **raw** `S1#st.eth` in `peer_up`. That value is `undefined`
+   when no `eth` capability was shared, and the consumers test
+   `maps:get(eth, Info, false) =/= false` -- so `undefined` **passes**, and a peer with no
+   `eth` capability would have counted as eth-ready. `eth_ready/1` is the one definition of
+   "eth-capable" and it answers `false`, so it is what travels.
+2. `eth_ready_peer/1` is **private**, so the test could not call it; the assertion was
+   rewritten against `eth_peer_count/1`, which uses that predicate verbatim. Adding an
+   export for a test would have been the second copy of the rule.
+
+**`eth_ready(S1)` and `S1#st.eth` cannot differ on any path that exists today** -- the
+`peer_up` send is inside `maybe_eth`'s `{ok, S1}' branch -- so nothing pins that choice, and
+the comment at the call site says so rather than implying otherwise. It is "correct by the
+specification and unobservable here", which are two different sentences.
+
+### Two things this measurement settled that were open questions
+
+**The RPC does report A's local head, and that is worth having checked.** A's chain is stuck
+at 11,846,219 and `eth_blockNumber` returns `0xb4c24b`, which **is** 11,846,219. So the
+projection is not answering from `base_source` here; it answers from the chain store, and it
+answers with the number it actually holds. (This was misread once during the measurement as
+"it had got past the blocker", and the arithmetic -- not the code -- was what was wrong.)
+
+**A has no inbound connection at all, and that is unexplained.** B's conn diagnostic names
+remote `0EB87AAFD7CAF95B`, which is exactly the id A logs as `rlpx listening on tcp 30303`.
+So B completed RLPx *and* the `eth` handshake with A. On A's side there is **not one** `rlpx
+conn diag` line, and that timer only starts once `maybe_eth` succeeds -- so A's conn never
+reached `peer_up`, or never existed. There are **zero** crash reports in A's log and A has
+never mentioned B's port. Asymmetric to that degree, with no error anywhere, is the shape
+that wants the accept path read next.
 
 ### Also found, also open
 

@@ -9,7 +9,7 @@
 -export([start_link/1, dial/3, dial/4, status/0, status/1, peers/0, peers/1,
          get_headers/4, get_headers/5, get_bodies/1, get_bodies/2,
          get_receipts/1, get_receipts/2, broadcast/1, broadcast/2,
-         eth_peer_count/0]).
+         eth_peer_count/0, eth_peer_count/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -150,9 +150,28 @@ handle_call(status, _From, S) ->
               peers => maps:size(S#st.peers),
               target => S#st.target,
               dialing => maps:size(S#st.dialing)}, S};
+%% **Answered from this manager's own state, never by calling the peer.**
+%%
+%% It used to be `[{Pid, peer_status(Pid)}]', one `gen_server:call(Pid, status, 2000)' per
+%% peer. That was wrong for a reason that is not about error handling: a
+%% `eth_peer_conn' executing `fetch_request/6' inside `handle_call({get_headers, ...})'
+%% **cannot answer any other message for up to 15 seconds**, because it owns `recv' and a
+%% `gen_server' handles one message at a time. So a peer doing exactly the work this node
+%% wants from it was reported `{error, down}' -- and `eth_ready_peer/1' filters on
+%% `is_map(Info)', so `eth_sync' was told there were no eth peers and never started.
+%%
+%% Measured consequences of the old form: `peers/0' answered `{error, down}' for a
+%% connection that was provably alive (`peer_up` = 1, never terminated, per-second
+%% diagnostics rising), `net_peerCount' alternated `0x1' and `0x0' on a stable connection,
+%% 22 `status' calls were logged against 40 `net_peerCount' samples -- so roughly half were
+%% never processed at all -- and `net_peerCount' cost **2.1-3.5 s** because each busy peer
+%% consumed the full 2 s timeout.
+%%
+%% Everything `peers/0' reports is now known here: `remote' and `hello' arrive with
+%% `peer_up', `eth' now arrives with it, and a `'DOWN'' removes the entry. So the answer is
+%% a lookup, and the cost is O(1) in the number of peers rather than O(peers x 2s).
 handle_call(peers, _From, S) ->
-    Infos = [{Pid, peer_status(Pid)} || Pid <- maps:keys(S#st.peers)],
-    {reply, Infos, S};
+    {reply, [{Pid, maps:get(Pid, S#st.peers)} || Pid <- maps:keys(S#st.peers)], S};
 handle_call(_Req, _From, S) ->
     {reply, {error, unknown_call}, S}.
 
@@ -252,11 +271,12 @@ handle_info({accepted, Ref, Res}, S) ->
         error ->
             {noreply, S}
     end;
-handle_info({peer_up, Pid, RemoteID, Hello}, S) ->
+handle_info({peer_up, Pid, RemoteID, Hello, Eth}, S) ->
     Peers = ensure_peer(S#st.peers, Pid),
     Split = erlang:monotonic_time(millisecond),
     Peers1 = Peers#{Pid := (maps:get(Pid, Peers))#{remote => RemoteID,
                                                    hello => Hello,
+                                                   eth => Eth,
                                                    since => Split}},
     logger:notice("etherlang: rlpx peer up ~s", [id8(RemoteID)]),
     {noreply, S#st{peers = Peers1}};
@@ -422,20 +442,18 @@ client_id() -> <<"etherlang/0.1.0">>.
 %% handshaking and conns that are dead. **Measured on two live nodes: `status/0' said
 %% `peers => 1' while `peers/0' said `{error, down}' for that one entry.**
 %%
-%% A dead conn answers from `peer_status/1' immediately rather than after its timeout, so
-%% the cost here is only a conn that is alive and unresponsive -- and that is a real cost:
-%% `net_peerCount' measured **2091-3525 ms** on the pair in `tools/two-node-status.sh',
-%% which is this function walking stuck connections, not the cost of a map.
-eth_peer_count() ->
+%% **This is O(1) in the number of peers, and that is the point.** It used to reach into
+%% each conn with `gen_server:call(Pid, status, 2000)' and so cost **2091-3525 ms** on the
+%% pair in `tools/two-node-status.sh' -- a conn executing `fetch_request/6' cannot answer
+%% for up to 15 s, so each one consumed the full timeout. `peers/0' now answers from this
+%% manager's own state, and nothing here calls a peer at all.
+eth_peer_count() -> eth_peer_count(?MODULE).
+
+eth_peer_count(Name) ->
     try
-        length([P || {P, Info} <- peers(),
+        length([P || {P, Info} <- peers(Name),
                       is_map(Info), maps:get(eth, Info, false) =/= false])
     catch _:_ -> 0
-    end.
-
-peer_status(Pid) ->
-    try gen_server:call(Pid, status, 2000)
-    catch _:_ -> {error, down}
     end.
 
 id8(ID) when byte_size(ID) >= 8 -> binary:encode_hex(binary:part(ID, 0, 8));

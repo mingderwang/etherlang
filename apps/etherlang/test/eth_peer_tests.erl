@@ -64,7 +64,34 @@ autodial() ->
             ok,
             %% Headers flow over the auto-dialed connection.
             {ok, Hdrs} = eth_peer:get_headers(peer_ad_a, {number, 0}, 2, 0, false),
-            ?assertEqual([0, 1], [header_num(H) || H <- Hdrs])
+            ?assertEqual([0, 1], [header_num(H) || H <- Hdrs]),
+            %% **A peer that cannot answer a message is still a peer.**
+            %%
+            %% This is the defect, stated as an assertion. `eth_peer:peers/0' used to be
+            %% `[{Pid, peer_status(Pid)}]' -- one `gen_server:call(Pid, status, 2000)' per
+            %% peer -- and a conn executing `fetch_request/6' inside
+            %% `handle_call({get_headers, ...})' owns `recv' for up to **15 seconds**, so it
+            %% could answer nothing in that window. `peer_status/1' gave up after 2 and
+            %% answered `{error, down}', `eth_ready_peer/1' filters on `is_map(Info)', and
+            %% `eth_sync' -- whose gate that is -- never started.
+            %%
+            %% `sys:suspend/1' makes the case deterministic instead of racy: the conn is
+            %% provably unable to answer anything, and the answer must not change.
+            %%
+            %% Injecting the `gen_server:call' back into `handle_call(peers, ...)' turns
+            %% this red with `{error, down}'.
+            {ConnPid, Info0} = hd(eth_peer:peers(peer_ad_a)),
+            ?assertEqual(true, maps:get(eth, Info0) =/= false),
+            ok = sys:suspend(ConnPid),
+            try
+                [{ConnPid, Info1} | _] = eth_peer:peers(peer_ad_a),
+                ?assertEqual(true, maps:get(eth, Info1) =/= false),
+                %% `eth_peer_count/1' uses `eth_ready_peer/1's predicate verbatim, and
+                %% `eth_sync' gates on that, so this is the number that starts the sync.
+                ?assertEqual(1, eth_peer:eth_peer_count(peer_ad_a))
+            after
+                ok = sys:resume(ConnPid)
+            end
         after
             stop(peer_ad_a), stop(peer_ad_b),
             stop(disc_ad_a), stop(disc_ad_b)
