@@ -32,6 +32,9 @@ autodial() ->
         {ok, _} = eth_discv4:start_link(#{name => disc_ad_a, port => 0,
                                           privkey => PrivA,
                                           bootnodes => [EnodeB]}),
+        %% A's own discovery id: `peer_ad_b' needs it to be told *which* accepted
+        %% connection is the one it should be reporting.
+        #{id := IDA} = eth_discv4:status(disc_ad_a),
         {ok, _} = eth_peer:start_link(#{name => peer_ad_b, port => BPort,
                                         privkey => PrivB, disc => disc_ad_b,
                                         target => 0, interval => 200,
@@ -44,24 +47,37 @@ autodial() ->
             ok = wait_eth_peer(peer_ad_a, IDB, 200),
             %% Exactly one connection to B (no duplicate dials).
             ?assertEqual(1, count_remote(peer_ad_a, IDB)),
-            %% **A positive assertion for `eth_peer:eth_peer_count/0' belongs here and
-            %% cannot be written.** `wait_eth_peer/3' has just proved, with this
-            %% module's own predicate, that a connected eth-capable peer exists -- and
-            %% the assertion still lost the race: `count_remote/2' returned 1 and
-            %% `eth_peer_count/0' returned 0 microseconds later.
-            %%
-            %% **That is not a fixture defect, it is the peer connection dying.** The
-            %% only fixture in the suite with a live eth peer has one that does not
-            %% survive past `peer_up', so a positive count is a race rather than a test.
-            %% It was tried in both positions -- before and after the `get_headers'
-            %% round trip -- and failed in both.
-            %%
-            %% The negative case is covered (`net_peer_count_is_zero_when_there_are_no_
-            %% peers_test_'), so what is missing is that a *non-zero* count is
-            %% distinguishable from a hardcoded `0x0'. Recorded in
-            %% `eth_open_claims_tests' rather than left as a comment, so it is a named
-            %% open item and not a silence.
-            ok,
+                          %% **Both sides count the peer, and the two sides are not interchangeable.**
+              %%
+              %% `peer_ad_b' has `target => 0', so it never dials: its only entry comes
+              %% from the **accept** path. `peer_ad_a' dials, so its entry comes from the
+              %% **dial** path, and the two paths used to build that entry differently.
+              %%
+              %% This is the positive assertion that was recorded here as unwritable, and
+              %% it is now writable for two separate reasons -- both had to be fixed, and
+              %% either one alone leaves it red:
+              %%
+              %%   * `wait_eth_peer/3' polls `peers/0', which used to call into each conn
+              %%     with a 2 s timeout. Asserting a count right after proved the peer
+              %%     existed and then got 0 microseconds later, because the conn was inside
+              %%     `fetch_request/6' and could not answer. **That was not the connection
+              %%     dying, as the comment here used to say**: `peers/0' now answers from
+              %%     the manager's own state, so there is nothing to time out.
+              %%   * `peer_ad_b' is where the real defect was. `handle_info({accepted,
+              %%     ...})' **replaced** the peer entry with `#{ref => MRef}' *after*
+              %%     `peer_up' had already put `remote', `hello' and `eth' in it, so the
+              %%     accepted peer held none of the three. `wait_eth_peer(peer_ad_b, ...)'
+              %%     could never succeed at all, and no positive assertion on the
+              %%     accepting side was possible.
+              %%
+              %% Both sides are asserted, and `peer_ad_b` is the one that bites on the
+              %% second. The negative case is covered separately
+              %% (`net_peer_count_is_zero_when_there_are_no_peers_test_'), so what is added
+              %% here is that a *non-zero* count is distinguishable from a hardcoded `0x0'.
+              ok = wait_eth_peer(peer_ad_b, IDA, 200),
+              ?assertEqual(1, count_remote(peer_ad_b, IDA)),
+              ?assertEqual(1, eth_peer:eth_peer_count(peer_ad_a)),
+              ?assertEqual(1, eth_peer:eth_peer_count(peer_ad_b)),
             %% Headers flow over the auto-dialed connection.
             {ok, Hdrs} = eth_peer:get_headers(peer_ad_a, {number, 0}, 2, 0, false),
             ?assertEqual([0, 1], [header_num(H) || H <- Hdrs]),

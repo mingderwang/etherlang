@@ -141,7 +141,7 @@ handle_call({dial, IP, Port, RemoteID}, _From, S) ->
     case eth_peer_conn:start_initiator_unlinked(self(), {IP, Port}, Args) of
         {ok, Pid} ->
             Ref = monitor(process, Pid),
-            {reply, {ok, Pid}, S#st{peers = (S#st.peers)#{Pid => #{ref => Ref}}}};
+            {reply, {ok, Pid}, S#st{peers = put_ref(S#st.peers, Pid, Ref)}};
         {error, _} = E ->
             {reply, E, S}
     end;
@@ -263,7 +263,7 @@ handle_info({accepted, Ref, Res}, S) ->
                     ok = gen_tcp:controlling_process(Sock, Pid),
                     MRef = monitor(process, Pid),
                     {noreply, S#st{accepting = Accepting,
-                                   peers = (S#st.peers)#{Pid => #{ref => MRef}}}};
+                                   peers = put_ref(S#st.peers, Pid, MRef)}};
                 {error, _} ->
                     (try gen_tcp:close(Sock) catch _:_ -> ok end),
                     {noreply, S#st{accepting = Accepting}}
@@ -343,6 +343,32 @@ ensure_peer(Peers, Pid) ->
     case maps:find(Pid, Peers) of
         {ok, _} -> Peers;
         error -> Peers#{Pid => #{ref => monitor(process, Pid)}}
+    end.
+
+%% **Record a monitor on an entry without discarding what is already there.**
+%%
+%% Two of the three places that create a peer entry wrote `Pid => #{ref => ...}', which
+%% *replaces* the whole map rather than merging into it. That is harmless on the dial path
+%% and wrong on the accept path, and the reason is the message order:
+%%
+%%   * the spawned acceptor calls `start_recipient_unlinked/3', which runs the handshake
+%%     and sends `peer_up' to this manager, and only then sends `{accepted, Ref, Res}';
+%%   * so `peer_up' -- carrying `remote', `hello' and `eth' -- is handled **first**, and the
+%%     `accepted' clause then replaced it with a bare `#{ref => MRef}'.
+%%
+%% The result was a live, eth-capable, fully handshaken inbound connection whose entry held
+%% no `eth' at all, so `eth_ready_peer/1' rejected it and `net_peerCount` answered **0x0 on
+%% the node that had just accepted a peer**. Measured on the pair in
+%% `tools/two-node-p2p.sh': node B, which *dialled* A, reported `0x1`; node A, which
+%% *accepted* B, reported `0x0'. Same code, same release, same moment -- the dial path and
+%% the accept path disagreed, and the only difference was which one had its entry replaced.
+%%
+%% `ensure_peer/2' above already knew this ordering -- its comment says so -- and the accept
+%% clause and the `dial' call were simply never given it.
+put_ref(Peers, Pid, Ref) ->
+    case maps:find(Pid, Peers) of
+        {ok, M} -> Peers#{Pid => M#{ref => Ref}};
+        error -> Peers#{Pid => #{ref => Ref}}
     end.
 
 %% Periodic maintenance: trim surplus, dial toward target.

@@ -106,36 +106,39 @@ create_charge_is_still_a_second_copy_of_the_schedules_figure_test() ->
     ?assertEqual(2, eth_fork_schedule:initcode_word_cost(shanghai)),
     ?assertEqual(2, eth_fork_schedule:initcode_word_cost(cancun)).
 
-%% **A non-zero `net_peerCount` is not distinguishable from a hardcoded `0x0`.**
-%%
-%% `eth_peer:eth_peer_count/0' counts connected eth-capable peers, and the negative case
-%% is covered -- `net_peer_count_is_zero_when_there_are_no_peers_test_' runs with no peer
-%% manager and gets `0x0'. **That fixture cannot tell a count from a constant**, so a
-%% handler that answered a hardcoded zero would satisfy it.
-%%
-%% The positive case needs a live eth-capable peer, and the only fixture in the suite
-%% that has one is `eth_peer_tests:autodial/0'. The assertion was written there and
-%% **lost the race**: `wait_eth_peer/3' had just proved with that module's own predicate
-%% that such a peer existed, `count_remote/2' returned 1, and `eth_peer_count/0'
-%% returned 0 microseconds later. It was tried on both sides of the `get_headers' round
-%% trip and failed on both.
-%%
-%% **So the gap is not a missing test, it is that the subject does not hold still.** The
-%% peer connection completes the eth handshake and then dies within about a second --
-%% `poll' gets `enotconn' from a socket the operating system still lists as ESTABLISHED.
-%% Until that is fixed this item cannot be closed honestly, and closing it by writing a
-%% test that retries until it passes would be a test that cannot fail.
-%%
-%% The check below is that the negative test still exists and the count function is still
-%% a count: a hardcoded `0x0' in the handler would leave both true, which is why this
-%% entry is a *gap* record rather than a ratchet.
-net_peer_count_has_no_positive_test_because_the_peer_dies_test() ->
-    %% No peer manager is running here, so the count is 0 -- and the assertion is that
-    %% it is an *integer*, which is what says the function exists and computes rather
-    %% than being absent. `erlang:function_exported/3' would need the module loaded and
-    %% would answer `false' for a module that had never been called, which is a fact
-    %% about this test rather than about `eth_peer'.
-    ?assert(is_integer(eth_peer:eth_peer_count())).
+%% **CLOSED: a non-zero `net_peerCount` is now distinguished from a hardcoded `0x0'.**
+  %%
+  %% This was a gap record and it was wrong about why. It said the peer connection "dies
+  %% within about a second -- `poll' gets `enotconn' from a socket the operating system
+  %% still lists as ESTABLISHED", and concluded the positive assertion was unwritable.
+  %% **The connection does not die** (`e823649` measured that over 60 s on a fresh pair).
+  %% Two other things were true, each of which alone made the assertion fail:
+  %%
+  %%   * `eth_peer:peers/0' called into each conn with a 2 s timeout, and a conn inside
+  %%     `fetch_request/6' cannot answer for up to 15 s, so the count read 0 immediately
+  %%     after `wait_eth_peer/3' had proved the peer existed (`cd511da`);
+  %%   * the **accept** path replaced the peer entry with `#{ref => MRef}' *after* `peer_up'
+  %%     had put `remote', `hello' and `eth' into it, so a peer that had *been accepted*
+  %%     reported as eth-incapable. The dialing side never had that bug, which is exactly
+  %%     why only the accepting side could tell.
+  %%
+  %% The closing check is **`eth_peer_tests:autodial/0`**, which asserts
+  %% `eth_peer_count/1` is 1 on **both** the dialing manager and the accepting one. That is
+  %% a behavioural assertion that runs on every suite, which is strictly better than a
+  %% ledger entry that describes it -- so there is no ledger entry, and that is the whole
+  %% reason this note exists rather than a `_test/0` function.
+  %%
+  %% **Deliberately no static check replaces it.** Three attempts to build one read
+  %% `eth_peer_tests''s beam and each was wrong: the first iterated the module's *top-level*
+  %% forms, which is where the module's functions live and not where the calls are (they are
+  %% inside `autodial/0''s body, under a `try'), so it found nothing; the second and third
+  %% read a **stale beam**, because a `--module=' run of this module does not rebuild a
+  %% test module that is not its dependency, and 15,033 pretty-printed characters is not
+  %% this file. A check that reads a sibling test's compiled form to confirm the sibling test
+  %% says something is a check about the build, not about the behaviour.
+  %%
+  %% The negative case is still covered separately and still lives here:
+  %% `net_peer_count_is_zero_when_there_are_no_peers_test_`.
 
 %% **`eth_evm:base_cost/1` does not exist.** `eth_fork_schedule` is the only price table,
 %% so the interpreter must ask it for the fork in hand. A second table is a second thing

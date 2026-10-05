@@ -34,8 +34,8 @@ with the file it sat above.
 
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
-build. OTP 29.1. Current: **49 src modules / 14,465 code lines, 65 test modules /
-14,441 code lines, 1029 eunit tests, all passing.**
+build. OTP 29.1. Current: **49 src modules / 14,506 code lines, 65 test modules /
+14,453 code lines, 1028 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive
 them with the procedure below rather than editing this sentence.
@@ -278,13 +278,65 @@ projection is not answering from `base_source` here; it answers from the chain s
 answers with the number it actually holds. (This was misread once during the measurement as
 "it had got past the blocker", and the arithmetic -- not the code -- was what was wrong.)
 
-**A has no inbound connection at all, and that is unexplained.** B's conn diagnostic names
-remote `0EB87AAFD7CAF95B`, which is exactly the id A logs as `rlpx listening on tcp 30303`.
-So B completed RLPx *and* the `eth` handshake with A. On A's side there is **not one** `rlpx
-conn diag` line, and that timer only starts once `maybe_eth` succeeds -- so A's conn never
-reached `peer_up`, or never existed. There are **zero** crash reports in A's log and A has
-never mentioned B's port. Asymmetric to that degree, with no error anywhere, is the shape
-that wants the accept path read next.
+**A has an inbound connection, and reading that cost an hour of the wrong file.**
+`eth_peer_conn` rotates its log, so `erlang.log.1` is a **stale rotation** -- it stopped
+being written at 01:05 while the node was still running and writing `erlang.log.4`. Every
+measurement of "A has no inbound connection" was taken from that file: no `rlpx conn diag`
+line, no crash report, no mention of B's port. All three are absences of evidence in a file
+that had stopped receiving events. Against the current rotation: **175 diag lines, remote
+exactly B's discovery id**, no crashes. The claim "A never accepted a peer" was an
+instrument pointed at a dead file, which is the same shape as every other time in this file's
+history that an absence was reported as a result.
+
+### Fixed: the accept path was deleting the peer entry it had just been told about
+
+With both nodes finally talking, `net_peerCount` was **asymmetric on identical code**: node
+B, which *dialled* A, reported `0x1`; node A, which *accepted* B, reported `0x0`. The two
+paths build the peer entry differently, and one of them threw the answer away.
+
+`handle_info({accepted, Ref, Res}, ...)` wrote `Pid => #{ref => MRef}` -- a **replacement**,
+not an update. And the message order guarantees the information was already there: the
+spawned acceptor calls `start_recipient_unlinked/3`, which runs the whole handshake and
+sends `peer_up` (carrying `remote`, `hello` and `eth`) to the manager, and only *then* sends
+`{accepted, Ref, Res}`. So `peer_up` was handled first and `accepted` overwrote it with a
+bare `#{ref => ...}`.
+
+The result: a live, eth-capable, fully handshaken inbound connection whose entry held no
+`eth` at all, so `eth_ready_peer/1` rejected it. `handle_call({dial, ...})` had the same
+replacement and is fixed with it; both now go through `put_ref/3`, which merges.
+
+**`ensure_peer/2` already knew this ordering** -- its comment says "peer_up may arrive before
+dial_result" -- and the accept clause was simply never given it. That is the shape worth
+noticing: the fix for a race existed one function away, with the race written in its comment,
+applied to one of the three sites that create an entry.
+
+**Measured, 20 samples per side:**
+
+| | before | after |
+|---|---|---|
+| A (`net_peerCount`, the accept side) | `0x0` in 20 of 20 | **`0x1` in 20 of 20** |
+| B (`net_peerCount`, the dialing side) | `0x1` in 20 of 20 | `0x1` in 20 of 20 |
+| latency, either side | 1.4-1.6 ms median | unchanged -- `peers/0` reads the manager's own state on both paths |
+
+The test is `eth_peer_tests:autodial/0`, whose `peer_ad_b` has `target => 0` so it **never
+dials**: its only entry comes from the accept path. It asserts `wait_eth_peer(peer_ad_b, ...)`
+succeeds and that `eth_peer_count/1` is 1 on **both** managers. Restoring the replacement
+turns it red with `autodial_timeout` -- the accept-side peer can never be reported, because
+by the time anyone looks, its entry says nothing about it.
+
+**That assertion is what closes the `eth_open_claims_tests` gap** which recorded that a
+non-zero `net_peerCount` was indistinguishable from a hardcoded `0x0`. The gap entry's own
+diagnosis was wrong twice over -- it blamed the connection dying, which `e823649` disproved,
+and it blamed the 2 s `peers/0` call, which `cd511da` removed -- and both of those were real
+blockers that had to be cleared before the assertion could be written at all. The entry is
+gone and the reason is recorded in that module, including **why no static replacement was
+built**: three attempts read `eth_peer_tests`'s beam, and one iterated the module's top-level
+forms (where the functions are, not the calls), and two read a stale beam because a
+`--module=` run of one test module does not rebuild another. A check that reads a sibling
+test's compiled form to confirm the sibling test says something is a check about the build.
+
+1028 eunit tests, down one: the closed gap was a `_test/0` function and deleting it is the
+point.
 
 ### Also found, also open
 
