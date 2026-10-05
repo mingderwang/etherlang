@@ -486,7 +486,7 @@ feature produce the same output, and the subject here was stuck by an unrelated 
 #### `start` could not have worked either
 
 `node_id_of/1` ran `erl -s nid main`. **There is no `nid` module in this repository**, so it
-returned nothing and `start` exited 1 at the guard on line 149. It derives the id properly
+printed nothing and the guard on line 149 would have exited 1. It derives the id properly
 now: `eth_ecies:pubkey/1` over the 32 raw bytes of `data/nodekey`, which are the *private*
 key, giving the 64-byte public key an enode wants. Checked against the node's own log rather
 than assumed -- A logs `id=0EB87AAFD7CAF95B` and the derivation produces `0eb87aafd7caf95b...`.
@@ -496,6 +496,21 @@ key wearing the public key's name. **It worked anyway**, because a bootnode enod
 what the dialer matches on: it dials host:port and learns the real id from the Hello. So the
 wrong value was invisible in exactly the way a wrong value here usually is -- and I made it
 by hand earlier in this same investigation before checking.
+
+**`start` now completes, measured rather than inferred: 80 s wall clock, both nodes up,
+`net_peerCount 0x1` on both.** That is the fix verified, not the code reading that motivated
+it.
+
+**And one observation does not fit that explanation, recorded because a tidy account that
+swallows a loose end is how the next reader gets misled.** The first attempt to run the fixed
+`start` **timed out after 30 minutes having printed nothing at all** -- not "could not read A's
+node id", not even the first `say` at line 122. Everything observed since is consistent with
+the code reading: `stop` returns in under a second, `start` finishes in 80 s, and no
+`erl -noshell` is left behind. None of that explains a run with no output whatsoever. So
+either the hang was in `stop_one`/`epmd` at that moment, or there is a second fault in this
+script that has not been reproduced. **Not reproduced is not the same as absent**, and it is
+written down here rather than dropped because the alternative is a claim that everything is
+understood.
 
 ### Open question, newly found by fixing the script: the chain store holds hashes as hex text
 
