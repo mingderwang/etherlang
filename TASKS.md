@@ -443,6 +443,82 @@ check the answer is about `N` seconds. If it is, the fix is to stop blocking for
 it removed a symptom without touching this, so a green `net_peerCount` and a stuck `eth_sync`
 are not in conflict.
 
+### Two operational scripts, tracked now, and four of their statements were false
+
+`tools/two-node-p2p.sh` and `tools/two-node-status.sh` are how this pair is run and how it
+is watched. Both were **untracked**, so none of this was in the repository, and **four
+statements in them were wrong** -- two of them about things this file had already measured
+and corrected. Every one of the four was found by reading the script while fixing another
+thing, and none would have been found by a test.
+
+| What the script said | What is true |
+|---|---|
+| "the peer conn completes the eth handshake and then dies ~33s later with enotconn on poll while lsof still shows the socket ESTABLISHED" | **Does not happen.** `e823649` measured a fresh pair over 60 s: `peer_up` = 1, `conn terminating` = 0, diagnostics rising. `peer_status/1` answering `{error, down}` is what read as a death -- and the socket was ESTABLISHED *because* nothing had closed it. |
+| "See the repo README section 'Two local nodes' for the measurement." | **There is no such section in `README.md`.** A pointer to a place that does not exist is worse than none: a reader either finds nothing and stops, or believes a section was removed. The measurement is here, attributed to a commit. |
+| `logs A\|B` tails `erlang.log.1` | **That is whichever rotation the current run is in, until it grows.** `eth_peer_conn` rotates on size, so `erlang.log.1` becomes a file that stopped receiving events. It is now `ls -t | head -1`, and a missing file is reported missing rather than substituted. |
+| the 10 s RPC timeout exists because `net_peerCount` measured 2091-3525 ms | **That is fixed** (`cd511da`; it is now ~1-2 ms). The timeout is still right, and now for the reason that is actually true: `eth_gasPrice` on the node with **no upstream** falls back to a dead endpoint and lands at **6007 ms** (5 samples, min 6006.3, max 6014.6). |
+
+**The `logs` defect is the one that cost an hour**, and it is the same defect committed in
+prose one commit earlier: reading a stale log rotation and reporting what it does not contain
+as a fact about the running node. This repository concluded "node A has no inbound connection
+at all" from a rotation whose last line was 28 minutes old, while the live file held 175
+lines naming the peer exactly. The script had the bug that produced the mistake.
+
+#### And two that were not statements but mechanisms that had never run
+
+* **`two-node-status.sh`'s live mode had never worked.** Line 141 printed `$RPCA` and
+  `$RPCB`; the variables are `RPC_A` and `RPC_B`, so under `set -u` the script died on the
+  first refresh with `RPCA: unbound variable`, exit 1. Its `--once` mode worked, **so the
+  one path that got exercised was the one that happened to work.** The live mode is now
+  verified end to end.
+* **The `dyn` column always read `+0`,** and the header promises the opposite. `PREV_A=()`
+  sat *inside* the `while true` loop, so the previous sample was cleared before `row/3`
+  could compare against it. A delta needs the sample before the one being drawn.
+
+**Verified with a stub, not against the live pair** -- and that distinction is the point.
+Both real nodes are stuck at their head, so `dyn +0` is the correct reading there and cannot
+distinguish a working delta from a broken one. Against a stub that advances its head by 7
+per request, with both node variables pointed at it: **`+0, +0, +14, +14`** -- the first two
+are each slot's first sample, then 14 per refresh, which is 7 x 2 requests. With the reset
+put back inside the loop the same stub reads `+0` forever. **A stuck subject and a broken
+feature produce the same output, and the subject here was stuck by an unrelated bug.**
+
+#### `start` could not have worked either
+
+`node_id_of/1` ran `erl -s nid main`. **There is no `nid` module in this repository**, so it
+returned nothing and `start` exited 1 at the guard on line 149. It derives the id properly
+now: `eth_ecies:pubkey/1` over the 32 raw bytes of `data/nodekey`, which are the *private*
+key, giving the 64-byte public key an enode wants. Checked against the node's own log rather
+than assumed -- A logs `id=0EB87AAFD7CAF95B` and the derivation produces `0eb87aafd7caf95b...`.
+
+The first version hexdumpped the nodekey and used those bytes as the id, which is the private
+key wearing the public key's name. **It worked anyway**, because a bootnode enode's id is not
+what the dialer matches on: it dials host:port and learns the real id from the Hello. So the
+wrong value was invisible in exactly the way a wrong value here usually is -- and I made it
+by hand earlier in this same investigation before checking.
+
+### Open question, newly found by fixing the script: the chain store holds hashes as hex text
+
+`/health` reports `chain.headHash` as `0x30783230626162...`, which decodes to the ASCII
+string `"0x20bab966..."` -- 66 bytes of hash **hex text**, where this codebase's convention
+is 32 raw bytes. `tools/two-node-status.sh` had this filed as a **`/health` encoding bug**:
+the handler encoding the value a second time.
+
+**It is not, and `/health` is the one thing here that is telling the truth.** The same bytes
+come out of the store: `erl_call -a 'eth_chain head []'` prints
+`{11846219, #Bin<48,120,50,48,98,97,98,57,54,54,...>}`, and 48/120/50/48 is ASCII `0x20`.
+`eth_chain:block_hash/1` is `maps:get(<<"hash">>, Block, <<>>)`, so the store holds whatever
+representation the block map carried, and `/health` reports that faithfully. Fixing `/health`
+would have hidden it -- the same shape as a fabricated check hiding the real ones behind it.
+
+**Not shown to cause anything, and that is stated rather than implied.** `missing_parent`
+compares a block's `ParentHash` against the stored head, so if the two representations ever
+disagree the chain cannot link. This node has appended 11,846,219 blocks, so on the path it
+took they evidently agree. **Which path that was is the open question**: blocks that arrive
+over p2p are decoded by `eth_eth`, and blocks that arrive from upstream JSON-RPC are decoded
+by the projection, and there is no test asserting that the two put the same bytes in a
+`<<"hash">>` field. Filed as a question, not a defect.
+
 ### Also found, also open
 
 | Item | Evidence |
