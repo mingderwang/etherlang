@@ -338,6 +338,90 @@ test's compiled form to confirm the sibling test says something is a check about
 1028 eunit tests, down one: the closed gap was a `_test/0` function and deleting it is the
 point.
 
+### The next blocker: `eth_sync` cannot get a single header across
+
+**Measured on the running pair.** With both sides now counting their peers, B still sits at
+`chain_empty` while reporting `0x1` peer, for 20 minutes of sampling. Both nodes' logs carry
+the same error, on both sides:
+
+```
+ERROR REPORT: sync tick crashed (exit:{timeout, {gen_server,call,
+  [<0.705.0>, {get_headers, {hash, <<32,186,185,102,240,97,35,140,...>>}, 192, 0, true}, 20000]}})
+  [{eth_sync,walk_back,5, eth_sync.erl,494},
+   {eth_sync,peer_catchup,3, eth_sync.erl,474},
+   {eth_sync,try_peers,2, eth_sync.erl,466},
+   {eth_sync,run_once,1, ...}]
+```
+
+The hash in the request is **A's own head hash**, so B is asking A for the 192 headers below
+A's tip, and the call exceeds its own 20,000 ms budget. B has crashed 11 times this way and A
+13, over roughly forty minutes of uptime -- so it is not a tight per-tick loop, and
+**"every tick" in the log message is the message's wording, not the measured rate.**
+
+**What is *not* the cause, because it was measured.** Two readings were wrong on the way
+here and both are worth keeping:
+
+* *"`handle_ms` is 0, so the connection is idle and the fault is elsewhere."* `handle_ms`
+  measures `handle_msg/3` only. A `gen_server` inside `handle_call/3` prints nothing, so this
+  number says nothing about the path that is failing. It was read as if it covered both.
+* *"`q` is growing without bound, so messages are never consumed."* Over eight consecutive
+  one-second samples it read 10, 10, 12, 12, 14, 15, 15, 17; over a further thirty seconds it
+  **plateaued at 19-23**. It is a stable backlog, not a leak. The first reading was taken over
+  exactly the window in which the number rises.
+
+### The defect this points at: a partial frame read is thrown away
+
+`eth_rlpx:recv_frame/3` reads a frame in **two sequential `gen_tcp:recv` calls that share one
+`Timeout`** -- 32 bytes of header, then `RSize + 16` of body. Two things follow, and the
+second is the problem:
+
+1. `recv_frame_header/6` advances `Sess#sess{ingress, dec}` -- the MAC chain and the AES
+   counter -- **before the body has been read**. That is correct, because the header must be
+   authenticated before the body is trusted.
+2. **If the body read times out, those 32 header bytes are already gone from the socket and
+   the caller is given the *old* session back.** `fetch_wait/5` in `eth_peer_conn` recurses
+   with the state it started from, so the advanced MAC counter is discarded along with the
+   frame. The stream is now **32 bytes out of step**, permanently.
+
+The next `recv_frame/3` reads the first 32 bytes of what was frame 1's *body* and treats them
+as a header. `mac_header/2` fails, the connection answers `{error, bad_header_mac}`, and
+**no frame sent after one slow frame can ever be read again** -- because each attempt
+consumes another 32 bytes and misinterprets them.
+
+**This is a hypothesis with a mechanism, not a measurement.** What is measured is the symptom
+(20 s timeouts, no progress, both directions). What is *not* yet measured is that a partial
+read actually happens on these two nodes, and that the post-timeout reads fail with
+`bad_header_mac` rather than something else. **The measurement that would settle it** is to
+read `bad_header_mac` out of the two running logs; if it is absent, this hypothesis is wrong
+and the queue-latency reading (below) is the one to pursue.
+
+**There is no test for it, and that is the larger fact.** `eth_rlpx_tests` exercises the
+handshake, the Hello exchange, Ping/Pong and MAC tampering -- and **`recv_frame/3` is never
+called by any test in the repository.** The receive path of the framing layer, which is the
+one place a byte-level slip becomes permanent, is the only part of it with no coverage.
+
+The test that would bite needs the frame split across two TCP segments, which a plain loopback
+pair cannot produce because `send_frame/4` writes header and body in one `gen_tcp:send`. The
+way to do it without reimplementing the framing is a **transparent byte relay** between the
+two sockets that forwards the first 32 bytes, waits, then forwards the rest. Writing the
+crypto by hand in the test would be a second implementation of `send_frame/4`, which is the
+fixture-identity trap.
+
+### The other reading of the same evidence, not yet excluded
+
+`eth_peer_conn:handle_info(poll, ...)` calls `eth_rlpx:recv(Sess, Sock, ?POLL_MS)` with
+`?POLL_MS = 1000`, **inside a `handle_info` callback**. A `gen_server` processes its mailbox
+FIFO, so every message behind a poll waits up to a second. A stable backlog of ~20 messages
+would then put a `'$gen_call'` at the back of ~20 seconds of polls -- which is exactly the
+observed 20,000 ms budget, arrived at from the other direction.
+
+**Both readings predict the same number**, and the arithmetic is the tell: 20 messages x
+1,000 ms = the timeout, with no free parameter. The discriminator is cheap: the partial-read
+reading predicts `bad_header_mac` in the logs and predicts the *first* call to be slow and the
+rest fast, while the queue reading predicts every call to be slow by roughly the backlog.
+**Reading one line of log settles it**, which is the cheapest experiment available and has not
+been run yet.
+
 ### Also found, also open
 
 | Item | Evidence |
