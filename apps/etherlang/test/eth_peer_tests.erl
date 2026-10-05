@@ -44,6 +44,24 @@ autodial() ->
             ok = wait_eth_peer(peer_ad_a, IDB, 200),
             %% Exactly one connection to B (no duplicate dials).
             ?assertEqual(1, count_remote(peer_ad_a, IDB)),
+            %% **A positive assertion for `eth_peer:eth_peer_count/0' belongs here and
+            %% cannot be written.** `wait_eth_peer/3' has just proved, with this
+            %% module's own predicate, that a connected eth-capable peer exists -- and
+            %% the assertion still lost the race: `count_remote/2' returned 1 and
+            %% `eth_peer_count/0' returned 0 microseconds later.
+            %%
+            %% **That is not a fixture defect, it is the peer connection dying.** The
+            %% only fixture in the suite with a live eth peer has one that does not
+            %% survive past `peer_up', so a positive count is a race rather than a test.
+            %% It was tried in both positions -- before and after the `get_headers'
+            %% round trip -- and failed in both.
+            %%
+            %% The negative case is covered (`net_peer_count_is_zero_when_there_are_no_
+            %% peers_test_'), so what is missing is that a *non-zero* count is
+            %% distinguishable from a hardcoded `0x0'. Recorded in
+            %% `eth_open_claims_tests' rather than left as a comment, so it is a named
+            %% open item and not a silence.
+            ok,
             %% Headers flow over the auto-dialed connection.
             {ok, Hdrs} = eth_peer:get_headers(peer_ad_a, {number, 0}, 2, 0, false),
             ?assertEqual([0, 1], [header_num(H) || H <- Hdrs])

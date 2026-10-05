@@ -972,6 +972,55 @@ with_receipt_chain_http(Fun) ->
 %% Three blocks for the feeHistory shape assertions. Block 0 carries a base fee;
 %% block 1 is pre-EIP-1559 and has none, which is what the zero-base-fee test
 %% reads. No receipts stored anywhere.
+%% The base fee `eth_gasPrice' reports: the block *after* the head, derived from the
+%% head's own gasUsed/gasLimit/baseFeePerGas by EIP-1559's update.
+%%
+%% **This lives here rather than in `eth_rpc_local_answers_tests' because the fixture is
+%% the whole point.** `eth_test_util:make_blocks/4' emits a `baseFeePerGas' and a
+%% `gasLimit' but no `gasUsed', so `next_base_fee/1' takes its pre-EIP-1559 clause and
+%% answers `0' -- which is the correct figure for a block that had no base fee, and so
+%% indistinguishable from a fabricated zero. `fee_linked_blocks/0' carries all three,
+%% and the assertion below is a *derivation* (`eth_fork_schedule:base_fee/3') rather
+%% than a constant.
+%%
+%% The second assertion is the one that stops it passing for the wrong reason: the
+%% derived fee must **differ from the head's own**. A handler that echoed
+%% `baseFeePerGas` would satisfy a test that only checked the value is a plausible hex
+%% quantity, and that is the mistake a one-line implementation makes.
+next_base_fee_for_head_reports_the_next_blocks_fee_not_the_heads_own_test() ->
+    with_chain(fun(Chain, Blocks) ->
+                   Newest = lists:last(Blocks),
+                   Used = gas_of(Newest, <<"gasUsed">>),
+                   Limit = gas_of(Newest, <<"gasLimit">>),
+                   HeadFee = gas_of(Newest, <<"baseFeePerGas">>),
+                   Expected = eth_fork_schedule:base_fee(Used, Limit, HeadFee),
+                   ?assertEqual({ok, Expected},
+                                eth_rpc_projection:next_base_fee_for_head(Chain)),
+                   %% Not the head's own fee, and not zero.
+                   ?assertNotEqual(HeadFee, Expected),
+                   ?assertNotEqual(0, Expected)
+               end).
+
+%% And it reads the *head*, so a chain whose newest block differs from an earlier one
+%% cannot be answered from the wrong end. The fixture's blocks have distinct base fees;
+%% asking for the head's successor and getting the genesis block's would be a fixture
+%% that only one of them satisfies.
+next_base_fee_for_head_reads_the_head_and_not_the_oldest_block_test() ->
+    with_chain(fun(Chain, Blocks) ->
+                   Oldest = hd(Blocks),
+                   Newest = lists:last(Blocks),
+                   FromOldest = eth_fork_schedule:base_fee(
+                       gas_of(Oldest, <<"gasUsed">>), gas_of(Oldest, <<"gasLimit">>),
+                       gas_of(Oldest, <<"baseFeePerGas">>)),
+                   {ok, Expected} = eth_rpc_projection:next_base_fee_for_head(Chain),
+                   ?assertEqual(
+                     eth_fork_schedule:base_fee(gas_of(Newest, <<"gasUsed">>),
+                                               gas_of(Newest, <<"gasLimit">>),
+                                               gas_of(Newest, <<"baseFeePerGas">>)),
+                     Expected),
+                   ?assertNotEqual(FromOldest, Expected)
+               end).
+
 with_chain(Fun) ->
     with_fresh_chain(fun(Chain) ->
                          Blocks = fee_linked_blocks(),

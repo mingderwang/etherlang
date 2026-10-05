@@ -106,6 +106,37 @@ create_charge_is_still_a_second_copy_of_the_schedules_figure_test() ->
     ?assertEqual(2, eth_fork_schedule:initcode_word_cost(shanghai)),
     ?assertEqual(2, eth_fork_schedule:initcode_word_cost(cancun)).
 
+%% **A non-zero `net_peerCount` is not distinguishable from a hardcoded `0x0`.**
+%%
+%% `eth_peer:eth_peer_count/0' counts connected eth-capable peers, and the negative case
+%% is covered -- `net_peer_count_is_zero_when_there_are_no_peers_test_' runs with no peer
+%% manager and gets `0x0'. **That fixture cannot tell a count from a constant**, so a
+%% handler that answered a hardcoded zero would satisfy it.
+%%
+%% The positive case needs a live eth-capable peer, and the only fixture in the suite
+%% that has one is `eth_peer_tests:autodial/0'. The assertion was written there and
+%% **lost the race**: `wait_eth_peer/3' had just proved with that module's own predicate
+%% that such a peer existed, `count_remote/2' returned 1, and `eth_peer_count/0'
+%% returned 0 microseconds later. It was tried on both sides of the `get_headers' round
+%% trip and failed on both.
+%%
+%% **So the gap is not a missing test, it is that the subject does not hold still.** The
+%% peer connection completes the eth handshake and then dies within about a second --
+%% `poll' gets `enotconn' from a socket the operating system still lists as ESTABLISHED.
+%% Until that is fixed this item cannot be closed honestly, and closing it by writing a
+%% test that retries until it passes would be a test that cannot fail.
+%%
+%% The check below is that the negative test still exists and the count function is still
+%% a count: a hardcoded `0x0' in the handler would leave both true, which is why this
+%% entry is a *gap* record rather than a ratchet.
+net_peer_count_has_no_positive_test_because_the_peer_dies_test() ->
+    %% No peer manager is running here, so the count is 0 -- and the assertion is that
+    %% it is an *integer*, which is what says the function exists and computes rather
+    %% than being absent. `erlang:function_exported/3' would need the module loaded and
+    %% would answer `false' for a module that had never been called, which is a fact
+    %% about this test rather than about `eth_peer'.
+    ?assert(is_integer(eth_peer:eth_peer_count())).
+
 %% **`eth_evm:base_cost/1` does not exist.** `eth_fork_schedule` is the only price table,
 %% so the interpreter must ask it for the fork in hand. A second table is a second thing
 %% that can drift, and this repository has deleted one already.

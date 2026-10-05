@@ -209,6 +209,60 @@ dispatch(<<"eth_blockNumber">>, _Params, State) ->
 dispatch(<<"eth_chainId">>, _Params, _State) ->
     {ok, eth_hex:encode_int(eth_fork_schedule:chain_id())};
 
+%% --------------------------------------------------------------------------
+%% Three methods with no clause here, which meant `-32601'. They are not on any
+%% roadmap; they are what a stock Ethereum status tool asks for, and a node that
+%% refuses them cannot be watched.
+%%
+%% **Measured, not assumed.** With these three absent, the eth-net-intelligence-api
+%% agent could not build its stats for either node and the dashboard showed both
+%% offline. It does not report the absence usefully: web3 0.x turned the `-32601'
+%% into `Error: invalid argument 0: hex string without 0x prefix', which names a
+%% *formatting* fault in this node's block responses -- and a scan of all 27 string
+%% fields of `eth_getBlockByNumber' found none missing the prefix. **The hex
+%% complaint was a symptom three layers downstream of an unsupported method**, which
+%% is why the hex claim was wrong and reading it would have sent the fix to the
+%% encoder instead of the dispatch table.
+%% --------------------------------------------------------------------------
+
+%% `net_version' is the chain id as a *decimal* string, not hex. Same source as
+%% `eth_chainId' above, so the two cannot report different chains.
+%%
+%% **The result is a binary, and that is not incidental.** `integer_to_list/1' was the
+%% first version and it answers an Erlang string -- a list of character codes -- where
+%% every other result in this function is a binary, so the JSON encoder is handed a
+%% different shape for this method alone. The test caught it as
+%% `binary_to_list("11155111")`: an argument printed as `"11155111"' rather than
+%% `<<"11155111">'`, which is the only place the difference is visible before the
+%% encoder decides what to do with it.
+dispatch(<<"net_version">>, _Params, _State) ->
+    {ok, integer_to_binary(eth_fork_schedule:chain_id())};
+
+dispatch(<<"eth_gasPrice">>, _Params, State) ->
+    Chain = maps:get(chain, State, eth_chain),
+    case eth_rpc_projection:next_base_fee_for_head(Chain) of
+        {ok, Fee} ->
+            {ok, eth_hex:encode_int(Fee)};
+        {error, no_local_head} ->
+            %% The same shape and the same reason as `eth_maxPriorityFeePerGas'
+            %% below: this node holds no head, so it has no evidence about the next
+            %% block's base fee. Another node does. A fallback with a reason is a
+            %% different thing from a refusal, and this is the former.
+            proxy(<<"eth_gasPrice">>, [])
+    end;
+
+dispatch(<<"net_peerCount">>, _Params, _State) ->
+    %% **Peers this node is actually talking to, not the size of a table.**
+    %% The predicate is `eth_peer:eth_ready_peer/1's, verbatim, so the number a
+    %% dashboard shows and the peer this node would sync from cannot disagree.
+    %%
+    %% `eth_peer:status/0' would have been cheaper -- it is a map size -- but it counts
+    %% conns that have not finished handshaking and conns that are dead. Measured on
+    %% two live nodes: it reported `peers => 1' while `eth_peer:peers/0' answered
+    %% `{error, down}' for that single entry, so the cheap number counted something
+    %% nothing could reach.
+    {ok, eth_hex:encode_int(eth_peer:eth_peer_count())};
+
 %% EIP-3675: the Merge took uncles out of the block header. A post-Merge block has
 %% none, so the count is `0` and the uncle is `null` -- and on this chain, which
 %% merged at genesis, that is true at *every* height it has. Both are therefore

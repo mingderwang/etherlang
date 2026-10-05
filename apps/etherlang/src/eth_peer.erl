@@ -8,7 +8,8 @@
 
 -export([start_link/1, dial/3, dial/4, status/0, status/1, peers/0, peers/1,
          get_headers/4, get_headers/5, get_bodies/1, get_bodies/2,
-         get_receipts/1, get_receipts/2, broadcast/1, broadcast/2]).
+         get_receipts/1, get_receipts/2, broadcast/1, broadcast/2,
+         eth_peer_count/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -411,6 +412,26 @@ shuffle(L) ->
     [X || {_, X} <- lists:sort(Tagged)].
 
 client_id() -> <<"etherlang/0.1.0">>.
+
+%% **Connected, eth-capable peers.** Exported because this is the manager's knowledge
+%% and the RPC handler should not be the only thing able to ask.
+%%
+%% The predicate is `eth_ready_peer/1's, verbatim, so this number and the peer the node
+%% would actually sync from cannot disagree. `status/0' would be cheaper -- it is a map
+%% size -- and it is the wrong number: it counts conns that have not finished
+%% handshaking and conns that are dead. **Measured on two live nodes: `status/0' said
+%% `peers => 1' while `peers/0' said `{error, down}' for that one entry.**
+%%
+%% A dead conn answers from `peer_status/1' immediately rather than after its timeout, so
+%% the cost here is only a conn that is alive and unresponsive -- and that is a real cost:
+%% `net_peerCount' measured **2091-3525 ms** on the pair in `tools/two-node-status.sh',
+%% which is this function walking stuck connections, not the cost of a map.
+eth_peer_count() ->
+    try
+        length([P || {P, Info} <- peers(),
+                      is_map(Info), maps:get(eth, Info, false) =/= false])
+    catch _:_ -> 0
+    end.
 
 peer_status(Pid) ->
     try gen_server:call(Pid, status, 2000)

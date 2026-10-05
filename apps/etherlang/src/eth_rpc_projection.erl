@@ -39,7 +39,9 @@
           transaction_at/3,
           transaction_by_hash/2,
           fee_history/4,
-          account_proof/3 ]).
+          account_proof/3,
+          next_base_fee/1,
+          next_base_fee_for_head/1 ]).
 
 %% ---------------------------------------------------------------------------
 %% Block number resolution
@@ -415,6 +417,26 @@ next_base_fee(#{<<"baseFeePerGas">> := Fee, <<"gasUsed">> := Used,
 %% it has none either. Zero, which is what the specification prescribes for
 %% pre-EIP-1559 blocks.
 next_base_fee(_B) -> 0.
+
+%% The base fee the *next* block will carry, from this node's own head -- or
+%% `no_local_head' when it holds no head at all.
+%%
+%% **It asks `eth_chain:head/1' rather than going through `resolve_block_number/2'.**
+%% That function answers `max(head_num(Chain), 0)', so an empty store and a head at
+%% block zero are the same answer, and `next_base_fee/1' on the resulting `#{}' returns
+%% 0 -- the number the specification prescribes for a pre-EIP-1559 block. So the
+%% empty-store case would have been reported as a **gas price of zero**, which is a
+%% claim about the chain's next block derived from a fact about this node's storage.
+%% Measured on the node with no upstream and an empty chain, which is exactly that
+%% case: every other read there answers `-32000 chain_empty', and this one would have
+%% answered `0x0' instead -- a number where the honest answer is a refusal.
+-spec next_base_fee_for_head(atom()) ->
+          {ok, non_neg_integer()} | {error, no_local_head}.
+next_base_fee_for_head(Chain) ->
+    case try eth_chain:head(Chain) catch _:_ -> undefined end of
+        {N, _} when is_integer(N) -> {ok, next_base_fee(block_of(Chain, N))};
+        _ -> {error, no_local_head}
+    end.
 
 %% "Zeroes are returned for pre-EIP-1559 blocks."
 base_fee_of(#{<<"baseFeePerGas">> := Fee}) -> eth_hex:decode(Fee);

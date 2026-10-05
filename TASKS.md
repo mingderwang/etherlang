@@ -34,8 +34,8 @@ with the file it sat above.
 
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
-build. OTP 29.1. Current: **49 src modules / 14,437 code lines, 65 test modules /
-14,347 code lines, 1021 eunit tests, all passing.**
+build. OTP 29.1. Current: **49 src modules / 14,465 code lines, 65 test modules /
+14,441 code lines, 1029 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive
 them with the procedure below rather than editing this sentence.
@@ -114,6 +114,112 @@ live. `CALLCODE` does not transfer value: `eth_evm.erl:1370` sets
 has no `send_timeout` while the outbound connect does, so the exposure is inbound-only.
 
 
+
+## What the two-node run found, and what is still open
+
+Running two etherlang nodes against each other on one host (2026-10-05) produced a list
+of findings that no test and no document held. All of these are measured; the
+measurement is named so it can be repeated.
+
+### Fixed in `9dc6c4a`'s successor: three methods the node refused
+
+`net_version`, `eth_gasPrice` and `net_peerCount` had **no clause in
+`eth_rpc_handler:dispatch/3'**, so they were answered `-32601`. That is the correct
+behaviour for a method the node does not implement -- the catch-all policy is
+deliberate -- and it still left the node unwatchable by any stock Ethereum status tool.
+
+**What the absence looked like from outside was misleading.** web3 0.x turned the
+`-32601' into `Error: invalid argument 0: hex string without 0x prefix', naming a
+*formatting* fault in this node's block responses. A scan of all 27 string fields of
+`eth_getBlockByNumber', and of every field of a transaction object inside it, found
+nothing missing the prefix. **The hex complaint was three layers downstream of an
+unsupported method.** Adding the three methods did **not** fix the dashboard, which is
+the second half of that sentence and the part worth keeping.
+
+`eth_gasPrice` reads the base fee of the block *after* the head, through
+`eth_rpc_projection:next_base_fee_for_head/1`. **That function asks `eth_chain:head/1'
+rather than going through `resolve_block_number/2'`**, because the latter answers
+`max(head_num(Chain), 0)' -- so an empty store and a head at block zero are the same
+answer, and `next_base_fee/1' on the resulting `#{}' returns `0`, the figure the
+specification prescribes for a pre-EIP-1559 block. The empty-store case would have
+reported a **gas price of zero**: a claim about the chain's next block derived from a
+fact about this node's storage. Measured on the node with no upstream and an empty
+chain, where every other read answers `-32000 chain_empty'.
+
+`net_peerCount` counts connected **eth-capable** peers via `eth_peer:eth_peer_count/0`,
+using `eth_peer:eth_ready_peer/1's predicate verbatim. `eth_peer:status/0' would be
+cheaper -- it is a map size -- and it is the wrong number: it counts conns that have not
+finished handshaking and conns that are dead. Measured on two live nodes, `status/0'
+said `peers => 1' while `peers/0' said `{error, down}' for that one entry.
+
+### The blocker: a peer connection that does not survive its own handshake
+
+**This is the load-bearing open item and nothing else can be closed behind it.**
+
+The conn completes the eth handshake -- `rlpx peer up', and the crash report carries
+`eth=true` -- and then dies. Two measurements of the same defect:
+
+* On the two-node pair: **about 33 seconds** after `peer up', B's crash report reads
+  `Last message in was poll` with reason `enotconn`, i.e. `eth_rlpx:recv' ->
+  `gen_tcp:recv' on a socket that is not connected -- while `lsof' still lists that
+  connection as **ESTABLISHED**. The socket is leaked, not closed.
+* In the test suite, `eth_peer_tests:autodial/0': `wait_eth_peer/3' proves with that
+  module's own predicate that an eth-capable peer exists, `count_remote/2' returns 1,
+  and `eth_peer_count/0' returns **0 microseconds later**. Tried on both sides of the
+  `get_headers' round trip; lost both times.
+
+`eth_rlpx:recv_frame/3` does **not** silently discard frames -- a MAC failure returns
+`bad_header_mac' -- so `enotconn' means nothing arrived, not that something arrived
+wrong.
+
+**Three hypotheses were formed and killed by measurement, and they are recorded because
+two of them would have had me "fix" correct code:**
+
+1. *"The eth message-id table is wrong."* Wrong. Against go-ethereum's
+   `eth/protocols/eth/protocol.go`: `GetBlockHeaders = 0x03`, `GetBlockBodies = 0x05`,
+   `GetReceipts = 0x0f`, `NewPooledTransactionHashes = 0x08` -- every offset in
+   `eth_eth:msg_*/1' matches exactly.
+2. *"p2p Pong (0x03) collides with eth GetBlockHeaders."* Wrong.
+   `eth_eth:negotiate_caps/2' starts its fold at base **16** (`{#{}, 16}'), so
+   `Base + 3 = 19`. go-ethereum's `Peer.handle` agrees: `baseProtocolLength = 4` and
+   subprotocol codes start at `0x10`.
+3. *"`eth_peer:dial/4' blocks the manager during the handshake."* Wrong for the observed
+   path. `auto_dial/2' and the accept branch both already use `spawn_monitor`; only the
+   **manual** `dial/4' is synchronous, and it has no caller in `src/` or `test/`.
+
+**What the next step has to be:** instrumentation on the socket lifecycle, not another
+reading of the code. Specifically `erlang:port_info(Sock, connected)` on the conn's
+socket -- if it answers `false` while the OS says ESTABLISHED, the port is no longer the
+connected socket, and the remaining suspect is that an inbound socket's controlling
+process is still `eth_peer` (`eth_peer_conn` never calls `controlling_process/2`).
+
+### Also found, also open
+
+| Item | Evidence |
+|---|---|
+| **A cannot advance the chain.** `append failed ({invalid_header,11846220,{invalid_header,{excess_blob_gas_mismatch,210359169,208436780}}})`, repeated ~150 times, leaving the local head at 11,846,219 while Sepolia was at 11,846,760. An earlier run hit the same class at 11,772,398 and *did* get past it, so it is not simply a wrong constant -- it is unexplained. | A's log |
+| **`/health` double-encodes `headHash`.** `0x30783230626162...` decodes to the ASCII string `"0x20bab966..."` -- the hash's hex text encoded a second time. Every other hash in this tree is the raw 32 bytes. | `curl :8545/health` |
+| **`DISCV4_PORT` and `RLPX_PORT` must be equal or the node is unreachable by bootnode.** `eth_discv4:parse_enode/1' builds `#{udp => Port, tcp => Port}` from the single port in an enode, but `eth_config` lets the two differ. Measured: `pending => 1` forever, `table_size => 0`. The node only warns when they are *equal*. | two-node run |
+| **`tools/etherlangctl` points at a tree the build does not produce.** It uses `_build/default/rel/etherlang`; `rebar3 as prod release` writes `_build/prod/rel/etherlang`. The `default` tree's `eth_config.beam` was dated 09-22 and its abstract code had **no `discv4_enabled/0` at all** -- so p2p never started and the node answered RPC from a stale 636 MB chain store looking completely healthy. | `lsof`, `beam_lib` |
+| **`etherlang_sup:90-91` is stale.** It says "RLPx only speaks p2p Hello/Ping/Pong (no eth capability / peer fetch yet); RPC sync is unchanged", which `eth_eth` and `eth_sync:445` contradict. | reading |
+| **`net_peerCount` costs 2.1-3.5 s.** `eth_peer:peers/1` calls into every peer with a 2 s timeout and the stuck connections each consume it. | two-node run |
+| **A positive `net_peerCount` has no test.** The negative case is covered; the only fixture with a live eth peer has one that dies within a second, so a non-zero count would be a race rather than a test. Recorded in `eth_open_claims_tests`. | injections |
+
+### The EthStats stack, and why it was abandoned
+
+`docker compose --profile ethstats up` runs, the dashboard serves on `:3001`, and both
+agents register (`etherlangLocal`, `etherlang2Local`). **It reports numbers this node
+does not produce**: `peers: 33` and `peers: 35` while `net_peerCount` answers `0x0`, and
+`gasPrice: 998966348` while `eth_gasPrice` answers `0x3d45b514` (1,027,850,260). Its
+agent is a 2016-era web3 0.x application. `tools/two-node-status.sh` reads the nodes
+directly instead, and says on its face what it cannot show (the discv4 routing table is
+exposed by no RPC method, and a single sample cannot show whether a head is advancing,
+so each row carries a delta).
+
+**What a current geth uses instead:** `--metrics` exposes Prometheus-format metrics on
+`:6060` (`--metrics.addr`, `--metrics.port`, `--metrics.influxdb`), which Prometheus
+scrapes and Grafana renders. **etherlang has no metrics endpoint at all**, and that is
+the real gap rather than anything about ethstats.
 
 ## Standing rule: a change to the node opens the ledger in the same commit
 
