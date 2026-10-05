@@ -152,46 +152,94 @@ cheaper -- it is a map size -- and it is the wrong number: it counts conns that 
 finished handshaking and conns that are dead. Measured on two live nodes, `status/0'
 said `peers => 1' while `peers/0' said `{error, down}' for that one entry.
 
-### The blocker: a peer connection that does not survive its own handshake
+### The blocker, found: a peer that is invisible exactly while it is working
 
-**This is the load-bearing open item and nothing else can be closed behind it.**
+**Two deadlines, and they disagree by 7.5x.**
 
-The conn completes the eth handshake -- `rlpx peer up', and the crash report carries
-`eth=true` -- and then dies. Two measurements of the same defect:
+```
+eth_peer_conn:fetch_request/6    deadline  15,000 ms    blocks the whole conn
+eth_peer:peer_status/1           gives up   2,000 ms    on that same process
+```
 
-* On the two-node pair: **about 33 seconds** after `peer up', B's crash report reads
-  `Last message in was poll` with reason `enotconn`, i.e. `eth_rlpx:recv' ->
-  `gen_tcp:recv' on a socket that is not connected -- while `lsof' still lists that
-  connection as **ESTABLISHED**. The socket is leaked, not closed.
-* In the test suite, `eth_peer_tests:autodial/0': `wait_eth_peer/3' proves with that
-  module's own predicate that an eth-capable peer exists, `count_remote/2' returns 1,
-  and `eth_peer_count/0' returns **0 microseconds later**. Tried on both sides of the
-  `get_headers' round trip; lost both times.
+`eth_peer_conn:handle_call({get_headers, ...})` calls `fetch_request/6`, which sends the
+request and then owns `recv` until the response arrives or **15 seconds** pass. A
+`gen_server` handles one message at a time, so for that entire window the process **cannot
+answer `gen_server:call(Pid, status, 2000)`** -- and `peer_status/1` abandons it and
+answers `{error, down}` from a bare `catch _:_`.
 
-`eth_rlpx:recv_frame/3` does **not** silently discard frames -- a MAC failure returns
-`bad_header_mac' -- so `enotconn' means nothing arrived, not that something arrived
-wrong.
+**A peer that is only visible while idle cannot be used for work, because starting the
+work hides it.** That is the whole defect, and it is self-referential: the fetch that
+makes the peer useful is the fetch that makes it invisible.
 
-**Three hypotheses were formed and killed by measurement, and they are recorded because
-two of them would have had me "fix" correct code:**
+### Every symptom, and which part of it this explains
+
+| Measured | Mechanism |
+|---|---|
+| `eth_peer:peers/0` answers `{error, down}` for a conn that is provably alive | mid-fetch; the 2 s call gives up |
+| `net_peerCount` alternates `0x1` / `0x0` on a stable connection | the sample lands in a gap between fetches, or inside one |
+| 22 `status` calls logged against 40 `net_peerCount` samples | roughly half the calls were never processed, because the conn was inside `handle_call` |
+| `net_peerCount` costs **2.1-3.5 s** | each stuck conn consumes the full 2 s |
+| `eth_ready_peer/1` answers `no_eth_peers` and `eth_sync` never starts | that is the gate `eth_sync` uses |
+| the conn diagnostic shows `handle_ms=0`, `q=0`, idle | it is not inside `handle_msg`; it is inside `handle_call` |
+| `peer_up` = 1, `conn terminating` = 0, diagnostic ticks rising steadily | **the connection never dies at all** |
+
+### The connection does not die. An earlier claim that it did was wrong.
+
+`91e7741`'s entry in this file, and several earlier ones, describe a peer connection dying
+about 33 seconds after `peer_up` with `{error, enotconn}' out of `poll`, while `lsof`
+still listed the socket as ESTABLISHED. **On the tree as it stands now that does not
+reproduce**: over 60 seconds and across a fresh pair, `peer_up` = 1, `conn terminating` = 0,
+and the per-second diagnostic ticks rise monotonically on both nodes. What was being
+observed as a death was `peer_status/1` reporting `{error, down}' -- and the socket was
+ESTABLISHED precisely *because* nothing had closed it.
+
+**`eth_peer_conn` now logs its own socket state on a non-normal terminate, so a real death
+would say whether the port still believed it was connected.** That question was what the
+whole search was for, and it is answered by the log line rather than by an observer:
+`erlang:port_info(Sock, connected)` at the moment of closing, which distinguishes a handle
+that is still a connected socket, one that is not, and one that is gone.
+
+### Two hypotheses killed by measurement, recorded because both would have broken working code
 
 1. *"The eth message-id table is wrong."* Wrong. Against go-ethereum's
    `eth/protocols/eth/protocol.go`: `GetBlockHeaders = 0x03`, `GetBlockBodies = 0x05`,
    `GetReceipts = 0x0f`, `NewPooledTransactionHashes = 0x08` -- every offset in
-   `eth_eth:msg_*/1' matches exactly.
-2. *"p2p Pong (0x03) collides with eth GetBlockHeaders."* Wrong.
-   `eth_eth:negotiate_caps/2' starts its fold at base **16** (`{#{}, 16}'), so
-   `Base + 3 = 19`. go-ethereum's `Peer.handle` agrees: `baseProtocolLength = 4` and
-   subprotocol codes start at `0x10`.
-3. *"`eth_peer:dial/4' blocks the manager during the handshake."* Wrong for the observed
-   path. `auto_dial/2' and the accept branch both already use `spawn_monitor`; only the
-   **manual** `dial/4' is synchronous, and it has no caller in `src/` or `test/`.
+   `eth_eth:msg_*/1` matches exactly.
+2. *"`handle_call(status, ...)` passes the wrong thing to `eth_rlpx:remote_id/1`."* Wrong.
+   `remote_id(#sess{remote = R}) -> R.` (eth_rlpx.erl:65) wants the session record, which
+   is what it is given. The `maps:get(node_id, Opts)` at eth_rlpx.erl:231 is inside
+   `recipient/3`, a different function; reading one line of a large file as the definition
+   of a name used elsewhere in it is what produced the claim. The diagnostic line was
+   "fixed" on that basis and the fix has been reverted.
 
-**What the next step has to be:** instrumentation on the socket lifecycle, not another
-reading of the code. Specifically `erlang:port_info(Sock, connected)` on the conn's
-socket -- if it answers `false` while the OS says ESTABLISHED, the port is no longer the
-connected socket, and the remaining suspect is that an inbound socket's controlling
-process is still `eth_peer` (`eth_peer_conn` never calls `controlling_process/2`).
+### And five instruments that were wrong before any of that
+
+Each was discarded against a control, which is the only reason any of them was caught:
+
+| Instrument | Why it was wrong |
+|---|---|
+| `strings` on a release beam, looking for a log format string | the release beam carries no readable literals -- **the control was the pre-existing log line, which was also absent** |
+| `beam_lib:chunks(B, [atoms])` looking for a function name | the atoms chunk does not list private functions -- **the control was `await_status/4`, which was also absent** |
+| calling `eth_peer_conn:port_connected/1` from outside | it is **private**; a private function answers `undef` by definition |
+| `erlang:function_exported/3` for the same | answers `false` for anything unexported |
+| `init stop` as a way to trigger the terminate log | the reason is `shutdown`, and `terminate/2` deliberately does not log that branch |
+
+**Five of the six instruments used in this search were mine and four of those five were
+broken.** The two that worked were reading the abstract code and reading the log, and both
+were reached only after the failures.
+
+### The fix, and why the small one is the right one
+
+**`eth_peer:peers/0` must not call into a process that may be busy.** The manager already
+learns `remote` and `Hello` when `peer_up` arrives, and `eth_ready` is fixed once the
+handshake is done, so `peers/0` can answer from the manager's own state and never enter the
+conn. That is small, it is observable (`net_peerCount` becomes O(1) instead of 2.1-3.5 s),
+and an injection that puts the `gen_server:call` back makes it slow and `{error, down}`
+again during a fetch.
+
+The structural alternative -- moving the fetch off the conn so it never owns `recv`, the way
+a real devp2p client tracks concurrent requests -- is correct and much larger, and it
+touches framing state.
 
 ### Also found, also open
 

@@ -14,6 +14,9 @@
 -define(PING_MS, 15000).
 -define(POLL_MS, 1000).
 -define(IDLE_TIMEOUT_MS, 120000).
+%% Shorter than the 2000 ms `peer_status/1' timeout it has to be diagnosed against, so a
+%% window in which that call would time out is guaranteed to contain a report.
+-define(DIAG_MS, 1000).
 
 -record(st, {sock,
              sess,
@@ -24,7 +27,17 @@
              pool,
              store,
              fetching = false,
-             last_in}).
+             last_in,
+             %% Wall-clock cost of the last `handle_msg/3', in milliseconds.
+             %%
+             %% This is the number the open item turns on. `peer_status/1' reaches this
+             %% process with `gen_server:call(Pid, status, 2000)', and a conn executing a
+             %% `handle_msg' cannot answer inside that window -- so it is reported as
+             %% **dead** while it is alive and working. `eth_peer:peers/0' then hands
+             %% `eth_ready_peer/1' a non-map, that answers `{error, no_eth_peers}', and
+             %% `eth_sync' never engages. See the `diag' tick for why the measurement has
+             %% to live in here.
+             handle_ms = 0}).
 
 %% Args: #{privkey, remote_id, node_id, client_id, caps, listen_port,
 %%         chain}. The _link variants link to the caller (tests); the
@@ -80,6 +93,7 @@ finish_init(Manager, Sock, Args, Sess) ->
                 {ok, S1} ->
                     erlang:send_after(?POLL_MS, self(), poll),
                     erlang:send_after(?PING_MS, self(), ping),
+                    erlang:send_after(?DIAG_MS, self(), diag),
                     Manager ! {peer_up, self(), eth_rlpx:remote_id(Sess1), Hello},
                     {ok, S1};
                 {error, Reason} ->
@@ -145,6 +159,18 @@ handle_call(status, _From, S) ->
              hello => S#st.hello,
              eth => eth_ready(S),
              last_in_ms_ago => erlang:monotonic_time(millisecond) - S#st.last_in},
+    %% **Whether this line is reached is the measurement.** `peer_status/1' answers
+    %% `{error, down}' from a bare `catch _:_', which merges three things that have
+    %% nothing in common: the call never arrived, it arrived and this handler raised,
+    %% and it timed out. This log says which of them happened.
+    %%
+    %%   this line appears   the call arrived and the handler answered
+    %%   neither appears     the call did not arrive, so the Pid the manager holds is
+    %%                       not this process
+    %%
+    %% At notice rather than info, because the release prints notice and above.
+    logger:notice("etherlang: rlpx conn status self=~p eth_ready=~p",
+                  [self(), eth_ready(S)]),
     {reply, Base, S};
 handle_call({get_headers, Ref, Max, Skip, Reverse}, _From, S) ->
     case S#st.eth of
@@ -229,11 +255,14 @@ handle_info(poll, S) ->
         {ok, Code, Data, Sess1} ->
             S1 = S#st{sess = Sess1,
                       last_in = erlang:monotonic_time(millisecond)},
-            case handle_msg(Code, Data, S1) of
-                {ok, S2} ->
-                    check_idle(reschedule_poll(S2));
+            T0 = erlang:monotonic_time(millisecond),
+            R = handle_msg(Code, Data, S1),
+            S2 = S1#st{handle_ms = erlang:monotonic_time(millisecond) - T0},
+            case R of
+                {ok, S3} ->
+                    check_idle(reschedule_poll(S3));
                 {stop, Reason} ->
-                    {stop, Reason, S1}
+                    {stop, Reason, S2}
             end;
         {error, timeout} ->
             check_idle(reschedule_poll(S));
@@ -242,6 +271,36 @@ handle_info(poll, S) ->
         {error, Reason} ->
             {stop, Reason, S}
     end;
+%% **What this conn is doing, from inside, where the answer cannot be blocked by the
+%% thing being diagnosed.**
+%%
+%% `eth_peer:peers/0' answers `{error, down}' for this process -- which `peer_status/1'
+%% produces when its 2 s `gen_server:call' times out -- while `eth_peer:status/0' counts
+%% it, the manager monitors it, and it never terminates. **No outside observer can settle
+%% that**, because every route in goes through `eth_peer:peers/1', which is the call that
+%% times out. Two attempts to watch it from outside produced nothing: one fixture did not
+%% reproduce the defect, and the second was cancelled before printing a line.
+handle_info(diag, S) ->
+    erlang:send_after(?DIAG_MS, self(), diag),
+    %% **The remote id comes from `#st.hello', not from `eth_rlpx:remote_id/1'.** The
+    %% latter takes the *args map* the conn was started with (`node_id = maps:get(...)
+    %% in its own state at eth_rlpx.erl:231), and handing it the session record instead
+    %% is a `badarg' -- which is how this line was caught: three tests failed with
+    %% `exception error: bad argument' and the reported position was the argument, not
+    %% the shape mismatch.
+    %% **`notice' and not `info'.** The release's logger prints notice and above --
+    %% every line in the running node's log is a `NOTICE REPORT' or a `WARNING REPORT' --
+    %% so an `info' line here would be filtered out of exactly the place this has to be
+    %% seen. That is not a guess about levels: it is what the log contains.
+    %% **`self=~p' is in this line for a measured reason.** The conn is provably idle
+    %% (`handle_ms=0', `q=0') and yet `eth_peer:peers/0' answers `{error, down}' for the
+    %% entry it holds. A live, idle gen_server cannot fail a `gen_server:call/3' with a
+    %% 2 s timeout, so the remaining explanation is that **the Pid in the manager's map is
+    %% not this process** -- and the only way to see that is to print both.
+    logger:notice("etherlang: rlpx conn diag self=~p remote=~s handle_ms=~p q=~p doing=~s",
+                [self(), id8(maps:get(node_id, S#st.hello, undefined)),
+                 S#st.handle_ms, queue_len(), doing()]),
+    {noreply, S};
 handle_info(ping, S) ->
     erlang:send_after(?PING_MS, self(), ping),
     case eth_rlpx:send(S#st.sess, S#st.sock, 2, eth_rlp:encode([])) of
@@ -257,13 +316,79 @@ terminate(Reason, S) ->
     case Reason of
         normal -> ok;
         shutdown -> ok;
-        _ -> logger:notice("etherlang: rlpx conn terminating (~p) eth=~p",
-                           [Reason, S#st.eth =/= undefined])
+        _ ->
+            %% **The port's own account of itself, at the moment it is being closed.**
+            %%
+            %% A connection here dies with `{error, enotconn}' out of `poll' ->
+            %% `eth_rlpx:recv' -> `gen_tcp:recv', which says the socket is *not
+            %% connected* -- while `lsof' still lists the connection as ESTABLISHED.
+            %% Those two facts cannot both be about the same socket, and which of them
+            %% is wrong decides where the defect is:
+            %%
+            %%   connected => true   the handle is a connected socket, so `enotconn'
+            %%                        did not come from this port's state and the cause
+            %%                        is upstream of the port
+            %%   connected => false  this port is not the connected socket -- the fd was
+            %%                        reused, or the socket was moved out from under
+            %%                        the conn
+            %%   undefined          the port is already gone
+            %%
+            %% It is here rather than in a probe because it is the only place the answer
+            %% exists: the conn dies within about a second of `peer_up', and every
+            %% external observer loses the race. Two attempts to watch it from outside
+            %% produced nothing -- one fixture did not reproduce the defect at all, and
+            %% the second was cancelled before it printed a line, because
+            %% `eth_peer:peers/1' blocks for up to two seconds per stuck connection,
+            %% which is the same slowness `net_peerCount' was measured at (2.1-3.5 s).
+            %% **An observer with the defect it is observing does not get an answer.**
+            logger:notice("etherlang: rlpx conn terminating (~p) eth=~p "
+                          "port_connected=~p port_id=~p",
+                          [Reason, S#st.eth =/= undefined,
+                           port_connected(S#st.sock), port_id(S#st.sock)])
     end,
     (try gen_tcp:close(S#st.sock) catch _:_ -> ok end),
     ok.
 
+%% `erlang:port_info/2' rather than `inet:getstat/1': it answers for the port term this
+%% process holds, with no name lookup and no DNS, and it cannot block.
+port_connected(Sock) ->
+    try erlang:port_info(Sock, connected) catch _:_ -> {error, not_a_port} end.
+
+%% The OS-level port number, which is what makes an fd-reuse diagnosis possible: two
+%% conns reporting the same number while only one connection exists is the signature.
+port_id(Sock) ->
+    try erlang:port_info(Sock, port) catch _:_ -> {error, not_a_port} end.
+
 code_change(_OldVsn, S, _Extra) -> {ok, S}.
+
+%% Queue depth and executing function. `current_stacktrace' rather than
+%% `current_function', because the interesting case is a *deep* call -- a
+%% `serve_headers_req' three frames down inside a DETS read -- and the top frame alone
+%% reports `erlang:apply/2' for every one of them.
+queue_len() ->
+    case erlang:process_info(self(), message_queue_len) of
+        {message_queue_len, N} -> N;
+        _ -> -1
+    end.
+
+doing() ->
+    case erlang:process_info(self(), current_stacktrace) of
+        %% **The fourth element is the arity, an integer, not an argument list.**
+        %% `length(A)' here is `length(0)' -- `exception error: bad argument' with
+        %% `called as length(0)' -- and it was copied out of a scratch probe rather than
+        %% written from the shape of the term. The stacktrace frame is `{M, F, Arity,
+        %% Location}'.
+        {current_stacktrace, [{M, F, Arity, _} | _]} ->
+            lists:flatten(io_lib:format("~p:~p/~p", [M, F, Arity]));
+        {current_stacktrace, []} ->
+            "idle";
+        _ ->
+            "?"
+    end.
+
+id8(ID) when is_binary(ID), byte_size(ID) >= 8 ->
+    binary:encode_hex(binary:part(ID, 0, 8));
+id8(_) -> <<"?">>.
 
 %% ---------------------------------------------------------------------------
 
