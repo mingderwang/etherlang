@@ -276,7 +276,52 @@ an_excess_blob_gas_that_is_not_the_computed_one_is_refused_test() ->
                                              put(<<"excessBlobGas">>, 524288, child()),
                                              cancun)).
 
-before_cancun_there_is_no_excess_blob_gas_to_check_test() ->
+%% **EIP-4844's update rule reads the *parent's* `blob_gas_used`, not the header's own.**
+  %%
+  %%     excess_blob_gas(parent) = max(parent.excess_blob_gas + parent.blob_gas_used
+  %%                                  - TARGET_BLOB_GAS_PER_BLOCK, 0)
+  %%
+  %% Every other fixture in this module has `blob_gas_used = 0` in **both** the parent and the
+  %% child, so parent and header agree and the two readings cannot be told apart. **That is
+  %% why the wrong one survived**: not a missing test, a fixture whose two arms are the same
+  %% number.
+  %%
+  %% Here the parent uses 9 blobs and the child uses none, so the rule applied to the parent's
+  %% value gives `0 + 1179648 - 393216 = 786432` and applied to the header's gives
+  %% `0 + 0 - 393216 = 0`. The header states `786432`, which is the parent's number.
+  %%
+  %% **Measured on the live pair, this is not hypothetical.** Sepolia block 11,846,220 is
+  %% refused with `{excess_blob_gas_mismatch, 210359169, 208436780}` -- the header's value and
+  %% something else. The validator reads `num(Header, <<"blobGasUsed">>)` and
+  %% `eth_fork_schedule:excess_blob_gas/3`'s parameters are named `ParentExcessBlobGas,
+  %% ParentBlobGasUsed`.
+  an_excess_blob_gas_computed_from_the_parents_blob_gas_used_is_accepted_test() ->
+      Parent = (parent())#{<<"excessBlobGas">> => hex(0),
+                         <<"blobGasUsed">> => hex(9 * eth_fork_schedule:blob_gas_per_blob())},
+      Child = (child())#{<<"blobGasUsed">> => hex(0),
+                       <<"excessBlobGas">> => hex(9 * eth_fork_schedule:blob_gas_per_blob()
+                                                  - eth_fork_schedule:target_blob_gas_per_block(cancun))},
+      ?assertEqual(ok, eth_block_validator:validate(Parent, Child, cancun)).
+
+%% **And the control: a child's own `blob_gas_used` cannot change the verdict.**
+  %%
+  %% This was written as the mirror of the test above -- the parent uses no blobs and the child
+  %% uses nine -- and it **failed with `{value, ok}` after the fix**, which is the more
+  %% informative result. Under EIP-4844 the header's own `blob_gas_used` does not appear in the
+  %% expression at all, so nine blobs here can neither excuse an `excess_blob_gas` of 0 nor
+  %% create a mismatch: the block is simply valid.
+  %%
+  %% So the assertion is `ok` and the name says what it holds rather than what I expected. The
+  %% first version asserted a mismatch, and it would have been a test arguing for a defect --
+  %% the header's own usage never had any bearing on this rule.
+  a_childs_own_blob_gas_used_does_not_affect_its_excess_blob_gas_test() ->
+      Parent = (parent())#{<<"excessBlobGas">> => hex(0),
+                           <<"blobGasUsed">> => hex(0)},
+      Child = (child())#{<<"blobGasUsed">> => hex(9 * eth_fork_schedule:blob_gas_per_blob()),
+                         <<"excessBlobGas">> => hex(0)},
+      ?assertEqual(ok, eth_block_validator:validate(Parent, Child, cancun)).
+
+  before_cancun_there_is_no_excess_blob_gas_to_check_test() ->
     Parent = maps:remove(<<"excessBlobGas">>, parent()),
     Header = maps:remove(<<"excessBlobGas">>, child()),
     ?assertEqual(ok, eth_block_validator:validate(Parent, Header, london)).

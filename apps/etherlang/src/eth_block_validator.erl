@@ -320,8 +320,19 @@ excess_blob_gas_mismatch(_Parent, _Header, Fork) ->
         true ->
             Parent = _Parent,
             Header = _Header,
+            %% **The *parent's* `blobGasUsed`, not the header's own.**
+            %%
+            %% EIP-4844: `excess_blob_gas(parent) = max(parent.excess_blob_gas +
+            %% parent.blob_gas_used - TARGET_BLOB_GAS_PER_BLOCK, 0)`. This read the header's
+            %% value, which is a different field entirely -- and `eth_fork_schedule:
+            %% excess_blob_gas/3` names its second parameter `ParentBlobGasUsed`, so the
+            %% call site was contradicting the function it calls.
+            %%
+            %% Every validator fixture had `blobGasUsed = 0` in **both** parent and child, so
+            %% the two readings agreed and nothing could tell them apart. It refused Sepolia
+            %% block 11,846,220 with `{excess_blob_gas_mismatch, 210359169, 208436780}`.
             case {num(Parent, <<"excessBlobGas">>), num(Header, <<"excessBlobGas">>),
-                  num(Header, <<"blobGasUsed">>)} of
+                  num(Parent, <<"blobGasUsed">>)} of
                 {PEG, HEG, PBGU} when is_integer(PEG), is_integer(HEG),
                                          is_integer(PBGU) ->
                     case eth_fork_schedule:excess_blob_gas(

@@ -35,7 +35,7 @@ with the file it sat above.
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
 build. OTP 29.1. Current: **49 src modules / 14,549 code lines, 65 test modules /
-14,551 code lines, 1029 eunit tests, all passing.**
+14,564 code lines, 1031 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive
 them with the procedure below rather than editing this sentence.
@@ -709,6 +709,70 @@ consequences, both mine:
 And one more, in the same family: `io:format/1` inside a test is how the `{acceptor_hello, _}`
 versus `{acceptor_hello, ...}` mix-up was found at all -- a receive that never matches and a
 receive that matches nothing print the same until you look at what is actually in the mailbox.
+
+### Fixed: the validator read the header's `blob_gas_used` where EIP-4844 says the parent's
+
+EIP-4844's update rule is
+
+```
+excess_blob_gas(parent) = max(parent.excess_blob_gas + parent.blob_gas_used
+                             - TARGET_BLOB_GAS_PER_BLOCK, 0)
+```
+
+`eth_block_validator:excess_blob_gas_mismatch/3` passed `num(Header, <<"blobGasUsed">>)` --
+**the header's own** value. `eth_fork_schedule:excess_blob_gas/3`'s parameters are named
+`ParentExcessBlobGas, ParentBlobGasUsed`, so the call site was contradicting the function it
+calls.
+
+**Every validator fixture had `blobGasUsed = 0` in *both* parent and child**, so the two
+readings agreed and no test could tell them apart. Not a missing test -- a fixture whose two
+arms are the same number. The new test gives the parent 9 blobs and the child none.
+
+```erlang
+%% before the fix:  {excess_blob_gas_mismatch, 786432, 0}
+%% after:           ok
+```
+and injecting the old field back turns it red with that exact value.
+
+**The control is the more informative half.** A child using 9 blobs with an
+`excessBlobGas` of 0 is **valid**, and the first version of that test asserted a mismatch. It
+failed with `{value, ok}` after the fix, and it was wrong to assert a refusal: the header's own
+`blob_gas_used` does not appear in the expression at all, so nine blobs there can neither
+create nor excuse a mismatch. Corrected to assert `ok`, and renamed to say what it holds.
+
+### The blocker is NOT closed, and the residual is unexplained
+
+A still refuses to sync, and the log says so on every attempt:
+
+```
+append failed ({invalid_header, 11846220,
+                {invalid_header, {excess_blob_gas_mismatch, 210359169, 208961068}}})
+```
+
+The computed value moved from **208436780 to 208961068**, so the fix is live in the running
+build. What has **not** been established is where the remaining difference comes from, and
+three of my attempts to infer it were all wrong, which is the part worth recording:
+
+1. I assumed the target was Cancun's 393216 and reverse-solved the chain's own numbers for it.
+   **The reverse-solved "target" came out as 14, 7.33, 12, 4, 14, 8.67, 5.33, 14, 6, 3.33**
+   across sixteen consecutive blocks. A consensus constant cannot do that, so the model -- not
+   the chain -- was wrong.
+2. I called `eth_fork_schedule:excess_blob_gas(cancun, ...)` to find out what the code
+   computes, and it returned 210,402,860, which is **neither** number in the log. The node was
+   using **1835008 (14 blobs)**, i.e. a later fork the schedule does have. I had probed the
+   wrong fork and treated the answer as the code's behaviour. Using the right fork, the *old*
+   code reproduces its own logged number exactly: `210140716 + 131072 - 1835008 = 208436780`.
+   **So `target_blob_gas_per_block/1` is not missing a BPO fork** -- that claim in this entry
+   was wrong before it was written.
+3. I compared A's stored head against upstream field by field, expecting the divergence to be
+   in the decode path. **All eight fields match**, including `excessBlobGas = 0xc867e2c` and
+   `blobGasUsed = 0xa0000`. That hypothesis is dead too.
+
+**What is left is 1,398,101, and no consistent model reproduces it.** The obvious next
+instrument is one line inside `excess_blob_gas_mismatch/3` printing `PEG`, `HEG`, `PBGU`, the
+resolved `Fork` and `target_blob_gas_per_block(Fork)` -- the node's own inputs, rather than an
+inference from a remote endpoint. That is not written. **Three wrong inferences in a row is the
+signal that the remaining work is measurement, not reasoning.**
 
 ### Also found, also open
 
