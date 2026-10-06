@@ -44,6 +44,12 @@
     %% must not trigger the system call. The two are different and must not be
     %% conflated.
     parent_beacon_block_root :: binary() | undefined,
+    %% **EIP-7843 (Amsterdam).** A slot number is a **consensus-layer** quantity -- the
+    %% CL computes it and passes it down through the Engine API -- and it is not the
+    %% block number: Sepolia block 11,856,337 carries `slotNumber' 11,296,768.
+    %% `undefined' means the payload had no such field (pre-Amsterdam), which is a
+    %% different answer from `0'; slot 0 is the genesis slot and a real value.
+    slot_number :: integer() | undefined,
     extra_data :: binary(),
     nonce :: binary(),
     mix_hash :: binary(),

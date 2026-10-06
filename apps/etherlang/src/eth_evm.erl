@@ -776,6 +776,18 @@ do_op(16#40, E, Ctx) ->
 do_op(16#41, E, Ctx) -> next(push(E, eth_word:from_bytes(s_env(coinbase, Ctx, <<0:160>>))), Ctx);
 do_op(16#42, E, Ctx) -> next(push(E, s_env(timestamp, Ctx, 0)), Ctx);
 do_op(16#43, E, Ctx) -> next(push(E, s_env(number, Ctx, 0)), Ctx);
+do_op(16#4B, E, Ctx) ->
+    %% **EIP-7843's SLOTNUM, and the one opcode that does not default.** Every
+    %% neighbouring clause is `s_env(Key, Ctx, 0)', which answers 0 for an Env that does not
+    %% carry the key. Slot 0 is the genesis slot and a real value, so that default would
+    %% let a block with no slot number report one. The fork gate in
+    %% `eth_fork_schedule:opcode_exists/2' means an Amsterdam block reaches this clause and
+    %% an Amsterdam block carries the field -- so an absent key here means the caller did
+    %% not wire it, and the honest answer is to refuse rather than invent.
+    case maps:find(slot_number, Ctx#ctx.env) of
+        {ok, Slot} when is_integer(Slot) -> next(push(E, Slot), Ctx);
+        _ -> unsupported({slot_number, absent}, E, Ctx)
+    end;
 do_op(16#44, E, Ctx) -> next(push(E, s_env(prevrandao, Ctx, 0)), Ctx);
 do_op(16#45, E, Ctx) -> next(push(E, s_env(gas_limit, Ctx, 0)), Ctx);
 do_op(16#46, E, Ctx) -> next(push(E, s_env(chain_id, Ctx, 1)), Ctx);

@@ -34,8 +34,8 @@ with the file it sat above.
 
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
-build. OTP 29.1. Current: **49 src modules / 14,555 code lines, 65 test modules /
-14,566 code lines, 1031 eunit tests, all passing.**
+build. OTP 29.1. Current: **49 src modules / 14,571 code lines, 65 test modules /
+14,752 code lines, 1047 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive
 them with the procedure below rather than editing this sentence.
@@ -793,7 +793,7 @@ certification. The design is working; the node is behind.
 
 | What | EIP | State |
 |------|-----|-------|
-| header field `slotNumber`, opcode `SLOTNUM` (`0x4b`, gas **2**) | EIP-7843 | header field **done**, in this commit; opcode **not** |
+| header field `slotNumber`, opcode `SLOTNUM` (`0x4b`, gas **2**) | EIP-7843 | header field, opcode, payload decode and Env wiring **all done** |
 | header field `blockAccessListHash`, and the block access list itself | EIP-7928 | header field **done**, in this commit; the BAL **not** |
 | `ExecutionPayloadV4` / `PayloadAttributesV4`, `engine_newPayloadV5`, `engine_getPayloadV6`, `engine_forkchoiceUpdatedV4` | both | **not** |
 
@@ -830,10 +830,39 @@ made of real hashes can tell `opt_data` from `opt_qty`.** An injection switching
 byte was added, and that test is now the one that protects *every* hash field in the header,
 not only the two new ones.
 
-**What is still missing, and it is the part that keeps `past_modelled_range` honest:** the
-`SLOTNUM` opcode, the block access list EIP-7928 defines, and the v4 payload objects. Until
-those exist a post-Amsterdam block cannot be *executed*, and a node that executed one would
+**`SLOTNUM` is implemented, and it is the only opcode in the interpreter that does not
+default.** `0x4b`, gas **2**, `introduced_by` Amsterdam, and every neighbour is
+`s_env(Key, Ctx, 0)` -- which answers 0 for an Env that does not carry the key. **Slot 0 is
+the genesis slot and a real value**, so that default would let a block with no slot number
+report one. `do_op/3` uses `maps:find/2` and refuses with
+`{unsupported, {slot_number, absent}}` instead, and `block_env/2` builds the key
+*conditionally* rather than seeding it.
+
+**Gas 2 is against the family it sits numerically inside, and that needed measuring rather
+than recalling.** `constant_cost/2` answers **2** for all of `0x41..0x46` and **5** for
+`0x47` SELFBALANCE, **20** for `0x48`/`0x49`/`0x4A`; the EVM adds the address family's
+extra on top, which is why `basefee_costs_20_test` exists. So the obvious move -- widening
+the `0x41..0x46` guard to `0x4B` -- would have silently repriced **four** existing
+instructions to fix one, and it is the kind of edit that compiles, passes nothing, and
+ships. EIP-7843 says 2 and geth charges `GasQuickStep`.
+
+**`base_gas_cost/3` is not fork-gated and that is by design**, which cost me an injection
+before I read it: availability is `opcode_exists/2`'s job, and
+`no_opcode_is_silently_unpriced_test` asserts the priced set at Cancun *exactly*. Adding
+`0x4b` without adding it to the price table failed that test with
+`{unexpected_prices, [16#4B]}` -- the table-driven test doing the one job it was built for.
+
+**What is still missing, and it is what keeps `past_modelled_range` honest:** the block
+access list EIP-7928 defines, and the v4 payload objects with
+`engine_newPayloadV5` / `engine_getPayloadV6` / `engine_forkchoiceUpdatedV4`. Until the BAL
+exists a post-Amsterdam block cannot be *executed*, and a node that executed one would
 produce a state root under rules it does not have -- so the refusal stays.
+
+**`payload_header_rlp/4` still builds 20 fields for an Amsterdam payload**, so
+`payload_block_hash/1` would hash a v4 payload's header wrongly. That path is unreachable
+today only because `past_modelled_range` refuses such a block before it is validated, which
+is a coincidence of ordering rather than a guard: **nothing in `eth_block` looks at
+`slotNumber` to decide the header shape.** Named here so it is not mistaken for done.
 
 ### A calendar-dependent fixture turned into a time bomb, and the refusal was the correct part
 

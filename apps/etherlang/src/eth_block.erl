@@ -78,6 +78,7 @@
           %% could never produce the bytes they were testing for, which made
           %% newPayloadV3 report every real transaction as unreadable and answer
           %% SYNCING where it should have answered INVALID.
+          block_env/2,
           hex_data/1 ]).
 
 -include_lib("etherlang/include/eth_block.hrl").
@@ -1487,10 +1488,16 @@ create_address(Sender, Nonce) ->
 %% The execution environment, in the shape eth_evm reads it: flat atom keys.
 %% BLOCKHASH needs a state view to resolve the requested block, so the state is
 %% carried alongside rather than looked up again by the opcode.
+%% **Exported so the Env contract is testable.** Its production caller is
+%% `execute_transactions/6' (line 901), and every other route to it is a test -- but the
+%% mapping it performs is consensus-relevant, and EIP-7843's half of it is the one key in
+%% this map that is *conditionally absent*. A reader can confirm the caller by grep; what a
+%% grep cannot do is assert that an Env built from a payload with no `slotNumber' has no
+%% `slot_number' key. Same reason `status_for_finalize/1' is exported.
 block_env(Block = #block{number = Number, timestamp = Ts, miner = Miner,
                          gas_limit = GL, base_fee_per_gas = BaseFee,
-                         mix_hash = Mix}, State) ->
-    #{number => Number,
+                         mix_hash = Mix, slot_number = Slot}, State) ->
+    Env0 = #{number => Number,
       timestamp => Ts,
       %% eth_evm:run/5 requires the fork. It is resolved from the block's own
       %% number and timestamp, which is the only pair the fork schedule takes,
@@ -1503,7 +1510,16 @@ block_env(Block = #block{number = Number, timestamp = Ts, miner = Miner,
       gas_limit => GL,
       base_fee => base_fee_of(BaseFee),
       chain_id => eth_fork_schedule:chain_id(),
-      state => State}.
+      state => State},
+    with_slot_number(Slot, Env0).
+
+%% **Absent is not zero.** Slot 0 is the genesis slot and a real value, so an Env that
+%% carries the key at all carries a genuine slot number, and one that does not is a
+%% block that never had one. This is the only Env key built this way, and the reason is
+%% the EIP's: the number comes from the consensus layer, so a node that does not have it
+%% has no value to substitute.
+with_slot_number(undefined, Env) -> maps:remove(slot_number, Env);
+with_slot_number(Slot, Env) -> Env#{slot_number => Slot}.
 
 base_fee_of(undefined) -> 0;
 base_fee_of(BaseFee) when is_integer(BaseFee) -> BaseFee;
@@ -1960,14 +1976,19 @@ put_optional_fields(Block, Payload) ->
     end,
     Block2 = set_quantity_field(blob_gas_used, pget(Payload, <<"blobGasUsed">>), Block1),
     Block3 = set_quantity_field(excess_blob_gas, pget(Payload, <<"excessBlobGas">>), Block2),
-    case pget(Payload, <<"parentBeaconBlockRoot">>) of
+    Block4 = case pget(Payload, <<"parentBeaconBlockRoot">>) of
         undefined -> Block3;
         {ok, Root} ->
             case maybe_word(Root) of
                 undefined -> Block3;
                 Word -> Block3#block{parent_beacon_block_root = Word}
             end
-    end.
+    end,
+    %% **EIP-7843.** `slotNumber' arrives in `ExecutionPayloadV4'. This decoder reads
+    %% V1/V2/V3 payloads as well, so the field is optional here for the same reason
+    %% `withdrawals' and `parentBeaconBlockRoot' are -- and, like them, an absent field
+    %% leaves `undefined' rather than 0, because 0 is the genesis slot.
+    set_quantity_field(slot_number, pget(Payload, <<"slotNumber">>), Block4).
 
 %% The value has to be decoded. Storing the raw `"0x0"' leaves a JSON string in a
 %% field the header encodes as a number, and RLP encodes a 3-byte binary as a
@@ -1982,6 +2003,8 @@ set_quantity_field(Field, {ok, Value}, Block) ->
             Block#block{blob_gas_used = Decoded};
         {ok, Decoded} when Field =:= excess_blob_gas ->
             Block#block{excess_blob_gas = Decoded};
+        {ok, Decoded} when Field =:= slot_number ->
+            Block#block{slot_number = Decoded};
         {error, _} ->
             Block
     end.

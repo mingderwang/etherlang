@@ -470,3 +470,56 @@ an_absent_base_fee_is_absent_and_not_zero_test() ->
     Block = (eth_block:new(<<0:256>>, 1))#block{base_fee_per_gas = undefined},
     ?assertEqual(undefined, maps:get(<<"baseFeePerGas">>, eth_block:header(Block))),
     ?assertNotEqual(<<"0x0">>, maps:get(<<"baseFeePerGas">>, eth_block:header(Block))).
+
+
+%% ===========================================================================
+%% EIP-7843: the slot number reaches the interpreter, and an absent one does not
+%% ===========================================================================
+%% The opcode is only half of it. `SLOTNUM' reads `slot_number' out of the Env with
+%% `maps:find/2' and refuses when the key is absent, so **the whole feature depends on
+%% this decoder leaving the key out** for a payload that carries no `slotNumber' -- and
+%% on not seeding it with 0, which is the genesis slot.
+%%
+%% The value is the one real Sepolia block 11,856,337 carries.
+
+slot_number_is_absent_unless_the_payload_carries_it_test() ->
+    %% The three fixtures are Paris, Shanghai and Cancun and all three predate the fork,
+    %% so this is the case that must be *absent* rather than *present and wrong*.
+    lists:foreach(fun({Fork, Fx}) ->
+        {ok, B} = eth_block:from_payload(maps:get(payload, Fx)),
+        ?assertEqual({Fork, undefined}, {Fork, B#block.slot_number})
+    end, eth_payload_fixture:all()),
+    {ok, Paris} = eth_block:from_payload(payload(eth_payload_fixture:paris())),
+    ?assertEqual(undefined, Paris#block.slot_number).
+
+a_payload_carrying_a_slot_number_decodes_it_test() ->
+    P = maps:put(<<"slotNumber">>, <<"0xac6000">>,
+                 payload(eth_payload_fixture:cancun())),
+    {ok, B} = eth_block:from_payload(P),
+    ?assertEqual(11296768, B#block.slot_number).
+
+the_env_carries_the_slot_number_from_the_payload_test() ->
+    %% End to end through the two hops, because the two can each be right while the pair
+    %% is wrong: a decoder that fills the record and an Env that seeds a different key
+    %% would both pass their own test.
+    P = maps:put(<<"slotNumber">>, <<"0xac6000">>,
+                 payload(eth_payload_fixture:cancun())),
+    {ok, B} = eth_block:from_payload(P),
+    Env = eth_block:block_env(B, eth_state:new(0, #{})),
+    ?assertEqual(11296768, maps:get(slot_number, Env)).
+
+the_env_omits_the_slot_number_for_a_block_that_has_none_test() ->
+    {ok, B} = eth_block:from_payload(payload(eth_payload_fixture:cancun())),
+    Env = eth_block:block_env(B, eth_state:new(0, #{})),
+    ?assertNot(maps:is_key(slot_number, Env)).
+
+the_env_carries_slot_zero_rather_than_omitting_it_test() ->
+    %% **The control for the test above.** The two differ by one instruction -- seeding
+    %% unconditionally with `Env#{slot_number => Slot}' and reading `Slot' -- and they
+    %% agree on every block except this one, where slot 0 is a real value. A handler that
+    %% treated 0 as "absent" would pass everything above and answer `SLOTNUM' on the
+    %% genesis slot with a refusal instead of a number.
+    {ok, B0} = eth_block:from_payload(payload(eth_payload_fixture:cancun())),
+    B = B0#block{slot_number = 0},
+    Env = eth_block:block_env(B, eth_state:new(0, #{})),
+    ?assertEqual(0, maps:get(slot_number, Env)).

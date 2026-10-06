@@ -3419,3 +3419,81 @@ exp_msg() ->
 %% program, and the whole claim is that the base's width never reaches the price.
 exp_push(W) when W < 256 -> <<16#60, W>>;
 exp_push(W) -> <<16#7F, W:256>>.
+
+
+%% ---------------------------------------------------------------------------
+%% EIP-7843: SLOTNUM is 0x4b, costs 2, and does not default
+%% ---------------------------------------------------------------------------
+%% **The gas figure is 2 and not 20, and the reason is worth stating because every
+%% neighbouring environment-reading opcode costs 20.** `constant_cost/2' returns the
+%% *base* for the whole `0x41..0x46` family -- all of them answer 2 -- and the EVM adds the
+%% family's extra on top, which is why `basefee_costs_20_test' above exists and why this
+%% opcode must not be written as "another environment reader". EIP-7843 says "The gas cost
+%% for SLOTNUM is a fixed fee of 2", and geth charges `GasQuickStep`. So 2 is right, and it
+%% is right *against* the family it sits numerically inside.
+-define(SLOTNUM_ENV, (#{fork => amsterdam, slot_number => 11296768})).
+
+%% Slot 11,296,768 is the value real Sepolia block 11,856,337 carries. **A test value
+%% that is a real chain value is worth one that is not**, because a round number could be
+%% produced by a stub.
+slotnum_costs_two_gas_test() ->
+    %% SLOTNUM + STOP. The program has to *run* the opcode or the figure below would be
+    %% the cost of a bare STOP, which is 0 -- a frame that never reached the instruction
+    %% reports a number that looks right for the wrong reason.
+    {ok, _, GasLeft, _, _} =
+        eth_evm:run(<<16#4B, 16#00>>, ?MSG0, ?STATE, ?SLOTNUM_ENV, ?GAS),
+    ?assertEqual(?GAS - 2, GasLeft).
+
+slotnum_pushes_the_slots_number_test() ->
+    %% SLOTNUM PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+    Code = <<16#4B, 16#60, 16#00, 16#52,
+             16#60, 16#20, 16#60, 16#00, 16#F3>>,
+    {ok, Out, _, _, _} =
+        eth_evm:run(Code, ?MSG0, ?STATE, ?SLOTNUM_ENV, ?GAS),
+    ?assertEqual(<<11296768:256>>, Out).
+
+slotnum_is_a_word_not_a_byte_test() ->
+    %% The same program, read back as a number. MSTORE took `0' as the offset and the slot
+    %% as the value, so the returned word *is* the slot number -- and a handler that
+    %% truncated to 64 bits or pushed the Env value unconverted would answer something
+    %% else. Slot 11,296,768 needs 24 bits, so a byte-width slip is visible here.
+    Code = <<16#4B, 16#60, 16#00, 16#52,
+             16#60, 16#20, 16#60, 16#00, 16#F3>>,
+    {ok, Out, _, _, _} =
+        eth_evm:run(Code, ?MSG0, ?STATE, ?SLOTNUM_ENV, ?GAS),
+    ?assertEqual(11296768, binary:decode_unsigned(Out)).
+
+slotnum_is_not_offered_before_amsterdam_test() ->
+    %% **The fork gate, asserted at the boundary rather than by a table.** Cancun is the
+    %% fork that owns 0x49 and 0x4A, so it is the nearest neighbour; a gate that returned
+    %% true for `cancun' would make the opcode available in every block with blobs in it.
+    ?assertNot(eth_fork_schedule:opcode_exists(16#4B, cancun)),
+    ?assertNot(eth_fork_schedule:opcode_exists(16#4B, prague)),
+    ?assert(eth_fork_schedule:opcode_exists(16#4B, amsterdam)).
+
+slotnum_refuses_when_the_environment_carries_no_slot_number_test() ->
+    %% **This is the assertion the opcode exists for.** `undefined' means the payload had
+    %% no `slotNumber', and every other environment-reading opcode in this file answers
+    %% `s_env(Key, Ctx, 0)' -- so the convenient implementation of SLOTNUM reports the
+    %% genesis slot for a block that has none. Slot 0 is a real slot, so there is no
+    %% version of "no slot number" this can answer with.
+    Code = <<16#4B, 16#00>>,
+    %% `run/5' answers a five-tuple on success and a **four**-tuple on a halt -- no logs
+    %% element, because a frame that halted produced none. Writing the three-element form
+    %% fails with a `pattern' that reads as the node refusing for the wrong reason.
+    ?assertMatch({error, {unsupported, {slot_number, absent}}, _State, _Logs},
+                 eth_evm:run(Code, ?MSG0, ?STATE, #{fork => amsterdam}, ?GAS)).
+
+slotnum_reads_slot_zero_rather_than_treating_it_as_absent_test() ->
+    %% **The other half, and it is the half that makes the refusal above correct rather
+    %% than merely cautious.** A handler written as `maps:get(slot_number, Env, undefined)`
+    %% and then `case undefined` would answer fine here -- but one written as
+    %% `case maps:is_key(...) of false -> refuse; true -> maps:get(..., 0) end` is the same
+    %% code, and the control is what tells the two apart. Slot 0 must push 0, and must not
+    %% be refused.
+    Code = <<16#4B, 16#60, 16#00, 16#52,
+             16#60, 16#20, 16#60, 16#00, 16#F3>>,
+    {ok, Out, _, _, _} =
+        eth_evm:run(Code, ?MSG0, ?STATE,
+                    #{fork => amsterdam, slot_number => 0}, ?GAS),
+    ?assertEqual(<<0:256>>, Out).

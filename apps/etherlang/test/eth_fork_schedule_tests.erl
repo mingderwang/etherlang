@@ -654,6 +654,7 @@ cancun_schedule() ->
         {16#48, "BASEFEE",      20},
         {16#49, "BLOBHASH",     20},
         {16#4A, "BLOBBASEFEE",  20},
+         {16#4B, "SLOTNUM",      2},
         {16#50, "POP",           2},
         {16#51, "MLOAD",         3},
         {16#52, "MSTORE",        3},
@@ -920,10 +921,10 @@ opcode_availability_only_grows_test() ->
 %% opcodes than there are bytes in the space.
 never_assigned_bytes_are_not_opcodes_in_any_fork_test() ->
     Unassigned = lists:seq(16#0C, 16#0F) ++ lists:seq(16#1E, 16#1F) ++
-                 lists:seq(16#21, 16#2F) ++ lists:seq(16#4B, 16#4F) ++
+                 lists:seq(16#21, 16#2F) ++ lists:seq(16#4C, 16#4F) ++
                  lists:seq(16#A5, 16#EF) ++ lists:seq(16#F6, 16#F9) ++
                  lists:seq(16#FB, 16#FC),
-    ?assertEqual(107, length(Unassigned)),
+    ?assertEqual(106, length(Unassigned)),
     ?assertEqual(256, available_count(amsterdam) + length(Unassigned)),
     Forks = [frontier, byzantium, constantinople, istanbul, london, shanghai,
              cancun, prague, osaka, amsterdam],
@@ -952,7 +953,8 @@ gated_opcodes_appear_at_their_owning_fork_test() ->
              {16#4A, cancun},             % BLOBBASEFEE    EIP-4844
              {16#5C, cancun},             % TLOAD          EIP-1153
              {16#5D, cancun},             % TSTORE         EIP-1153
-             {16#5E, cancun}],            % MCOPY          EIP-5656
+             {16#5E, cancun},             % MCOPY          EIP-5656
+             {16#4B, amsterdam}],        % SLOTNUM        EIP-7843
     All = [frontier, homestead, dao, tangerine, spurious_dragon, byzantium,
            constantinople, petersburg, istanbul, muir_glacier, berlin, london,
            arrow_glacier, gray_glacier, merge, paris, shanghai, cancun, deneb,

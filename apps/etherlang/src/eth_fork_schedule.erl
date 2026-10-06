@@ -798,6 +798,7 @@ opcode_exists(_Opcode, _Fork) ->
 %%   0x48 BASEFEE                   EIP-3198 London
 %%   0x49 BLOBHASH                  EIP-4844 Cancun
 %%   0x4A BLOBBASEFEE               EIP-4844 Cancun
+%%   0x4B SLOTNUM                   EIP-7843 Amsterdam
 %%   0x5C TLOAD                     EIP-1153 Cancun
 %%   0x5D TSTORE                    EIP-1153 Cancun
 %%   0x5E MCOPY                     EIP-5656 Cancun
@@ -827,6 +828,7 @@ introduced_by(16#47) -> istanbul;
 introduced_by(16#48) -> london;
 introduced_by(16#49) -> cancun;
 introduced_by(16#4A) -> cancun;
+introduced_by(16#4B) -> amsterdam;
 introduced_by(16#5C) -> cancun;
 introduced_by(16#5D) -> cancun;
 introduced_by(16#5E) -> cancun;
@@ -1603,6 +1605,11 @@ base_gas_cost(16#3E, _, _) -> 3;
 base_gas_cost(16#3F, Fork, Args) -> access_cost(16#3F, Fork, Args);  % EXTCODEHASH
 base_gas_cost(16#40, _, _) -> 20;                                  % BLOCKHASH
 base_gas_cost(Op, _, _) when Op >= 16#41, Op =< 16#46 -> 2;
+%% EIP-7843: "The gas cost for SLOTNUM is a fixed fee of 2." It sits inside the 0x41..0x46
+%% range that already charges 2, so the range cannot simply be widened to 0x4B: 0x47
+%% SELFBALANCE is 5 and 0x49/0x4A carry Cancun's own prices, and widening the guard would
+%% silently reprice four instructions to fix one.
+base_gas_cost(16#4B, _, _) -> 2;
 %% SELFBALANCE is 5. It shared a clause with CREATE and CREATE2 -- the three
 %% opcodes that read the *caller's* account -- and inherited 32000. A contract
 %% checking its own balance could not afford to do so.
