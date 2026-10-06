@@ -34,8 +34,8 @@ with the file it sat above.
 
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
-build. OTP 29.1. Current: **49 src modules / 14,506 code lines, 65 test modules /
-14,453 code lines, 1028 eunit tests, all passing.**
+build. OTP 29.1. Current: **49 src modules / 14,518 code lines, 65 test modules /
+14,535 code lines, 1029 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive
 them with the procedure below rather than editing this sentence.
@@ -533,6 +533,83 @@ took they evidently agree. **Which path that was is the open question**: blocks 
 over p2p are decoded by `eth_eth`, and blocks that arrive from upstream JSON-RPC are decoded
 by the projection, and there is no test asserting that the two put the same bytes in a
 `<<"hash">>` field. Filed as a question, not a defect.
+
+### Fixed, and it is NOT the sync blocker: a frame could block for twice its budget
+
+`eth_rlpx:recv_frame/3` read a frame in **two `gen_tcp:recv` calls handed the same
+`Timeout`** -- 32 bytes of header, then `RSize + 16` of body -- so a frame could block for
+twice what it was given: the header read takes `Timeout`, and if it succeeds on the last
+millisecond the body read takes `Timeout` again. `eth_peer_conn:fetch_wait/5` re-derives the
+remaining time *between* iterations of its loop and this function re-derived nothing *within*
+one, so the two together spent the budget twice and nothing checked.
+
+One absolute deadline now runs through both reads (`recv_frame_until/3`), and the guard is
+`max(1, Deadline - now)` because **`gen_tcp:recv/3` reads a timeout of 0 as *wait forever*** --
+so an exhausted budget would have become exactly the thing the deadline exists to prevent.
+
+**This is the first test in the repository that calls `recv_frame/3` at all.** It needs a byte
+relay, because a plain loopback pair cannot produce the shape: `send_frame/4` writes header
+and body in one `gen_tcp:send', so a frame is always whole by the time a socket sees it.
+Writing the framing by hand in the test would be a second implementation of `send_frame/4`,
+which is the fixture-identity trap -- a hand-written preimage agrees with the code by
+construction and disagrees with it silently. The relay holds a write for 800 ms, forwards only
+the first 32 bytes and parks the rest; `recv/3` is given 1000 ms and the assertion is at
+1400 ms, which is 400 ms above the correct answer and 400 ms below the old one. Restoring the
+double spend turns it red.
+
+**And the measurement did not move, which is the result.** Re-running the pair after the fix:
+
+| | before the fix | after |
+|---|---|---|
+| diagnostic gap, median | 4-5 s | **19.01 s** |
+| diagnostic gap, max | 19.03 s | **54.15 s** |
+| `sync tick crashed`, B | 11 in ~40 min | 12 in ~4 min |
+| B | `chain_empty` | `chain_empty` |
+
+**So this is a real defect, with a test that bites, and it is not what is stopping the sync.**
+It is committed because it is a defect -- a deadline that is spent twice is a deadline that is
+not a deadline -- and recorded here because the reasoning that produced it was wrong in a way
+worth keeping.
+
+### What the ~19 s actually is, and the four things that are now ruled out
+
+**The method that located it, because it is the transferable part.** `?DIAG_MS` is 1000, so a
+gap in the diagnostic **is** the length of the block: a `gen_server` cannot process a message
+while it is inside `handle_call/3`, so the tick's absence is the measurement. Intervals of
+19.01 s and 19.03 s on two independent processes are a shared timer rather than a coincidence.
+
+**What that method cannot do, which I asserted it could.** I read "24 samples, none with
+`fetching = true`" as *the conn is never inside a fetch*. **That is backwards: the diagnostic
+cannot observe the state it is in**, because observing it is what being blocked prevents. It
+went into the first version of this entry as evidence.
+
+Measured, on this pair, and each one ruled out:
+
+| Candidate | Measured | Verdict |
+|---|---|---|
+| RLP decode of the 192-header payload | **4 ms** (157,636 bytes, 821-byte headers) | out |
+| `eth_eth:verify_chain/3` on 192 linked headers | **289 ms**, returns `ok` | out |
+| `eth_keccak:hash/1` | **3 ms** per 821-byte header | out |
+| the frame's double-spent `Timeout` (above) | fixed, test bites | **out** |
+
+**Request-side work is therefore about 0.3 s, against a 15,000 ms fetch deadline and a
+20,000 ms call budget.** So roughly 3.7 s of the ~19 s is still unattributed, and 15 s of it is
+inside `fetch_request` -- which means either the deadline is still being overrun by something
+this measurement cannot see, or the block is not one `get_headers` call.
+
+**That last one is the fork, and it is not resolvable from the outside.** `eth_sync:walk_back/5`
+may issue two calls back to back; a `'$gen_call'` queued behind another one is served only
+after the first returns, so a block can be two 15 s fetches with the diagnostic tick invisible
+across both. Distinguishing that needs the number **from inside the handler**: elapsed time of
+each `handle_call({get_headers, ...})', and the fetch's own result beside it. That is one log
+line and it is not written yet.
+
+Two mistakes of mine are recorded because they cost the time and would cost it again:
+`binary:copy(<<I:256>>, 32)` is 1024 bytes, not 32 -- my first header template was 14,157
+bytes and every measurement taken through it was of a header 20x too large; and
+`verify_chain/3` **returns on the first broken link**, so an unlinked fixture measures nothing
+at all while looking like a fast success. Both were caught by printing the encoded size and
+the return value instead of believing the timing.
 
 ### Also found, also open
 

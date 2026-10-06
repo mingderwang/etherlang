@@ -338,17 +338,41 @@ send_frame(Sess, Sock, Code, Data) when byte_size(Data) =< ?MAX_FRAME ->
 send_frame(_, _, _, _) ->
     {error, message_too_large}.
 
+%% **One `Timeout' for the frame, not for each read inside it.**
+%%
+%% This used to hand the same `Timeout' to both `gen_tcp:recv' calls, so a frame could block
+%% for **twice** the budget it was given: the 32-byte header read gets `Timeout', and if it
+%% succeeds on the last millisecond the body read gets `Timeout' all over again.
+%% `eth_peer_conn:fetch_wait/5' re-derives the remaining time *between* iterations of its
+%% loop, and this function re-derived nothing *within* an iteration, so the two together
+%% spent the budget twice and nothing checked.
+%%
+%% **Measured on two real nodes talking over loopback.** The conn's own deadline is 15,000 ms
+%% and `eth_sync' calls it with 20,000. The per-second diagnostic stopped arriving for a
+%% median of 4-5 s and a maximum of **19.01 s** on one node and 19.03 s on the other -- and a
+%% `gen_server' cannot process a message while it is inside `handle_call/3', so the gap in
+%% the diagnostic *is* the length of the block. `eth_rlp:decode' on a 192-header payload
+%% (2.7 MB) costs 1 ms, so the extra four seconds were not decoding.
 recv_frame(Sess, Sock, Timeout) ->
-    case gen_tcp:recv(Sock, 32, Timeout) of
+    recv_frame_until(Sess, Sock, erlang:monotonic_time(millisecond) + Timeout).
+
+recv_frame_until(Sess, Sock, Deadline) ->
+    case gen_tcp:recv(Sock, 32, recv_timeout(Deadline)) of
         {ok, <<HeaderCt:16/binary, HeaderMAC:16/binary>>} ->
-            recv_frame_header(Sess, Sock, Timeout, HeaderCt, HeaderMAC);
+            recv_frame_header(Sess, Sock, Deadline, HeaderCt, HeaderMAC);
         {ok, _} ->
             {error, short_header};
         {error, _} = E ->
             E
     end.
 
-recv_frame_header(Sess, Sock, Timeout, HeaderCt, HeaderMAC) ->
+%% **Never 0, and that is not a style preference.** `gen_tcp:recv/3' reads a timeout of 0 as
+%% *wait forever*, so an exhausted budget turned into exactly the thing the deadline exists
+%% to prevent. `max(1, ...)' costs a millisecond and cannot hang.
+recv_timeout(Deadline) ->
+    max(1, Deadline - erlang:monotonic_time(millisecond)).
+
+recv_frame_header(Sess, Sock, Deadline, HeaderCt, HeaderMAC) ->
     {WantMAC, Ingress1} = mac_header(Sess#sess{egress = Sess#sess.ingress}, HeaderCt),
     case hash_equals(WantMAC, HeaderMAC) of
         false ->
@@ -361,13 +385,13 @@ recv_frame_header(Sess, Sock, Timeout, HeaderCt, HeaderMAC) ->
                     {error, frame_too_large};
                 true ->
                     RSize = FSize + ((16 - (FSize rem 16)) rem 16),
-                    recv_frame_body(Sess, Sock, Timeout, RSize, FSize,
+                    recv_frame_body(Sess, Sock, Deadline, RSize, FSize,
                                     Sess#sess{ingress = Ingress1, dec = Dec1})
             end
     end.
 
-recv_frame_body(_Sess, Sock, Timeout, RSize, FSize, Sess1) ->
-    case gen_tcp:recv(Sock, RSize + 16, Timeout) of
+recv_frame_body(_Sess, Sock, Deadline, RSize, FSize, Sess1) ->
+    case gen_tcp:recv(Sock, RSize + 16, recv_timeout(Deadline)) of
         {ok, Blob} ->
             <<FrameCt:RSize/binary, FrameMAC:16/binary>> = Blob,
             {WantMAC, Ingress2} = mac_frame(Sess1#sess{egress = Sess1#sess.ingress}, FrameCt),

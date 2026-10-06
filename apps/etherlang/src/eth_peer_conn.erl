@@ -328,9 +328,10 @@ handle_info(diag, S) ->
     %% entry it holds. A live, idle gen_server cannot fail a `gen_server:call/3' with a
     %% 2 s timeout, so the remaining explanation is that **the Pid in the manager's map is
     %% not this process** -- and the only way to see that is to print both.
-    logger:notice("etherlang: rlpx conn diag self=~p remote=~s handle_ms=~p q=~p doing=~s",
+    logger:notice("etherlang: rlpx conn diag self=~p remote=~s handle_ms=~p q=~p calls=~p fetching=~p doing=~s",
                 [self(), id8(maps:get(node_id, S#st.hello, undefined)),
-                 S#st.handle_ms, queue_len(), doing()]),
+                 S#st.handle_ms, queue_len(), queued_calls(),
+                   S#st.fetching, doing()]),
     {noreply, S};
 handle_info(ping, S) ->
     erlang:send_after(?PING_MS, self(), ping),
@@ -401,6 +402,27 @@ queue_len() ->
         {message_queue_len, N} -> N;
         _ -> -1
     end.
+
+%% **How many of the queued messages are unanswered calls.**
+%%
+%% `queue_len/0' alone cannot say whether a backlog matters, because the messages in it are
+%% not interchangeable. A `poll' costs this process up to `?POLL_MS' of blocking and is then
+%% consumed instantly; a `'$gen_call'' sits behind whatever is already in flight and its
+%% caller is counting the seconds. **A backlog of 20 that is 20 polls is a healthy
+%% connection, and a backlog of 20 that is 18 calls is the sync failure -- and both print the
+%% same number.**
+%%
+%% This is the number that decides between the two readings of a 20,000 ms call timeout, and
+%% it is here because neither can be taken from outside the process any more: `net_peerCount'
+%% answers from the manager and deliberately does not call the conn.
+queued_calls() ->
+    case erlang:process_info(self(), messages) of
+        {messages, Msgs} -> length([M || M <- Msgs, is_gen_call(M)]);
+        _ -> -1
+    end.
+
+is_gen_call({'$gen_call', _, _}) -> true;
+is_gen_call(_) -> false.
 
 doing() ->
     case erlang:process_info(self(), current_stacktrace) of
