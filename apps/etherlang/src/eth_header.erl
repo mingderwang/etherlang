@@ -31,7 +31,28 @@ header_fields() ->
      {opt_qty,  <<"blobGasUsed">>},
      {opt_qty,  <<"excessBlobGas">>},
      {opt_data, <<"parentBeaconBlockRoot">>},
-     {opt_data, <<"requestsHash">>}].
+     {opt_data, <<"requestsHash">>},
+      %% **Amsterdam is two EIPs, not one.** `slotNumber` is EIP-7843 and
+      %% `blockAccessListHash` is EIP-7928, and Amsterdam headers carry **both**. I found
+      %% the second one by fetching a real Amsterdam header, hashing it, and getting a hash
+      %% that did not match -- which is a different way of learning a field exists than
+      %% reading a schedule entry, and the only reason it was caught before the EIP was
+      %% declared implemented.
+      {opt_data, <<"blockAccessListHash">>},
+      %% **EIP-7843: a 23rd header field, `slotNumber`, a `uint64`.**
+      %%
+      %% The EIP says only "The header encoding shall be extended to include a slotNumber
+      %% field of type uint64" and **does not fix the position**, exactly as EIP-7685 did not
+      %% fix `requestsHash`'s. The position here is pinned against a real block rather than
+      %% chosen: Sepolia block **11,856,337**, the first with `slotNumber`, at timestamp
+      %% 1791294816 which is precisely `amsterdamTime`, hashes to
+      %% `0xa03f956aeb69d3fa234d9894c4309f4bb089cca9b6440cb45066c9ba39222588` with this field
+      %% **appended last**, and its value is `0xac6000` = 11,296,768. The block before it,
+      %% 11,856,336 at timestamp 1791294804, has no `slotNumber` at all, which is what makes
+      %% the field optional rather than a 22-field default -- and therefore why an
+      %% `opt_qty` and not a `qty`: a fixed-width encoding here would change the hash of every
+      %% pre-Amsterdam block on every network.
+      {opt_qty,  <<"slotNumber">>}].
 
 hash(Block) when is_map(Block) ->
     case header_term(Block) of

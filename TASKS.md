@@ -789,17 +789,51 @@ head" -- and the refusal is **correct behaviour**: a block past the range would 
 under rules the node does not have, and a wrong figure is worse than a declined
 certification. The design is working; the node is behind.
 
-**Amsterdam is EIP-7843 (SLOTNUM opcode).** Three surfaces, from the EIP and from geth's
-`core/chain_makers.go:544`:
+**Amsterdam is two EIPs, not one, and the second one was found by hashing a block.**
 
-* a **22nd header field `slotNumber`** (`uint64`, `rlp:"optional"`, appended after
-  `requestsHash`) -- so post-Amsterdam headers do not hash to their own value under this
-  node's encoding, which is why the range has to be enforced rather than wished away;
-* the **`SLOTNUM` opcode**, pushing the block's slot number;
-* **`ExecutionPayloadV4` / `PayloadAttributesV4`** carrying `slotNumber`, and therefore
-  `engine_newPayloadV5`, `engine_getPayloadV6`, `engine_forkchoiceUpdatedV5`.
+| What | EIP | State |
+|------|-----|-------|
+| header field `slotNumber`, opcode `SLOTNUM` (`0x4b`, gas **2**) | EIP-7843 | header field **done**, in this commit; opcode **not** |
+| header field `blockAccessListHash`, and the block access list itself | EIP-7928 | header field **done**, in this commit; the BAL **not** |
+| `ExecutionPayloadV4` / `PayloadAttributesV4`, `engine_newPayloadV5`, `engine_getPayloadV6`, `engine_forkchoiceUpdatedV4` | both | **not** |
 
-**None of the three is implemented.** That is the work item, and it is bounded.
+**I had this as one EIP and named `forkchoiceUpdatedV5`.** EIP-7843's own text says
+`engine_forkchoiceUpdatedV4`, and the header carries a second field I had never heard of.
+Both errors came from the same place: writing down what the EIP said about the *opcode* and
+assuming the fork was only that. The field list came from geth's `core/types/block.go`, which
+is a **reading** of the fork rather than of one document:
+
+    RequestsHash        *common.Hash `json:"requestsHash" rlp:"optional"`
+    BlockAccessListHash *common.Hash `json:"blockAccessListHash" rlp:"optional"`
+    SlotNumber          *uint64      `json:"slotNumber" rlp:"optional"`
+
+**And the second field was found by a failing hash, not by reading that list** -- I fetched a
+real Amsterdam header, put `slotNumber` last, and `eth_header:hash/1` answered something that
+was not the block's hash. That is the ordinary way a missing field announces itself, and the
+schedule entry that named the fork had said nothing about either field.
+
+**Amsterdam headers are 23 fields, and the node now hashes them correctly.** Sepolia block
+**11,856,337** (timestamp 1791294816, which is precisely `amsterdamTime`, so the first
+Amsterdam block on Sepolia) hashes to its claimed
+`0xa03f956aeb69d3fa234d9894c4309f4bb089cca9b6440cb45066c9ba39222588` with
+`blockAccessListHash` then `slotNumber` appended last. Block **11,856,336**, immediately
+before it, has neither field and still hashes to its own claim -- which is what makes the
+fields *optional* rather than a 23-field default, and a fixed-width encoding would change the
+hash of every pre-Amsterdam block on every network.
+
+**Both fields are `optional` and that is not a detail.** `0xe6048b5d...` and the integer
+`0xe6048b5d...` have the **same RLP encoding**, because an RLP integer is minimal big-endian
+and this value has no leading zero byte to strip. Every hash in the fixture starts with a
+non-zero byte -- which is what a uniform 32-byte field usually looks like -- so **no fixture
+made of real hashes can tell `opt_data` from `opt_qty`.** An injection switching
+`blockAccessListHash` to `opt_qty` was green until a fixture with a deliberately zeroed first
+byte was added, and that test is now the one that protects *every* hash field in the header,
+not only the two new ones.
+
+**What is still missing, and it is the part that keeps `past_modelled_range` honest:** the
+`SLOTNUM` opcode, the block access list EIP-7928 defines, and the v4 payload objects. Until
+those exist a post-Amsterdam block cannot be *executed*, and a node that executed one would
+produce a state root under rules it does not have -- so the refusal stays.
 
 ### A calendar-dependent fixture turned into a time bomb, and the refusal was the correct part
 
