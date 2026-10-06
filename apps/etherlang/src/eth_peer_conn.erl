@@ -211,9 +211,28 @@ handle_call({get_headers, Ref, Max, Skip, Reverse}, _From, S) ->
             %% Suspend the poll loop while the blocking fetch owns recv.
             Req = eth_eth:encode_get_headers(Ref, Max, Skip, Reverse),
             Verify = fun(Term) -> eth_eth:verify_chain(Term, not Reverse, to_skip(Skip)) end,
+            T0 = erlang:monotonic_time(millisecond),
             {Reply, S1} = fetch_request(S#st{fetching = true}, Base + 3,
                                         eth_rlp:encode(Req), Base + 4,
                                         fun eth_eth:decode_headers_bin/1, Verify),
+            %% **How long one `get_headers' call occupied this process, and what it got back.**
+            %%
+            %% A `gen_server' cannot process a message while it is inside `handle_call/3',
+            %% so the gap between two `?DIAG_MS` diagnostic lines *is* the length of the
+            %% block. Measured that way the block is ~19 s on a node whose fetch deadline is
+            %% 15,000 ms and whose caller's budget is 20,000 ms, and the request-side work
+            %% (RLP decode 4 ms, `eth_eth:verify_chain/3' 289 ms over 192 linked headers)
+            %% accounts for about 0.3 s of it. So roughly 3.7 s is unattributed, and the
+            %% gap cannot distinguish "one call overran its deadline" from "`eth_sync'
+            %% issued two calls back to back and the second waited behind the first".
+            %%
+            %% **This line is what separates those two**, because `n' is the call's ordinal
+            %% within this process: consecutive n' values mean separate calls, and a single
+            %% n' with a 19 s `ms' means one call that blocked for 19 s.
+            logger:notice("etherlang: get_headers n=~p ms=~p want=~p max=~p skip=~p rev=~p "
+                          "-> ~p",
+                          [get_headers_n(), erlang:monotonic_time(millisecond) - T0,
+                           short_ref(Ref), Max, Skip, Reverse, tag_reply(Reply)]),
             S2 = S1#st{fetching = false},
             erlang:send_after(?POLL_MS, self(), poll),
             {reply, Reply, S2}
@@ -328,10 +347,10 @@ handle_info(diag, S) ->
     %% entry it holds. A live, idle gen_server cannot fail a `gen_server:call/3' with a
     %% 2 s timeout, so the remaining explanation is that **the Pid in the manager's map is
     %% not this process** -- and the only way to see that is to print both.
-    logger:notice("etherlang: rlpx conn diag self=~p remote=~s handle_ms=~p q=~p calls=~p fetching=~p doing=~s",
+    logger:notice("etherlang: rlpx conn diag self=~p remote=~s handle_ms=~p q=~p calls=~p fetching=~p base=~p doing=~s",
                 [self(), id8(maps:get(node_id, S#st.hello, undefined)),
                  S#st.handle_ms, queue_len(), queued_calls(),
-                   S#st.fetching, doing()]),
+                   S#st.fetching, eth_base(S#st.eth), doing()]),
     {noreply, S};
 handle_info(ping, S) ->
     erlang:send_after(?PING_MS, self(), ping),
@@ -423,6 +442,41 @@ queued_calls() ->
 
 is_gen_call({'$gen_call', _, _}) -> true;
 is_gen_call(_) -> false.
+
+%% A per-process counter, so the log says *which* call was long rather than how long the
+%% conn was busy. It is in the process dictionary on purpose: it exists only for this log
+%% line and threading an N through `handle_call/3' would change a signature for a message.
+%% `{hash, <<32,186,185,102,240,97,35,140,...>>}' is 130-odd characters and the logger
+%% wraps the line in the middle of it, so the *result* of the call ends up on a continuation
+%% line and the whole entry becomes unmeasurable with a single grep. Printing the first 4
+%% bytes is enough to tell one request from another.
+%% **The negotiated message-code base, which decides whether a request is recognised at all.**
+%% `get_headers' is sent as `Base + 3' and the receiver dispatches on the code *it*
+%% negotiated, so two nodes that picked different forks cannot read each other's requests.
+%% Measured on the pair in `tools/two-node-p2p.sh': `serve_headers_req ENTER' is logged
+%% **zero** times on both nodes, so neither has ever seen a `get_headers' request. This is the
+%% number that says whether the code or the wire is at fault.
+eth_base(undefined) -> none;
+eth_base(#{base := B}) -> B;
+eth_base(_) -> '?'.
+
+short_ref({hash, H}) when is_binary(H), byte_size(H) >= 4 -> {hash, binary:part(H, 0, 4)};
+short_ref({number, N}) -> {number, N};
+short_ref(Other) -> Other.
+
+get_headers_n() ->
+    N = case get(get_headers_n) of undefined -> 0; V -> V end,
+    put(get_headers_n, N + 1),
+    N.
+
+%% `{ok, [H1, H2, ...]}' is 192 items long and erl_logger truncates it, so the shape is
+%% reported and not the payload. `ok' is kept distinct from an error: "the peer answered and
+%% the chain does not link" and "the peer never answered" have nothing in common, and a log
+%% line that prints both as a term has already thrown one of them away.
+tag_reply({ok, Hs}) when is_list(Hs) -> {ok, length(Hs)};
+tag_reply({ok, Other}) -> {ok, Other};
+tag_reply({error, _} = E) -> E;
+tag_reply(Other) -> Other.
 
 doing() ->
     case erlang:process_info(self(), current_stacktrace) of
@@ -773,8 +827,37 @@ fetch_wait(S, ExpectCode, Decode, Verify, Deadline) ->
             end;
         {ok, 1, _, Sess1} ->
             {{error, remote_disconnect}, S#st{sess = Sess1}};
-        {ok, _, _, Sess1} ->
-            fetch_wait(S#st{sess = Sess1}, ExpectCode, Decode, Verify, Deadline);
+        {ok, Other, Data, Sess1} ->
+            %% **A fetch must not make this process deaf.**
+            %%
+            %% Anything that is not the awaited response used to be **discarded**, and
+            %% `handle_info(poll, #st{fetching = true}, ...)` does not read the socket at all
+            %% while a fetch owns it. So for the whole 15,000 ms of a fetch this process
+            %% answered nobody -- and on two nodes that fetch from each other, neither one
+            %% ever sees the other's request.
+            %%
+            %% **Measured, on the pair in `tools/two-node-p2p.sh`.** Both nodes logged
+            %% `get_headers n=.. ms=15002..15006 -> {error, ..}` over and over, to the
+            %% millisecond of the fetch deadline, with **one success in thirteen at 13 ms**.
+            %% That 13 ms is the whole finding: it is the only moment either side was not
+            %% inside a fetch, and the only request either side answered. The failures were
+            %% never a slow peer. They were a deaf one.
+            %%
+            %% The Ping clause two cases above already replies inline, so this is that same
+            %% treatment extended to every code -- which is what a devp2p peer must do:
+            %% serving a peer while fetching is normal, not an exception.
+            S1a = S#st{sess = Sess1, last_in = erlang:monotonic_time(millisecond)},
+            %% **Proof that the deafness is gone.** This line only exists when a frame
+            %% arrived *during* a fetch and was served inline, which is the whole point:
+            %% `handle_info(poll, #st{fetching = true}, ...)' still does not read the socket,
+            %% so a zero here means the conn is answering nobody and the peer is being
+            %% starved by its own outbound request.
+            logger:notice("etherlang: fetch_wait served an unrequested frame code=~p "
+                          "bytes=~p", [Other, byte_size(Data)]),
+            case handle_msg(Other, Data, S1a) of
+                {ok, S2} -> fetch_wait(S2, ExpectCode, Decode, Verify, Deadline);
+                {stop, Reason} -> {{error, Reason}, S1a}
+            end;
         {error, timeout} ->
             case Deadline > erlang:monotonic_time(millisecond) of
                 true -> fetch_wait(S, ExpectCode, Decode, Verify, Deadline);

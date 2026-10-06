@@ -76,6 +76,44 @@ autodial() ->
               %% here is that a *non-zero* count is distinguishable from a hardcoded `0x0'.
               ok = wait_eth_peer(peer_ad_b, IDA, 200),
               ?assertEqual(1, count_remote(peer_ad_b, IDA)),
+              %% **A peer that is fetching must still answer the other one.**
+              %%
+              %% This is the defect, and it is the reason two of these nodes could not sync
+              %% even though they were connected. `handle_info(poll, #st{fetching = true}, S)`
+              %% does not read the socket at all while a fetch owns it, and `fetch_wait/5`
+              %% **discarded** any frame that was not the awaited response. So for the whole
+              %% 15,000 ms of a fetch this process answered nobody -- and when both peers fetch
+              %% from each other, neither one ever sees the other's request.
+              %%
+              %% Measured on the pair in `tools/two-node-p2p.sh`: both nodes logged
+              %% `get_headers ms=15002..15006 -> {error, timeout}` over and over, to the
+              %% millisecond of the fetch deadline, with **one success in thirteen, at 13 ms**.
+              %% That 13 ms is the whole finding -- the only moment either side was not inside
+              %% a fetch, and the only request either side answered.
+              %%
+              %% The fixture makes the fetch block without a network: ask for a block the peer
+              %% does not have, and `serve_headers/5` answers **nothing** (its `{error, _}'
+              %% branch sends no frame), so the fetch waits out its whole deadline. Then the
+              %% *other* side asks for something that does exist, and that request must be
+              %% served while the first fetch is still running.
+              %%
+              %% Before the fix B's call waits for A's fetch to end, so it returns at about
+              %% 15,000 ms and the assertion at 5,000 ms fails. There is no timing race here:
+              %% the blocking fetch is 15,000 ms long by construction.
+              spawn(fun() ->
+                        try eth_peer:get_headers(peer_ad_a, {hash, <<0:256>>}, 1, 0, false)
+                        catch _:_ -> {error, abandoned}
+                        end
+                end),
+              timer:sleep(1000),
+              {T, Served} = timer:tc(fun() ->
+                                             eth_peer:get_headers(peer_ad_b, {number, 0},
+                                                                  1, 0, false)
+                                         end),
+              io:format("~n  peer fetch test: served in ~w ms -> ~p~n",
+                        [T div 1000, tag_headers(Served)]),
+              ?assertMatch({ok, [_ | _]}, Served),
+              ?assert(T < 5000000),
               ?assertEqual(1, eth_peer:eth_peer_count(peer_ad_a)),
               ?assertEqual(1, eth_peer:eth_peer_count(peer_ad_b)),
             %% Headers flow over the auto-dialed connection.
@@ -136,6 +174,11 @@ wait_eth_peer(Name, ID, N) ->
         [_ | _] -> ok;
         [] -> timer:sleep(100), wait_eth_peer(Name, ID, N - 1)
     end.
+
+%% The count, not the payload: a header term is ~700 bytes, eunit truncates it, and a
+%% truncated wrong answer is indistinguishable from a right one.
+tag_headers({ok, Hs}) when is_list(Hs) -> {ok, length(Hs), 'headers'};
+tag_headers(E) -> E.
 
 count_remote(Name, ID) ->
     Infos = eth_peer:peers(Name),

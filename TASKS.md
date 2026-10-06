@@ -34,8 +34,8 @@ with the file it sat above.
 
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
-build. OTP 29.1. Current: **49 src modules / 14,518 code lines, 65 test modules /
-14,535 code lines, 1029 eunit tests, all passing.**
+build. OTP 29.1. Current: **49 src modules / 14,545 code lines, 65 test modules /
+14,551 code lines, 1029 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive
 them with the procedure below rather than editing this sentence.
@@ -610,6 +610,105 @@ bytes and every measurement taken through it was of a header 20x too large; and
 `verify_chain/3` **returns on the first broken link**, so an unlinked fixture measures nothing
 at all while looking like a fast success. Both were caught by printing the encoded size and
 the return value instead of believing the timing.
+
+### Fixed: a conn that is fetching no longer stops answering peers
+
+`handle_info(poll, #st{fetching = true}, S)` does not read the socket at all while a fetch
+owns it, and `fetch_wait/5` **discarded** any frame that was not the awaited response. So for
+the whole 15,000 ms of a fetch this process answered nobody -- and when both peers fetch from
+each other, neither one ever sees the other's request. That is not a slow peer; it is a deaf
+one, and the two look identical from the caller's side.
+
+**Measured, on the pair in `tools/two-node-p2p.sh`, before the fix.** Both nodes logged
+
+```
+get_headers n=0 ms=15002 -> {error, timeout}
+get_headers n=1 ms=15002 -> {error, timeout}
+get_headers n=2 ms=15003 -> {error, timeout}
+get_headers n=3 ms=15006 -> {error, timeout}
+get_headers n=4 ms=13    -> {ok, ...}          <-- the only success, in thirteen
+```
+
+**Every failure lands on the millisecond of the 15,000 ms fetch deadline**, and the single
+success is the only moment either side was not inside a fetch. A `get_headers` call that
+returns `{error, timeout}` at exactly the deadline is a peer that answered nothing, and the
+one that returned in 13 ms is the same code path on the same second.
+
+**After the fix, same pair:**
+
+```
+B: n=2 ms=14 -> {ok, ...}   n=3 ms=12 -> {ok, ...}   n=4 ms=11 -> {ok, ...}
+A: `fetch_wait served an unrequested frame' logged 9 times
+```
+
+**The test is the same shape and reproduces the same numbers.** `eth_peer_tests:autodial/0`
+asks one side for a block the peer does not have -- and `eth_eth:serve_headers/5`'s
+`{error, _}' branch sends **no frame at all**, so the fetch waits out its full deadline
+without a network or a timer -- and then has the *other* side ask for something that does
+exist. Injecting the discard back:
+
+```
+peer fetch test: served in 15002 ms -> {error,timeout}
+```
+
+which is the live measurement, in a unit test, to the millisecond. There is no timing race
+here: the blocking fetch is 15,000 ms long by construction.
+
+`fetch_wait/5` now calls `handle_msg/3` on the frame it did not expect. The Ping clause two
+cases above already replied inline, so this is that same treatment extended to every code --
+which is what a devp2p peer must do: serving a peer while fetching is normal, not an
+exception. **This is the structural change `TASKS.md` had recorded as "correct and much
+larger, and it touches framing state"**; it turned out to be two lines, because `fetch_wait`
+already read the frame and already knew how to handle it.
+
+**A diagnostic that earned its place.** `handle_call({get_headers, ...})` now logs the elapsed
+time, the call's ordinal within the process, and the shape of the reply:
+
+```
+etherlang: get_headers n=4 ms=11 want={hash,<<...>>} max=192 skip=0 rev=true -> {ok, 1}
+```
+
+The ordinal is the part that matters. **The gap in the per-second diagnostic cannot tell
+"one call overran" from "two calls back to back"**, because a `'$gen_call'` queued behind
+another is served only after the first returns and the tick is invisible across both; the
+ordinal can. And `want=` prints the hash's first 4 bytes rather than all 32, because the full
+form wrapped the line and put the result on a continuation, where one grep cannot see it.
+
+### And the reason B still does not sync: A has one block in its store
+
+With the deafness gone, B's requests succeed -- and return **`{ok, 1}`**. One header, not the
+192 asked for. `eth_eth:walk/6` is correct (`Rev = true` steps `Num - 1`); it stops because
+`eth_chain:get_by_number/2` finds nothing one below the head.
+
+**A's `/health` reports `chain.blocks = 1`.** Its `eth_getBlockByNumber` answers for the head
+*and its parent* -- but those answers come from the upstream RPC, because `base_source` is
+`upstream` on A. The chain store holds the head and nothing else.
+
+**So the `excess_blob_gas_mismatch` at 11,846,220 is not "A cannot advance". It is "A has no
+chain to serve",** and B cannot sync from a peer with one block no matter how well the two
+nodes talk. That reorders the remaining work: the blob-gas rule is now the blocker for p2p
+sync, not a separate consensus defect.
+
+### A build that failed for several cycles, and what I concluded from it
+
+**The `fetch_wait/5` fix referenced `S1` where the parameter is `S`, so it did not compile**,
+and neither did an instrument inserted into `serve_headers_req/2` with a stray `;`. Two
+consequences, both mine:
+
+* `rebar3 as prod release` output went to `/dev/null` in the rebuild loop, so a **failed build
+  produced no evidence and the old release kept running.** I then measured the pair, concluded
+  "the fix does not help", and wrote that down -- three rebuild cycles against a tree that had
+  never contained the change. The tell was available the whole time and I did not look for it:
+  `grep base=` in the running node's log returned **nothing**, which is not what a successful
+  rebuild looks like.
+* AGENTS.md's rule is that `warnings_as_errors` makes any warning a failure. It does not say a
+  *compile error* is loud, because a release build redirects it away. **A verification step
+  that shares its plumbing with the step it verifies checks nothing** -- `>/dev/null` on a
+  rebuild is the same mistake as the `cp` from the wrong path.
+
+And one more, in the same family: `io:format/1` inside a test is how the `{acceptor_hello, _}`
+versus `{acceptor_hello, ...}` mix-up was found at all -- a receive that never matches and a
+receive that matches nothing print the same until you look at what is actually in the mailbox.
 
 ### Also found, also open
 
