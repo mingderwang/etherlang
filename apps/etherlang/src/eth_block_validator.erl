@@ -338,7 +338,27 @@ excess_blob_gas_mismatch(_Parent, _Header, Fork) ->
                     case eth_fork_schedule:excess_blob_gas(
                              Fork,PEG, PBGU) of
                         HEG -> ok;
-                        Other -> {error, {invalid_header,
+                        Other ->
+                            %% **This line exists because the arithmetic could not be
+                            %% reconstructed from outside.** Three attempts to infer where the
+                            %% remaining 1,398,101 came from were all wrong: reverse-solving
+                            %% the chain's own numbers for a target gave a value that changed
+                            %% every few blocks; probing `eth_fork_schedule:excess_blob_gas/3'
+                            %% with `cancun' gave a third number which I read as the code's
+                            %% behaviour, when the node was using a later fork's target; and
+                            %% comparing A's stored head against upstream field by field found
+                            %% all eight fields equal, which killed that hypothesis as well.
+                            %%
+                            %% So the inputs are printed rather than inferred. **On every
+                            %% evaluation and not only on failure** -- a rule that logs only
+                            %% when it is wrong cannot be compared with a case where it was
+                            %% right, and that control is what each of those inferences needed.
+                            logger:notice("etherlang: excessBlobGas fork=~p parent=~p "
+                                          "header=~p target=~p computed=~p agrees=~p",
+                                          [Fork, PEG, HEG,
+                                           eth_fork_schedule:target_blob_gas_per_block(Fork),
+                                           Other, Other =:= HEG]),
+                            {error, {invalid_header,
                                           {excess_blob_gas_mismatch, HEG, Other}}}
                     end;
                 _ ->

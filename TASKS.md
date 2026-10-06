@@ -34,8 +34,8 @@ with the file it sat above.
 
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
-build. OTP 29.1. Current: **49 src modules / 14,549 code lines, 65 test modules /
-14,564 code lines, 1031 eunit tests, all passing.**
+build. OTP 29.1. Current: **49 src modules / 14,555 code lines, 65 test modules /
+14,566 code lines, 1031 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive
 them with the procedure below rather than editing this sentence.
@@ -773,6 +773,88 @@ instrument is one line inside `excess_blob_gas_mismatch/3` printing `PEG`, `HEG`
 resolved `Fork` and `target_blob_gas_per_block(Fork)` -- the node's own inputs, rather than an
 inference from a remote endpoint. That is not written. **Three wrong inferences in a row is the
 signal that the remaining work is measurement, not reasoning.**
+
+### Amsterdam activated on 2026-10-06 and the node cannot certify a block past it
+
+**This is now, not eventually.** Sepolia's `amsterdamTime` is **1791294816 =
+2026-10-06T13:53:36Z**, read from go-ethereum's `params/chainspecs/sepolia.json`, and the
+node's own schedule already carries `{time, 1791294816, amsterdam}` -- so the fork *is* named
+and *is* scheduled. What it does not have is the **rules**.
+
+`eth_fork_schedule:past_modelled_range/3` takes the frontier from `last_activation/1` of the
+network's schedule, so **the newest modelled fork becoming active is by definition "past the
+modelled range"**. The function's own comment says this is intended -- "Sepolia's modelled
+range ends at Amsterdam, 2026-10-06. On that day this function starts answering `true' for its
+head" -- and the refusal is **correct behaviour**: a block past the range would be executed
+under rules the node does not have, and a wrong figure is worse than a declined
+certification. The design is working; the node is behind.
+
+**Amsterdam is EIP-7843 (SLOTNUM opcode).** Three surfaces, from the EIP and from geth's
+`core/chain_makers.go:544`:
+
+* a **22nd header field `slotNumber`** (`uint64`, `rlp:"optional"`, appended after
+  `requestsHash`) -- so post-Amsterdam headers do not hash to their own value under this
+  node's encoding, which is why the range has to be enforced rather than wished away;
+* the **`SLOTNUM` opcode**, pushing the block's slot number;
+* **`ExecutionPayloadV4` / `PayloadAttributesV4`** carrying `slotNumber`, and therefore
+  `engine_newPayloadV5`, `engine_getPayloadV6`, `engine_forkchoiceUpdatedV5`.
+
+**None of the three is implemented.** That is the work item, and it is bounded.
+
+### A calendar-dependent fixture turned into a time bomb, and the refusal was the correct part
+
+`eth_tx_validity_tests:child_block/3` built its blocks through `eth_block:new/2`, which stamps
+`erlang:system_time(second)` (`eth_block.erl:130`). `eth_block:finalize/1` then validates that
+timestamp, so **from 2026-10-07 every block the module built was refused** for being past the
+modelled range, and `valid_nonce_is_required_test` failed in a suite that had been green at
+1031.
+
+**It fails with or without this session's other changes** -- verified by stashing them and
+re-running -- which is the only way to tell a date from a regression.
+
+The fixture now pins the timestamp to `1000001`, the parent's `1000` plus a second: after the
+parent, as `timestamp_not_after_parent` requires, and decades inside every activation the
+node models. **A test that depends on today's date is a test with an expiry date**, and this
+one had one nobody wrote down.
+
+**Production was never affected**, and the reason is worth recording: `eth_block_builder`
+overrides the field with the CL's `payloadAttributes.timestamp` (`eth_block_builder.erl:258`)
+and only falls back to `eth_block:new`'s default when the CL omits one. That fallback is the
+same latent bug, on a path where the CL *can* trigger it.
+
+### A local eth-netstats, and why the hosted one is not an option
+
+`tools/netstats/` runs https://github.com/cubedro/eth-netstats (0.0.9) locally against a node.
+That fork needs **no mongo**, and only node and npm.
+
+**`ethstats.net` has no DNS record at all** from any public resolver -- checked against 1.1.1.1
+and 8.8.8.8, with `registry.npmjs.org` and publicnode resolving as controls -- so there is
+nothing to connect to, and no client package on npm any more (`eth-net-intelligence-api` and
+`ethstats-client` both 404).
+
+**Every figure on that dashboard is measured from the node's own JSON-RPC.** Fields the node
+does not expose are sent as `null` so the UI shows a gap rather than a plausible number,
+because the hosted service's failure was exactly that: it showed `peers: 33` and
+`gasPrice: 998966348` while the node answered `net_peerCount 0x0` and
+`eth_gasPrice 0x3d45b514`. `blockTime` is **derived** from consecutive height samples and says
+so at the sampler, because a derivation presented as a measurement is how a number becomes a
+claim the node never made.
+
+**Upstream 0.0.9 has a silent bug that this repository had to patch to see anything at all.**
+`Node.setStats/3` calls `callback(null, this.getStats())` and then **falls through** to
+`callback('Stats undefined', null)` -- no `return`. `Collection.update/3`'s callback tests
+`err !== null` first, so every *successful* update took the error branch, logged
+"Update error: Stats undefined", and never forwarded to the dashboard. The stats were
+recorded (`setBlock`, `setBasicStats` and `setPending` had all run), so **the server looked
+healthy and the UI showed nothing** -- the same failure as the hosted service, by a different
+cause. One line, kept as `netstats-0.0.9-missing-return.patch`.
+
+Three more things cost real time and are in the script's comments: `/api` is the socket that
+carries `hello`/`update` and `/external` is the collections channel, so a message posted to
+the wrong one **connects cleanly and produces no log line at all**; the dashboard socket sends
+nothing until the client says `ready`; and the dashboard's vocabulary is its own --
+`Node.setBasicStats/2` reads `active`, not `online`, and ignores a top-level `height` entirely
+in favour of `stats.block.number`.
 
 ### Also found, also open
 

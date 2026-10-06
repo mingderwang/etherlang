@@ -126,9 +126,31 @@ int_to_32(V) -> <<V:256/unsigned-big>>.
 
 %% A block ready to finalize: its parent's declared state root is the MPT's own
 %% root, which is the condition finalize/1 requires before it will execute.
+%% **The timestamp is pinned, and it has to be.**
+%%
+%% `eth_block:new/2' stamps `erlang:system_time(second)', so every block built here used to
+%% carry the wall clock -- and `eth_block:finalize/1' validates that against
+%% `eth_fork_schedule:past_modelled_range/3`, whose frontier is the newest fork the node
+%% models. Sepolia's Amsterdam activated at 1791294816 (2026-10-06T13:53:36Z), so from the
+%% next day **every block this module built was refused for being past the modelled range**
+%% and `valid_nonce_is_required_test` failed in a suite that had been green at 1031.
+%%
+%% The refusal was *correct*: the node cannot certify a post-Amsterdam block, because it does
+%% not have EIP-7843's `slotNumber' header field yet. The **test** was what was wrong -- it
+%% was asking about transaction nonces while depending on today's date.
+%%
+%% A fixed value is also what makes this module independent of the schedule: the timestamp has
+%% to be after the parent (`timestamp_not_after_parent') and inside the modelled range, and
+%% 1000001 is the parent's `1000' plus a second -- decades inside every activation modelled.
+%%
+%% **Production was never affected**: `eth_block_builder' overrides the field with the CL's
+%% `payloadAttributes.timestamp' (eth_block_builder.erl:258) and only falls back to this
+%% default when the CL omits one.
+-define(CHILD_TS, 1000001).
 child_block(Parent, Number, Txs) ->
     (eth_block:new(Parent, Number))#block{transactions = Txs,
-                                          miner = ?COINBASE}.
+                                           miner = ?COINBASE,
+                                           timestamp = ?CHILD_TS}.
 
 %% A child block whose fee collector is a known address, so the coinbase payment
 %% is observable rather than going to the default zero address.

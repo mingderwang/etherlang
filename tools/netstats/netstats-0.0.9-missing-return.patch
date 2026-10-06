@@ -1,0 +1,21 @@
+diff --git a/lib/node.js b/lib/node.js
+index 8e4f9ca..e9a49a1 100644
+--- a/lib/node.js
++++ b/lib/node.js
+@@ -140,6 +140,16 @@ Node.prototype.setStats = function(stats, history, callback)
+ 		this.setPending( _.result(stats, 'pending', this.stats.pending), function (err, stats) {} );
+ 
+ 		callback(null, this.getStats());
++
++		// **The missing `return` here is an upstream bug, and it is silent.** Without it the
++		// `callback('Stats undefined', null)` below runs on *every* successful update too, so
++		// `Collection.update/3`'s callback -- which tests `if(err !== null)` first -- always
++		// took the error branch, logged "Update error: Stats undefined", and never forwarded
++		// the stats to the dashboard. The stats themselves *were* recorded (`setBlock`,
++		// `setBasicStats` and `setPending` had all run), so the server looked alive and the UI
++		// showed nothing. That is the failure the hosted service was abandoned for, reproduced
++		// by a different cause.
++		return;
+ 	}
+ 
+ 	callback('Stats undefined', null);
