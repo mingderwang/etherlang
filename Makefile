@@ -1,19 +1,95 @@
 SHELL := /bin/bash
-REBAR := $(shell command -v rebar3 2>/dev/null)
+## **The working rebar3 first, and only then PATH.**
+##
+## `command -v rebar3` *does* find something on this machine -- a mise shim that answers
+## `rebar3 is not a valid shim` and exits non-zero. So a Makefile that resolves its tool with
+## `command -v` alone runs a broken launcher and gets mise's complaint on stderr in place of
+## a build, which is how `release-pair` first failed while looking like a stale release.
+## Meanwhile every number in this repository was produced by invoking
+## `/Users/mingderwang/.bin/rebar3` by absolute path.
+##
+## The order is therefore: the known-good path, then PATH. **A Makefile target that cannot
+## run its tool must fail, not print something and exit 0** -- that shape cost three
+## measurement cycles before this gate existed.
+REBAR ?= $(shell ls -1 "$$HOME/.bin/rebar3" 2>/dev/null || ls -1 /Users/mingderwang/.bin/rebar3 2>/dev/null || command -v rebar3 2>/dev/null)
 
-.PHONY: all compile test eunit counts check-ledger docs rationale edoc-preview clean docker-build docker-test docker-run compose-up compose-down compose-logs bench
+## Fail loudly rather than run a broken command. It is expanded inside a recipe, not used as a
+## prerequisite: a variable holding a recipe line is a *target name* to make, and using it as a
+## prerequisite gives `No rule to make target '@test''.
+NEED_REBAR = test -n "$(REBAR)" || { echo "rebar3 not found. Set REBAR=/path/to/rebar3"; exit 1; }
+
+.PHONY: all compile test eunit release-pair counts check-ledger docs rationale edoc-preview clean docker-build docker-test docker-run compose-up compose-down compose-logs bench
 
 all: compile
 
 ## Compile (local rebar3, if available)
 compile:
-	@if [ -n "$(REBAR)" ]; then $(REBAR) as prod compile; \
-	else echo "rebar3 not installed locally; use 'make docker-test' or 'make docker-build'"; fi
+	@$(NEED_REBAR)
+	@$(REBAR) as prod compile
 
 test: eunit
 eunit:
-	@if [ -n "$(REBAR)" ]; then $(REBAR) eunit; \
-	else echo "rebar3 not installed locally; use 'make docker-test'"; exit 1; fi
+	@$(NEED_REBAR)
+	@$(REBAR) eunit
+
+## **Rebuild both release trees, start the pair, and refuse to report success on a stale
+## build.**
+##
+## This target exists because of a specific, measured failure. A fix was written to
+## `apps/etherlang/src/eth_peer_conn.erl`, the rebuild was run as
+## `rebar3 as prod release >/dev/null`, **the build failed**, and because the output went
+## nowhere the old release kept running. Three rebuild cycles were then spent measuring the
+## pair and concluding -- in writing -- that the fix "does not help". It had never been
+## compiled. The clue was available throughout: a marker added in the same edit
+## (`base=`) was **absent** from the running node's log, which is not what a successful
+## rebuild looks like.
+##
+## Two failures, one cause. `warnings_as_errors` makes a *warning* fail the build, and says
+## nothing about a *compile error* whose output has been discarded; and a verification step
+## that shares its plumbing with the step it verifies checks nothing. So:
+##
+##   * the build's output is never discarded, and a missing "successfully assembled" fails;
+##   * after the nodes are up, the newest source file is compared against the beams actually
+##     shipped in the release. **Source newer than the shipped beam fails loudly.** That is
+##     the check whose absence cost three cycles.
+##
+## `MARKER` is optional and is asserted to appear in the running node's log, for when a change
+## is only observable in a log line: `make release-pair MARKER='base='`.
+release-pair:
+	@set -u; \
+	STAMP="$$(git rev-parse --short HEAD 2>/dev/null)-$$(date +%s)"; \
+	$(NEED_REBAR); \
+	src=$$(find apps/etherlang/src -name '*.erl' -newer _build/prod/rel/etherlang/lib 2>/dev/null | head -1); \
+	echo "== building _build/prod (output is NOT discarded) =="; \
+	$(REBAR) as prod release 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tail -5; \
+	$(REBAR) as prod release 2>&1 | grep -q 'successfully assembled' \
+	  || { echo "FAIL: rebar3 as prod release did not assemble -- the release is stale or broken"; exit 1; }; \
+	echo "== syncing node2 =="; \
+	rm -rf _build/node2/rel/etherlang && mkdir -p _build/node2/rel && \
+	rsync -a --exclude 'data' _build/prod/rel/etherlang _build/node2/rel/ && \
+	sed -i '' 's/^-sname etherlang$/-sname etherlang2/' _build/node2/rel/etherlang/releases/*/vm.args; \
+	echo "== freshness gate =="; \
+	newest_src=$$(find apps/etherlang/src apps/etherlang/include -name '*.erl' -o -name '*.hrl' 2>/dev/null | xargs stat -f '%m' 2>/dev/null | sort -n | tail -1); \
+	newest_beam=$$(find _build/prod/rel/etherlang/lib -name '*.beam' 2>/dev/null | xargs stat -f '%m' 2>/dev/null | sort -n | tail -1); \
+	if [ -n "$$newest_src" ] && [ -n "$$newest_beam" ] && [ "$$newest_src" -gt "$$newest_beam" ]; then \
+	  echo "FAIL: newest source ($$newest_src) is NEWER than the newest shipped beam ($$newest_beam)"; \
+	  echo "      the release does not contain the current tree. Do not measure anything."; \
+	  ls -l $$src 2>/dev/null; exit 1; \
+	fi; \
+	echo "  ok: shipped beams are newer than every source file"; \
+	echo "== starting the pair (ETH_BUILD_STAMP=$STAMP) =="; \
+	ETH_BUILD_STAMP="$$STAMP" tools/two-node-p2p.sh start; \
+	newest_log=$$(ls -t _build/prod/rel/etherlang/log/erlang.log.* 2>/dev/null | head -1); \
+	grep -q "build stamp $$STAMP" "$$newest_log" 2>/dev/null \
+	  || { echo "FAIL: $$newest_log does not contain \"build stamp $$STAMP\""; \
+	       echo "      the running node did not come from the build just made."; \
+	       echo "      what it says instead:"; grep -o "build stamp [^ ]*" "$$newest_log" | tail -3; exit 1; }; \
+	echo "  ok: the running node logged this exact stamp"; \
+	if [ -n "$(MARKER)" ]; then \
+	  grep -q '$(MARKER)' "$$newest_log" 2>/dev/null \
+	    || { echo "FAIL: marker '$(MARKER)' absent from $$newest_log"; exit 1; }; \
+	  echo "  ok: marker '$(MARKER)' present"; \
+	fi
 
 ## The size figures quoted in README.md, AGENTS.md and TASKS.md. **Run this and paste its
 ## output; do not edit the numbers by hand.** The counts drifted three times, and the

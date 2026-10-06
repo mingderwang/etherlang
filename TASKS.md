@@ -34,7 +34,7 @@ with the file it sat above.
 
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
-build. OTP 29.1. Current: **49 src modules / 14,545 code lines, 65 test modules /
+build. OTP 29.1. Current: **49 src modules / 14,549 code lines, 65 test modules /
 14,551 code lines, 1029 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive

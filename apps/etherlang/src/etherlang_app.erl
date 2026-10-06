@@ -42,6 +42,17 @@ check_config() ->
 %% and exposed, and refusing to boot an operator out of a configuration they chose on
 %% purpose is a worse answer than saying so once.
 start(_StartType, _StartArgs) ->
+    %% **Which build is this, printed before anything else can refuse to run.**
+    %%
+    %% `make release-pair` sets `ETH_BUILD_STAMP` to `<git sha>-<epoch>` and then asserts that
+    %% exact string appears in the log this process just wrote. **The first version of that
+    %% gate asserted a marker from a *connection* diagnostic**, which cannot be satisfied when
+    %% no peer has connected -- an instrument with no positive result, which is worse than no
+    %% instrument, and it reported a healthy build as stale.
+    %%
+    %% It is here rather than after `check_config/0` on purpose: a node that refuses to boot is
+    %% exactly the case where knowing *which* build refused is worth the most.
+    logger:notice("etherlang: build stamp ~ts", [build_stamp()]),
     case check_config() of
         {error, Problems} ->
             logger:error("refusing to start: configuration is not usable", #{
@@ -50,6 +61,15 @@ start(_StartType, _StartArgs) ->
         {ok, Warnings} ->
             [logger:warning("configuration: ~s", [format_problem(W)]) || W <- Warnings],
             start_unchecked()
+    end.
+
+%% **Absent is a value here.** A node started by hand rather than by `make release-pair'
+%% answers `unstamped', and that string in a log is the reason a freshness check cannot
+%% conclude anything -- so it is stated rather than left blank.
+build_stamp() ->
+    case os:getenv("ETH_BUILD_STAMP") of
+        false -> "unstamped";
+        S -> S
     end.
 
 format_problem({Var, Given, Why}) ->
