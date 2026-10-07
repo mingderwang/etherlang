@@ -321,7 +321,76 @@ an_excess_blob_gas_that_is_not_the_computed_one_is_refused_test() ->
                          <<"excessBlobGas">> => hex(0)},
       ?assertEqual(ok, eth_block_validator:validate(Parent, Child, cancun)).
 
-  before_cancun_there_is_no_excess_blob_gas_to_check_test() ->
+  %% **EIP-7918, through the production validator rather than the fork schedule.**
+%%
+%% The unit tests in `eth_4844_tests' pin the rule; this pins that `validate/3' supplies
+%% it correctly, and it is the only test that can tell the parent's base fee from the
+%% header's. Injecting `num(Header, <<"baseFeePerGas">>)` in place of `num(Parent, ...)`
+%% -- the exact one-word confusion the previous fix was about -- left the whole validator
+%% module green, because every fixture in it had `baseFeePerGas` identical in parent and
+%% child. **Two headers that agree about a field cannot test which header is read.**
+%%
+%% Sepolia 11,846,219 -> 11,846,220, the pair that stopped the node:
+%%
+%%   parent  excessBlobGas 210140716  blobGasUsed 655360  baseFeePerGas 1057813701
+%%   child   excessBlobGas 210359169  blobGasUsed 131072
+%%
+%% **Getting the two base fees onto opposite sides of the reserve threshold took real
+%% numbers, and that is the part worth keeping.** The threshold at this block's excess is
+%% `blobPrice / 8192` = 1,034,202,240. EIP-1559 derives the child's fee from the parent's,
+%% so the two are within a percent of each other and a fixture that sets one without the
+%% other is refused by `base_fee_mismatch' before the blob rule is ever reached -- which
+%% is what my first two attempts did. The parent's `gasUsed` is lowered to 12,000,000 so
+%% the child's fee *falls* rather than rises, putting it at 1,031,368,359: **below** the
+%% threshold while the parent is **above** it. That is the only arrangement in which the
+%% two readings give different answers.
+-define(BPO2_THRESHOLD_PARENT, 1057813701).
+-define(BPO2_THRESHOLD_GAS_USED, 12000000).
+
+bpo2_pair(ParentBaseFee, ParentGasUsed) ->
+    Parent = (parent())#{<<"excessBlobGas">> => hex(210140716),
+                         <<"blobGasUsed">> => hex(655360),
+                         <<"gasUsed">> => hex(ParentGasUsed),
+                         <<"baseFeePerGas">> => hex(ParentBaseFee)},
+    Child = (child())#{<<"gasUsed">> => hex(21000),
+                       <<"baseFeePerGas">> =>
+                           hex(eth_fork_schedule:base_fee(
+                                 ParentGasUsed, ?PARENT_GAS_LIMIT, ParentBaseFee)),
+                       <<"excessBlobGas">> => hex(210359169),
+                       <<"blobGasUsed">> => hex(131072)},
+    {Parent, Child}.
+
+sep_11_846_220_is_accepted_by_the_validator_test() ->
+    {Parent, Child} = bpo2_pair(?BPO2_THRESHOLD_PARENT, ?BPO2_THRESHOLD_GAS_USED),
+    ?assertEqual(ok, eth_block_validator:validate(Parent, Child, bpo2)).
+
+%% **The control: reading the *header's* base fee refuses this exact block.**
+%%
+%% The header's fee is 1,031,368,359, below the threshold, so the reserve does not bind,
+%% EIP-4844's subtraction applies and the rule answers 208961068 -- **the figure this
+%% node logged as `computed' before EIP-7918 existed.** So the two readings are not
+%% cosmetic: one accepts the block the chain produced and the other rejects it.
+the_blocks_own_base_fee_is_not_the_one_eip_7918_reads_test() ->
+    {Parent, Child} = bpo2_pair(?BPO2_THRESHOLD_PARENT, ?BPO2_THRESHOLD_GAS_USED),
+    HeaderFee = eth_hex:decode(maps:get(<<"baseFeePerGas">>, Child)),
+    ParentFee = eth_hex:decode(maps:get(<<"baseFeePerGas">>, Parent)),
+    ?assertNotEqual(ParentFee, HeaderFee),
+    ?assertEqual(210359169, eth_fork_schedule:excess_blob_gas(bpo2, 210140716, 655360,
+                                                             ParentFee)),
+    ?assertEqual(208961068, eth_fork_schedule:excess_blob_gas(bpo2, 210140716, 655360,
+                                                             HeaderFee)).
+
+%% **Why the control stops at the fork schedule and does not call `validate/3' again.**
+%%
+%% Giving the header the parent's base fee is what would prove the validator reads the
+%% wrong one -- and it cannot be done through `validate/3', because `base_fee_mismatch'
+%% runs first and refuses any header whose fee is not the one EIP-1559 derives. **The
+%% check-ordering that makes a fixture unbuildable is the same ordering that would make
+%% the confusion harmless if it were the other way round**, and the test that covers it
+%% is the one above: with the header's fee in place, `validate/3' refuses this block, so
+%% the acceptance test fails. That is the injection, run as a test.
+
+before_cancun_there_is_no_excess_blob_gas_to_check_test() ->
     Parent = maps:remove(<<"excessBlobGas">>, parent()),
     Header = maps:remove(<<"excessBlobGas">>, child()),
     ?assertEqual(ok, eth_block_validator:validate(Parent, Header, london)).

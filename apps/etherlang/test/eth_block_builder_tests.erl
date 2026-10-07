@@ -281,7 +281,8 @@ a_built_block_carries_the_eip_4844_excess_blob_gas_test() ->
         Attrs = (attributes(Head))#{parent_excess_blob_gas => 600000,
                                      parent_blob_gas_used => 131072},
         {ok, Payload, _Value} = eth_block_builder:build(Attrs),
-        Expected = eth_fork_schedule:excess_blob_gas(fork_of(Attrs), 600000, 131072),
+        Expected = eth_fork_schedule:excess_blob_gas(fork_of(Attrs), 600000, 131072,
+                                                    maps:get(parent_base_fee_per_gas, Attrs, 0)),
         ?assertNotEqual(0, Expected),
         ?assertEqual(eth_hex:encode_int(Expected),
                      maps:get(<<"excessBlobGas">>, Payload))

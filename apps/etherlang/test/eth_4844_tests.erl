@@ -174,20 +174,20 @@ versioned_hash_validity_test() ->
 %% the price is the 1 wei minimum.
 blob_gas_price_floor_test() ->
     ?assertEqual(1, eth_fork_schedule:blob_gas_price(cancun, 0)),
-    ?assertEqual(1, eth_fork_schedule:blob_base_fee(cancun, 0, 0)),
-    ?assertEqual(1, eth_fork_schedule:blob_base_fee(cancun, 0, eth_fork_schedule:blob_gas_per_blob())).
+    ?assertEqual(1, eth_fork_schedule:blob_base_fee(cancun, 0, 0, 0)),
+    ?assertEqual(1, eth_fork_schedule:blob_base_fee(cancun, 0, eth_fork_schedule:blob_gas_per_blob(), 0)).
 
 %% Excess blob gas is the parent's excess plus what the parent's blobs used,
 %% less the per-block target, floored at zero. The target is three blobs.
 excess_blob_gas_test() ->
     PerBlob = eth_fork_schedule:blob_gas_per_blob(),
     ?assertEqual(131072, PerBlob),
-    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(cancun, 0, 0)),
-    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(cancun, 0, 3 * PerBlob)),
-    ?assertEqual(PerBlob, eth_fork_schedule:excess_blob_gas(cancun, 0, 4 * PerBlob)),
+    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(cancun, 0, 0, 0)),
+    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(cancun, 0, 3 * PerBlob, 0)),
+    ?assertEqual(PerBlob, eth_fork_schedule:excess_blob_gas(cancun, 0, 4 * PerBlob, 0)),
     %% Parent excess is carried forward, not recomputed from zero.
-    ?assertEqual(PerBlob, eth_fork_schedule:excess_blob_gas(cancun, PerBlob, 3 * PerBlob)),
-    ?assertEqual(2 * PerBlob, eth_fork_schedule:excess_blob_gas(cancun, PerBlob, 4 * PerBlob)).
+    ?assertEqual(PerBlob, eth_fork_schedule:excess_blob_gas(cancun, PerBlob, 3 * PerBlob, 0)),
+    ?assertEqual(2 * PerBlob, eth_fork_schedule:excess_blob_gas(cancun, PerBlob, 4 * PerBlob, 0)).
 
 %% The price curve is fake_exponential(1, excess, 3338477). Rather than quote a
 %% remembered constant, the expected value is recomputed here by an independent
@@ -759,16 +759,16 @@ a_pre_cancun_fork_uses_cancuns_row_test() ->
 %% would have caught it, and it is written as the two counters rather than as the
 %% function's output, so a reader can see which figure moved.
 the_excess_blob_gas_target_is_the_fork_s_target_test() ->
-    Cancun = eth_fork_schedule:excess_blob_gas(cancun, 0, 6 * 131072),
-    Prague = eth_fork_schedule:excess_blob_gas(prague, 0, 6 * 131072),
+    Cancun = eth_fork_schedule:excess_blob_gas(cancun, 0, 6 * 131072, 0),
+    Prague = eth_fork_schedule:excess_blob_gas(prague, 0, 6 * 131072, 0),
     ?assertEqual(3 * 131072, Cancun),
     ?assertEqual(0, Prague),
     %% And the far end of the table.
-    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(bpo2, 0, 6 * 131072)),
+    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(bpo2, 0, 6 * 131072, 0)),
     %% 22 blobs used against BPO2's 14-blob target leaves 8, and using exactly the target
     %% leaves nothing -- the two halves are the boundary and it is worth pinning both.
-    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(bpo2, 0, 14 * 131072)),
-    ?assertEqual(8 * 131072, eth_fork_schedule:excess_blob_gas(bpo2, 0, 22 * 131072)).
+    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(bpo2, 0, 14 * 131072, 0)),
+    ?assertEqual(8 * 131072, eth_fork_schedule:excess_blob_gas(bpo2, 0, 22 * 131072, 0)).
 
 %% **The curve is flatter after Prague, so the same excess costs less.** Prague divides by
 %% 5,007,716 where Cancun divides by 3,338,477, and a larger denominator in a
@@ -1444,3 +1444,171 @@ spec_blob_price(Excess) ->
 spec_fe(_F, _N, D, _I, Output, Acc) when Acc =< 0 -> Output div D;
 spec_fe(F, N, D, I, Output, Acc) ->
     spec_fe(F, N, D, I + 1, Output + Acc, (Acc * N) div (D * I)).
+
+
+%% ===========================================================================
+%% EIP-7918: the reserve-price branch of calc_excess_blob_gas
+%% ===========================================================================
+%% **This node implemented only EIP-4844's branch and refused Sepolia 11,846,220
+%% forever.** The two branches are not a rounding difference and not a fee question:
+%% they disagree on the committed `excessBlobGas` header field, so the node computed a
+%% header no other client produces and then rejected the chain's.
+%%
+%% The EIP, quoted whole (eip-7918.md, "Functions"):
+%%
+%%     if BLOB_BASE_COST * parent.base_fee_per_gas >
+%%        GAS_PER_BLOB * get_base_fee_per_blob_gas(parent):
+%%         return parent.excess_blob_gas
+%%              + parent.blob_gas_used * (max - target) // max
+%%     else:
+%%         return parent.excess_blob_gas + parent.blob_gas_used - target_blob_gas
+%%
+%% Four facts below are the ones that were each wrong at least once while reading it:
+%%
+%% * the scaled term is a **ratio**, `used * (max-target) / max`, not `used - target`;
+%% * for Sepolia at BPO2 that ratio is **exactly 1/3** (target 14, max 21), which is
+%%   where a "thirds of a blob" reading of the chain's own numbers comes from;
+%% * `blob_price` is a function of the **parent's excess blob gas**, not of the
+%%   parent's blob gas used -- passing the latter makes the price 1 wei, the reserve
+%%   test vacuously true, and the branch selection wrong on 6 of 20 real transitions;
+%% * the schedule used is the **current block's**, so a fork boundary uses the new
+%%   fraction, target and max.
+
+%% **Sepolia 11,846,220 -- the block the node refused, pinned against the chain.**
+%%
+%% parent 11,846,219: excess 210140716, blobGasUsed 655360 (5 blobs),
+%%                    baseFeePerGas 1057813701
+%% chain's header:     excessBlobGas 210359169
+%%
+%%   EIP-7918: 210140716 + 655360 * (21-14) / 21 = 210140716 + 218453 = 210359169
+%%   EIP-4844: 210140716 + 655360 - 1835008      = 208961068
+%%
+%% The second figure is exactly the one the node logged as `computed', so this test
+%% fails on the pre-fix code and for the right reason.
+eip_7918_reserve_price_branch_reproduces_the_block_that_stopped_the_node_test() ->
+    ?assertEqual(210359169,
+                 eth_fork_schedule:excess_blob_gas(bpo2, 210140716, 655360, 1057813701)).
+
+%% **The control, and it is the branch the previous test cannot see.**
+%%
+%% Sepolia 11,846,221 has parent excess 210359169 and parent base fee 1027978516, and
+%% there the reserve price does *not* exceed the blob price -- so the original EIP-4844
+%% branch is correct and the chain's header is 208655233. An implementation that took
+%% the EIP-7918 branch unconditionally would refuse this block instead, and refusing
+%% one block rather than the other is not a smaller defect.
+eip_7918_keeps_the_eip_4844_branch_where_the_reserve_does_not_bind_test() ->
+    ?assertEqual(208655233,
+                 eth_fork_schedule:excess_blob_gas(bpo2, 210359169, 131072, 1027978516)).
+
+%% **The gate: pre-Osaka the comparison is not made at all.**
+%%
+%% Same four inputs as the pinned block, at a fork before Osaka, must give EIP-4844's
+%% answer -- because the base fee must not reach the result before the fork that gives
+%% it that reach. `at_least(bpo2, osaka)` is true, so this is genuinely exercising the
+%% gate rather than a fork that happens to be older.
+eip_7918_does_not_apply_before_osaka_test() ->
+    %% Prague's target is six blobs, not BPO2's fourteen, so the EIP-4844 answer at these
+    %% inputs is a different figure -- and stating it as 208961068 (BPO2's answer) would
+    %% have tested the target rather than the gate. 210140716 + 655360 - 786432.
+    ?assertEqual(210009644,
+                 eth_fork_schedule:excess_blob_gas(prague, 210140716, 655360, 1057813701)),
+    ?assert(eth_fork_schedule:at_least(bpo2, osaka)),
+    ?assertNot(eth_fork_schedule:at_least(prague, osaka)).
+
+%% **The two branches differ by more than a rounding error, and this is the size of it.**
+%%
+%% `used - target` versus `used * (max-target) / max`: for 655360 used and target
+%% 1835008 the first is -1179648 (an *increase* in excess that never happens, because
+%% EIP-4844's floor is what makes it 0) and the second is +218453. **A subtraction and a
+%% ratio that both reduce the increment are not the same rule**, and only the ratio
+%% moves the counter when a block uses less than the target -- which is most blocks.
+%% **The gate, tested where removing it is visible.**
+%%
+%% My first gate assertion used the pinned block's inputs at `prague' and asserted
+%% EIP-4844's answer. Removing `at_least(Fork, osaka)' from the implementation left that
+%% test **green**, and the reason is worth keeping: Prague's update fraction is
+%% 5,007,716, so at an excess of 209 million the blob price is `e^41.9` -- far above the
+%% reserve, the EIP-7918 branch is not selected even without a gate, and the two rules
+%% agree by coincidence. **A gate test whose inputs make the gated code path irrelevant is
+%% not a gate test.**
+%%
+%% The excess below is chosen so the blob price *is* below the reserve: at Prague's
+%% fraction, `e^(excess/5007716)` stays under `basefee/16` for an excess below about 90
+%% million. 50,000,000 qualifies, and the two branches then differ by 699,050 rather than
+%% agreeing.
+eip_7918_is_gated_on_osaka_where_the_gate_can_be_seen_test() ->
+    Excess = 50000000,
+    BaseFee = 1057813701,
+    %% The price really is under the reserve here, so the branch is live:
+    ?assert(8192 * BaseFee > 131072 * eth_fork_schedule:blob_gas_price(prague, Excess)),
+    ?assert(8192 * BaseFee < 131072 * eth_fork_schedule:blob_gas_price(prague, 210140716)),
+    %% Prague is pre-Osaka, so EIP-4844's subtraction applies and this is the answer:
+    ?assertEqual(49344640,
+                 eth_fork_schedule:excess_blob_gas(prague, Excess, 131072, BaseFee)),
+    %% And the two branches are far enough apart at these inputs for the gate to be the
+    %% only thing deciding it: max 9, target 6, so the ratio is `used/3` = 43690 against a
+    %% subtraction of 655360.
+    ?assertEqual(50043690,
+                 Excess + 131072 * (9 - 6) div 9).
+
+eip_7918_scales_by_a_ratio_and_not_by_a_subtraction_test() ->
+    PerBlob = eth_fork_schedule:blob_gas_per_blob(),
+    Target = eth_fork_schedule:target_blob_gas_per_block(bpo2),
+    ?assertEqual(14 * PerBlob, Target),
+    ?assertEqual(21 * PerBlob, eth_fork_schedule:max_blob_gas_per_block(bpo2)),
+    %% **The branch needs a high excess to be reachable at all**, and my first version of
+    %% this test used `excess = 0' and asserted a non-zero result. It got 0, correctly:
+    %% EIP-7918's `if` sits *after* the floor clause, so `0 + 131072 < 1835008` returns 0
+    %% before the comparison is reached. **A low-excess chain cannot tell the two rules
+    %% apart**, which is the whole reason the bug survived: it only appears in the regime
+    %% Sepolia has been in since BPO2, where the counter sits above ten million.
+    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(bpo2, 0, PerBlob, 1057813701)),
+    %% At a high excess the ratio moves the counter by `used/3` where EIP-4844 subtracts
+    %% the full target, and the two are nowhere near each other.
+    ?assertEqual(218453,
+                 eth_fork_schedule:excess_blob_gas(bpo2, 210140716, 655360, 1057813701)
+                                 - 210140716),
+    %% With a base fee of 0 the reserve cannot bind, so EIP-4844's subtraction runs, and
+    %% for five blobs against a fourteen-blob target it **reduces** the counter by
+    %% 1,179,648 rather than raising it. That is the whole difference in one line: the
+    %% chain raises and this node lowered, on every block where the reserve binds.
+    ?assertEqual(655360 - 1835008,
+                 eth_fork_schedule:excess_blob_gas(bpo2, 210140716, 655360, 0) - 210140716),
+    %% `used * (max - target) / max` is `used / 3` here, and a subtraction would be
+    %% `used - target` -- which for five blobs is *negative*, so a subtraction reading of
+    %% the EIP would leave the counter unchanged rather than growing it.
+    ?assertEqual(655360 * 7 div 21, 218453),
+    ?assert(655360 - Target < 0).
+
+%% **A block below the target still floors at zero in *both* branches.**
+%%
+%% EIP-7918's own `if` sits *after* the floor clause, and getting that order wrong
+%% reintroduces the defect in a new place: a chain with a low excess would carry a
+%% non-zero counter and its blob base fee would be above the 1 wei minimum.
+eip_7918_floors_at_zero_below_the_target_in_either_branch_test() ->
+    Target = eth_fork_schedule:target_blob_gas_per_block(bpo2),
+    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(bpo2, 0, Target - 1, 1057813701)),
+    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(bpo2, 0, Target - 1, 0)),
+    ?assertEqual(0, eth_fork_schedule:excess_blob_gas(bpo2, 0, 0, 1057813701)),
+    ?assertEqual(1, eth_fork_schedule:blob_base_fee(bpo2, 0, 0, 1057813701)).
+
+%% **`BLOB_BASE_COST` is a comparison term and not a charge.** The EIP's parameter table
+%% gives it as `2**13`, and nothing here bills it: a block's gasUsed is unchanged by it.
+%% The test is that the *only* place the number appears is the comparison, which is why
+%% it is a macro in this module and not a term in the gas table.
+eip_7918_blob_base_cost_is_a_parameter_and_not_a_gas_charge_test() ->
+    %% Raising the parent's base fee enough to bind the reserve moves the excess by
+    %% `used * (max-target) / max`, which is at most `used` -- never `BLOB_BASE_COST`
+    %% per blob. A block using five blobs moves the counter by 218453; charging
+    %% `BLOB_BASE_COST` per blob would move it by 5 * 8192 = 40960, which is a
+    %% different figure and would land in `gasUsed` if the constant leaked into the
+    %% gas table.
+    ?assertEqual(218453, eth_fork_schedule:excess_blob_gas(bpo2, 210140716, 655360, 1057813701)
+                                 - 210140716),
+    %% The charge it is not: five blobs at `BLOB_BASE_COST` each. Stated as an equality
+    %% because `?assertNotEqual(5 * 8192, 218453)` is **rejected by the compiler** -- both
+    %% arguments are computable at compile time, so it cannot match and the assertion
+    %% could never fail. A test whose outcome the compiler can settle before it runs is
+    %% not a test.
+    ?assertEqual(40960, 5 * 8192),
+    ?assertEqual(218453, 655360 * 7 div 21).

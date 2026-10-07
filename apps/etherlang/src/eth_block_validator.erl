@@ -331,12 +331,18 @@ excess_blob_gas_mismatch(_Parent, _Header, Fork) ->
             %% Every validator fixture had `blobGasUsed = 0` in **both** parent and child, so
             %% the two readings agreed and nothing could tell them apart. It refused Sepolia
             %% block 11,846,220 with `{excess_blob_gas_mismatch, 210359169, 208436780}`.
+            %% **The parent's `baseFeePerGas` is a fourth input, and EIP-7918 is why.**
+            %% `calc_excess_blob_gas` compares the reserve price `BLOB_BASE_COST *
+            %% parent.base_fee_per_gas` against the blob price, and takes a different branch
+            %% on the answer. Omitting it would make the comparison false at every block
+            %% and silently select EIP-4844's branch -- which is the defect this fixes, so
+            %% it is named here rather than left to be re-derived.
             case {num(Parent, <<"excessBlobGas">>), num(Header, <<"excessBlobGas">>),
-                  num(Parent, <<"blobGasUsed">>)} of
-                {PEG, HEG, PBGU} when is_integer(PEG), is_integer(HEG),
+                  num(Parent, <<"blobGasUsed">>), num(Parent, <<"baseFeePerGas">>)} of
+                {PEG, HEG, PBGU, PBF} when is_integer(PEG), is_integer(HEG),
                                          is_integer(PBGU) ->
                     case eth_fork_schedule:excess_blob_gas(
-                             Fork,PEG, PBGU) of
+                             Fork, PEG, PBGU, PBF) of
                         HEG -> ok;
                         Other ->
                             %% **This line exists because the arithmetic could not be

@@ -8,7 +8,7 @@
 -module(eth_fork_schedule).
 
 -export([ blob_gas_per_blob/0, blob_schedule/1, target_blob_gas_per_block/1,
-          max_blob_gas_per_block/1, excess_blob_gas/3, blob_base_fee/3,
+          max_blob_gas_per_block/1, excess_blob_gas/4, blob_base_fee/4,
           blob_gas_price/2,
           past_modelled_range/3,
           past_modelled_range/4,
@@ -924,6 +924,14 @@ burn_base_fee(BaseFee, GasUsed) when is_integer(BaseFee), is_integer(GasUsed) ->
 %% to silently charging the Cancun curve.
 -define(MIN_BLOB_GASPRICE, 1).
 
+%% **EIP-7918's `BLOB_BASE_COST` = `2**13`.** The constant is the *execution gas* a node
+%% is assumed to spend per blob, and it is what the reserve price is expressed in: the
+%% rule compares the price of `GAS_PER_BLOB` blob gas against `BLOB_BASE_COST` units of
+%% execution gas priced at the parent's base fee. It is a **parameter of the comparison,
+%% not a charge** -- nothing here bills a transaction this much, and reading it as a cost
+%% would put 8,192 gas per blob into a block's `gasUsed`.
+-define(BLOB_BASE_COST, 8192).
+
 blob_gas_per_blob() -> 131072.
 
 %% **EIP-4844's per-blob gas never changes, so it is the one blob figure without a
@@ -1044,15 +1052,70 @@ target_blob_gas_per_block(Fork) ->
 %% blobs -- so a Prague block was having six blobs' worth of gas subtracted per block and
 %% a BPO2 block fourteen, which moves the excess counter by a third to five times the
 %% correct amount and therefore every blob base fee derived from it.
-excess_blob_gas(Fork, ParentExcessBlobGas, ParentBlobGasUsed)
+excess_blob_gas(Fork, ParentExcessBlobGas, ParentBlobGasUsed, ParentBaseFeePerGas)
   when is_integer(ParentExcessBlobGas), is_integer(ParentBlobGasUsed) ->
-    max(0, ParentExcessBlobGas + ParentBlobGasUsed
-            - target_blob_gas_per_block(Fork));
-excess_blob_gas(_Fork, _ParentExcessBlobGas, _ParentBlobGasUsed) ->
+    case blob_schedule(Fork) of
+        {TargetBlobs, MaxBlobs, _Fraction} ->
+            TargetBlobGas = TargetBlobs * blob_gas_per_blob(),
+            case ParentExcessBlobGas + ParentBlobGasUsed < TargetBlobGas of
+                true ->
+                    0;
+                false ->
+                    %% **EIP-7918, quoted whole** (eip-7918.md, "Functions"):
+                    %%
+                    %%     if BLOB_BASE_COST * parent.base_fee_per_gas >
+                    %%        GAS_PER_BLOB * get_base_fee_per_blob_gas(parent):
+                    %%         return parent.excess_blob_gas
+                    %%              + parent.blob_gas_used * (max - target) // max
+                    %%     else:
+                    %%         return parent.excess_blob_gas
+                    %%              + parent.blob_gas_used - target_blob_gas
+                    %%
+                    %% **This node had only the `else` branch**, which is EIP-4844 verbatim,
+                    %% and it is a *consensus* defect rather than a stale fee: the two
+                    %% branches disagree by `used - used*(max-target)/max` on every block
+                    %% where the reserve binds, so the node computed a different excess, a
+                    %% different blob base fee, and then refused the block. It refused Sepolia
+                    %% 11,846,220 with `{excess_blob_gas_mismatch, 210359169, 208961068}` and
+                    %% stopped there forever.
+                    %%
+                    %% **The factor is `(max - target) / max`, not `(used - target)`, and for
+                    %% Sepolia at BPO2 it is exactly 1/3** -- target 14, max 21. A subtraction
+                    %% and a ratio that both reduce the increment are not the same rule: only
+                    %% the ratio floors it at zero when a block uses nothing.
+                    case below_reserve_price(Fork, ParentBaseFeePerGas,
+                                             ParentExcessBlobGas) of
+                        true ->
+                            ParentExcessBlobGas
+                            + ParentBlobGasUsed * (MaxBlobs - TargetBlobs) div MaxBlobs;
+                        false ->
+                            ParentExcessBlobGas + ParentBlobGasUsed - TargetBlobGas
+                    end
+            end
+    end;
+excess_blob_gas(_Fork, _ParentExcessBlobGas, _ParentBlobGasUsed, _ParentBaseFee) ->
     0.
 
-blob_base_fee(Fork, ParentExcessBlobGas, ParentBlobGasUsed) ->
-    blob_gas_price(Fork, excess_blob_gas(Fork, ParentExcessBlobGas, ParentBlobGasUsed)).
+%% **EIP-7918 is gated on Osaka and was applied at every fork before.**
+%%
+%% Three things have to be true together and the gate is what makes them consistent:
+%% the fork is at least `osaka', the parent's base fee is a number, and the reserve
+%% price exceeds the blob price. **The base fee only enters the comparison**, never the
+%% result -- a block's excess depends on its parent's base fee, which is why this
+%% function grew an argument rather than being given the parent's header.
+%%
+%% Pre-Osaka the comparison is skipped entirely, which is what keeps every pre-Osaka
+%% figure in this module bit-identical to what it was before EIP-7918 existed.
+below_reserve_price(Fork, ParentBaseFeePerGas, ParentExcessBlobGas) ->
+    at_least(Fork, osaka)
+        andalso is_integer(ParentBaseFeePerGas)
+        andalso ?BLOB_BASE_COST * ParentBaseFeePerGas
+                 > blob_gas_per_blob() * blob_gas_price(Fork, ParentExcessBlobGas).
+
+blob_base_fee(Fork, ParentExcessBlobGas, ParentBlobGasUsed, ParentBaseFeePerGas) ->
+    blob_gas_price(Fork,
+                   excess_blob_gas(Fork, ParentExcessBlobGas, ParentBlobGasUsed,
+                                   ParentBaseFeePerGas)).
 
 %% Blob gas price as a function of excess blob gas. This is the EIP-4844
 %% fake_exponential with the minimum price as its base, so a block whose

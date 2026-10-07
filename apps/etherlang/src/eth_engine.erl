@@ -1207,7 +1207,12 @@ parent_fields(ParentHash) ->
                     {ok, #{parent_hash => ParentHash, number => N + 1,
                            gas_limit => GL, base_fee => BF,
                            parent_excess_blob_gas => PE,
-                           parent_blob_gas_used => PB}};
+                           parent_blob_gas_used => PB,
+                           %% EIP-7918: `calc_excess_blob_gas` compares a reserve price
+                           %% built from the *parent's* base fee. `BaseFee` above is read
+                           %% from the same header as `PE` and `PB`, so it is the parent's,
+                           %% not the block being built's -- which is what the rule asks for.
+                           parent_base_fee_per_gas => BF}};
                 Other ->
                     {error, {unreadable_parent, Other}}
             end;

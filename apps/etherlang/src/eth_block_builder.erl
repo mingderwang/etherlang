@@ -289,7 +289,8 @@ with_attributes(Block, Attributes) ->
         excess_blob_gas = eth_fork_schedule:excess_blob_gas(
                             build_fork(Attributes),
                             maps:get(parent_excess_blob_gas, Attributes, 0),
-                            maps:get(parent_blob_gas_used, Attributes, 0)),
+                            maps:get(parent_blob_gas_used, Attributes, 0),
+                            maps:get(parent_base_fee_per_gas, Attributes, 0)),
         %% This node includes no blob transactions -- it has no transaction type-3
         %% encoder on the build path -- so its own blob gas used is 0. Stating 0 is
         %% a claim that is true of this build, not a default: the builder's

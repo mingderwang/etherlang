@@ -34,8 +34,8 @@ with the file it sat above.
 
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
-build. OTP 29.1. Current: **49 src modules / 14,571 code lines, 65 test modules /
-14,752 code lines, 1047 eunit tests, all passing.**
+build. OTP 29.1. Current: **49 src modules / 14,596 code lines, 65 test modules /
+14,823 code lines, 1056 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive
 them with the procedure below rather than editing this sentence.
@@ -788,6 +788,72 @@ range ends at Amsterdam, 2026-10-06. On that day this function starts answering 
 head" -- and the refusal is **correct behaviour**: a block past the range would be executed
 under rules the node does not have, and a wrong figure is worse than a declined
 certification. The design is working; the node is behind.
+
+### EIP-7918 was missing, and it is what stopped the node syncing
+
+**This was the sync blocker and it is now fixed.** The node refused Sepolia 11,846,220
+with `{excess_blob_gas_mismatch, 210359169, 208961068}` and retried it forever, so its
+head sat at 11,846,219 and `net_peerCount` was 0 because there was nothing to serve.
+
+**EIP-7918 adds a second branch to `calc_excess_blob_gas`, and this node had only the
+first.** Quoted whole from `eip-7918.md`:
+
+    if BLOB_BASE_COST * parent.base_fee_per_gas >
+       GAS_PER_BLOB * get_base_fee_per_blob_gas(parent):
+        return parent.excess_blob_gas
+             + parent.blob_gas_used * (max - target) // max
+    else:
+        return parent.excess_blob_gas + parent.blob_gas_used - target_blob_gas
+
+**The second figure is exactly the one the node logged as `computed`.** The defect is a
+consensus one and not a stale fee: the two branches disagree on the committed
+`excessBlobGas` header field, so the node computed a header no other client produces and
+then rejected the chain's. Measured on 20 consecutive Sepolia transitions: **14 take the
+EIP-7918 branch and 6 the original, and the union reproduces all 20 exactly.** The two
+never both match, so no single formula explains the chain -- which is why seven attempts
+to infer a target from the chain's own numbers all failed before the EIP was read.
+
+**Three readings of the EIP were each wrong first, and all three would have shipped:**
+
+* **The scaled term is a ratio, `used * (max - target) / max`, not `used - target`.** For
+  Sepolia at BPO2 (target 14, max 21) the ratio is **exactly 1/3** -- which is where the
+  "thirds of a blob" reading of the chain came from. It was never a fraction of a blob.
+  The difference is visible in one line: five blobs raise the counter by 218453 under
+  EIP-7918 and *lower* it by 1179648 under EIP-4844.
+* **`blob_price` is a function of the parent's _excess blob gas_, not of the parent's blob
+  gas used.** I passed the latter, which makes the price the 1 wei floor and the reserve
+  test **vacuously true**, so the branch selection was wrong on **6 of the 20** transitions
+  -- which is what made a rule that fits 14 of 20 look like it fit all 20 and leave the
+  other 6 unexplained. This is the second time in this work that a wrong argument produced
+  a plausible number rather than an error.
+* **The schedule is the current block's, not the parent's** -- "the *new*
+  `blobSchedule.max` and `blobSchedule.target` must be used". Only visible in the EIP's
+  prose, not in geth's `calcExcessBlobGas`, which resolves the config by head timestamp
+  and so cannot be read as though it were the parent's.
+
+**`excess_blob_gas/3` became `/4` rather than gaining a sibling.** The parent's base fee
+enters the comparison, so leaving `/3` in place would have been two answers to one
+question -- the shape this repository treats as the worst one for a validation rule.
+
+**Two of the new tests existed to close holes the first attempts left open**, and both
+holes were found by injections that came back green:
+
+* A fork-gate test using the pinned block's inputs at `prague` **stayed green with the gate
+  deleted**, because Prague's update fraction makes the blob price `e^41.9` there, far above
+  the reserve, so both branches agree by coincidence. **A gate test whose inputs make the
+  gated path irrelevant is not a gate test.** The replacement uses an excess of 50,000,000,
+  which puts the price under the reserve and the two branches 699,050 apart.
+* Injecting `num(Header, <<"baseFeePerGas">>)` in place of `num(Parent, ...)` **left the
+  whole validator module green**, because every fixture had the same base fee in parent and
+  child. Getting them onto opposite sides of the 1,034,202,240 threshold needed EIP-1559
+  to *lower* the child's fee (parent `gasUsed` at 12,000,000), which is the only
+  arrangement in which the two readings differ.
+
+**Untested, and named rather than hidden:** the comparison is strict `>`, and
+`>=` was injected with the suite green. Reaching it needs
+`BLOB_BASE_COST * baseFee == GAS_PER_BLOB * fake_exponential(...)` exactly, which is
+`baseFee == 16 * price`, and no real chain produces it. The strictness is stated in the
+EIP's own `if` and copied verbatim rather than pinned by a test.
 
 **Amsterdam is two EIPs, not one, and the second one was found by hashing a block.**
 
