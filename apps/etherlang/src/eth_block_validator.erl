@@ -84,7 +84,7 @@
 
 -module(eth_block_validator).
 
--export([validate/2, validate/3, rule_names/0]).
+-export([validate/2, validate/3, rule_names/0, unreachable_rule_names/0]).
 
 %% `execution-specs', `vm/gas.py' lines 175-176. Both are quoted rather than derived
 %% because neither is derivable from anything in this repository, and a consensus
@@ -132,7 +132,27 @@ rule_names() ->
      gas_used_above_gas_limit, gas_limit_above_bound, gas_limit_below_bound,
      gas_limit_below_minimum, base_fee_mismatch, excess_blob_gas_mismatch,
      non_zero_difficulty, non_zero_nonce, ommers_hash_not_empty,
-     extra_data_too_long, past_modelled_range].
+     extra_data_too_long] ++ unreachable_rules().
+
+%% **The rules this module can name but no fixture can provoke.**
+%%
+%% `past_modelled_range' is the only one, and it is kept rather than deleted because
+%% deleting a name from this list is how a rule stops being reported in a log line -- the
+%% failure mode the two-direction assertion in `every_rule_this_module_exports_is_
+%% produced_by_the_fixture_that_claims_it_test' exists to catch.
+%%
+%% It became unreachable when the frontier changed from *the schedule's newest
+%% activation* to *the newest fork this node has no rules for*. Every fork in every
+%% schedule is modelled, so `eth_fork_schedule:past_modelled_range/4' answers `false' for
+%% every block on all three networks and this rule cannot fire. **That is the intended
+%% state, not a gap**: the rule guards a fork landing without rules, and
+%% `no_scheduled_fork_is_left_unmodelled_test' is that guard now -- and it fails *naming
+%% the fork* rather than moving a frontier nobody reads.
+%%
+%% **`++` and not `|`.** `[a, b | L]' in a list literal is an **improper list**, so the
+%% original form produced a value no caller comparing against a flat list could match, and
+%% the coverage test reported a shape mismatch instead of the thing being fixed.
+unreachable_rules() -> [past_modelled_range].
 
 %% ===========================================================================
 %% Rules that need no parent
@@ -603,3 +623,7 @@ past_modelled_range(Header) ->
         _ ->
             ok
     end.
+
+%% Exported for the coverage test's second assertion, which compares the set rather
+%% than counting it.
+unreachable_rule_names() -> unreachable_rules().

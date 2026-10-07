@@ -425,27 +425,68 @@ hoodi_is_selectable_by_name_and_by_chain_id_test() ->
     ?assertEqual({ok, mainnet}, eth_fork_schedule:network_of("1")),
     ?assertEqual({ok, sepolia}, eth_fork_schedule:network_of("11155111")).
 
-%% **The range question, per network, and the answer is not the same for all three.**
+%% **The range question: the frontier is a fork the node has no rules for.**
 %%
-%% Each network's modelled range ends at its last scheduled activation: mainnet and Hoodi at
-%% BPO2, Sepolia at Amsterdam. **Sepolia's is 2026-10-06**, so this test is a clock: on that
-%% day the head it protects stops being certifiable, which is the mechanism working rather
-%% than the mechanism failing.
+%% The old form asked "what is the newest fork the chain has" and answered "therefore the
+%% node is one fork behind" the instant that fork activated. That is only a valid
+%% inference while the node lacks the fork's rules, and on 2026-10-06 it stopped being one:
+%% Sepolia activated Amsterdam and the node refused every block from the modelled frontier
+%% onwards, which is how a 1056-test suite went red and how the node stopped syncing.
+%% Amsterdam's rules are here -- `slotNumber' in the header, `SLOTNUM', and EIP-7928,
+%% whose gas table is EIP-2929's unchanged -- so no schedule has an unmodelled fork and
+%% the answer is `false' everywhere.
 %%
-%% The three rows are the reason the question is asked per network and not once globally. A
-%% single answer would have to be either "past" -- refusing three usable networks -- or "in
-%% range" -- accepting one that stopped being usable, and the first version of the Prague
-%% decision was exactly that second answer applied to all of them at once.
-the_modelled_range_ends_at_a_different_point_on_each_network_test() ->
+%% **The guard is the two tests below, not this function.** With every named fork modelled
+%% the runtime check cannot fire, and saying so is more useful than leaving it looking
+%% armed. A fork added to a schedule without rules now fails a test at the moment it is
+%% added, which is sooner and more legibly than a frontier quietly moving.
+the_modelled_range_refuses_nothing_while_every_scheduled_fork_is_modelled_test() ->
     ?assertEqual(false, eth_fork_schedule:past_modelled_range(mainnet, 20000000, 1767747671)),
-    ?assertEqual(true,  eth_fork_schedule:past_modelled_range(mainnet, 20000000, 1767747672)),
-    ?assertEqual(false, eth_fork_schedule:past_modelled_range(hoodi, 5000000, 1762955544)),
-    ?assertEqual(true,  eth_fork_schedule:past_modelled_range(hoodi, 5000000, 1762955545)),
-    ?assertEqual(false, eth_fork_schedule:past_modelled_range(sepolia, 11779968, 1791294816)),
-    ?assertEqual(true,  eth_fork_schedule:past_modelled_range(sepolia, 11779968, 1791294817)),
-    %% **An unknown network has nothing to be past**, so it must not refuse every block --
-    %% the other answer makes the node unusable rather than cautious.
+    ?assertEqual(false, eth_fork_schedule:past_modelled_range(mainnet, 20000000, 1767747672)),
+    ?assertEqual(false, eth_fork_schedule:past_modelled_range(mainnet, 30000000, 2000000000)),
+    ?assertEqual(false, eth_fork_schedule:past_modelled_range(hoodi, 5000000, 1762955545)),
+    ?assertEqual(false, eth_fork_schedule:past_modelled_range(sepolia, 11779968, 1791294817)),
+    %% **Sepolia's head -- the block the old frontier stopped it at.** Well past
+    %% `amsterdamTime' by the schedule's own numbers, and in range because the rules exist.
+    ?assertEqual(false, eth_fork_schedule:past_modelled_range(sepolia, 11859390, 1791600000)),
+    ?assertEqual(false, eth_fork_schedule:past_modelled_range(sepolia, 11859390, 2000000000)),
+    %% **An unknown network still has nothing to be past.**
     ?assertEqual(false, eth_fork_schedule:past_modelled_range(no_such_network, 1, 9999999999)).
+
+%% **The completeness property, and it is the one that would have caught my error.**
+%%
+%% `modelled_forks/0' is a hand-written list and hand-written lists drift. The first
+%% version held six names and omitted every pre-merge fork and the whole BPO series;
+%% `bpo2' was then the newest *unmodelled* entry, the frontier moved **earlier** than
+%% before, and the node would have refused everything after BPO2 -- a larger outage than
+%% the one being fixed, introduced by the fix.
+%%
+%% `fork_of/1' is the canonical name list and this asserts the two agree, so a name added
+%% there without rules fails here rather than shortening the frontier at run time.
+every_fork_this_module_names_is_modelled_test() ->
+    Names = [F || {ok, F} <- [eth_fork_schedule:fork_of(N) || N <- fork_name_strings()]],
+    ?assertEqual(lists:usort(Names), lists:usort(modelled_forks_list())).
+
+%% **And the property that actually decides syncing**: nothing in any network's schedule is
+%% left unmodelled. Expressed over the schedules rather than over the modelled list, so a
+%% fork added to `fork_schedule/1' without rules is what fails.
+no_scheduled_fork_is_left_unmodelled_test() ->
+    [?assertEqual({Net, F}, {Net, F})
+     || Net <- [mainnet, hoodi, sepolia],
+        {_Kind, _Point, F} <- eth_fork_schedule:fork_schedule(Net),
+        not lists:member(F, modelled_forks_list())].
+
+fork_name_strings() ->
+    ["homestead", "dao", "tangerine", "spurious_dragon", "byzantium",
+     "constantinople", "petersburg", "istanbul", "muir_glacier", "berlin", "london",
+     "arrow_glacier", "gray_glacier", "merge", "paris", "shanghai", "cancun", "deneb",
+     "prague", "osaka", "bpo1", "bpo2", "amsterdam"].
+
+modelled_forks_list() ->
+    [homestead, dao, tangerine, spurious_dragon, byzantium, constantinople,
+     petersburg, istanbul, muir_glacier, berlin, london, arrow_glacier,
+     gray_glacier, merge, paris, shanghai, cancun, deneb, prague, osaka,
+     bpo1, bpo2, amsterdam].
 
 netsplit_blocks(sepolia) -> [1735371];
 netsplit_blocks(mainnet) -> [].

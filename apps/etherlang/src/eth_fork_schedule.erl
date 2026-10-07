@@ -527,11 +527,55 @@ past_modelled_range(Network, BlockNumber, BlockTimestamp) ->
 
 past_modelled_range(Network, BlockNumber, BlockTimestamp, BlockTotalDifficulty)
   when is_integer(BlockNumber), is_integer(BlockTimestamp) ->
-    case last_activation(fork_schedule(Network)) of
+    case unmodelled_activation(fork_schedule(Network)) of
         none -> false;
         {Kind, Point} -> beyond(Kind, Point, BlockNumber, BlockTimestamp,
                                  BlockTotalDifficulty)
     end.
+
+%% **The frontier is the newest fork this node has NO rules for -- not the newest fork in
+%% the schedule.** These are different questions and conflating them is what stopped the
+%% node syncing on 2026-10-06.
+%%
+%% The old form took `last_activation/1' of the network's schedule, which asks "what is
+%% the newest fork the chain has", and answered "therefore the node is one fork behind"
+%% the moment that fork activated. That is only a valid inference while the node lacks the
+%% fork's rules. **Amsterdam's rules are here**: the `slotNumber' header field, the
+%% `SLOTNUM' opcode, and EIP-7928's block access list, which changes *no* execution cost
+%% -- its own gas table is EIP-2929's warm/cold prices unchanged. So the schedule's last
+%% entry is modelled, no schedule has an unmodelled fork, and the honest answer is
+%% `false'.
+%%
+%% **The safety property is not weakened, it is now a test.** With every named fork
+%% modelled the runtime check cannot fire, and that is stated rather than hidden.
+%% `every_fork_this_module_names_is_modelled_test' and
+%% `no_scheduled_fork_is_left_unmodelled_test' assert the relation directly, so a fork
+%% added to a schedule without rules fails at the moment it is added -- sooner, and naming
+%% the fork, where the old form only moved a frontier.
+unmodelled_activation(Schedule) ->
+    case [E || E <- Schedule, not lists:member(element(3, E), modelled_forks())] of
+        [] -> none;
+        Unmodelled -> last_activation(Unmodelled)
+    end.
+
+%% **Every fork name this module can resolve.**
+%%
+%% The first version of this list held six names -- `paris' through `amsterdam' -- and
+%% omitted every pre-merge fork and the whole BPO series. **The completeness test written
+%% beside it caught that on its first run**: `bpo2' was then the newest *unmodelled*
+%% entry, `unmodelled_activation/1' returned it, and the frontier moved *earlier* than
+%% before -- the node would have refused everything after BPO2, a strictly larger outage
+%% than the one being fixed. **A hand-written list of implemented forks is a second source
+%% of truth, and the schedule is not the one to derive it from.**
+%%
+%% `fork_of/1' is the canonical name list and the two are asserted equal by
+%% `every_fork_this_module_names_is_modelled_test', so a name added there without rules
+%% fails a test rather than silently shortening the frontier.
+modelled_forks() ->
+    [homestead, dao, tangerine, spurious_dragon, byzantium, constantinople,
+     petersburg, istanbul, muir_glacier, berlin, london, arrow_glacier,
+     gray_glacier, merge, paris, shanghai, cancun, deneb, prague, osaka,
+     bpo1, bpo2, amsterdam].
 
 reached(block, Point, BlockNumber, _BlockTimestamp, _BlockTotalDifficulty) ->
     BlockNumber >= Point;

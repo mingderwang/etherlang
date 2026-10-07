@@ -491,7 +491,20 @@ every_rule_this_module_exports_is_produced_by_the_fixture_that_claims_it_test() 
     Produced = [Rule || {_P, _H, Rule} <- cases()],
     %% Both directions. Either half alone would pass with a rule silently missing from
     %% the list a caller reads in a log line.
-    ?assertEqual(Named, Produced).
+    %% **Against the producible set, which is `Named' minus the unreachable ones.** Writing
+    %% `?assertEqual(Named, Produced)' after `past_modelled_range' lost its fixture would
+    %% have failed, and the tempting repair -- putting the rule back in `cases()' with an
+    %% invented schedule entry -- would have made the test pass by asserting the rule
+    %% rather than exercising it. Subtracting is the assertion that keeps both halves
+    %% honest: a rule with a fixture must appear, and a rule without one must be declared.
+    ?assertEqual(Named -- eth_block_validator:unreachable_rule_names(), Produced),
+    %% **And the rules that are named but unproducible, asserted as a set.** Without this
+    %% the other direction is satisfiable by deleting a name from `rule_names/0`, which is
+    %% the one edit that makes the coverage test pass while the rule stops being reported.
+    %% Compared as a set rather than counted, so a *new* unreachable rule must be written
+    %% down here too.
+    ?assertEqual({unreachable_rules, [past_modelled_range]},
+                 {unreachable_rules, eth_block_validator:unreachable_rule_names()}).
 
 %% The fixtures, each with the rule it is meant to provoke.
 %% The fixtures, each with the rule it is meant to provoke, and **the parent it is
@@ -526,12 +539,29 @@ cases() ->
      {P, put(<<"difficulty">>, 1, C), non_zero_difficulty},
      {P, put(<<"nonce">>, <<1:64>>, C), non_zero_nonce},
      {P, put(<<"sha3Uncles">>, <<1:256>>, C), ommers_hash_not_empty},
-     {P, put(<<"extraData">>, <<0:264>>, C), extra_data_too_long},
+     {P, put(<<"extraData">>, <<0:264>>, C), extra_data_too_long}
      %% **Past the last fork this node models.** The default configured network in a test
      %% run is Sepolia, whose modelled range ends at Amsterdam, 1,791,294,816 -- 2026-10-06.
      %% One second later is outside it, and because this rule sits in the parentless group
      %% it fires before `timestamp_not_after_parent' would.
-     {P, put(<<"timestamp">>, 1791294817, C), past_modelled_range}].
+     %% **`past_modelled_range` has no row here, and its absence is the point.**
+     %%
+     %% It used to be provoked here with timestamp 1791294817 -- Amsterdam plus one
+     %% second -- because `past_modelled_range/3' took the schedule's *last activation*
+     %% as its frontier, so every block from the modelled frontier onward counted as
+     %% "past the modelled range" and this rule fired. **That is what stopped the node
+     %% syncing**: it sat at 11,846,219 refusing everything after it.
+     %%
+     %% The frontier is now the newest fork the node has **no rules for**, and every fork
+     %% in every schedule is modelled, so the rule **cannot be reached through any of the
+     %% three networks**. A row here would have to invent a schedule entry, and a fixture
+     %% that invents the input a rule needs asserts the rule rather than exercising it.
+     %%
+     %% The unreachability is bounded by two tests in `eth_fork_schedule_tests':
+     %% `every_fork_this_module_names_is_modelled_test' and
+     %% `no_scheduled_fork_is_left_unmodelled_test'. They are the guard the old frontier
+      %% was, and unlike it they name the fork that would reopen this rule.
+     ].
 
 
 %% **Any arity.** The reasons come in three shapes -- a bare atom

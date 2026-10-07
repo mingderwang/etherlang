@@ -34,8 +34,8 @@ with the file it sat above.
 
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
-build. OTP 29.1. Current: **49 src modules / 14,596 code lines, 65 test modules /
-14,823 code lines, 1056 eunit tests, all passing.**
+build. OTP 29.1. Current: **49 src modules / 14,608 code lines, 65 test modules /
+14,844 code lines, 1058 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive
 them with the procedure below rather than editing this sentence.
@@ -788,6 +788,57 @@ range ends at Amsterdam, 2026-10-06. On that day this function starts answering 
 head" -- and the refusal is **correct behaviour**: a block past the range would be executed
 under rules the node does not have, and a wrong figure is worse than a declined
 certification. The design is working; the node is behind.
+
+### The modelled-range frontier was the wrong question, and it stopped the node twice
+
+`past_modelled_range/4` took **the schedule's newest activation** as its frontier and
+answered "therefore the node is one fork behind". That is only a valid inference while the
+node lacks that fork's rules, and it stopped being one twice:
+
+* **2026-10-06, Amsterdam.** Sepolia activated it and `eth_tx_validity_tests` went red
+  (a fixture carrying the wall clock), then the node stopped accepting blocks entirely.
+* **The frontier now asks the other question**: the newest fork the node has **no rules
+  for**. Amsterdam's rules are present -- `slotNumber`, `SLOTNUM`, and EIP-7928, whose gas
+  table is EIP-2929's unchanged -- so no schedule has an unmodelled fork and the answer is
+  `false` everywhere.
+
+**The guard moved from a date to a test, and that is strictly better.** With every named
+fork modelled the runtime check *cannot fire*, which is stated rather than left looking
+armed. `every_fork_this_module_names_is_modelled_test` and
+`no_scheduled_fork_is_left_unmodelled_test` assert the relation directly, so a fork added
+to a schedule without rules fails at the moment it is added -- naming the fork -- where
+the old form only moved a frontier nobody reads.
+
+**My first `modelled_forks/0` had six names and omitted every pre-merge fork and the whole
+BPO series.** `bpo2` was then the newest *unmodelled* entry, the frontier moved **earlier**
+than before, and the node would have refused everything after BPO2: a larger outage than
+the one being fixed, introduced by the fix. The completeness test caught it on its first
+run, which is the only reason it was not shipped.
+
+**`past_modelled_range` is now unreachable and is named as such.**
+`eth_block_validator:unreachable_rule_names/0` lists it and the coverage test asserts that
+set, so the rule stays in the log vocabulary. Fabricating a schedule entry to keep a
+fixture would have made the coverage test pass by *asserting* the rule rather than
+exercising it.
+
+### Still open, and both are on the Engine API path rather than the sync path
+
+* **The block access list's contents are not verified.** `blockAccessListHash` is a header
+  field the node now reproduces (so the block hash is right), and EIP-7928 changes **no
+  execution cost**, so the node executes Amsterdam blocks correctly. What it cannot do is
+  check that the BAL hashes to the committed value, because **`blockAccessList` is not
+  available from the upstream this node uses** -- `eth_getBlockByNumber` returns only the
+  hash and `debug_getBlockAccessList` does not exist there (checked against
+  `ethereum-sepolia-rpc.publicnode.com`). The empty-list case *is* pinned, against the
+  chain: `keccak256(rlp([]))` = `0x1dcc4de8...`, which is this repository's
+  `empty_uncle_hash`.
+* **`payload_header_rlp/4` still builds 20 fields for a Prague or Amsterdam payload.** It
+  handles `paris`, `shanghai` and `cancun` only, so a Prague payload's `requestsHash` and
+  an Amsterdam payload's `blockAccessListHash` and `slotNumber` are all missing from the
+  encoded header, and `payload_block_hash/1` would answer a wrong hash. **`eth_block_payload_tests`
+  pins Paris, Shanghai and Cancun and has no Prague or Amsterdam case**, which is why this
+  is still true. It does not affect syncing -- that path is `newPayload`, not import --
+  and it is the next thing to fix.
 
 ### EIP-7918 was missing, and it is what stopped the node syncing
 
