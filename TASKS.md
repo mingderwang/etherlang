@@ -34,8 +34,8 @@ with the file it sat above.
 
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
-build. OTP 29.1. Current: **49 src modules / 14,608 code lines, 65 test modules /
-14,844 code lines, 1058 eunit tests, all passing.**
+build. OTP 29.1. Current: **49 src modules / 14,672 code lines, 65 test modules /
+14,898 code lines, 1063 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive
 them with the procedure below rather than editing this sentence.
@@ -821,24 +821,47 @@ set, so the rule stays in the log vocabulary. Fabricating a schedule entry to ke
 fixture would have made the coverage test pass by *asserting* the rule rather than
 exercising it.
 
-### Still open, and both are on the Engine API path rather than the sync path
+### The payload encoder spelled three header shapes and needed five
 
-* **The block access list's contents are not verified.** `blockAccessListHash` is a header
-  field the node now reproduces (so the block hash is right), and EIP-7928 changes **no
-  execution cost**, so the node executes Amsterdam blocks correctly. What it cannot do is
-  check that the BAL hashes to the committed value, because **`blockAccessList` is not
-  available from the upstream this node uses** -- `eth_getBlockByNumber` returns only the
-  hash and `debug_getBlockAccessList` does not exist there (checked against
-  `ethereum-sepolia-rpc.publicnode.com`). The empty-list case *is* pinned, against the
-  chain: `keccak256(rlp([]))` = `0x1dcc4de8...`, which is this repository's
-  `empty_uncle_hash`.
-* **`payload_header_rlp/4` still builds 20 fields for a Prague or Amsterdam payload.** It
-  handles `paris`, `shanghai` and `cancun` only, so a Prague payload's `requestsHash` and
-  an Amsterdam payload's `blockAccessListHash` and `slotNumber` are all missing from the
-  encoded header, and `payload_block_hash/1` would answer a wrong hash. **`eth_block_payload_tests`
-  pins Paris, Shanghai and Cancun and has no Prague or Amsterdam case**, which is why this
-  is still true. It does not affect syncing -- that path is `newPayload`, not import --
-  and it is the next thing to fix.
+`payload_header_rlp/4` handled `paris`, `shanghai` and `cancun`. **A Prague payload was
+encoded as a 20-field Cancun header** -- EIP-7685's `requestsHash` missing -- and an
+Amsterdam one as the same 20 fields, missing `requestsHash`, `blockAccessListHash` and
+`slotNumber`. `payload_block_hash/1` answered a hash that is not the block's, which
+`newPayload` reports to the client as `INVALID_BLOCK_HASH` on a perfectly valid payload.
+`eth_block_payload_tests` pinned Paris, Shanghai and Cancun and had **no Prague case**,
+which is the whole reason this survived; that is the same shape as the earlier
+`requestsHash` omission and the fixture that would have caught it.
+
+Fixed: `payload_header_fork/1` now tells Prague and Amsterdam apart by the fields the
+payload carries -- `ExecutionPayloadV4` "has the syntax of ExecutionPayloadV3 and appends
+the new field: `blockAccessList`", and its listing carries `blockAccessList` and
+`slotNumber` -- and the encoder emits 21 and 23 fields.
+
+**The block access list's commitment is now checked, which is the item this file recorded
+as unverifiable.** `block_access_list_hash = keccak256(rlp(block_access_list))`, and
+`ExecutionPayloadV4` carries `blockAccessList` as the RLP bytes themselves -- so **the hash
+is over those bytes directly** and the BAL's internal structure never has to be decoded.
+The earlier note was true of the public JSON-RPC this node syncs from (`eth_getBlockByNumber`
+returns only the hash; `debug_getBlockAccessList` does not exist there) and false of the
+Engine API, which is where a proposer actually sends it. The empty case is pinned three
+ways: EIP-7928's stated `keccak256(rlp([]))`, this repository's `empty_uncle_hash()`, and
+the computation -- all `0x1dcc4de8...`.
+
+**`requestsHash` is now refused by name rather than omitted.** It is not a payload field;
+it lives in the beacon roots contract's storage, and this node has no other source for it
+on the Engine API path. Two wrong answers were available -- a 20-field header, or a named
+error -- and the named one is chosen. **Reading the beacon roots contract's storage is the
+remaining work**, and it is what would let `newPayload` accept a Prague or Amsterdam
+payload outright.
+
+**Coverage gap, stated rather than hidden.** Three injections came back **green**: returning
+the BAL bytes un-hashed, appending `requestsHash` twice, and putting `slotNumber` before
+`blockAccessListHash`. The tests prove the new terms *participate* -- two payloads differing
+hash differently -- and that is satisfied by all three. The test that would close it rebuilds
+the 23-field header through `eth_header:hash/1`, a second encoder with its own field list, and
+compares hashes; it was written and **removed un-green** rather than committed failing. So the
+**order of the last two fields, and that the BAL is keccak'd rather than passed through, rest
+on the EIP's text and on `eth_header`'s pinned real-block hashes, not on a payload-path test.**
 
 ### EIP-7918 was missing, and it is what stopped the node syncing
 

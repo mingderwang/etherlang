@@ -523,3 +523,119 @@ the_env_carries_slot_zero_rather_than_omitting_it_test() ->
     B = B0#block{slot_number = 0},
     Env = eth_block:block_env(B, eth_state:new(0, #{})),
     ?assertEqual(0, maps:get(slot_number, Env)).
+
+
+%% ===========================================================================
+%% Prague and Amsterdam: the encoder had three shapes and needed five
+%% ===========================================================================
+%% `payload_header_rlp/4' spelled Paris, Shanghai and Cancun. **A Prague payload was
+%% encoded as a 20-field Cancun header** -- EIP-7685's `requestsHash' missing -- and an
+%% Amsterdam one as the same 20 fields, missing `requestsHash', `blockAccessListHash' and
+%% `slotNumber'. `payload_block_hash/1' therefore answered a hash that is not the block's,
+%% which `newPayload' reports to the client as `INVALID_BLOCK_HASH` on a valid payload.
+%% `eth_block_payload_tests' pinned Paris, Shanghai and Cancun and had no Prague case,
+%% which is the whole reason this survived.
+
+%% **The header for a Prague payload is 21 fields and the 21st is `requestsHash`.**
+%%
+%% Asserted as a *difference* from the 20-field encoding rather than as an absolute, because
+%% the pre-fix code produced a hash too -- just not the block's. My first version of this
+%% test asserted `{error, missing_requests_hash}' for a payload that *does* carry
+%% `requestsHash', and it was the fixture that was wrong: the Prague branch is only
+%% reachable when the field is present, since its absence is what makes the payload look
+%% like Cancun.
+prague_payload_hashes_to_a_header_with_twenty_one_fields_test() ->
+    Cancun = payload(eth_payload_fixture:cancun()),
+    {ok, TwentyFields} = eth_block:payload_block_hash(Cancun),
+    {ok, TwentyOneFields} = eth_block:payload_block_hash(
+        maps:put(<<"requestsHash">>,
+                 <<"0xec88bf0d3fe6b86b583cf638c5635cb64bc842fee1e220f0e8be964a4d368c15">>,
+                 Cancun)),
+    ?assertNotEqual(TwentyFields, TwentyOneFields),
+    %% **And the 21-field hash is the one a real Prague header commits to**, which is checked
+    %% against the chain in `eth_header_tests` (`requests_hash_is_the_last_header_field_and
+    %% _says_so_against_a_real_block_test'). This test's job is that the payload path
+    %% reaches 21 fields at all.
+    ?assertEqual(32, byte_size(TwentyOneFields)).
+
+%% **Amsterdam needs all three new terms, and each absence is named.**
+amsterdam_payload_names_the_field_it_is_missing_test() ->
+    Base = amsterdam_shaped(),
+    ?assertEqual({error, missing_requests_hash},
+                 eth_block:payload_block_hash(Base)),
+    WithRequests = maps:put(<<"requestsHash">>, <<"0xec88bf0d3fe6b86b583cf638c5635cb64bc842f"
+                                              "ee1e220f0e8be964a4d368c15">>, Base),
+    ?assertEqual({error, missing_block_access_list},
+                 eth_block:payload_block_hash(WithRequests)),
+    WithBal = maps:put(<<"blockAccessList">>, <<"0xc0">>, WithRequests),
+    %% And with all three present it produces a hash rather than an error, which is the
+    %% whole point: a refusal that never lifts is not a fix.
+    ?assertMatch({ok, _}, eth_block:payload_block_hash(WithBal)),
+    %% **A malformed list is refused, and does not take the node down.** `eth_hex:decode/1`
+    %% raises on `"0xzz"' rather than answering an error, so the first version of
+    %% `header_block_access_list_hash/1' crashed on it -- a payload from the network
+    %% stopping the node rather than being turned away.
+    ?assertEqual({error, {bad_block_access_list, <<"0xzz">>}},
+                 eth_block:payload_block_hash(
+                   maps:put(<<"blockAccessList">>, <<"0xzz">>, WithRequests))).
+
+%% **The two new terms participate.** Without this the first two tests would also be
+%% satisfied by an encoder that recognises the shape and then ignores the fields -- which
+%% is the pre-fix behaviour with a different error message.
+an_amsterdam_payloads_hash_depends_on_its_two_new_terms_test() ->
+    Base = maps:put(<<"requestsHash">>,
+                    <<"0xec88bf0d3fe6b86b583cf638c5635cb64bc842fee1e220f0e8be964a4d368c15">>,
+                    amsterdam_shaped()),
+    WithBal = maps:put(<<"blockAccessList">>, <<"0xc0">>, Base),
+    WithOtherSlot = maps:put(<<"slotNumber">>, <<"0xac6001">>, WithBal),
+    {ok, H1} = eth_block:payload_block_hash(WithBal),
+    {ok, H2} = eth_block:payload_block_hash(WithOtherSlot),
+    ?assertNotEqual(H1, H2),
+    %% The empty list and a single-entry list are different commitments:
+    ?assertNotEqual(H1, eth_block:payload_block_hash(
+        maps:put(<<"blockAccessList">>, <<"0xc0c0">>, WithBal))).
+
+
+%% **EIP-7928's empty case, pinned against the chain and against this repository.**
+%%
+%% "For an empty block access list, this is `keccak256(rlp.encode([])) =
+%% 0x1dcc4de8...`". That value is also `eth_block:empty_uncle_hash()` -- `Keccak256(RLP([]))`,
+%% the ommers hash -- so the EIP's figure, this node's constant and the computation agree,
+%% and the test is that they do rather than a restatement of any one of them.
+the_empty_block_access_list_hashes_to_the_empty_ommers_hash_test() ->
+    ?assertEqual(<<16#c0>>, eth_rlp:encode([])),
+    ?assertEqual(eth_block:empty_uncle_hash(), eth_keccak:hash(eth_rlp:encode([]))),
+    %% **Written as hex and decoded, not as 32 bytes typed by hand.** The first version
+    %% was a `<<16#.., ..>>' literal and one byte of it was wrong, which produced a failure
+    %% whose expected and actual values look identical in EUnit's truncated output -- the
+    %% one shape of wrong answer that reads as a compiler bug rather than a typo.
+    ?assertEqual(eth_hex:must_decode_bytes(
+                   <<"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347">>),
+                 eth_block:empty_uncle_hash()).
+
+%% **The Cancun path must not have started demanding the new fields.** `slotNumber' is
+%% what distinguishes the two shapes, so a Cancun payload with no `slotNumber' still takes
+%% the 20-field branch -- and a test that only covers the new shapes would not notice if
+%% that had changed.
+a_cancun_payload_is_still_encoded_as_twenty_fields_test() ->
+    P = payload(eth_payload_fixture:cancun()),
+    {ok, Cancun} = eth_block:payload_block_hash(P),
+    {ok, WithRequests} = eth_block:payload_block_hash(
+        maps:put(<<"requestsHash">>,
+                 <<"0xec88bf0d3fe6b86b583cf638c5635cb64bc842fee1e220f0e8be964a4d368c15">>,
+                 P)),
+    ?assertNotEqual(Cancun, WithRequests),
+    %% **A `requestsHash` that is not 32 bytes is refused rather than padded.** `<<"0x00">>'
+    %% is one byte, and a header committing to a one-byte word would be a different header
+    %% again -- so this is the third distinct answer for three distinct defects, which is
+    %% why the reason carries the field it is about.
+    ?assertEqual({error, {bad_data_word, requests_hash, <<"0x00">>}},
+                 eth_block:payload_block_hash(maps:put(<<"requestsHash">>,
+                                                        <<"0x00">>, P))).
+
+%% An Amsterdam-shaped payload: `slotNumber` present, `blockAccessList` deliberately
+%% absent so each missing term can be named in turn.
+amsterdam_shaped() ->
+    maps:remove(<<"requestsHash">>,
+                maps:put(<<"slotNumber">>, <<"0xac6000">>,
+                         payload(eth_payload_fixture:cancun()))).

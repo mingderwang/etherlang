@@ -217,6 +217,26 @@ from_json(Map) when is_map(Map) ->
 %% something else is a malformed one; leaving it undefined would make the
 %% EIP-4788 call silently not happen, so it is dropped to undefined only for
 %% genuinely absent values and kept as a word otherwise.
+%% **Any length, unlike `maybe_word/1`'s 32.** A block access list is an RLP blob whose
+%% size is the block's business, not a header word, so it must not go through a decoder
+%% that answers `undefined' for anything but 32 bytes.
+%%
+%% **`eth_hex:decode/1` raises** on a value that is not hex, so it cannot be its own guard:
+%% a payload carrying `"0xzz"' would stop the node rather than be refused. `try` is what
+%% turns that into an answer, and it is why this function exists separately from
+%% `maybe_word/1' rather than inlined at the call site.
+maybe_bytes(V) ->
+    %% **`must_decode_bytes/1`, not `decode/1`.** `decode/1` answers an **integer** and
+    %% signals a non-hex value by `ok = check_hex(S)` raising -- so it is the wrong function
+    %% twice over, and my first two attempts used it: matching `{ok, Bin}' against it gave a
+    %% `try_clause' with no clause to report, because the value is an integer.
+    try eth_hex:must_decode_bytes(V) of
+        Bin when is_binary(Bin) -> Bin;
+        Other -> Other
+    catch
+        _:_ -> undefined
+    end.
+
 maybe_word(undefined) -> undefined;
 maybe_word(V) when is_binary(V), byte_size(V) =:= 66 ->
     binary:decode_hex(binary:part(V, 2, 64));
@@ -1610,7 +1630,7 @@ payload_block_hash(Payload) ->
                     case payload_roots(Payload, Wire) of
                         {error, Reason} -> {error, Reason};
                         {ok, Roots} ->
-                            case payload_header_rlp(Block, Roots, Fork) of
+                            case payload_header_rlp(Payload, Block, Roots, Fork) of
                                 {error, Reason2} -> {error, Reason2};
                                 Encoded -> {ok, eth_keccak:hash(Encoded)}
                             end
@@ -1636,10 +1656,41 @@ payload_header_fork(Payload) ->
         {Used, Excess, _} when Used =/= undefined, Excess =/= undefined ->
             case pget(Payload, <<"parentBeaconBlockRoot">>) of
                 undefined -> {error, missing_parent_beacon_block_root};
-                _ -> {ok, cancun}
+                _ -> payload_fork_after_cancun(Payload)
             end;
         {Used, Excess, _} ->
             {error, {partial_blob_fields, Used, Excess}}
+    end.
+
+%% **Prague and Amsterdam, told apart by the fields the payload carries.**
+%%
+%% `ExecutionPayloadV3' has no `requestsHash' and `ExecutionPayloadV4' adds exactly two
+%% fields, `blockAccessList' and `slotNumber' (execution-apis src/engine/amsterdam.md,
+%% "ExecutionPayloadV4": "This structure has the syntax of ExecutionPayloadV3 and appends
+%% the new field: blockAccessList" -- and the listing that follows carries both). So the
+%% presence of `slotNumber' identifies an Amsterdam payload and its absence a Prague one.
+%%
+%% **This is what the old version could not do.** It returned `{ok, cancun}' for anything
+%% with blob fields and a beacon root, so a Prague or Amsterdam payload was encoded as a
+%% **20-field Cancun header** -- missing `requestsHash', and missing `blockAccessListHash'
+%% and `slotNumber' as well. `payload_block_hash/1' then answered a hash that is not the
+%% block's, which `newPayload' reports as `INVALID_BLOCK_HASH' on a perfectly valid
+%% payload. **A wrong hash is worse than a refusal**, so this is the fix that matters even
+%% before the two new fields are read correctly.
+%%
+%% The EIP-7685 `requestsHash' is **not** a payload field: it is written into the beacon
+%% roots contract's storage, so a Prague header needs a value the payload does not carry.
+%% `header_requests_hash/1' takes it from the payload when a caller supplies one and
+%% otherwise refuses by name, because the alternative -- omitting it -- is the 20-field
+%% header this function just stopped producing.
+payload_fork_after_cancun(Payload) ->
+    case pget(Payload, <<"slotNumber">>) of
+        undefined ->
+            case pget(Payload, <<"requestsHash">>) of
+                undefined -> {ok, cancun};
+                _ -> {ok, prague}
+            end;
+        _ -> {ok, amsterdam}
     end.
 
 payload_roots(Payload, Wire) ->
@@ -1761,7 +1812,7 @@ decoded_quantity(Payload, Key, Default) ->
     end.
 
 %% The 16 fields of Paris, then the two Shanghai and Cancun each appended.
-payload_header_rlp(#block{parent_hash = PH, miner = Miner, sha3_uncles = SU,
+payload_header_rlp(Payload, #block{parent_hash = PH, miner = Miner, sha3_uncles = SU,
                           state_root = SR, receipts_root = RR,
                           logs_bloom = Bloom, difficulty = Diff, number = N,
                           gas_limit = GL, gas_used = GU, timestamp = Ts,
@@ -1776,16 +1827,105 @@ payload_header_rlp(#block{parent_hash = PH, miner = Miner, sha3_uncles = SU,
         shanghai ->
             eth_rlp:encode(Base ++ [maps:get(withdrawals_root, Roots)]);
         cancun ->
-            eth_rlp:encode(Base ++ [maps:get(withdrawals_root, Roots),
-                                   maps:get(blob_gas_used, Roots),
-                                   maps:get(excess_blob_gas, Roots),
-                                   %% EIP-4788's header field, which is also the
-                                   %% value handed to the system call. It has to
-                                   %% be the same 32 bytes in both places: a
-                                   %% header that commits to one root while the
-                                   %% contract records another is a block whose
-                                   %% state root nobody can reproduce.
-                                   parent_beacon_root(Roots, Block)])
+            eth_rlp:encode(Base ++ cancun_terms(Roots, Block));
+        %% **21 fields.** EIP-7685's `requestsHash`, and its position is pinned against a
+        %% real Sepolia Prague block rather than chosen -- see `eth_header:header_fields/0'.
+        prague ->
+            case header_requests_hash(Payload) of
+                {ok, Requests} ->
+                    eth_rlp:encode(Base ++ cancun_terms(Roots, Block) ++ [Requests]);
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        %% **23 fields.** EIP-7928's `blockAccessListHash' then EIP-7843's `slotNumber', in
+        %% that order, which is go-ethereum's `core/types/block.go' order and the order
+        %% `eth_header:header_fields/0' encodes. Both are pinned against Sepolia block
+        %% 11,856,337 -- the first with a `slotNumber' -- whose claimed hash this reproduces.
+        amsterdam ->
+            case {header_requests_hash(Payload),
+                  header_block_access_list_hash(Payload),
+                  header_slot_number(Payload)} of
+                {{ok, Requests}, {ok, BalHash}, {ok, Slot}} ->
+                    eth_rlp:encode(Base ++ cancun_terms(Roots, Block)
+                                   ++ [Requests, BalHash, Slot]);
+                {{error, R}, _, _} -> {error, R};
+                {_, {error, R}, _} -> {error, R};
+                {_, _, {error, R}} -> {error, R}
+            end
+    end.
+
+%% The twenty terms every Cancun-or-later header starts with.
+cancun_terms(Roots, Block) ->
+    [maps:get(withdrawals_root, Roots),
+     maps:get(blob_gas_used, Roots),
+     maps:get(excess_blob_gas, Roots),
+     %% EIP-4788's header field, which is also the value handed to the system call. It
+     %% has to be the same 32 bytes in both places: a header that commits to one root
+     %% while the contract records another is a block whose state root nobody reproduces.
+     parent_beacon_root(Roots, Block)].
+
+%% **EIP-7685's `requestsHash' is not a payload field.** It is written into the beacon roots
+%% contract's storage, so a Prague or Amsterdam payload does not carry it and this node has
+%% no other source for it *on the Engine API path*.
+%%
+%% **So this refuses by name rather than omitting the field.** The previous encoder handled
+%% only Paris, Shanghai and Cancun and answered a 20-field header for a Prague payload -- a
+%% hash that is not the block's, reported to the client as `INVALID_BLOCK_HASH'. Two wrong
+%% answers were available and the named one is chosen: `{error, missing_requests_hash}' says
+%% what is absent, where a shorter header asserts something false about a block that exists.
+header_requests_hash(Payload) ->
+    case pget(Payload, <<"requestsHash">>) of
+        undefined -> {error, missing_requests_hash};
+        {ok, V} -> data_word(V, requests_hash)
+    end.
+
+%% **EIP-7928: `block_access_list_hash = keccak256(rlp(block_access_list))`.**
+%%
+%% `ExecutionPayloadV4' carries `blockAccessList' as the "RLP-encoded block access list",
+%% so **the hash is over those bytes directly** and the BAL's internal structure never has to
+%% be decoded to check the commitment. That is why this is verifiable at all: TASKS.md
+%% recorded the BAL contents as unverifiable, which is true of the public JSON-RPC this node
+%% syncs from -- `eth_getBlockByNumber' returns only the hash and `debug_getBlockAccessList'
+%% does not exist there -- and false of the Engine API, which is where a proposer actually
+%% sends it.
+%%
+%% The empty case is pinned against the chain rather than derived: EIP-7928 says it encodes
+%% as `0xc0` and hashes to `0x1dcc4de8...', which is this repository's
+%% `eth_block:empty_uncle_hash()' -- the same value, for the same reason.
+header_block_access_list_hash(Payload) ->
+    case pget(Payload, <<"blockAccessList">>) of
+        undefined -> {error, missing_block_access_list};
+        {ok, V} ->
+            %% **`eth_hex:decode/1` raises on a value that is not hex**, so it cannot be
+            %% the guard: a payload carrying `"0xzz"' would take the node down rather than
+            %% being refused. `maybe_word/1' is the same decode behind a `try' and is
+            %% already the shape this file uses everywhere else for a DATA field.
+            case maybe_bytes(V) of
+                undefined -> {error, {bad_block_access_list, V}};
+                Rlp -> {ok, eth_keccak:hash(Rlp)}
+            end
+    end.
+
+%% **EIP-7843's `slotNumber', a QUANTITY.** `undefined' and `0' are different answers: 0 is
+%% the genesis slot, and an Amsterdam payload omitting the field is malformed rather than a
+%% block at slot zero.
+header_slot_number(Payload) ->
+    case pget(Payload, <<"slotNumber">>) of
+        undefined -> {error, missing_slot_number};
+        {ok, V} ->
+            case payload_quantity(V) of
+                {ok, N} -> {ok, N};
+                {error, _} -> {error, {bad_slot_number, V}}
+            end
+    end.
+
+%% A 32-byte header word from a DATA field. Absent is not `<<0:256>>': a field that is not
+%% there and a field carrying the zero word are different, and only the second is a value a
+%% header can commit to.
+data_word(V, What) ->
+    case maybe_word(V) of
+        undefined -> {error, {bad_data_word, What, V}};
+        Word -> {ok, Word}
     end.
 
 parent_beacon_root(Roots, #block{parent_beacon_block_root = undefined}) ->
