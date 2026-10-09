@@ -18,7 +18,7 @@ REBAR ?= $(shell ls -1 "$$HOME/.bin/rebar3" 2>/dev/null || ls -1 /Users/mingderw
 ## prerequisite gives `No rule to make target '@test''.
 NEED_REBAR = test -n "$(REBAR)" || { echo "rebar3 not found. Set REBAR=/path/to/rebar3"; exit 1; }
 
-.PHONY: all compile test eunit release-pair counts check-ledger docs rationale edoc-preview clean docker-build docker-test docker-run compose-up compose-down compose-logs bench
+.PHONY: all compile test eunit release-pair counts check-ledger check-gate docs rationale edoc-preview clean docker-build docker-test docker-run compose-up compose-down compose-logs bench
 
 all: compile
 
@@ -156,6 +156,15 @@ counts:
 	echo "  Update TASKS.md (the open-items list), README.md or AGENTS.md in this"; \
 	echo "  commit, or say in the commit message why this change needs none."; \
 	exit 1
+
+## Is the pre-commit gate actually armed? Run this when in doubt.
+##
+## `core.hooksPath` pointing at a missing directory makes git skip every hook **silently**,
+## and `git config --get core.hooksPath` still prints a correct-looking value. That happened
+## here and was found by committing through it -- so the target does the whole check, including
+## committing a src/-only change and requiring it to be refused.
+check-gate:
+	@bash tools/check-gate.sh
 
 ## API reference (edoc) into doc/, which is gitignored -- it is a build artifact.
 ##

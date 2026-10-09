@@ -35,21 +35,40 @@ else
     fail=1
 fi
 
-# The probe: a src-only change must be refused. Done in a temporary index so the working tree
-# is never touched, because a self-check that dirties the tree is its own small hazard.
-if [ -f "$hook" ] && [ "$fail" -eq 0 ]; then
-    before=$(git rev-parse HEAD)
-    printf '\n' >> apps/etherlang/src/eth_word.erl
-    git add apps/etherlang/src/eth_word.erl
-    if git commit -q -m "gate self-test (must not be committed)" >/dev/null 2>&1; then
-        echo "  ${RED}FAIL${RST} a src-only change was ACCEPTED -- the gate is not armed"
-        git reset --hard "$before" >/dev/null 2>&1
-        fail=1
-    else
-        echo "  ${GRN}ok${RST}   a src-only change is refused (exit non-zero, HEAD unmoved)"
-        git reset --hard "$before" >/dev/null 2>&1
+# The probe: a src-only change must be refused.
+#
+# **It restores the file by copying a backup, and it never runs `git reset --hard`.** The
+# first version used `git reset --hard HEAD` and it destroyed uncommitted work -- including a
+# Makefile edit made moments earlier, which is how I lost one twice before noticing. **A gate
+# that deletes the tree it is protecting is worse than no gate**, and `git reset --hard` on a
+# dirty tree is the single most destructive thing a script can do by reflex.
+#
+# Only the index is touched (`git add`, then `git reset -q`); the file goes back from the copy.
+probe=apps/etherlang/src/eth_word.erl
+if [ -f "$hook" ] && [ "$fail" -eq 0 ] && [ -f "$probe" ]; then
+    backup=$(mktemp)
+    head_before=$(git rev-parse HEAD)
+    cp "$probe" "$backup" || { echo "  ${RED}FAIL${RST} could not back up $probe"; fail=1; }
+    if [ "$fail" -eq 0 ]; then
+        printf '\n' >> "$probe"
+        git add "$probe"
+        if git commit -q -m "gate self-test (must not be committed)" >/dev/null 2>&1; then
+            echo "  ${RED}FAIL${RST} a src-only change was ACCEPTED -- the gate is not armed"
+            fail=1
+        else
+            after=$(git rev-parse HEAD)
+            if [ "$after" = "$head_before" ]; then
+                echo "  ${GRN}ok${RST}   a src-only change is refused (HEAD unmoved)"
+            else
+                echo "  ${RED}FAIL${RST} the probe moved HEAD -- refusing to leave that in place"
+                git reset --hard "$head_before" >/dev/null 2>&1
+                fail=1
+            fi
+        fi
+        cp "$backup" "$probe"          # restore by copy, not by git
+        rm -f "$backup"
+        git reset -q -- "$probe" 2>/dev/null || git reset -q 2>/dev/null || true
     fi
-    git reset -q 2>/dev/null || true
 fi
 
 [ "$fail" -eq 0 ] && echo "  gate: armed" || echo "  gate: NOT ARMED"
