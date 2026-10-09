@@ -297,9 +297,25 @@ appended_keys() -> [<<"withdrawals">>, <<"blobGasUsed">>, <<"excessBlobGas">>,
 %% key set is demanded of an object that has none of them.
 required_attributes(paris) -> [];
 required_attributes(shanghai) -> [<<"withdrawals">>];
-required_attributes(cancun) -> [<<"withdrawals">>, <<"parentBeaconBlockRoot">>].
+required_attributes(cancun) -> [<<"withdrawals">>, <<"parentBeaconBlockRoot">>];
+%% **`PayloadAttributesV4` "has the syntax of PayloadAttributesV3 and appends two new
+%% fields: `slotNumber` and `targetGasLimit`"** (execution-apis src/engine/amsterdam.md).
+%%
+%% `targetGasLimit` appears in **neither** EIP-7843 nor EIP-7928 and is in neither header
+%% field list this node encodes -- it is a *target*, and nothing in the header commits to it.
+%% It is listed here because the attributes object must carry it to match the structure, and
+%% **this node does not act on it**: a `gasLimit` other than the one the block's own header
+%% carries would change the block, and there is no rule in the header or the fork schedule
+%% that says which target wins. Recorded rather than silently accepted.
+required_attributes(amsterdam) -> [<<"withdrawals">>, <<"parentBeaconBlockRoot">>,
+                                   <<"slotNumber">>, <<"targetGasLimit">>];
+%% Prague's method is `getPayloadV4` and its attributes object is still `PayloadAttributesV3`
+%% (src/engine/prague.md adds `executionRequests` to the *response*, not to the attributes),
+%% so V4 asks for exactly what V3 asked for.
+required_attributes(prague) -> required_attributes(cancun).
 
-appended_attribute_keys() -> [<<"withdrawals">>, <<"parentBeaconBlockRoot">>].
+appended_attribute_keys() -> [<<"withdrawals">>, <<"parentBeaconBlockRoot">>,
+                              <<"slotNumber">>, <<"targetGasLimit">>].
 
 %% The structure a method of the given version requires of a payload whose
 %% timestamp is Timestamp.
@@ -358,7 +374,13 @@ at_or_after(Fork, Timestamp) ->
 -spec version_fork(integer()) -> atom().
 version_fork(1) -> paris;
 version_fork(2) -> shanghai;
-version_fork(3) -> cancun.
+version_fork(3) -> cancun;
+version_fork(4) -> prague;
+%% **There is no `getPayloadV5`.** The documents name `engine_getPayloadV4` (prague.md) and
+%% `engine_getPayloadV6` (amsterdam.md), and nothing between them, so version 5 has no clause
+%% here on purpose: an unmapped version is refused rather than answered with a neighbour's
+%% structure, which is the failure this module has committed to twice already.
+version_fork(6) -> amsterdam.
 
 %% ok | {error, Code, Message}
 -spec payload_admission(map() | term(), integer()) -> ok | {error, integer(), binary()}.
@@ -558,6 +580,33 @@ attributes_frame_admission(Attributes, 3) ->
         error ->
             %% A QUANTITY is checked as part of matching the structure, so an
             %% unreadable one is a shape failure, and the code is -38003.
+            {error, ?INVALID_ATTRIBUTES,
+             <<"invalid payload attributes: timestamp">>}
+    end;
+attributes_frame_admission(Attributes, 4) ->
+    attributes_frame_check(Attributes, prague);
+%% **`getPayloadV6` is gated on `amsterdam` and not on `6`.** There is no `getPayloadV5`,
+%% so the method numbers and the fork numbers drift apart, and forwarding the version
+%% straight into `frame_admission/2` -- which is what this did -- raises `function_clause`
+%% on the first V6 attributes object. **Two version axes, and only one of them is a fork.**
+attributes_frame_admission(Attributes, 6) ->
+    attributes_frame_check(Attributes, amsterdam).
+
+attributes_frame_check(Attributes, Fork) ->
+    %% The same timestamp gate the payload methods use, and for the same reason: a
+    %% `PayloadAttributesV4` arriving at a pre-Amsterdam timestamp is a client using the
+    %% wrong version, and `-38005` is the code the specification defines for that.
+    case strict_quantity_field(Attributes, <<"timestamp">>) of
+        {ok, Timestamp} ->
+            %% **A boolean is not an answer `attributes_admission/2` can carry.** It matches
+            %% `ok' and `{error, Code, Message}' and nothing else, so returning
+            %% `in_fork_frame/2`'s `false' made every pre-fork attributes object look like
+            %% a success -- a refusal that reads as an acceptance.
+            case in_fork_frame(Fork, Timestamp) of
+                true -> ok;
+                false -> {error, ?UNSUPPORTED_FORK, <<"unsupported fork">>}
+            end;
+        error ->
             {error, ?INVALID_ATTRIBUTES,
              <<"invalid payload attributes: timestamp">>}
     end.

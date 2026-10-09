@@ -1115,6 +1115,93 @@ new_payload_v2_answers_invalid_params_for_the_wrong_structure_test() ->
 %% is "not provided" (cancun.md item 1) and so is -32602, not -38005: the frame
 %% check is about the payload's timestamp and says nothing about this parameter.
 %% ===========================================================================
+%% The Prague and Amsterdam method set, all four dispatch clauses
+%% ===========================================================================
+%% **"Recognised" is the assertion, not "works".** `-32601` and a plausible-looking status
+%% are both things a handler without the clause can answer, and a status from a catch-all
+%% proxy would read as success to anything checking only for an error's absence.
+
+new_payload_v4_is_recognised_test() ->
+    with_http(fun(Port) ->
+        {ok, Body, _} = call(Port, <<"engine_newPayloadV4">>,
+                             [payload(), [], <<0:256>>, []]),
+        ?assertNot(is_error(Body, -32601))
+    end).
+
+forkchoice_updated_v4_is_recognised_test() ->
+    with_http(fun(Port) ->
+        %% An all-zero head is the specification's "not claimed" marker, so this reaches
+        %% `eth_engine` and answers VALID rather than being refused by the state check --
+        %% which is what makes it a test of the *dispatch* rather than of the head.
+        {ok, Body, _} = call(Port, <<"engine_forkchoiceUpdatedV4">>,
+                             [forkchoice(undefined), <<0:256>>, []]),
+        ?assertNot(is_error(Body, -32601))
+    end).
+
+%% **`getPayloadV4` and `getPayloadV6` answer `-38001` for an unknown payload id**, which is
+%% the specification's code and proves the method ran rather than being proxied. A `-32601`
+%% here would mean the dispatch clause is missing; a `-32602` would mean the parameter
+%% shape is wrong.
+get_payload_v4_and_v6_answer_unknown_payload_id_test() ->
+    with_http(fun(Port) ->
+        [begin
+             {ok, Body, _} = call(Port, Method, [<<"0x0102030405060708">>]),
+             ?assertEqual({Method, -38001}, {Method, error_code(Body)})
+         end || Method <- [<<"engine_getPayloadV4">>, <<"engine_getPayloadV6">>]]
+    end).
+
+%% **`PayloadAttributesV4` demands `slotNumber` and `targetGasLimit`, and
+%% `targetGasLimit` is in neither EIP this fork is built from.** It appears in
+%% execution-apis and nowhere else: not in EIP-7843's header field, not in EIP-7928. So the
+%% structure check requires a field the node has no rule for -- which is recorded rather
+%% than papered over, and asserted here so the requirement is visible in a test.
+payload_attributes_v4_requires_slot_number_and_target_gas_limit_test() ->
+    with_http(fun(Port) ->
+        %% Without both, the attributes object is not V4's and the answer is -38003.
+        {ok, Body, _} = call(Port, <<"engine_getPayloadV6">>,
+                             [<<"0x0102030405060708">>]),
+        ?assertEqual(-38001, error_code(Body)),
+        %% And the structure check itself, asked directly of the admission function so the
+        %% requirement does not have to be inferred from an end-to-end refusal. **A
+        %% comprehension over `[x || true]` is not a way to name a term** -- my first
+        %% version had one here and it did not parse, which is the cheapest possible report
+        %% of a construct that was never going to mean anything.
+        %% **An attributes object, not a payload.** My first version passed the *payload*
+        %% fixture to `attributes_admission/2', which checks a different structure --
+        %% `required_attributes/1` against `appended_attribute_keys/0` -- so the assertion was
+        %% about the wrong object entirely and would have passed for the wrong reason on a
+        %% node that checked nothing.
+        A = amsterdam_attributes(),
+        ?assertMatch({error, -38003, _},
+                     eth_engine:attributes_admission(maps:remove(<<"slotNumber">>, A), 6)),
+        ?assertMatch({error, -38003, _},
+                     eth_engine:attributes_admission(
+                       maps:remove(<<"targetGasLimit">>, A), 6)),
+        %% **Both present: the structure passes and the frame gate is reached.** The
+        %% timestamp is post-Amsterdam, so this is `ok` rather than `-38005` -- which is the
+        %% assertion that the fork gate is a *separate* check and not a side effect of the
+        %% structure one.
+        ?assertEqual(ok, eth_engine:attributes_admission(A, 6)),
+        %% And Prague's method wants V3's attributes, so the same object is refused there.
+        ?assertMatch({error, -38003, _},
+                     eth_engine:attributes_admission(A, 4))
+    end).
+
+%% `PayloadAttributesV4`, with the timestamp after Sepolia's Amsterdam activation.
+amsterdam_attributes() ->
+    #{<<"timestamp">> => <<"0x6ac7a2e0">>,
+      <<"prevRandao">> => <<0:256>>,
+      <<"suggestedFeeRecipient">> => <<0:160>>,
+      <<"withdrawals">> => [],
+      <<"parentBeaconBlockRoot">> => <<0:256>>,
+      <<"slotNumber">> => <<"0xac6000">>,
+      <<"targetGasLimit">> => <<"0x1c9c380">>}.
+
+error_code(#{<<"error">> := #{<<"code">> := Code}}) -> Code;
+error_code(#{<<"result">> := #{<<"code">> := Code}}) -> Code;
+error_code(_Body) -> none.
+
+%% ===========================================================================
 %% engine_newPayloadV5: the method that carries `executionRequests`
 %% ===========================================================================
 %% **`requestsHash` has exactly one source on this path and it is this method's fourth

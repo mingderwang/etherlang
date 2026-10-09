@@ -120,20 +120,37 @@ handle_body(Body, State) ->
                     handle_new_payload(Map, State, Id, 2);
                 <<"engine_newPayloadV3">> ->
                     handle_new_payload_v3(Map, State, Id);
+                <<"engine_newPayloadV4">> ->
+                    %% Prague's method. **Same fourth parameter, different payload shape**:
+                    %% "Method parameter list is extended with `executionRequests`" over an
+                    %% `ExecutionPayloadV3` (src/engine/prague.md), against V5's
+                    %% `ExecutionPayloadV4`. One handler, two versions, and the version is
+                    %% what selects the structure.
+                    handle_new_payload_with_requests(Map, State, Id, 4);
                 <<"engine_newPayloadV5">> ->
-                    handle_new_payload_v5(Map, State, Id);
+                    handle_new_payload_with_requests(Map, State, Id, 5);
                 <<"engine_forkchoiceUpdatedV1">> ->
                     handle_forkchoice_updated(Map, State, Id, 1);
                 <<"engine_forkchoiceUpdatedV2">> ->
                     handle_forkchoice_updated(Map, State, Id, 2);
                 <<"engine_forkchoiceUpdatedV3">> ->
                     handle_forkchoice_updated(Map, State, Id, 3);
+                <<"engine_forkchoiceUpdatedV4">> ->
+                    %% Amsterdam's method. **Prague has no forkchoiceUpdatedV4 of its own** --
+                    %% prague.md names V1, V2 and V3 -- so the number tracks the *fork*, not
+                    %% the payload structure, the opposite of `newPayloadV4`/`V5`. Two
+                    %% version axes in one module, and this is the second place they differ.
+                    handle_forkchoice_updated(Map, State, Id, 4);
                 <<"engine_getPayloadV1">> ->
                     handle_get_payload(Map, Id, 1);
                 <<"engine_getPayloadV2">> ->
                     handle_get_payload(Map, Id, 2);
                 <<"engine_getPayloadV3">> ->
                     handle_get_payload(Map, Id, 3);
+                <<"engine_getPayloadV4">> ->
+                    handle_get_payload(Map, Id, 4);
+                <<"engine_getPayloadV6">> ->
+                    handle_get_payload(Map, Id, 6);
                 <<"engine_exchangeTransitionConfigurationV1">> ->
                     handle_exchange_config(Map, State, Id);
                 _ ->
@@ -267,7 +284,7 @@ handle_new_payload_v3(Map, _State, Id) ->
 %% one writer is here and the one reader is `eth_block:header_requests_hash/1`, so the key has
 %% a single normaliser and a single reader -- but a parameter would be the honest shape, and
 %% this is recorded as the reason the two have not diverged.
-handle_new_payload_v5(Map, _State, Id) ->
+handle_new_payload_with_requests(Map, _State, Id, Version) ->
     case param(Map, 0) of
         P when is_map(P) ->
             case parent_beacon_root_admission(param(Map, 2)) of
@@ -281,13 +298,13 @@ handle_new_payload_v5(Map, _State, Id) ->
                     %% absent or null list is the empty list, and its hash is the chain's
                     %% `0xe3b0c442...`.
                     P1 = P#{<<"executionRequests">> => execution_requests(param(Map, 3))},
-                    %% **5, not 4.** `admit_payload/3`'s second argument is the *method*
-                    %% version -- it selects the payload structure -- and not a parameter
-                    %% count. Passing 4 asked for Prague's structure on a method that
-                    %% carries Amsterdam's, and `structure_for_version/2` had no clause
-                    %% for it, so the handler died with `function_clause` on the first V5
-                    %% call. **An arity that reads like a count and is not one.**
-                    case admit_payload(P1, 5, Id) of
+                    %% **The method version, not a parameter count.** `admit_payload/3`'s
+                    %% second argument selects the payload structure, and the hard-coded `5`
+                    %% was wrong the moment V4 arrived. My first pass passed `4` here meaning
+                    %% "four parameters" and the handler died with `function_clause` -- **an
+                    %% arity that reads like a count and is not one, and the crash named
+                    %% neither.**
+                    case admit_payload(P1, Version, Id) of
                         {admission_error, Code2, Message2, Id2} ->
                             error_rpc(Id2, Code2, Message2);
                         proceed ->
@@ -451,7 +468,20 @@ get_payload_result(Payload, 3, BlockValue) ->
         <<"proofs">> => [],
         <<"blobs">> => []
       },
-      <<"shouldOverrideBuilder">> => false}.
+      <<"shouldOverrideBuilder">> => false};
+%% **Prague's `getPayloadV4`: the V3 shape plus `executionRequests`** (src/engine/prague.md,
+%% "The response of this method is extended with the `executionRequests` field"). The list
+%% is **empty and that is a claim, not a default**: this node's builder includes no blob
+%% transactions and has no execution-request type to produce, so there is nothing to report.
+%% A fabricated request would be a commitment this node has not earned.
+get_payload_result(Payload, 4, BlockValue) ->
+    (get_payload_result(Payload, 3, BlockValue))#{<<"executionRequests">> => []};
+%% **Amsterdam's `getPayloadV6`: the same response shape over `ExecutionPayloadV4`.** The
+%% payload carries `slotNumber` and `blockAccessList` because it is whatever the builder
+%% produced; this node's builder emits no blob transactions, so its BAL is empty and its
+%% `blockAccessListHash` is the empty list's hash.
+get_payload_result(Payload, 6, BlockValue) ->
+    get_payload_result(Payload, 4, BlockValue).
 
 handle_exchange_config(Map, _State, Id) ->
     case param(Map, 0) of
