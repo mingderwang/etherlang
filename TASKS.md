@@ -1907,6 +1907,45 @@ that is a smaller piece of work than the guessing it replaces.
    cannot produce a block another client would accept has not been measured at all,
    and that is the measurement Lighthouse actually cares about.
 
+### Two local nodes: the handshake works, and the cold-start sync path does not exist
+
+**Measured on a live pair, A synced to the Sepolia tip (11,875,097) and B given no upstream:**
+
+| what | result |
+|---|---|
+| A `net_peerCount` / B `net_peerCount` | `0x1` / `0x1` -- **handshake works both ways** |
+| B's view of A's head | present, 32 bytes, via the `eth/69` status forkid |
+| `get_headers n=192 rev=true` from A | `{ok, 192}` in ~1.0 s, repeatedly |
+| B's `eth_blockNumber` | `chain_empty` |
+| B's `eth_sync status` | **times out** |
+
+**So the p2p plumbing is sound and the defect is in `eth_sync`'s cold start.** Three things,
+all measured or read:
+
+1. **`?PEER_WALK_CAP` is 2048 headers.** `peer_catchup/3` walks back from the peer's head
+   until it finds a local anchor, capped at 2048. From A's tip that reaches 11,873,049, and an
+   empty store has no anchor there. **A cold node cannot bridge to genesis this way at all**:
+   genesis is 11.87M headers back, i.e. ~61,900 `get_headers` calls. devp2p's `eth/68`
+   `getBlockHeaders` also serves **forward** by number (`reverse=0` with a start number), and
+   this node never asks that way -- which is the request a cold sync actually needs.
+2. **`peer_fill/3` answers `{mode = follow, synced = true}` when it has nothing to append.**
+   That is a node with an empty chain declaring itself synced. It is the same shape as the
+   defects this file records elsewhere: **a status this node has not earned.**
+3. **The walk runs inside the `eth_sync` gen_server**, so a tick longer than the caller's
+   timeout makes `eth_sync:status/0` time out -- the node cannot report its own state while it
+   is syncing. The walk needs to be bounded in *iterations* and yield between them, not bounded
+   only in headers.
+
+**Fixed here: the script, which is why none of this was measurable before.**
+`tools/two-node-p2p.sh` did B's `-sname` rename **inside the tree-copy branch**, so once
+`_build/node2/rel/etherlang` existed the `sed` never ran, B's `vm.args` kept
+`-sname etherlang`, and B died at boot with `the name etherlang@HOST seems to be in use`.
+`daemon` redirects to `/dev/null`, so a B that refuses to start is indistinguishable from a B
+that was never started, and `status` said "not running" for both. **B had never started in any
+measurement taken before this** -- which is the answer to why Phase 7 read 0 of 7 with nothing
+obviously wrong. The rename is now unconditional and **verified**, because a step that can
+silently do nothing has to be checked rather than assumed.
+
 ### The commit gate, and the failure that produced it
 
 **`d47f57e` changed `apps/etherlang/src/` and committed with `make check-ledger` red. That

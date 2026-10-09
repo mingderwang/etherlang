@@ -176,8 +176,30 @@ start() {
         say "copying the tree for node B"
         rm -rf "$B_TREE"; mkdir -p "$(dirname "$B_TREE")"
         rsync -a "$A_TREE" "$B_TREE"
-        # note 3: B needs its own OTP node name
-        sed -i '' 's/^-sname etherlang$/-sname etherlang2/' "$B_TREE"/releases/*/vm.args
+    fi
+
+    # **note 3, and it runs on every start rather than only on the copy.**
+    #
+    # This was the reason "B is not running" for as long as it was: the rename lived inside
+    # the copy branch, so once `_build/node2/rel/etherlang' existed the sed never ran, B's
+    # `vm.args' kept `-sname etherlang', and B died at boot with
+    #
+    #     Protocol 'inet_tcp': the name etherlang@HOST seems to be in use by another
+    #     Erlang node
+    #
+    # **A step that can silently do nothing must be checked, not assumed.** The sed is
+    # idempotent, so running it always costs nothing; and the verification below is the part
+    # that matters, because the failure it prevents is invisible -- `daemon` redirects its
+    # output to /dev/null, so a B that refuses to start is indistinguishable from a B that was
+    # never started, and `status` then says "not running" for both.
+    for f in "$B_TREE"/releases/*/vm.args; do
+        [ -f "$f" ] || continue
+        sed -i '' 's/^-sname etherlang$/-sname etherlang2/' "$f"
+    done
+    if grep -qs '^-sname etherlang$' "$B_TREE"/releases/*/vm.args; then
+        say "B's vm.args still declares -sname etherlang; B cannot register alongside A."
+        say "  fix: sed -i '' 's/^-sname etherlang$/-sname etherlang2/' $B_TREE/releases/*/vm.args"
+        exit 1
     fi
 
     stop_one etherlang "$A_TREE" >/dev/null
