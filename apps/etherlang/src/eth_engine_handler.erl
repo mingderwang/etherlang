@@ -120,6 +120,8 @@ handle_body(Body, State) ->
                     handle_new_payload(Map, State, Id, 2);
                 <<"engine_newPayloadV3">> ->
                     handle_new_payload_v3(Map, State, Id);
+                <<"engine_newPayloadV5">> ->
+                    handle_new_payload_v5(Map, State, Id);
                 <<"engine_forkchoiceUpdatedV1">> ->
                     handle_forkchoice_updated(Map, State, Id, 1);
                 <<"engine_forkchoiceUpdatedV2">> ->
@@ -246,6 +248,60 @@ handle_new_payload_v3(Map, _State, Id) ->
         _ ->
             invalid_params(Id)
     end.
+
+%% **`engine_newPayloadV5`**, which is the same method with `ExecutionPayloadV4` and a fourth
+%% parameter. execution-apis src/engine/amsterdam.md, engine_newPayloadV5, Request:
+%%
+%%   1. `executionPayload`: ExecutionPayloadV4
+%%   2. `expectedBlobVersionedHashes`: Array of DATA, 32 Bytes
+%%   3. `parentBeaconBlockRoot`: DATA, 32 Bytes
+%%   4. `executionRequests`: Array of DATA
+%%
+%% **That fourth parameter is where `requestsHash` comes from.** It is not a payload field --
+%% EIP-7685's value is `compute_requests_hash(executionRequests)` -- so without this method a
+%% Prague or Amsterdam payload had no way to be hashed at all, and the previous commit's
+%% `missing_requests_hash` was the honest symptom of its absence.
+%%
+%% The requests are attached to the payload map under their own name rather than threaded as a
+%% separate argument through `payload_block_hash/1`. **That is a bridge, not a design**: the
+%% one writer is here and the one reader is `eth_block:header_requests_hash/1`, so the key has
+%% a single normaliser and a single reader -- but a parameter would be the honest shape, and
+%% this is recorded as the reason the two have not diverged.
+handle_new_payload_v5(Map, _State, Id) ->
+    case param(Map, 0) of
+        P when is_map(P) ->
+            case parent_beacon_root_admission(param(Map, 2)) of
+                {error, Code, Message} ->
+                    error_rpc(Id, Code, Message);
+                ok ->
+                    %% **A null fourth parameter is an empty request list, not an error.**
+                    %% The specification's rule that a null field "MUST be considered as not
+                    %% provided" would make it -32602, and a CL that sends `null' for a block
+                    %% with no requests would be refused for a payload that is valid. An
+                    %% absent or null list is the empty list, and its hash is the chain's
+                    %% `0xe3b0c442...`.
+                    P1 = P#{<<"executionRequests">> => execution_requests(param(Map, 3))},
+                    %% **5, not 4.** `admit_payload/3`'s second argument is the *method*
+                    %% version -- it selects the payload structure -- and not a parameter
+                    %% count. Passing 4 asked for Prague's structure on a method that
+                    %% carries Amsterdam's, and `structure_for_version/2` had no clause
+                    %% for it, so the handler died with `function_clause` on the first V5
+                    %% call. **An arity that reads like a count and is not one.**
+                    case admit_payload(P1, 5, Id) of
+                        {admission_error, Code2, Message2, Id2} ->
+                            error_rpc(Id2, Code2, Message2);
+                        proceed ->
+                            blob_hashes_reply(P1, param(Map, 1), Id)
+                    end
+            end;
+        _ ->
+            invalid_params(Id)
+    end.
+
+execution_requests(null) -> [];
+execution_requests(undefined) -> [];
+execution_requests(List) when is_list(List) -> List;
+execution_requests(_Other) -> [].
 
 %% "Any field having `null' value MUST be considered as not provided" -- so a null
 %% parentBeaconBlockRoot is a missing parameter, which is -32602 and not -38005.

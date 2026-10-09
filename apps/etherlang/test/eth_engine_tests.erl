@@ -1114,6 +1114,98 @@ new_payload_v2_answers_invalid_params_for_the_wrong_structure_test() ->
 %% newPayloadV3's third parameter is parentBeaconBlockRoot, DATA, 32 bytes. A null
 %% is "not provided" (cancun.md item 1) and so is -32602, not -38005: the frame
 %% check is about the payload's timestamp and says nothing about this parameter.
+%% ===========================================================================
+%% engine_newPayloadV5: the method that carries `executionRequests`
+%% ===========================================================================
+%% **`requestsHash` has exactly one source on this path and it is this method's fourth
+%% parameter.** `ExecutionPayloadV4` does not carry it (execution-apis
+%% src/engine/amsterdam.md), so a node without V5 cannot hash a Prague or Amsterdam payload
+%% at all -- which is what `missing_requests_hash` was reporting before it became derivable.
+
+%% **The method exists, and "recognised" is asserted rather than assumed.** `-32601` and a
+%% status are both plausible answers from a handler that never had the clause.
+new_payload_v5_is_recognised_test() ->
+    with_http(fun(Port) ->
+        {ok, Body, _} = call(Port, <<"engine_newPayloadV5">>,
+                             [payload(), [], <<0:256>>, []]),
+        %% **A map pattern is not an expression** -- only a match context accepts one -- so
+        %% this asks the question through a function rather than inline.
+        ?assertNot(is_error(Body, -32601))
+    end).
+
+%% **A null fourth parameter is an empty request list, not a missing parameter.**
+%%
+%% The specification says a null field "MUST be considered as not provided", which would
+%% make this -32602 -- and a CL that sends `null` for a block with no requests would be
+%% refused for a payload that is perfectly valid. The empty list's hash is the chain's
+%% `0xe3b0c442...`, so there is a value to commit to and refusing wastes it.
+new_payload_v5_treats_null_execution_requests_as_an_empty_list_test() ->
+    with_http(fun(Port) ->
+        %% **A payload in V5's own structure.** My first version sent the Cancun fixture to
+        %% V5 and asserted "not -32602" -- and got -32602, correctly: `structure_admission/2`
+        %% compares the appended keys against `required_structure(amsterdam)' and the
+        %% Cancun fixture carries neither `blockAccessList' nor `slotNumber'. **A test that
+        %% asks a method about the wrong structure is testing the structure check**, and the
+        %% parameter it meant to ask about never ran.
+        P = amsterdam_payload(),
+        [begin
+             {ok, Body, _} = call(Port, <<"engine_newPayloadV5">>, [P, [], <<0:256>>, R]),
+             ?assertNot(is_error(Body, -32602))
+         end || R <- [null, []]]
+    end).
+
+%% A payload carrying the two fields `ExecutionPayloadV4` appends. `executionRequests` is
+%% the method's fourth parameter and is deliberately not here -- it is attached by the
+%% handler, and a structure check that demanded it would refuse every other method's payload.
+amsterdam_payload() ->
+    maps:merge(payload(),
+               #{<<"blockAccessList">> => <<"0xc0">>, <<"slotNumber">> => <<"0xac6000">>}).
+
+%% **The beacon-root gate is unchanged and still comes first.** V5 has one more parameter
+%% than V3 and a test that only checked the new one would not notice if that gate had been
+%% dropped along the way -- and it is the gate that keeps a payload for the wrong fork out.
+new_payload_v5_still_requires_a_parent_beacon_block_root_test() ->
+    with_http(fun(Port) ->
+        [?assertMatch({ok, #{<<"error">> := #{<<"code">> := -32602}}, _},
+                      call(Port, <<"engine_newPayloadV5">>, [payload(), [], Root, []]))
+         || Root <- [null, undefined, <<"0x00">>, 42]]
+    end).
+
+%% **An Amsterdam-shaped payload reaches the 23-field header check.**
+%%
+%% Asserted as `INVALID_BLOCK_HASH` rather than `INVALID`: the fixture's own hash does not
+%% match a header carrying `slotNumber`, so the *hash* rule is the one that fires, and a
+%% V5 handler that dropped the payload's new fields on the floor would answer something
+%% else. `requestsHash` is supplied, so the refusal is not the one from the previous commit.
+new_payload_v5_reaches_the_amsterdam_header_check_test() ->
+    with_http(fun(Port) ->
+        %% **The timestamp has to be at or after Prague**, or the answer is `-38005
+        %% Unsupported fork' -- which is what this test got first, and it is the right
+        %% answer: the method serves Prague-or-later and the Cancun fixture is older. A test
+        %% that reaches the header check has to get past the frame gate first, and the gate
+        %% is the reason a wrong-fork payload is refused before anything is hashed.
+        %% 1,791,600,000 is after Sepolia's Prague activation (1,741,159,776) and after
+        %% Amsterdam (1,791,294,816).
+        P = maps:merge(payload(),
+                       #{<<"timestamp">> => <<"0x6ac7a2e0">>,
+                         <<"slotNumber">> => <<"0xac6000">>,
+                         <<"blockAccessList">> => <<"0xc0">>}),
+        %% **`INVALID` with `{block_hash_mismatch, _}`, which is the answer that matters.**
+        %% I first asserted `INVALID_BLOCK_HASH` and the test told me otherwise: this node
+        %% reports the hash disagreement through `finalize/1`'s verdict, so the status is
+        %% `INVALID` and the reason carries the figure. **The point of the assertion is that
+        %% a hash was computed at all** -- on this path, before the fix, the payload could
+        %% not be encoded at all and the answer was `-32602`/`missing_requests_hash`.
+        {ok, #{<<"result">> := #{<<"status">> := <<"INVALID">>,
+                                  <<"validationError">> := Reason}}, _} =
+            call(Port, <<"engine_newPayloadV5">>, [P, [], <<0:256>>, []]),
+        ?assertNotEqual(nomatch, binary:match(Reason, <<"block_hash_mismatch">>)),
+        %% And specifically **not** the refusal this path used to give, which is the whole
+        %% point: before `executionRequests` became a source, the answer here was
+        %% `missing_requests_hash`.
+        ?assertEqual(nomatch, binary:match(Reason, <<"requests_hash">>))
+    end).
+
 new_payload_v3_requires_a_parent_beacon_block_root_test() ->
     with_http(fun(Port) ->
         P = payload(),
@@ -1328,6 +1420,11 @@ claims(Extra) ->
     maps:merge(#{<<"iat">> => os:system_time(second),
                  <<"id">> => <<"engine-tests">>,
                  <<"clv">> => <<"etherlang-tests/1">>}, Extra).
+
+%% **Does this answer carry exactly this JSON-RPC error code?** A pattern is not an
+%% expression in Erlang, so the negative assertions above cannot be written inline.
+is_error(#{<<"error">> := #{<<"code">> := Code}}, Code) -> true;
+is_error(_Body, _Code) -> false.
 
 call(Port, Method, Params) -> call(Port, Method, Params, default).
 

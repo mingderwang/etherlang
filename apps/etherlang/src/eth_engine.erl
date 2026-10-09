@@ -265,14 +265,22 @@ code_change(_OldVsn, S, _Extra) -> {ok, S}.
 required_structure(paris) -> [];
 required_structure(shanghai) -> [<<"withdrawals">>];
 required_structure(cancun) -> [<<"withdrawals">>, <<"blobGasUsed">>,
-                              <<"excessBlobGas">>].
+                              <<"excessBlobGas">>];
+%% **EIP-7928's `blockAccessList` and EIP-7843's `slotNumber`,** which is what
+%% `ExecutionPayloadV4` appends. `executionRequests` is deliberately **not** here: it is
+%% `newPayloadV5`'s fourth *parameter*, not a payload field, and a structure check that
+%% demanded it would refuse every payload sent to any other method.
+required_structure(amsterdam) -> [<<"withdrawals">>, <<"blobGasUsed">>,
+                                 <<"excessBlobGas">>, <<"blockAccessList">>,
+                                 <<"slotNumber">>].
 
 %% Every key any version appends, so "the keys this payload carries" is a
 %% comparison over a fixed set rather than over the payload's own keys. A payload
 %% with a key not in this list cannot be versioned by it, and
 %% structure_admission/2 will not notice -- eth_block:from_payload/1 ignores
 %% unknown fields too, which is a separate, documented looseness.
-appended_keys() -> [<<"withdrawals">>, <<"blobGasUsed">>, <<"excessBlobGas">>].
+appended_keys() -> [<<"withdrawals">>, <<"blobGasUsed">>, <<"excessBlobGas">>,
+                    <<"blockAccessList">>, <<"slotNumber">>].
 
 %% payloadAttributes has its own version line, and it is *not* the payload's.
 %% PayloadAttributesV1 is timestamp, prevRandao and suggestedFeeRecipient
@@ -320,7 +328,15 @@ structure_for_version(2, Timestamp) ->
         true -> shanghai;
         false -> paris
     end;
-structure_for_version(3, _Timestamp) -> cancun.
+structure_for_version(3, _Timestamp) -> cancun;
+%% **`newPayloadV4` and `newPayloadV5` are two methods over three payload structures.**
+%% `ExecutionPayloadV4` "has the syntax of ExecutionPayloadV3 and appends the new field:
+%% blockAccessList" (execution-apis src/engine/amsterdam.md), so a Prague payload is still
+%% V3-shaped and `newPayloadV4` -- which is Prague's method -- asks for `cancun'. Only V5
+%% asks for the Amsterdam structure. Conflating the method number with the structure number
+%% is the mistake this clause exists to prevent: the handler passes the *method* version.
+structure_for_version(4, _Timestamp) -> cancun;
+structure_for_version(5, _Timestamp) -> amsterdam.
 
 %% One-sided: has this fork activated yet?
 at_or_after(Fork, Timestamp) ->
@@ -389,6 +405,29 @@ frame_admission(1, _Timestamp) -> ok;
 frame_admission(2, _Timestamp) -> ok;
 frame_admission(3, Timestamp) ->
     case in_fork_frame(cancun, Timestamp) of
+        true -> ok;
+        false -> {error, ?UNSUPPORTED_FORK, <<"unsupported fork">>}
+    end;
+%% **`-38005 Unsupported fork`, and each method is gated on the fork it was introduced for.**
+%%
+%% My first pass gated V4 and V5 both at `prague', reasoning that "ExecutionPayloadV4 exists
+%% from Prague onwards". The test answered `-38005' for a post-Amsterdam timestamp, and it
+%% was right to: **`in_fork_frame/2` asks whether the timestamp falls *between* this fork and
+%% the next**, so a Prague frame ends when Osaka activates. Gating the Amsterdam method at
+%% Prague refuses every timestamp the method exists to serve.
+%%
+%% The method number and the payload structure number are different axes, and this is where
+%% that shows: `newPayloadV4` is Prague's method over a **V3-shaped** payload, and
+%% `newPayloadV5` is Amsterdam's over a **V4-shaped** one. Hence `structure_for_version/2`
+%% maps 4 to `cancun` and 5 to `amsterdam` -- the payload, not the fork -- while this maps 4
+%% to `prague` and 5 to `amsterdam` -- the fork.
+frame_admission(4, Timestamp) ->
+    case in_fork_frame(prague, Timestamp) of
+        true -> ok;
+        false -> {error, ?UNSUPPORTED_FORK, <<"unsupported fork">>}
+    end;
+frame_admission(5, Timestamp) ->
+    case in_fork_frame(amsterdam, Timestamp) of
         true -> ok;
         false -> {error, ?UNSUPPORTED_FORK, <<"unsupported fork">>}
     end.
