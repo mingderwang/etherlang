@@ -1875,9 +1875,38 @@ cancun_terms(Roots, Block) ->
 %% what is absent, where a shorter header asserts something false about a block that exists.
 header_requests_hash(Payload) ->
     case pget(Payload, <<"requestsHash">>) of
-        undefined -> {error, missing_requests_hash};
-        {ok, V} -> data_word(V, requests_hash)
+        {ok, V} ->
+            data_word(V, requests_hash);
+        undefined ->
+            %% **EIP-7685's value is derivable, and this is where it comes from.**
+            %% `requestsHash` is not a payload field -- `ExecutionPayloadV4`'s listing has
+            %% no such entry -- but `engine_newPayloadV5`'s fourth parameter is
+            %% `executionRequests` (execution-apis src/engine/amsterdam.md), and
+            %% `compute_requests_hash` is a pure function of that list. So the header term
+            %% is computed rather than refused whenever the caller supplies the requests.
+            %%
+            %% **My earlier note claimed the value "lives in the beacon roots contract's
+            %% storage" and was wrong.** EIP-7251 is about consolidation requests and
+            %% defines no such slot; its constants are a queue at a predeploy. The right
+            %% source was the newPayload parameter list, two documents away from the one I
+            %% had read.
+            case pget(Payload, <<"executionRequests">>) of
+                undefined ->
+                    {error, missing_requests_hash};
+                {ok, Requests} ->
+                    {ok, eth_fork_schedule:requests_hash(execution_request_bytes(Requests))}
+            end
     end.
+
+%% `executionRequests` arrives as an array of DATA, each `"0x..."`. **Decoded strictly**:
+%% a value that will not decode is not a request this node can hash, and answering the
+%% empty-list hash for it would commit to a value nothing asked for.
+execution_request_bytes(Requests) when is_list(Requests) ->
+    [Bin || R <- Requests,
+            {ok, Bin} <- [maybe_bytes(R)],
+            is_binary(Bin)];
+execution_request_bytes(_Other) ->
+    [].
 
 %% **EIP-7928: `block_access_list_hash = keccak256(rlp(block_access_list))`.**
 %%

@@ -34,8 +34,8 @@ with the file it sat above.
 
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
-build. OTP 29.1. Current: **49 src modules / 14,672 code lines, 65 test modules /
-14,993 code lines, 1065 eunit tests, all passing.**
+build. OTP 29.1. Current: **49 src modules / 14,692 code lines, 65 test modules /
+15,038 code lines, 1069 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive
 them with the procedure below rather than editing this sentence.
@@ -847,12 +847,35 @@ Engine API, which is where a proposer actually sends it. The empty case is pinne
 ways: EIP-7928's stated `keccak256(rlp([]))`, this repository's `empty_uncle_hash()`, and
 the computation -- all `0x1dcc4de8...`.
 
-**`requestsHash` is now refused by name rather than omitted.** It is not a payload field;
-it lives in the beacon roots contract's storage, and this node has no other source for it
-on the Engine API path. Two wrong answers were available -- a 20-field header, or a named
-error -- and the named one is chosen. **Reading the beacon roots contract's storage is the
-remaining work**, and it is what would let `newPayload` accept a Prague or Amsterdam
-payload outright.
+**`requestsHash` is computed, not refused -- and my reason for refusing it was wrong.**
+`eth_fork_schedule:requests_hash/1` implements EIP-7685's `compute_requests_hash`, and
+`engine_newPayloadV5`'s **fourth parameter is `executionRequests`** (execution-apis
+src/engine/amsterdam.md), so the value is a pure function of what the client sends. The header
+term is derived from it whenever the payload does not carry the field.
+
+**The note this replaces asserted that `requestsHash` "lives in the beacon roots contract's
+storage", and that is false.** EIP-7251 is about consolidation requests and defines no such
+slot -- its constants are a queue at a predeploy address. **The right source was the newPayload
+parameter list, one document from the one I had read.** A comment written from a
+half-remembering became a refusal, and the refusal read as careful rather than as a gap in what
+I had actually checked.
+
+**It is `sha256`, not keccak**, and this is the only non-keccak commitment in the module --
+worth stating because `eth_keccak:hash/1` is the reflex here and it is the wrong one. Three
+rules, and the second is the one a plain loop gets wrong: items with empty `request_data` are
+**excluded**; items are **sorted by `request_type` ascending**; and the outer hash is over the
+**concatenated inner digests**.
+
+**The empty case is the chain's value.** `sha256("")` = `0xe3b0c442...`, which is exactly what
+real Sepolia Prague block 11,722,100 carries -- the value this repository once read as "SHA-256
+of nothing, therefore invented" and hand-entered.
+
+**Where the sort leaves a choice, it is recorded as one.** EIP-7685 says only "ordered by
+`request_type` ascending" and nothing about two requests sharing a type. `lists:sort/2` is
+stable, so the caller's order survives, and the test asserts that the two orders hash
+*differently*. My first version asserted they hash alike, which would have demanded an ordering
+the specification does not define -- and a node that invented one would disagree with every other
+client exactly where nobody can check it.
 
 **The coverage gap is closed, and it took two rounds because the first attempt was removed
 un-green rather than committed failing.** The tests above prove only that the new terms

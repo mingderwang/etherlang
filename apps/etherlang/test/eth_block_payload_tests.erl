@@ -561,8 +561,24 @@ prague_payload_hashes_to_a_header_with_twenty_one_fields_test() ->
 %% **Amsterdam needs all three new terms, and each absence is named.**
 amsterdam_payload_names_the_field_it_is_missing_test() ->
     Base = amsterdam_shaped(),
+    %% **No `requestsHash` and no `executionRequests` -- still refused by name.** The
+    %% refusal is not gone; it moved to the case where neither source is present, which is
+    %% what a bare payload with no newPayload parameter behind it is.
     ?assertEqual({error, missing_requests_hash},
                  eth_block:payload_block_hash(Base)),
+    %% **And with `executionRequests` the value is computed rather than refused.** This is
+    %% the case that was a refusal in the previous two commits, and it is what makes
+    %% `newPayloadV5` able to hash a Prague or Amsterdam payload at all.
+    %% The terms are checked in order -- requests, then the list, then the slot -- so a
+    %% payload with `executionRequests` alone advances to the *next* missing term rather
+    %% than hashing. That ordering is why the assertions below add them one at a time.
+    ?assertEqual({error, missing_block_access_list},
+                 eth_block:payload_block_hash(
+                   maps:put(<<"executionRequests">>, [], Base))),
+    ?assertMatch({ok, _},
+                 eth_block:payload_block_hash(
+                   maps:put(<<"executionRequests">>, [],
+                            maps:put(<<"blockAccessList">>, <<"0xc0">>, Base)))),
     WithRequests = maps:put(<<"requestsHash">>, <<"0xec88bf0d3fe6b86b583cf638c5635cb64bc842f"
                                               "ee1e220f0e8be964a4d368c15">>, Base),
     ?assertEqual({error, missing_block_access_list},
@@ -595,6 +611,89 @@ an_amsterdam_payloads_hash_depends_on_its_two_new_terms_test() ->
     ?assertNotEqual(H1, eth_block:payload_block_hash(
         maps:put(<<"blockAccessList">>, <<"0xc0c0">>, WithBal))).
 
+
+%% ===========================================================================
+%% EIP-7685: requests_hash, and the chain's own value for the empty case
+%% ===========================================================================
+%% `requestsHash` is **not** a payload field and **not** in the beacon roots contract's
+%% storage -- EIP-7251 is about consolidation requests and defines no such slot. It is
+%% derived from the **`executionRequests` parameter of `engine_newPayloadV5`**
+%% (execution-apis src/engine/amsterdam.md: params are `executionPayload`,
+%% `expectedBlobVersionedHashes`, `parentBeaconBlockRoot`, `executionRequests`). So the
+%% value is computable, and this node was refusing to hash a Prague or Amsterdam payload
+%% over a gap that has a source.
+
+%% **The empty case, and it is the chain's value.** Real Sepolia Prague block 11,722,100
+%% carries `requestsHash = 0xe3b0c442...` because a block with no requests hashes an empty
+%% string. This repository once read that value as "SHA-256 of nothing, therefore invented"
+%% and hand-entered it; it is simply `sha256("")`, and now the node computes it.
+requests_hash_of_no_requests_is_sha256_of_nothing_test() ->
+    ?assertEqual(eth_hex:must_decode_bytes(
+                   <<"0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855">>),
+                 eth_fork_schedule:requests_hash([])),
+    ?assertEqual(crypto:hash(sha256, <<>>), eth_fork_schedule:requests_hash([])),
+    %% And the same 32 bytes the real Prague header carries.
+    ?assertEqual(crypto:hash(sha256, <<>>),
+                 eth_hex:must_decode_bytes(
+                   <<"0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855">>)).
+
+%% **Three rules, and the second is the one a plain loop gets wrong.**
+requests_hash_excludes_empty_requests_sorts_by_type_and_hashes_the_digests_test() ->
+    R1 = <<16#01, 1, 2, 3>>,          %% type 0x01, some data
+    R2 = <<16#00, 9, 9>>,             %% type 0x00 -- sorts first
+    %% Excluded: a bare type prefix with no `request_data`. Contributing it would change the
+    %% hash, and the EIP says it must not.
+    Empty = <<16#02>>,
+    ?assertEqual(crypto:hash(sha256, [crypto:hash(sha256, R2), crypto:hash(sha256, R1)]),
+                 eth_fork_schedule:requests_hash([R1, R2, Empty])),
+    %% Sorted by type, so the order the caller hands them over does not matter...
+    ?assertEqual(eth_fork_schedule:requests_hash([R1, R2]),
+                 eth_fork_schedule:requests_hash([R2, R1])),
+    %% ...and an empty request changes nothing at all.
+    ?assertEqual(eth_fork_schedule:requests_hash([R1, R2]),
+                 eth_fork_schedule:requests_hash([R1, R2, <<16#02>>, <<16#03>>])),
+    %% **And it is the digests that are hashed, not the requests.** Two different request
+    %% lists can share this only if their inner digests match, which is the whole point of
+    %% the intermediate list.
+    ?assertNotEqual(crypto:hash(sha256, [R1, R2]),
+                    eth_fork_schedule:requests_hash([R1, R2])).
+
+%% **Same type twice: the sort must not drop one.** `lists:sort/2` with a `<` predicate
+%% loses elements on ties, and a dropped request is a different commitment with no error.
+requests_hash_keeps_every_request_when_two_share_a_type_test() ->
+    A = <<16#01, 1>>,
+    B = <<16#01, 2>>,
+    %% **Both digests, in the sorted order.** Stated as the expected concatenation rather
+    %% than as "the hash is not either of these", because my first version asserted the
+    %% latter with a comprehension that counted how many of the two requests equalled the
+    %% hash -- which is zero for any input and would have passed on a function that dropped
+    %% both. **A count that cannot come out other than zero is not an assertion.**
+    ?assertEqual(crypto:hash(sha256, [crypto:hash(sha256, A), crypto:hash(sha256, B)]),
+                 eth_fork_schedule:requests_hash([A, B])),
+    %% **Ties keep the caller's order, and that is a choice rather than a derived rule.**
+    %% EIP-7685 says only "ordered by `request_type` ascending" and says nothing about two
+    %% requests sharing a type -- which in practice means the block's request list already
+    %% has them in the canonical order and the sort must not reorder them. `lists:sort/2` is
+    %% stable, so it does not. Asserted explicitly because the *opposite* -- asserting the
+    %% two orders hash alike -- is the assertion I wrote first and it is **wrong**: it would
+    %% demand an ordering the specification does not define, and a node that invented one
+    %% would disagree with every other client exactly where nobody can check it.
+    ?assertNotEqual(eth_fork_schedule:requests_hash([A, B]),
+                    eth_fork_schedule:requests_hash([B, A])),
+    ?assertEqual(crypto:hash(sha256, [crypto:hash(sha256, A), crypto:hash(sha256, B)]),
+                 eth_fork_schedule:requests_hash([A, B])),
+    ?assertEqual(crypto:hash(sha256, [crypto:hash(sha256, B), crypto:hash(sha256, A)]),
+                 eth_fork_schedule:requests_hash([B, A])),
+    ?assertNotEqual(eth_fork_schedule:requests_hash([A]),
+                    eth_fork_schedule:requests_hash([A, B])).
+
+%% **sha256, not keccak.** Every other commitment this repository derives is keccak --
+%% `eth_keccak:hash/1` is the reflex -- and EIP-7685 is the one that is not.
+requests_hash_is_sha256_and_not_keccak_test() ->
+    R = <<16#01, 1, 2, 3>>,
+    ?assertNotEqual(eth_keccak:hash(R), crypto:hash(sha256, R)),
+    ?assertEqual(crypto:hash(sha256, [crypto:hash(sha256, R)]),
+                 eth_fork_schedule:requests_hash([R])).
 
 %% **The 23-field header, re-derived on an independent path.**
 %%

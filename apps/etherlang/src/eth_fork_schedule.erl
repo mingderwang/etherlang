@@ -8,7 +8,7 @@
 -module(eth_fork_schedule).
 
 -export([ blob_gas_per_blob/0, blob_schedule/1, target_blob_gas_per_block/1,
-          max_blob_gas_per_block/1, excess_blob_gas/4, blob_base_fee/4,
+          max_blob_gas_per_block/1, requests_hash/1, excess_blob_gas/4, blob_base_fee/4,
           blob_gas_price/2,
           past_modelled_range/3,
           past_modelled_range/4,
@@ -1155,6 +1155,54 @@ below_reserve_price(Fork, ParentBaseFeePerGas, ParentExcessBlobGas) ->
         andalso is_integer(ParentBaseFeePerGas)
         andalso ?BLOB_BASE_COST * ParentBaseFeePerGas
                  > blob_gas_per_blob() * blob_gas_price(Fork, ParentExcessBlobGas).
+
+%% ---------------------------------------------------------------------------
+%% EIP-7685: requests_hash
+%% ---------------------------------------------------------------------------
+
+%% **EIP-7685's `compute_requests_hash`, quoted whole** (eip-7685.md, "Block Header"):
+%%
+%%     def compute_requests_hash(block_requests: Sequence[bytes]):
+%%         m = sha256()
+%%         for r in block_requests:
+%%             if len(r) > 1:
+%%                 m.update(sha256(r).digest())
+%%         return m.digest()
+%%
+%% and, from the prose above it: "Within the intermediate list, `requests` items must be
+%% ordered by `request_type` ascending."
+%%
+%% **This is `sha256`, not keccak**, and it is the only place in this module that is not a
+%% keccak derivation. That is worth stating plainly because every other commitment here --
+%% the empty ommers hash, the blob base fee, the header fields -- is keccak, so the
+%% `eth_keccak`-shaped habit is the wrong one to reach for. `crypto:hash/2` is already used
+%% by `eth_ecies` and the sha256 precompile, so this adds no dependency.
+%%
+%% **Three rules, and the second is the one a loop gets wrong.** Items whose
+%% `request_data` is empty -- a bare 1-byte type prefix -- are **excluded**, not hashed as a
+%% one-byte string; the items are **sorted by their first byte** before hashing; and the
+%% outer hash is over the **concatenated inner digests**, not over the requests themselves.
+%%
+%% **The empty case is the chain's, not mine.** With no requests the outer sha256 is over an
+%% empty string, `0xe3b0c442...`, and that is exactly the `requestsHash` real Sepolia Prague
+%% block 11,722,100 carries -- the value this repository once hand-entered after reading it
+%% as "SHA-256 of nothing, therefore invented" when it is simply what the network reports.
+requests_hash(Requests) when is_list(Requests) ->
+    Kept = [R || R <- Requests, is_binary(R), byte_size(R) > 1],
+    Sorted = lists:sort(fun request_before/2, Kept),
+    crypto:hash(sha256, [crypto:hash(sha256, R) || R <- Sorted]).
+
+%% Ascending by `request_type`, which is the first byte. `<=` and not `<` because
+%% `lists:sort/2` documents its predicate as "returns true if A =< B", and a `<` here
+%% silently drops elements on ties -- and two requests of the same type would then be
+%% ordered by nothing at all.
+request_before(A, B) -> request_type(A) =< request_type(B).
+
+%% A one-byte request carries a type and no data; `request_type/1` still answers for it,
+%% because the filter that removes it runs first and asking anyway would be a crash on a
+%% value the spec says to skip.
+request_type(<<Type, _/binary>>) -> Type;
+request_type(<<>>) -> 0.
 
 blob_base_fee(Fork, ParentExcessBlobGas, ParentBlobGasUsed, ParentBaseFeePerGas) ->
     blob_gas_price(Fork,
