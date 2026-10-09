@@ -596,6 +596,156 @@ an_amsterdam_payloads_hash_depends_on_its_two_new_terms_test() ->
         maps:put(<<"blockAccessList">>, <<"0xc0c0">>, WithBal))).
 
 
+%% **The 23-field header, re-derived on an independent path.**
+%%
+%% **Three injections came back green against the tests above, and this is the test that
+%% closes them.** Asserting only that the new terms *participate* -- two payloads with
+%% different values hashing differently -- is satisfied by an encoder that appends
+%% `requestsHash` twice, hashes nothing, or puts `slotNumber` before `blockAccessListHash`.
+%% All three were injected and all three passed.
+%%
+%% So the header is rebuilt here through `eth_header:hash/1`, a **different encoder with
+%% its own field list**, and the two hashes must agree. That pins presence, order and the
+%% BAL's keccak in one comparison -- the same technique that pinned `requestsHash` when it
+%% was added.
+an_amsterdam_payloads_hash_is_the_23_field_header_test() ->
+    P = amsterdam_payload(),
+    {ok, Node} = eth_block:payload_block_hash(P),
+    {ok, Expected} = eth_header:hash(expected_header(P)),
+    ?assertEqual(Expected, Node),
+    {ok, Fields} = eth_header:to_rlp_list(expected_header(P)),
+    ?assertEqual(23, length(Fields)),
+    %% **The last three, in the order the EIP and geth both give.** Asserted by value and
+    %% position, so a swapped pair cannot pass by hashing the same bytes some other way.
+    ?assertEqual(eth_hex:must_decode_bytes(
+                   maps:get(<<"requestsHash">>, P)), lists:nth(21, Fields)),
+    ?assertEqual(eth_block:empty_uncle_hash(), lists:nth(22, Fields)),
+    ?assertEqual(16#ac6000, lists:last(Fields)).
+
+%% **The same cross-check for Prague, and it is not redundant.** The 23-field test above
+%% caught "BAL not hashed", "order swapped" and "slotNumber dropped" -- and injection
+%% "append `requestsHash` twice" still came back **green**, because that branch has no
+%% cross-check of its own. **A test that pins one shape says nothing about its sibling**,
+%% and Prague andAmsterdam share a branch's first term and nothing else.
+prague_payloads_hash_is_the_21_field_header_test() ->
+    P = prague_payload(),
+    {ok, Node} = eth_block:payload_block_hash(P),
+    {ok, Expected} = eth_header:hash(prague_header(P)),
+    ?assertEqual(Expected, Node),
+    {ok, Fields} = eth_header:to_rlp_list(prague_header(P)),
+    ?assertEqual(21, length(Fields)),
+    ?assertEqual(eth_hex:must_decode_bytes(maps:get(<<"requestsHash">>, P)),
+                 lists:last(Fields)).
+
+prague_payload() ->
+    prague_payload_with(payload(eth_payload_fixture:cancun())).
+
+prague_payload_with(P) ->
+    maps:put(<<"requestsHash">>,
+             <<"0xec88bf0d3fe6b86b583cf638c5635cb64bc842fee1e220f0e8be964a4d368c15">>, P).
+
+%% The 21-field header: `expected_header/1` minus Amsterdam's two terms. Written out rather
+%% than derived by removing keys, because a helper that removes the very keys under test
+%% cannot fail when they are the wrong ones.
+prague_header(P) ->
+    {ok, Block} = eth_block:from_payload(P),
+    #{<<"parentHash">> => q(Block#block.parent_hash),
+      <<"sha3Uncles">> => q(Block#block.sha3_uncles),
+      <<"miner">> => q(Block#block.miner),
+      <<"stateRoot">> => q(Block#block.state_root),
+      <<"transactionsRoot">> => q(eth_block:tx_root(Block#block.transactions)),
+      <<"receiptsRoot">> => q(Block#block.receipts_root),
+      <<"logsBloom">> => q(Block#block.logs_bloom),
+      <<"difficulty">> => n(Block#block.difficulty),
+      <<"number">> => n(Block#block.number),
+      <<"gasLimit">> => n(Block#block.gas_limit),
+      <<"gasUsed">> => n(Block#block.gas_used),
+      <<"timestamp">> => n(Block#block.timestamp),
+      <<"extraData">> => q(Block#block.extra_data),
+      <<"mixHash">> => q(Block#block.mix_hash),
+      <<"nonce">> => q(Block#block.nonce),
+      <<"baseFeePerGas">> => n(Block#block.base_fee_per_gas),
+      <<"withdrawalsRoot">> => q(eth_fork_schedule:withdrawals_root(
+                                    Block#block.withdrawals)),
+      <<"blobGasUsed">> => n(Block#block.blob_gas_used),
+      <<"excessBlobGas">> => n(Block#block.excess_blob_gas),
+      <<"parentBeaconBlockRoot">> => q(Block#block.parent_beacon_block_root),
+      <<"requestsHash">> => maps:get(<<"requestsHash">>, P)}.
+
+amsterdam_payload() ->
+    Base = payload(eth_payload_fixture:cancun()),
+    maps:put(<<"requestsHash">>,
+             <<"0xec88bf0d3fe6b86b583cf638c5635cb64bc842fee1e220f0e8be964a4d368c15">>,
+             maps:put(<<"slotNumber">>, <<"0xac6000">>,
+                      maps:put(<<"blockAccessList">>, <<"0xc0">>, Base))).
+
+%% The JSON-RPC header map for this payload. **Every term is taken from the payload or
+%% recomputed from it**, and each helper names the field it choked on: the first version of
+%% this raised `badarg` from `binary:encode_unsigned/2` with the offending field nowhere in
+%% the message, which is the shape of bug this repository keeps re-learning.
+expected_header(P) ->
+    {ok, Block} = eth_block:from_payload(P),
+    #{<<"parentHash">> => q(Block#block.parent_hash),
+      <<"sha3Uncles">> => q(Block#block.sha3_uncles),
+      <<"miner">> => q(Block#block.miner),
+      <<"stateRoot">> => q(Block#block.state_root),
+      <<"transactionsRoot">> => q(eth_block:tx_root(Block#block.transactions)),
+      <<"receiptsRoot">> => q(Block#block.receipts_root),
+      <<"logsBloom">> => q(Block#block.logs_bloom),
+      <<"difficulty">> => n(Block#block.difficulty),
+      <<"number">> => n(Block#block.number),
+      <<"gasLimit">> => n(Block#block.gas_limit),
+      <<"gasUsed">> => n(Block#block.gas_used),
+      <<"timestamp">> => n(Block#block.timestamp),
+      <<"extraData">> => q(Block#block.extra_data),
+      <<"mixHash">> => q(Block#block.mix_hash),
+      <<"nonce">> => q(Block#block.nonce),
+      <<"baseFeePerGas">> => n(Block#block.base_fee_per_gas),
+      <<"withdrawalsRoot">> => q(eth_fork_schedule:withdrawals_root(
+                                    Block#block.withdrawals)),
+      <<"blobGasUsed">> => n(Block#block.blob_gas_used),
+      <<"excessBlobGas">> => n(Block#block.excess_blob_gas),
+      <<"parentBeaconBlockRoot">> => q(Block#block.parent_beacon_block_root),
+      <<"requestsHash">> => maps:get(<<"requestsHash">>, P),
+      %% **A DATA field, not a quantity.** `blockAccessListHash` is a 32-byte word, and
+      %% `eth_keccak:hash/1` answers those bytes -- so this wants `q/1`. My first version
+      %% passed it to `n/1`, and the named error `{not_a_quantity, <<29,204,77,...>>}' is
+      %% the whole 32 bytes sitting in the message, which is a far better failure than the
+      %% `badarg` the same mistake produced through `binary:encode_unsigned/2`.
+      <<"blockAccessListHash">> => q(eth_keccak:hash(
+                                        eth_hex:must_decode_bytes(
+                                          maps:get(<<"blockAccessList">>, P)))),
+      <<"slotNumber">> => maps:get(<<"slotNumber">>, P)}.
+
+%% A DATA term as the `"0x..."' string the header encoder reads. **`is_binary` alone is not
+%% enough**: `eth_block`'s record holds some of these as lists, and `binary:encode_hex/2`
+%% answers `badarg` for a list rather than failing here where the field name is known.
+q(Bin) when is_binary(Bin) ->
+    <<"0x", (binary:encode_hex(Bin, lowercase))/binary>>;
+q(List) when is_list(List) ->
+    <<"0x", (list_to_binary([binary:encode_hex(<<B>>, lowercase) || B <- List]))/binary>>;
+q(Other) ->
+    error({not_a_data_field, Other}).
+
+%% A QUANTITY as `"0x..."`.
+n(0) ->
+    %% **`binary:encode_unsigned(0, 16)` raises `badarg`** -- the minimal encoding of zero
+    %% is the empty binary and the function refuses it. A Cancun block's `difficulty` is
+    %% exactly 0, so this is the first quantity every one of these headers carries, and
+    %% without the clause the test died four frames below with no field named. Written as
+    %% `"0x0"' because that is what `eth_hex:encode_int(0)` emits and the two have to agree.
+    <<"0x0">>;
+n(N) when is_integer(N), N > 0 ->
+    %% **`erlang:integer_to_binary/2`, not `binary:encode_unsigned/2`.** The latter raises
+    %% `badarg` on *every* value on this OTP -- verified directly, 6,985,356 included -- so
+    %% two earlier attempts blamed zero and negative integers, and neither was true. The
+    %% error names neither the value nor the field, which is what sent me looking for the
+    %% wrong thing twice: **a helper that cannot report its input turns a one-line mistake
+    %% into a hunt.**
+    <<"0x", (erlang:integer_to_binary(N, 16))/binary>>;
+n(Other) ->
+    error({not_a_quantity, Other}).
+
 %% **EIP-7928's empty case, pinned against the chain and against this repository.**
 %%
 %% "For an empty block access list, this is `keccak256(rlp.encode([])) =

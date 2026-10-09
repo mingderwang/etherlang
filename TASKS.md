@@ -35,7 +35,7 @@ with the file it sat above.
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
 build. OTP 29.1. Current: **49 src modules / 14,672 code lines, 65 test modules /
-14,898 code lines, 1063 eunit tests, all passing.**
+14,993 code lines, 1065 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive
 them with the procedure below rather than editing this sentence.
@@ -854,14 +854,30 @@ error -- and the named one is chosen. **Reading the beacon roots contract's stor
 remaining work**, and it is what would let `newPayload` accept a Prague or Amsterdam
 payload outright.
 
-**Coverage gap, stated rather than hidden.** Three injections came back **green**: returning
-the BAL bytes un-hashed, appending `requestsHash` twice, and putting `slotNumber` before
-`blockAccessListHash`. The tests prove the new terms *participate* -- two payloads differing
-hash differently -- and that is satisfied by all three. The test that would close it rebuilds
-the 23-field header through `eth_header:hash/1`, a second encoder with its own field list, and
-compares hashes; it was written and **removed un-green** rather than committed failing. So the
-**order of the last two fields, and that the BAL is keccak'd rather than passed through, rest
-on the EIP's text and on `eth_header`'s pinned real-block hashes, not on a payload-path test.**
+**The coverage gap is closed, and it took two rounds because the first attempt was removed
+un-green rather than committed failing.** The tests above prove only that the new terms
+*participate* -- two payloads differing hash differently -- and three injections satisfied
+that: BAL bytes returned un-hashed, `requestsHash` appended twice, `slotNumber` before
+`blockAccessListHash`.
+
+The tests that close them rebuild the header through **`eth_header:hash/1`, a second encoder
+with its own field list**, and compare hashes -- the technique that pinned `requestsHash` when
+it was added. **One per shape, and Prague was not redundant:** after the 23-field test landed,
+"append `requestsHash` twice" was *still green*, because it is the Prague branch and Prague had
+no cross-check. **A test that pins one shape says nothing about its sibling.** Five injections,
+five red.
+
+**Two bugs the instrumentation had, both worth the space.**
+
+* **`binary:encode_unsigned/2` raises `badarg` on every value on this OTP** -- verified
+  directly, 6,985,356 included. Two attempts blamed zero and then negative integers, and
+  neither was true. The error names neither the value nor the field, which sent me looking
+  for the wrong thing twice: **a helper that cannot report its input turns a one-line mistake
+  into a hunt.** `erlang:integer_to_binary/2` is the replacement, and the quantity helper now
+  names the field in its own failure.
+* **`eth_hex:decode/1` answers an integer and raises on non-hex; it is not a byte decoder.**
+  Used for the BAL on the first attempt, which produced a `try_clause` with no clause to
+  report, because the value was an integer and the guard wanted a binary.
 
 ### EIP-7918 was missing, and it is what stopped the node syncing
 
