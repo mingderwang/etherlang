@@ -34,8 +34,8 @@ with the file it sat above.
 
 **Build and test.** `make counts` is the authority for the architecture numbers; do not
 edit them by hand. `rebar.config` sets `warnings_as_errors`, so any warning fails the
-build. OTP 29.1. Current: **49 src modules / 14,732 code lines, 65 test modules /
-15,075 code lines, 1073 eunit tests, all passing.**
+build. OTP 29.1. Current: **49 src modules / 14,765 code lines, 65 test modules /
+15,120 code lines, 1077 eunit tests, all passing.**
 
 **82 tasks across 9 phases — 46 done, 36 remaining.** Counted, not asserted; re-derive
 them with the procedure below rather than editing this sentence.
@@ -1031,17 +1031,21 @@ before I read it: availability is `opcode_exists/2`'s job, and
 `0x4b` without adding it to the price table failed that test with
 `{unexpected_prices, [16#4B]}` -- the table-driven test doing the one job it was built for.
 
-**What is still missing, and it is what keeps `past_modelled_range` honest:** the block
-access list EIP-7928 defines, and the v4 payload objects with
-`engine_newPayloadV5` / `engine_getPayloadV6` / `engine_forkchoiceUpdatedV4`. Until the BAL
-exists a post-Amsterdam block cannot be *executed*, and a node that executed one would
-produce a state root under rules it does not have -- so the refusal stays.
+**Both items this section listed as missing are now closed**, and the paragraph that listed
+them is corrected here rather than left to rot:
 
-**`payload_header_rlp/4` still builds 20 fields for an Amsterdam payload**, so
-`payload_block_hash/1` would hash a v4 payload's header wrongly. That path is unreachable
-today only because `past_modelled_range` refuses such a block before it is validated, which
-is a coincidence of ordering rather than a guard: **nothing in `eth_block` looks at
-`slotNumber` to decide the header shape.** Named here so it is not mistaken for done.
+* **`payload_header_rlp/4` built 20 fields for an Amsterdam payload.** It now spells 21
+  (Prague) and 23 (Amsterdam), pinned against real Sepolia blocks by a second encoder.
+* **The v4 payload objects did not exist.** `engine_newPayloadV4`, `engine_newPayloadV5`,
+  `engine_getPayloadV4`, `engine_getPayloadV6`, `engine_forkchoiceUpdatedV4` and
+  `PayloadAttributesV4` are all present.
+
+**What genuinely remains is one thing, and it is not a code gap.** The block access list's
+*contents* cannot be checked from this node's upstream: `eth_getBlockByNumber` returns only
+`blockAccessListHash` and `debug_getBlockAccessList` does not exist there. On the Engine API
+path it **is** checked -- `ExecutionPayloadV4` carries the RLP bytes and
+`block_access_list_hash = keccak256(rlp(block_access_list))`. EIP-7928 changes **no execution
+cost** (its gas table is EIP-2929's), so Amsterdam blocks execute correctly either way.
 
 ### A calendar-dependent fixture turned into a time bomb, and the refusal was the correct part
 
@@ -1903,6 +1907,43 @@ that is a smaller piece of work than the guessing it replaces.
    cannot produce a block another client would accept has not been measured at all,
    and that is the measurement Lighthouse actually cares about.
 
+### Three version axes in one module, and they do not line up
+
+`structure_for_version/2` is keyed on the **payload structure**, `frame_admission/2` on the
+**fork**, and the **method number** on neither:
+
+| method | payload structure | fork frame |
+|---|---|---|
+| `newPayloadV4` | `cancun` (V3-shaped) | `prague` |
+| `newPayloadV5` | `amsterdam` (V4-shaped) | `amsterdam` |
+| `forkchoiceUpdatedV4` | -- | `amsterdam` |
+| `getPayloadV4` | `cancun` | `prague` |
+| `getPayloadV6` | `amsterdam` | `amsterdam` |
+
+**There is no `getPayloadV5`.** prague.md names `getPayloadV4` and amsterdam.md names
+`getPayloadV6`, so version 5 has **no clause on purpose** -- an unmapped version is refused
+rather than answered with a neighbour's structure. Forwarding the method version straight into
+`frame_admission/2` raised `function_clause` on the first V6 attributes object; it asks
+`in_fork_frame/2` directly now.
+
+**`targetGasLimit` is in `PayloadAttributesV4` and in no EIP this fork is built from.** Not in
+EIP-7843, not in EIP-7928, not in any header field this node encodes -- it is a *target*, and
+nothing in the header commits to it. The structure check requires the object to carry a field
+**this node has no rule for**, recorded at `required_attributes/1` rather than papered over: a
+`gasLimit` other than the one the block's own header carries would change the block, and
+nothing says which target wins.
+
+**`attributes_frame_check/2` returned a boolean, and `attributes_admission/2` matches only `ok`
+and `{error, Code, Message}`.** Every pre-fork attributes object therefore matched neither and
+fell through to `ok`: **a refusal that reads as an acceptance**, and the most dangerous shape in
+this work. Only a test that asks for the pre-Amsterdam case directly could see it.
+
+**One test was checking the wrong object.** The `PayloadAttributesV4` assertion first passed
+the *payload* fixture to `attributes_admission/2`, which checks a different structure
+(`required_attributes/1` against `appended_attribute_keys/0`) -- so it would have passed on a
+node that checked nothing at all.
+
+
 ### Deliberately later: the rest of the Engine API
 
 These are real gaps, not low-priority decoration, but they are not on the critical
@@ -1920,8 +1961,10 @@ they are not forgotten rather than worked on prematurely.
   clause in any per-fork file of `execution-apis`; implementing it now would mean
   inventing its shape. The EIP-4788 execution side is already done; only the
   engine-API plumbing is missing.
-- **Engine API V4/V5** (Osaka, Amsterdam). Mainnet is not on these, so V3 is the
-  highest version a live consensus client calls.
+- ~~**Engine API V4/V5** (Osaka, Amsterdam)~~ — **done**: `newPayloadV4`/`V5`,
+  `getPayloadV4`/`V6`, `forkchoiceUpdatedV4` and `PayloadAttributesV4` all exist.
+  `targetGasLimit` is required by the attributes structure and is in no EIP this
+  fork is built from, which is recorded at `required_attributes/1`.
 - **`engine_getBlobsV1`** (Phase 5). The point-evaluation check is already local;
   this is the method that surfaces it, and `eth_kzg:blob_to_kzg_commitment/1` is
   still deliberately unimplemented, so it would need that first.
