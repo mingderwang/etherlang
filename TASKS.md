@@ -1946,6 +1946,47 @@ measurement taken before this** -- which is the answer to why Phase 7 read 0 of 
 obviously wrong. The rename is now unconditional and **verified**, because a step that can
 silently do nothing has to be checked rather than assumed.
 
+### The cold-start fix was attempted, measured, and withdrawn
+
+**Withdrawn on purpose, and the measurements are kept because they are the useful part.**
+
+Attempted, in `eth_sync`: a `cold_step/3` that requests headers **forward by number**
+(`{number, N}`, `reverse = false`) instead of walking back from the peer's head; a `warm_step/2`
+that keeps the walk cursor in `#st{}` so a tick makes one request; and a guard so
+`peer_fill/3` cannot answer `{mode = follow, synced = true}` on an empty chain.
+
+**Measured, working:**
+
+| what | result |
+|---|---|
+| forward request reaches A and is served | `want={number,1} max=192 rev=false -> {ok, ...}` in **7 ms** |
+| A receives them | 11 requests, matching B's count |
+| backward request, for comparison | ~**1000 ms** for the same 192 headers |
+| `eth_header`-independent | `eth_eth:encode_get_headers({number, N}, ...)` always accepted it -- sync simply never asked |
+
+**Measured, not working -- and this is why it was withdrawn:**
+
+* **Nothing is appended.** B stayed at `chain_empty` through 11 forward requests. The headers
+  arrive and `peer_append/5` does not take them; the contiguity check needs a local head and an
+  empty store's head is `undefined`, not genesis. That is the piece still missing, and it is
+  where the next attempt has to start.
+* **`eth_sync:status/0` still times out.** Bounding the walk did not help, so the long part of
+  the tick is `get_bodies/2` or `peer_append/5`, not `get_headers/5`. **The blocking call is
+  still unidentified**, and a fix that moves the blocking call rather than removing it is not a
+  fix.
+
+So the tree keeps the old `eth_sync` and this paragraph. **A half-finished sync rewrite that
+cannot be shown to advance a chain is worse than a documented gap**, and leaving it in would
+have made `past_modelled_range`-style refusals look like progress.
+
+**And a measurement artefact worth more than the code was.** With `data/` included in the tree
+copy, B reported **height 11,875,292 forty seconds after starting** -- A's chain, copied. Its
+log held **one** `get_headers` and **zero** `rlpx conn diag`, so nothing had gone over the wire.
+**A plausible number out of a copied directory is the exact shape of result that is easy to
+believe**, and it was caught only because the log counters were read next to it.
+`tools/two-node-p2p.sh` now excludes `data/` and `log/` from the copy, which is what makes a
+cold start measurable at all.
+
 ### The commit gate, and the failure that produced it
 
 **`d47f57e` changed `apps/etherlang/src/` and committed with `make check-ledger` red. That

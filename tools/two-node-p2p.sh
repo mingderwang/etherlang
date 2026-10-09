@@ -174,9 +174,37 @@ start() {
     fi
     if [ ! -x "$B_TREE/bin/etherlang" ]; then
         say "copying the tree for node B"
-        rm -rf "$B_TREE"; mkdir -p "$(dirname "$B_TREE")"
-        rsync -a "$A_TREE" "$B_TREE"
+        rm -rf "$B_TREE"; mkdir -p "$B_TREE"
+        # **Trailing slashes on both sides, so this copies the *contents*.**
+        #
+        # `rsync -a SRC DST' with DST already present puts SRC *inside* DST, which produced
+        # `_build/node2/rel/etherlang/etherlang' -- a tree with no `bin' and no
+        # `releases', so B started as nothing at all. `rm -rf` above removes the obvious
+        # cause, but the copy has to be right when the destination is created by something
+        # else, and `SRC/ DST/' is the form that means what it says either way.
+        # **`data/` and `log/` are excluded, and that exclusion is the measurement.**
+        #
+        # Copying them made B report a height of 11,875,292 within 40 seconds -- A's chain,
+        # copied. B's log recorded **one** `get_headers` and **zero** `rlpx conn diag`, so
+        # nothing had gone over the wire. **A plausible number from a copied directory is
+        # the exact shape of result this repository keeps being fooled by**, and the only
+        # reason it was caught is that the log counters were read next to it.
+        rsync -a --exclude data --exclude log "$A_TREE/" "$B_TREE/"
     fi
+
+    # **Verify the tree before starting B, because every failure below is silent.**
+    # `daemon' redirects to /dev/null, so a B that does not start is indistinguishable from a
+    # B that was never asked to. The first version of this check looked only at
+    # `vm.args' -- which does not exist in a wrongly-shaped tree, so `grep -qs' found nothing,
+    # the check passed, and the wrong tree went on to fail in a way that read like a node bug.
+    for required in bin/etherlang releases; do
+        if [ ! -e "$B_TREE/$required" ]; then
+            say "B's tree is missing $required -- it was not copied correctly."
+            say "  B_TREE=$B_TREE"
+            say "  fix: rm -rf \"\$B_TREE\" && bash tools/two-node-p2p.sh start"
+            exit 1
+        fi
+    done
 
     # **note 3, and it runs on every start rather than only on the copy.**
     #
