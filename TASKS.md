@@ -1907,6 +1907,33 @@ that is a smaller piece of work than the guessing it replaces.
    cannot produce a block another client would accept has not been measured at all,
    and that is the measurement Lighthouse actually cares about.
 
+### The commit gate, and the failure that produced it
+
+**`d47f57e` changed `apps/etherlang/src/` and committed with `make check-ledger` red. That
+was this agent's error, not a rule that was unclear and not anybody else's.** The check
+printed its verdict, the verdict disagreed with the commit, and the commit went anyway --
+because the check is a *judgement* rather than a build failure, and nothing was running it.
+TASKS.md was wrong until `1ede3b3` corrected it.
+
+**The mechanism, because a note is not one.** `tools/git-hooks/pre-commit` refuses a `src/`
+change with no ledger change, and refuses when `make check-ledger` fails.
+`tools/install-hooks.sh` points git at it; `tools/check-gate.sh` **verifies the gate is
+armed**, and `make check-gate` runs that.
+
+**`core.hooksPath` pointing at a missing directory makes git skip every hook, silently.**
+`git reset --hard` removed `tools/git-hooks/` while the configuration still named it, and
+`git config --get core.hooksPath` printed a correct-looking value while enforcing nothing --
+**found by committing through it**, which is the only way it would have been found. **A gate
+that has quietly stopped existing is worse than no gate**, because the next red commit is then
+a surprise instead of a reminder. Hence the third check in `check-gate.sh`: it commits a
+`src/`-only change and requires it to be refused.
+
+**Two things it deliberately does not do.** It does not run `rebar3 eunit` -- a four-minute
+gate on every commit gets bypassed, and `warnings_as_errors` already makes a broken build fail
+loudly. And it does not inspect the message. `--no-verify` still exists, because anything
+bypassable can be bypassed; the point is that bypassing becomes a flag in the command line
+rather than the default outcome of forgetting.
+
 ### Three version axes in one module, and they do not line up
 
 `structure_for_version/2` is keyed on the **payload structure**, `frame_admission/2` on the

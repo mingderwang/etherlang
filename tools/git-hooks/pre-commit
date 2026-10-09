@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# The gate that was not there when d47f57e shipped. That failure was mine.
+# ---------------------------------------------------------------------------
+# `d47f57e' changed apps/etherlang/src/ and committed with `make check-ledger' **red**. The
+# check is a judgement rather than a build failure, so nothing stopped it, and the commit and
+# the check disagreed in the one direction that hides the problem. TASKS.md was wrong until a
+# second commit fixed it.
+#
+# **This file is the mechanism, not the intention.** Not a habit and not a note in AGENTS.md: a
+# process that refuses. `tools/install-hooks.sh' points git here and runs the self-check.
+#
+# It does NOT run `rebar3 eunit'. A four-minute gate on every commit gets bypassed, and
+# `warnings_as_errors' already makes a broken build fail loudly at compile time. This gate is
+# for the judgement a compiler cannot make.
+#
+# **`--no-verify` still exists.** Anything bypassable can be bypassed; the point is that
+# bypassing is a flag in the command line rather than the default outcome of forgetting.
+
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+RED=$'\033[31m'
+YEL=$'\033[33m'
+RST=$'\033[0m'
+
+src_changed=$(git diff --name-only HEAD -- apps/etherlang/src | head -1)
+ledger_changed=$(git diff --name-only HEAD -- TASKS.md README.md AGENTS.md | head -1)
+
+if [ -n "$src_changed" ] && [ -z "$ledger_changed" ]; then
+    echo "${YEL}pre-commit:${RST} apps/etherlang/src/ changed and no ledger file did."
+    echo "  src: $src_changed"
+    echo ""
+    echo "  Either the change names a gap in TASKS.md, or the commit message says why it"
+    echo "  needs none. ${YEL}d47f57e${RST} shipped without this and had to be corrected by"
+    echo "  ${YEL}1ede3b3${RST}."
+    echo ""
+    exit 1
+fi
+
+if ! make -s check-ledger; then
+    echo ""
+    echo "${RED}pre-commit:${RST} make check-ledger failed. Not committing."
+    exit 1
+fi
+
+exit 0
